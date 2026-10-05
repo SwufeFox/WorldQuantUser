@@ -1,0 +1,12 @@
+{
+  "settings": {
+    "region": "USA",
+    "universe": "TOP3000",
+    "neutralization": "SUBINDUSTRY",
+    "start": 0
+  },
+  "alphas": [
+    {"expression": "rank(ts_delta(close, 5))", "decay": 6},
+    {"expression": "ts_rank(volume, 20)", "decay": 8}
+  ]
+}
