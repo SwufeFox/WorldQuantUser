@@ -1,5 +1,6 @@
 import requests
 from os import environ
+from pathlib import Path
 from time import sleep
 import time
 import json
@@ -22,10 +23,64 @@ ts_ops = ["ts_rank", "ts_zscore", "ts_delta",  "ts_sum", "ts_delay",
  
 ops_set = basic_ops + ts_ops 
 
+
+_DOTENV_LOADED = False
+
+
+def _load_dotenv(path=None):
+    """Load KEY=VALUE pairs from a .env file into os.environ.
+
+    Runs once per process. Real environment variables always win over .env,
+    so CI/shell configuration is never silently overridden.
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+
+    env_path = Path(__file__).resolve().parent / ".env" if path is None else Path(path)
+    if not env_path.is_file():
+        return
+
+    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key and key not in environ:
+            environ[key] = value
+
+
+def get_credentials(prefix="BRAIN"):
+    """Return (username, password) for the WorldQuant BRAIN API.
+
+    Reads <prefix>_USERNAME / <prefix>_PASSWORD from the environment, after
+    loading a .env file next to this module when present. Never hardcode
+    credentials in the source tree.
+    """
+    _load_dotenv()
+    username = environ.get(prefix + "_USERNAME", "").strip()
+    password = environ.get(prefix + "_PASSWORD", "").strip()
+    if not username or not password:
+        raise RuntimeError(
+            "Missing credentials: set {}_USERNAME and {}_PASSWORD in the "
+            "environment, or copy .env.example to .env next to machine_lib.py "
+            "and fill it in.".format(prefix, prefix)
+        )
+    return username, password
+
+
 def login():
     
-    username = ""
-    password = ""
+    username, password = get_credentials()
  
     # Create a session to persistently store the headers
     s = requests.Session()
@@ -720,8 +775,7 @@ def twin_field_factory(op, field, fields):
  
 def login_hk():
     
-    username = ""
-    password = ""
+    username, password = get_credentials()
     
     # Create a session to persistently store the headers
     s = requests.Session()

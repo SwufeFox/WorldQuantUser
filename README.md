@@ -2,6 +2,24 @@
 
 用结构化 JSON 批量运行 `machine_lib.py` 中已有的 Alpha 模拟流程。CLI 只提供 `simulate` 子命令，没有提交 Alpha 的命令。
 
+## 凭据配置
+
+凭据不再写在源码里。`machine_lib.login()` / `login_hk()` 通过 `machine_lib.get_credentials()` 读取 `BRAIN_USERNAME` 和 `BRAIN_PASSWORD`：优先取真实环境变量，其次取 `machine_lib.py` 同目录下 `.env` 文件中的同名键（真实环境变量优先）。任何时候都不要把凭据提交进仓库。
+
+任选一种方式：
+
+```sh
+# 方式一：环境变量
+export BRAIN_USERNAME="your-username"
+export BRAIN_PASSWORD="your-password"
+
+# 方式二：.env 文件（已被 .gitignore 忽略）
+cp .env.example .env
+"$EDITOR" .env
+```
+
+缺少任一凭据时，`get_credentials()` 会抛出 `RuntimeError` 说明如何配置，而不是用空字符串去请求服务。
+
 ## 桌面 GUI
 
 使用 Python 3 启动标准库 Tkinter 界面：
@@ -20,7 +38,7 @@ python research_cli.py simulate --help
 python research_cli.py simulate research.example.json
 ```
 
-示例文件：[research.example.json](research.example.json)。每个 alpha 可独立指定 `decay`，不指定时使用 `6`。运行 CLI simulate 会调用真实 BRAIN 服务；请仅在有意执行模拟且已配置 `machine_lib.login()` 凭据时运行。帮助命令不会导入 `machine_lib` 或访问服务。
+示例文件：[research.example.json](research.example.json)。每个 alpha 可独立指定 `decay`，不指定时使用 `6`。运行 CLI simulate 会调用真实 BRAIN 服务；请仅在有意执行模拟且已按上文「凭据配置」设置好 `BRAIN_USERNAME` / `BRAIN_PASSWORD` 时运行。帮助命令不会导入 `machine_lib` 或访问服务。
 
 ## 输入格式
 
