@@ -241,77 +241,189 @@ def load_task_pool_single(alpha_list, limit_of_single_simulations):
     return pool
 
 
-def single_simulate(alpha_pool, neut, region, universe, start):
+BRAIN_API_URL = "https://api.worldquantbrain.com"
 
+
+class SimulationError(RuntimeError):
+    """A simulation could not be submitted or its result could not be read."""
+
+
+def _retry_after_seconds(response):
+    """Return the seconds BRAIN wants us to wait, or 0 when the job is ready.
+
+    The header is missing or a string depending on the endpoint, so it is
+    parsed leniently instead of indexed directly.
+    """
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def poll_simulation(s, progress_url):
+    """Poll one simulation progress URL until BRAIN stops asking us to retry.
+
+    Returns the final progress payload, e.g. ``{"status": "COMPLETE",
+    "alpha": "..."}``. Raises ``requests.RequestException`` on transport
+    errors.
+    """
+    while True:
+        progress = s.get(progress_url)
+        progress.raise_for_status()
+        retry_after = _retry_after_seconds(progress)
+        if not retry_after:
+            break
+        sleep(retry_after)
+    return progress.json()
+
+
+def submit_single_simulation(s, simulation_data):
+    """POST one single-alpha simulation and return its progress URL.
+
+    Raises ``SimulationError`` when BRAIN accepts the request without a
+    Location header, and ``requests.RequestException`` on transport errors.
+    """
+    response = s.post(BRAIN_API_URL + "/simulations", json=simulation_data)
+    response.raise_for_status()
+    location = response.headers.get("Location")
+    if not location:
+        raise SimulationError(
+            "submit response has no Location header (HTTP %s): %s"
+            % (response.status_code, response.text[:500]))
+    return location
+
+
+def fetch_alpha_metrics(s, alpha_id):
+    """Read one alpha's settings and in-sample metrics back from BRAIN.
+
+    Returns ``{"alpha_id", "expression", "settings", "is"}`` where ``is`` is
+    the raw in-sample block (sharpe, fitness, turnover, ..., checks). This is
+    the data ``single_simulate`` used to discard. Raises
+    ``requests.RequestException`` on transport errors.
+    """
+    while True:
+        response = s.get(BRAIN_API_URL + "/alphas/" + alpha_id)
+        response.raise_for_status()
+        retry_after = _retry_after_seconds(response)
+        if not retry_after:
+            break
+        sleep(retry_after)
+    payload = response.json()
+    return {
+        "alpha_id": alpha_id,
+        "expression": (payload.get("regular") or {}).get("code"),
+        "settings": payload.get("settings"),
+        "is": payload.get("is"),
+    }
+
+
+def _single_simulation_data(alpha, decay, neut, region, universe):
+    # 3 single alphas in each task
+    return {
+        'type': 'REGULAR',
+        'settings': {
+            'instrumentType': 'EQUITY',
+            'region': region,
+            'universe': universe,
+            'delay': 1,
+            'decay': decay,
+            'neutralization': neut,
+            'truncation': 0.08,
+            'pasteurization': 'ON',
+            'testPeriod': 'P0Y',
+            'unitHandling': 'VERIFY',
+            'nanHandling': 'ON',
+            'language': 'FASTEXPR',
+            'visualization': False,
+        },
+        'regular': alpha,
+    }
+
+
+def single_simulate(alpha_pool, neut, region, universe, start):
+    """Submit and poll batches of single-alpha simulations.
+
+    Returns one record per expression, in submission order::
+
+        {"expression", "decay", "alpha_id", "status", "metrics", "error"}
+
+    ``status`` is the BRAIN simulation status ("COMPLETE"/"WARNING"/...);
+    ``metrics`` is the ``fetch_alpha_metrics`` payload for completed alphas,
+    so callers can rank results without a second request. ``error`` holds a
+    message when an expression could not be submitted, polled or read back,
+    and is None otherwise. Failures are reported per expression instead of
+    being swallowed, and an expired session is re-established once before
+    giving up on an expression.
+    """
     s = login()
 
-    brain_api_url = 'https://api.worldquantbrain.com'
+    results = []
 
     for x, task in enumerate(alpha_pool):
         if x < start: continue
-        progress_urls = []
-        for y, (alpha, decay) in enumerate(task):
-
-            # 3 single alphas in each task
-            simulation_data = {
-                'type': 'REGULAR',
-                'settings': {
-                    'instrumentType': 'EQUITY',
-                    'region': region, 
-                    'universe': universe, 
-                    'delay': 1,
-                    'decay': decay, 
-                    'neutralization': neut,
-                    'truncation': 0.08,
-                    'pasteurization': 'ON',
-                    'testPeriod': 'P0Y',
-                    'unitHandling': 'VERIFY',
-                    'nanHandling': 'ON',
-                    'language': 'FASTEXPR',
-                    'visualization': False,
-                },
-            'regular': alpha}
-
+        submitted = []
+        for alpha, decay in task:
+            record = {
+                "expression": alpha,
+                "decay": decay,
+                "alpha_id": None,
+                "status": None,
+                "metrics": None,
+                "error": None,
+            }
+            simulation_data = _single_simulation_data(alpha, decay, neut, region, universe)
             try:
-                simulation_response = s.post('https://api.worldquantbrain.com/simulations', json=simulation_data)
-                simulation_progress_url = simulation_response.headers['Location']
-                progress_urls.append(simulation_progress_url)
-            except:
-                print("location key error: %s"%simulation_response.content)
-                sleep(600)
+                location = submit_single_simulation(s, simulation_data)
+            except requests.HTTPError as exc:
+                status_code = exc.response.status_code if exc.response is not None else None
+                if status_code not in (401, 403):
+                    record["error"] = "submit failed: %s" % exc
+                    results.append(record)
+                    continue
+                # Session expired: log in again and retry this expression once.
                 s = login()
+                try:
+                    location = submit_single_simulation(s, simulation_data)
+                except (requests.RequestException, SimulationError) as retry_exc:
+                    record["error"] = "submit failed after re-login: %s" % retry_exc
+                    results.append(record)
+                    continue
+            except (requests.RequestException, SimulationError) as exc:
+                record["error"] = "submit failed: %s" % exc
+                results.append(record)
+                continue
+            record["status"] = "SUBMITTED"
+            submitted.append((record, location))
 
         print("task %d post done"%(x))
 
-        for j, progress in enumerate(progress_urls):
+        for record, progress_url in submitted:
             try:
-                while True:
-                    simulation_progress = s.get(progress)
-                    if simulation_progress.headers.get("Retry-After", 0) == 0:
-                        break
-                    #print("Sleeping for " + simulation_progress.headers["Retry-After"] + " seconds")
-                    sleep(float(simulation_progress.headers["Retry-After"]))
-
-                status = simulation_progress.json().get("status", 0)
-                if status != "COMPLETE" and status != "WARNING":
-                    print("Not complete : %s"%(progress))
-
-                """
-                alpha_id = simulation_progress.json()["alpha"]
-
-                set_alpha_properties(s,
-                        alpha_id,
-                        name = "%s"%name,
-                        color = None,)
-                """
-            except KeyError:
-                print("look into: %s"%progress)
-            except Exception as e:
-                print(f"other error: {e}")
+                payload = poll_simulation(s, progress_url)
+                status = payload.get("status")
+                record["status"] = status
+                alpha_id = payload.get("alpha")
+                if status in ("COMPLETE", "WARNING") and alpha_id:
+                    record["alpha_id"] = alpha_id
+                    try:
+                        record["metrics"] = fetch_alpha_metrics(s, alpha_id)
+                    except requests.RequestException as exc:
+                        record["error"] = "metrics fetch failed: %s" % exc
+                else:
+                    record["error"] = payload.get("message") or ("status=%s" % status)
+                    print("Not complete : %s (%s)"%(progress_url, record["error"]))
+            except (requests.RequestException, ValueError) as exc:
+                record["error"] = "poll failed: %s" % exc
+                print("look into: %s (%s)"%(progress_url, exc))
+            results.append(record)
 
         print("task %d simulate done"%(x))
-    
+
     print("Simulate done")
+    return results
 
 
 def set_alpha_properties(

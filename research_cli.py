@@ -72,21 +72,38 @@ def run_simulation(args):
             batches = machine_lib.load_task_pool_single(
                 [(a["expression"], a["decay"]) for a in request["alphas"]], args.batch_size
             )
-            # This existing function posts simulations and polls them; it returns None.
-            machine_lib.single_simulate(
+            results = machine_lib.single_simulate(
                 batches, settings["neutralization"], settings["region"],
                 settings["universe"], settings["start"]
-            )
+            ) or []
     except Exception as exc:
         return fail("模拟调用失败: {}".format(exc), EXIT_RUNTIME)
+    results = [dict(r) for r in results]
+    summary = {"COMPLETE": 0, "WARNING": 0, "FAILED": 0}
+    for record in results:
+        status = record.get("status")
+        if status == "COMPLETE":
+            summary["COMPLETE"] += 1
+        elif status == "WARNING":
+            summary["WARNING"] += 1
+        else:
+            summary["FAILED"] += 1
+    if not results:
+        simulation_status = "unknown"
+    elif summary["FAILED"] == 0:
+        simulation_status = "complete"
+    elif summary["COMPLETE"] or summary["WARNING"]:
+        simulation_status = "partial"
+    else:
+        simulation_status = "failed"
     print(json.dumps({
         "ok": True,
         "operation": "simulate",
         "expression_count": len(request["alphas"]),
-        "simulation_status": "unknown",
+        "simulation_status": simulation_status,
         "settings": settings,
-        "result": None,
-        "result_note": "machine_lib.single_simulate 返回 None；本 CLI 无法提供 Alpha 指标或确认各任务完成状态。",
+        "result_summary": summary,
+        "result": results,
     }, ensure_ascii=False))
     return 0
 

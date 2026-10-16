@@ -212,7 +212,11 @@ class ResearchGUI:
             with contextlib.redirect_stdout(QueueWriter(self.events)), contextlib.redirect_stderr(QueueWriter(self.events)):
                 result = machine_lib.single_simulate(batches, settings["neutralization"],
                                                      settings["region"], settings["universe"], settings["start"])
-            state = "未知（函数返回 None，无法确认任务完成状态）" if result is None else "未知（函数未提供可确认的状态）"
+            counts = {}
+            for record in result or []:
+                key = record.get("status") or "FAILED"
+                counts[key] = counts.get(key, 0) + 1
+            state = "、".join(f"{key} {counts[key]}" for key in sorted(counts)) or "无结果"
             self.events.put(("done", f"调用结束；模拟状态：{state}"))
         except Exception as exc:
             # Avoid rendering likely credential-like values from third-party exception text.
