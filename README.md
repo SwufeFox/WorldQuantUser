@@ -1,71 +1,195 @@
-# Alpha Research CLI
+# Alpha Machine
 
-用结构化 JSON 批量运行 `machine_lib.py` 中已有的 Alpha 模拟流程，并取回每条表达式的 Alpha 指标。CLI 只提供 `simulate` 子命令，没有提交 Alpha 的命令。
+Tools for researching [WorldQuant BRAIN](https://platform.worldquantbrain.com/)
+alphas: generate FASTEXPR expressions, simulate them, and read back which ones
+scored well.
 
-## 安装依赖
+The repository is built around one idea: **a program should be able to drive the
+whole loop without reading the source.** Every capability is reachable from
+`research_cli.py`, whose contract is documented by the tool itself.
 
-```sh
-pip install -r requirements.txt
+```
+research_cli.py schema      # the whole contract, as JSON
 ```
 
-运行依赖 `requests` 和 `pandas`（见 `requirements.txt`）。
+## Layout
 
-## 凭据配置
+| File | Job |
+| --- | --- |
+| `research_cli.py` | The machine-readable CLI. stdout is always one JSON document. |
+| `research_config.py` | Research-file format: parsing and validation, shared by CLI and GUI. |
+| `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
+| `research_gui.py` | Small tkinter wrapper for interactive use. |
+| `Alpha Machine.ipynb` | Worked example, first-order → second-order → third-order alphas. |
+| `tests/` | Offline contract tests. No account required. |
 
-凭据不再写在源码里。`machine_lib.login()` / `login_hk()` 通过 `machine_lib.get_credentials()` 读取 `BRAIN_USERNAME` 和 `BRAIN_PASSWORD`：优先取真实环境变量，其次取 `machine_lib.py` 同目录下 `.env` 文件中的同名键（真实环境变量优先）。任何时候都不要把凭据提交进仓库。
+## Install
 
-任选一种方式：
+```bash
+pip install -r requirements.txt      # requests (required), pandas (optional)
+```
 
-```sh
-# 方式一：环境变量
-export BRAIN_USERNAME="your-username"
-export BRAIN_PASSWORD="your-password"
+`pandas` is only needed for the notebook and `fields_to_df()`; the CLI runs
+without it.
 
-# 方式二：.env 文件（已被 .gitignore 忽略）
+## Credentials
+
+Copy the template and fill it in:
+
+```bash
 cp .env.example .env
-"$EDITOR" .env
 ```
 
-缺少任一凭据时，`get_credentials()` 会抛出 `RuntimeError` 说明如何配置，而不是用空字符串去请求服务。
+`.env` is git-ignored. Real environment variables (`BRAIN_USERNAME`,
+`BRAIN_PASSWORD`) take precedence over the file:
 
-## 桌面 GUI
-
-使用 Python 3 启动标准库 Tkinter 界面：
-
-```sh
-python research_gui.py
+```bash
+export BRAIN_USERNAME=you@example.com
+export BRAIN_PASSWORD=...
 ```
 
-在表达式编辑区每行输入一条 Alpha；可直接输入 `expression | decay`（例如 `rank(close) | 8`），省略 decay 时默认为 `6`。GUI 可加载和保存与下方 CLI 相同的 JSON 格式。点击“开始模拟”前会显示真实服务操作确认；确认后会登录并向 WorldQuant BRAIN 提交模拟，界面日志不会输出认证凭据。模拟结束后 GUI 按每条表达式返回的 `status` 汇总显示（例如 `COMPLETE 3`）。GUI 不提供 Alpha 提交流程。
+`machine_lib.get_credentials()` raises `MissingCredentials` when either is
+absent — nothing silently sends an empty login.
 
-## CLI 使用
+Sessions are cached in `.brain_session.json` (also git-ignored). BRAIN sessions
+last hours but challenges rapid repeated logins with a captcha, so the cache is
+what keeps a sequence of CLI calls cheap. Use `--relogin` to force a new login
+or `--no-cache` to ignore the cache for one call.
 
-```sh
-python research_cli.py --help
-python research_cli.py simulate --help
-python research_cli.py simulate research.example.json
+## Driving it from a script or an agent
+
+stdout is **always exactly one JSON document**, so every call is:
+
+```python
+result = json.loads(subprocess.run([...], capture_output=True).stdout)
+if not result["ok"]:
+    handle(result["error"]["code"], result["error"]["message"], result["error"]["hint"])
 ```
 
-示例文件：[research.example.json](research.example.json)。每个 alpha 可独立指定 `decay`，不指定时使用 `6`。运行 CLI simulate 会调用真实 BRAIN 服务；请仅在有意执行模拟且已按上文「凭据配置」设置好 `BRAIN_USERNAME` / `BRAIN_PASSWORD` 时运行。帮助命令不会导入 `machine_lib` 或访问服务。
+Progress goes to stderr, never stdout. Failures carry a stable `error.code` and
+a process exit code (`USAGE`/`INVALID_INPUT` 2, `AUTH_*` 3, `RATE_LIMITED`/
+`SERVICE_ERROR` 4, `NOT_FOUND` 5, `SIMULATION_FAILED` 6).
 
-## 输入格式
+### Discover the surface
+
+```bash
+python research_cli.py schema            # commands, arguments, formats, codes
+python research_cli.py schema simulate   # one command in detail
+```
+
+### Check the account
+
+```bash
+python research_cli.py auth check
+```
+
+Returns `user_id`, `permissions` and the regions that actually have data. A
+`TUTORIAL` account only sees `USA` — every other region returns zero datasets.
+
+### Browse metadata (quota-free)
+
+```bash
+python research_cli.py catalog operators --search ts_ --group "Time Series"
+python research_cli.py catalog categories                 # field/alpha counts = crowding
+python research_cli.py catalog datasets --region USA
+python research_cli.py catalog fields --dataset fundamental6 --type MATRIX \
+    --search liability --limit 20 --expressions
+```
+
+`--expressions` also emits ready-to-paste snippets, already winsorized and
+backfilled. Add `--save out.json` to keep a snapshot for offline use.
+
+### Simulate
+
+Always validate before spending quota:
+
+```bash
+python research_cli.py simulate --expr "rank(liabilities/assets)-0.5" --decay 4 --dry-run
+```
+
+`--dry-run` prints the exact `POST /simulations` payloads without contacting
+BRAIN, so it needs no credentials.
+
+Then run for real:
+
+```bash
+python research_cli.py simulate research.json --sort sharpe --top 5 --stream
+```
+
+`--stream` emits JSON Lines progress events on stderr (`submitted`, `completed`,
+`rate_limited`) while the single JSON result stays on stdout. The result
+contains one record per expression (`expression`, `decay`, `alpha_id`,
+`status`, `metrics`, `checks`, `error`) plus a `summary` with counts, a
+`ranking` sorted by sharpe, and `best`.
+
+A failed expression is reported in its own record instead of aborting the run;
+the command only fails outright when *every* expression failed.
+
+### Inspect results
+
+```bash
+python research_cli.py alpha get P0Mq0wEM
+python research_cli.py alpha list --min-sharpe 1.5 --limit 20
+```
+
+Both are quota-free.
+
+## Research files
 
 ```json
 {
-  "settings": {
-    "region": "USA",
-    "universe": "TOP3000",
-    "neutralization": "SUBINDUSTRY",
-    "start": 0
-  },
+  "settings": {"region": "USA", "universe": "TOP3000", "neutralization": "SUBINDUSTRY", "decay": 6},
   "alphas": [
-    {"expression": "rank(ts_delta(close, 5))", "decay": 6}
+    "rank(liabilities/assets)-0.5",
+    {"expression": "rank(ts_delta(close, 5))", "decay": 4},
+    ["ts_rank(volume, 20)", 8]
   ]
 }
 ```
 
-`settings` 可省略，默认值依次为 `USA`、`TOP3000`、`SUBINDUSTRY`、`0`。`region` 接受 USA、GLB、EUR、ASI、CHN、HKG、JPN、KOR、TWN；`universe` 必须为非空字符串；`neutralization` 接受 NONE、MARKET、SECTOR、INDUSTRY、SUBINDUSTRY、COUNTRY、SLOW、FAST；`start` 为非负整数。`alphas` 必须是非空数组，表达式为非空字符串，`decay` 为非负有限数值。
+Command-line flags override the file, which overrides the defaults. A file that
+does not start with `{` or `[` is read as plain text: one expression per line,
+blank lines and `#` comments skipped.
 
-CLI 按 `--batch-size`（默认 3）分组，并调用 `single_simulate(alpha_pools, neut, region, universe, start)`。该函数返回每条表达式一条记录：`{"expression", "decay", "alpha_id", "status", "metrics", "error"}`，其中 `metrics` 是完成后的 Alpha 设置与样本内指标（`sharpe`、`fitness`、`turnover`、`checks` 等），`error` 在失败时给出原因。CLI 成功 JSON 的 `result` 即该记录数组，`result_summary` 按状态计数，`simulation_status` 为 `complete` / `partial` / `failed`（无结果时为 `unknown`）。提交或轮询失败的表达式会按条记录错误，而不是被静默丢弃；会话过期时会重新登录并重试一次。
+## Using `machine_lib` directly
 
-输入错误退出码为 `2`，模拟调用错误退出码为 `3`。验证时可运行 `python research_cli.py --help`、`python research_cli.py simulate --help`；不要为验证而运行 simulate，因为它会请求真实 BRAIN 服务。
+```python
+import machine_lib as ml
+
+session = ml.load_session()                     # cached session, logs in if needed
+fields = ml.get_datafields(session, dataset_id="fundamental6", region="USA",
+                           universe="TOP3000", delay=1, field_type="MATRIX")
+print(ml.process_datafields(fields)[:3])        # FASTEXPR-ready snippets
+
+records = ml.simulate_alphas(session, [("rank(cap)", 6)], settings={"region": "USA"})
+print(records[0]["metrics"]["sharpe"])
+```
+
+Errors are typed and subclass `machine_lib.BrainError`: `MissingCredentials`,
+`AuthError`, `CaptchaRequired`, `NotFound`, `RateLimited`, `ServiceError`,
+`SimulationError`, each with a stable `code`.
+
+## Notes and limits
+
+* **Simulation quota is real.** `simulate` without `--dry-run` spends it;
+  `catalog` and `alpha` never do.
+* **Rate limits.** Metadata endpoints return HTTP 429 under load and
+  submissions have their own limit. `machine_lib` absorbs both with the
+  advertised `Retry-After` backoff and surfaces `RateLimited` only when the
+  budget is exhausted.
+* **Pagination.** BRAIN caps `limit` at 50 per page; `get_datafields` pages
+  internally.
+* **Region access is account-scoped.** Unknown region/neutralization values are
+  rejected before any request is made.
+* **No interactive prompts.** `login_hk()` raises with the authorization URL
+  instead of blocking on `input()`.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Fully offline: schema, dry-run payloads, research-file parsing, credential
+precedence, error envelopes, and a guard that no credential file is tracked by
+git.

@@ -1,27 +1,105 @@
-import requests
+import json
+import pickle
+import random
+import re
+import time
+from collections import defaultdict
+from itertools import combinations, product
 from os import environ
 from pathlib import Path
 from time import sleep
-import time
-import json
-import pandas as pd
-import random
-import pickle
-from itertools import product
-from itertools import combinations
-from collections import defaultdict
 from urllib.parse import urljoin
-import pickle
- 
 
-# 将添加获得权限的Vector操作符添加在此处
- 
-basic_ops = ["reverse", "inverse", "rank", "zscore", "quantile", "normalize"]
- 
-ts_ops = ["ts_rank", "ts_zscore", "ts_delta",  "ts_sum", "ts_delay", 
-          "ts_std_dev", "ts_mean",  "ts_arg_min", "ts_arg_max","ts_scale", "ts_quantile"]
- 
-ops_set = basic_ops + ts_ops 
+import requests
+
+try:  # pandas is optional: only the dataframe helpers and the notebook need it
+    import pandas as pd
+except ImportError:  # pragma: no cover - exercised only when pandas is absent
+    pd = None
+
+
+# ---------------------------------------------------------------------------
+# Errors
+#
+# Everything this module raises on purpose derives from BrainError and carries
+# a stable ``code``. Callers map ``code`` -> process exit code, so failures stay
+# machine-readable instead of leaking a traceback shape.
+# ---------------------------------------------------------------------------
+class BrainError(RuntimeError):
+    code = "BRAIN_ERROR"
+    #: Optional actionable next step, surfaced verbatim by the CLI.
+    hint = None
+
+
+class MissingCredentials(BrainError):
+    code = "AUTH_MISSING"
+
+
+class AuthError(BrainError):
+    code = "AUTH_FAILED"
+
+
+class CaptchaRequired(AuthError):
+    """BRAIN wants a human captcha before it will hand out a session."""
+
+    code = "AUTH_CAPTCHA"
+    hint = ("too many logins in a short window; wait a few minutes, then retry. "
+            "Reusing the cached session avoids this.")
+
+
+class NotFound(BrainError):
+    code = "NOT_FOUND"
+
+
+class RateLimited(BrainError):
+    code = "RATE_LIMITED"
+
+
+class SimulationError(BrainError):
+    code = "SIMULATION_FAILED"
+
+
+class ServiceError(BrainError):
+    """BRAIN answered with a non-2xx status we could not classify further."""
+
+    code = "SERVICE_ERROR"
+
+
+# ---------------------------------------------------------------------------
+# Simulation settings
+# ---------------------------------------------------------------------------
+#: Base payload for ``POST /simulations``. Callers override individual keys;
+#: see ``resolve_settings`` for merge + validation rules.
+DEFAULT_SETTINGS = {
+    "instrumentType": "EQUITY",
+    "region": "USA",
+    "universe": "TOP3000",
+    "delay": 1,
+    "decay": 6,
+    "neutralization": "SUBINDUSTRY",
+    "truncation": 0.08,
+    "pasteurization": "ON",
+    "testPeriod": "P0Y",
+    "unitHandling": "VERIFY",
+    "nanHandling": "ON",
+    "language": "FASTEXPR",
+    "visualization": False,
+}
+
+#: Regions the API accepts. Which ones actually return data depends on the
+#: account's permissions (a TUTORIAL account only sees USA).
+REGIONS = [
+    "USA", "GLB", "EUR", "ASI", "CHN", "HKG", "JPN", "KOR", "TWN", "IND",
+    "AMR", "EMEA", "APAC",
+]
+
+NEUTRALIZATIONS = ["NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY"]
+
+#: Non-exhaustive list of common universes, used for input validation hints.
+UNIVERSES = [
+    "TOP3000", "TOP1000", "TOP600", "TOP500", "TOP200", "TOP100",
+    "TOPSP500", "TOPSP1000", "MINVOL1M", "ILLIQUID_MINVOL1M",
+]
 
 
 _DOTENV_LOADED = False
@@ -70,7 +148,7 @@ def get_credentials(prefix="BRAIN"):
     username = environ.get(prefix + "_USERNAME", "").strip()
     password = environ.get(prefix + "_PASSWORD", "").strip()
     if not username or not password:
-        raise RuntimeError(
+        raise MissingCredentials(
             "Missing credentials: set {}_USERNAME and {}_PASSWORD in the "
             "environment, or copy .env.example to .env next to machine_lib.py "
             "and fill it in.".format(prefix, prefix)
@@ -79,68 +157,254 @@ def get_credentials(prefix="BRAIN"):
 
 
 def login():
-    
+    """Authenticate and return a ``requests.Session`` for the BRAIN API.
+
+    Raises ``MissingCredentials`` when no username/password is configured and
+    ``AuthError`` when BRAIN rejects them. Prints nothing: use
+    ``authenticate()`` if you want to know which account you are using.
+    """
+    session, _ = authenticate()
+    return session
+
+
+def authenticate():
+    """Return ``(session, info)`` for the configured BRAIN credentials.
+
+    ``info`` is ``{"user_id", "permissions", "token_expiry"}`` -- deliberately
+    not the ``/users/self`` payload, which carries account PII (email, phone).
+    """
     username, password = get_credentials()
- 
-    # Create a session to persistently store the headers
-    s = requests.Session()
- 
-    # Save credentials into session
-    s.auth = (username, password)
- 
-    # Send a POST request to the /authentication API
-    response = s.post('https://api.worldquantbrain.com/authentication')
-    print(response.content)
-    return s  
+    session = requests.Session()
+    session.auth = (username, password)
+    response = session.post(BRAIN_API_URL + "/authentication")
+    if response.status_code != 201:
+        body = response.text[:300]
+        if "captcha" in body.lower():
+            raise CaptchaRequired(
+                "BRAIN is asking for a captcha before issuing a session (HTTP 400)."
+            )
+        raise AuthError(
+            "authentication failed (HTTP %s): %s" % (response.status_code, body)
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    token = payload.get("token")
+    info = {
+        "user_id": (payload.get("user") or {}).get("id"),
+        "permissions": payload.get("permissions") or [],
+        "token_expiry": (token or {}).get("expiry") if isinstance(token, dict)
+        else payload.get("tokenExpiry"),
+    }
+    return session, info
 
 
-def get_datasets(
-    s,
-    instrument_type: str = 'EQUITY',
-    region: str = 'USA',
-    delay: int = 1,
-    universe: str = 'TOP3000'
-):
-    url = "https://api.worldquantbrain.com/data-sets?" +\
-        f"instrumentType={instrument_type}&region={region}&delay={str(delay)}&universe={universe}"
-    result = s.get(url)
-    datasets_df = pd.DataFrame(result.json()['results'])
-    return datasets_df
+def regular_expression(alpha):
+    """Return ``(code, description, operator_count)`` from an alpha payload.
 
-
-def get_datafields(
-    s,
-    instrument_type: str = 'EQUITY',
-    region: str = 'USA',
-    delay: int = 1,
-    universe: str = 'TOP3000',
-    dataset_id: str = '',
-    search: str = ''
-):
-    if len(search) == 0:
-        url_template = "https://api.worldquantbrain.com/data-fields?" +\
-            f"&instrumentType={instrument_type}" +\
-            f"&region={region}&delay={str(delay)}&universe={universe}&dataset.id={dataset_id}&limit=50" +\
-            "&offset={x}"
-        count = s.get(url_template.format(x=0)).json()['count'] 
-        
+    BRAIN returns ``regular`` as a plain string for some alphas and as
+    ``{"code", "description", "operatorCount"}`` for others; callers should not
+    have to branch on that.
+    """
+    regular = alpha.get("regular")
+    if isinstance(regular, dict):
+        code, description, count = (regular.get("code"), regular.get("description"),
+                                    regular.get("operatorCount"))
     else:
-        url_template = "https://api.worldquantbrain.com/data-fields?" +\
-            f"&instrumentType={instrument_type}" +\
-            f"&region={region}&delay={str(delay)}&universe={universe}&limit=50" +\
-            f"&search={search}" +\
-            "&offset={x}"
-        count = 100
-    
-    datafields_list = []
-    for x in range(0, count, 50):
-        datafields = s.get(url_template.format(x=x))
-        datafields_list.append(datafields.json()['results'])
- 
-    datafields_list_flat = [item for sublist in datafields_list for item in sublist]
- 
-    datafields_df = pd.DataFrame(datafields_list_flat)
-    return datafields_df
+        code, description, count = regular, None, None
+    if isinstance(code, str):
+        code = code.strip()
+    return code, description, count
+
+
+def session_cache_path():
+    """Where a reused BRAIN session cookie is kept (git-ignored)."""
+    return Path(__file__).resolve().parent / ".brain_session.json"
+
+
+def save_session(session, info=None, path=None):
+    """Persist an authenticated session's cookies so later calls can reuse it."""
+    info = info or {}
+    target = Path(path or session_cache_path())
+    target.write_text(json.dumps({
+        "cookies": requests.utils.dict_from_cookiejar(session.cookies),
+        "saved_at": time.time(),
+        "expiry_seconds": info.get("token_expiry"),
+        "user_id": info.get("user_id"),
+        "permissions": info.get("permissions"),
+    }, indent=2))
+    return target
+
+
+def load_session(cache_path=None, use_cache=True, refresh=False):
+    """Return an authenticated session, reusing a cached cookie when still valid.
+
+    BRAIN issues sessions that last hours, but challenges repeated logins with a
+    captcha -- so re-authenticating on every CLI call is both slow and fragile.
+    With ``use_cache`` a saved cookie is reused until shortly before it expires;
+    ``refresh`` forces a fresh login. The cache file is git-ignored.
+    """
+    path = Path(cache_path or session_cache_path())
+    if use_cache and not refresh and path.is_file():
+        try:
+            cached = json.loads(path.read_text())
+            saved_at = float(cached.get("saved_at") or 0)
+            expiry = float(cached.get("expiry_seconds") or 0)
+            if expiry and time.time() < saved_at + expiry - 60:
+                session = requests.Session()
+                session.auth = get_credentials()
+                session.cookies.update(cached.get("cookies") or {})
+                return session
+        except (OSError, ValueError, TypeError, MissingCredentials):
+            pass  # fall through to a fresh login
+    session, info = authenticate()
+    try:
+        save_session(session, info, path)
+    except OSError:
+        pass  # a read-only checkout must not break a working session
+    return session
+
+
+def get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
+                 universe="TOP3000", limit=None):
+    """List datasets available for a region/universe/delay as ``list[dict]``.
+
+    Quota-free. Returns ``[]`` when the account has no data for that
+    combination (which is what a TUTORIAL account sees outside USA).
+    """
+    payload = request_json(
+        s, "GET", "/data-sets",
+        params={
+            "instrumentType": instrument_type,
+            "region": region,
+            "delay": delay,
+            "universe": universe,
+        },
+    )
+    results = _as_results(payload, "data-sets")
+    return results[:limit] if limit else results
+
+
+def _as_results(payload, *keys):
+    """Normalize a BRAIN collection response into a list.
+
+    Some endpoints wrap rows in ``{"results": [...]}`` and some return a bare
+    JSON array, so callers should not have to care which.
+    """
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        for key in keys:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        for key in ("results", "operators", "categories", "data-sets", "datafields"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+    return []
+
+
+def fetch_operators(s, search="", group=""):
+    """List FASTEXPR operators as ``list[dict]`` (``name``, ``category``, ...).
+
+    Quota-free. ``search`` matches the name or description, ``group`` an exact
+    category such as ``Time Series``.
+    """
+    operators = _as_results(request_json(s, "GET", "/operators"))
+    if group:
+        operators = [o for o in operators if (o.get("category") or "") == group]
+    if search:
+        needle = search.lower()
+        operators = [
+            o for o in operators
+            if needle in ((o.get("name") or "") + " " + (o.get("description") or "")).lower()
+        ]
+    return operators
+
+
+def fetch_operator_doc(s, name):
+    """Return one operator's documentation page (markdown body + metadata)."""
+    return request_json(s, "GET", "/operators/" + name)
+
+
+def fetch_data_categories(s, region="USA", universe="TOP3000", delay=1):
+    """Return the data categories with their field/alpha counts and value score.
+
+    ``alphaCount`` is a rough crowding signal: high counts mean "many people
+    already mined this".
+    """
+    payload = request_json(
+        s, "GET", "/data-categories",
+        params={"region": region, "universe": universe, "delay": delay},
+    )
+    return _as_results(payload, "categories")
+
+
+def get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
+                   universe="TOP3000", dataset_id="", search="", field_type=None,
+                   limit=None):
+    """List datafields as ``list[dict]`` (``id``, ``description``, ``type``, ...).
+
+    Paginates over ``GET /datafields`` and stops early once ``limit`` rows are
+    collected. ``field_type`` filters on the BRAIN type (MATRIX, VECTOR, GROUP).
+    Quota-free.
+    """
+    fields = []
+    offset = 0
+    page = 50  # BRAIN rejects larger pages with HTTP 400
+    while True:
+        payload = request_json(
+            s, "GET", "/data-fields",
+            params={
+                "instrumentType": instrument_type,
+                "region": region,
+                "delay": delay,
+                "universe": universe,
+                "dataset.id": dataset_id,
+                "limit": page,
+                "offset": offset,
+            },
+        )
+        results = _as_results(payload, "datafields")
+        if not results:
+            break
+        for item in results:
+            if field_type and item.get("type") != field_type:
+                continue
+            if search and search.lower() not in (
+                (item.get("id") or "") + " " + (item.get("description") or "")
+            ).lower():
+                continue
+            fields.append(item)
+            if limit and len(fields) >= limit:
+                return fields
+        offset += page
+        if offset >= (payload.get("count") or 0):
+            break
+    return fields
+
+
+def field_ids(fields, field_type=None, search=""):
+    """Return the ``id`` of each field, optionally filtered by type/substring."""
+    return [
+        f["id"]
+        for f in fields
+        if f.get("id")
+        and (not field_type or f.get("type") == field_type)
+        and (
+            not search
+            or search.lower() in ((f.get("id") or "") + " " + (f.get("description") or "")).lower()
+        )
+    ]
+
+
+def fields_to_df(fields):
+    """Wrap ``list[dict]`` metadata in a DataFrame when pandas is installed."""
+    if pd is None:
+        raise RuntimeError("pandas is required for fields_to_df(); pip install pandas")
+    return pd.DataFrame(fields)
 
 
 def get_vec_fields(fields):
@@ -160,12 +424,24 @@ def get_vec_fields(fields):
     return(vec_fields)
 
 
-def process_datafields(df):
+def process_datafields(fields):
+    """Turn field metadata into directly usable FASTEXPR snippets.
 
-    datafields = []
-    datafields += df[df['type'] == "MATRIX"]["id"].tolist()
-    datafields += get_vec_fields(df[df['type'] == "VECTOR"]["id"].tolist())
-    return ["winsorize(ts_backfill(%s, 120), std=4)"%field for field in datafields]
+    Accepts the ``list[dict]`` from :func:`get_datafields` (or a DataFrame, for
+    older notebooks). MATRIX fields are winsorized + backfilled, VECTOR fields
+    are converted to a scalar via ``vec_avg``.
+    """
+    if pd is not None and hasattr(fields, "to_dict"):
+        fields = fields.to_dict("records")
+    matrix = [
+        'winsorize(ts_backfill(%s, 120), std=4)' % f["id"]
+        for f in fields if f.get("type") == "MATRIX" and f.get("id")
+    ]
+    vector = [
+        'vec_avg(%s)' % f["id"]
+        for f in fields if f.get("type") == "VECTOR" and f.get("id")
+    ]
+    return matrix + vector
 
 
 def ts_factory(op, field):
@@ -244,186 +520,345 @@ def load_task_pool_single(alpha_list, limit_of_single_simulations):
 BRAIN_API_URL = "https://api.worldquantbrain.com"
 
 
-class SimulationError(RuntimeError):
-    """A simulation could not be submitted or its result could not be read."""
-
-
 def _retry_after_seconds(response):
-    """Return the seconds BRAIN wants us to wait, or 0 when the job is ready.
+    """Seconds BRAIN wants us to wait, or 0 when the request is ready.
 
-    The header is missing or a string depending on the endpoint, so it is
-    parsed leniently instead of indexed directly.
+    ``Retry-After`` drives both the progress protocol and submission rate
+    limiting. It is parsed leniently and, on non-2xx responses, capped so a
+    large advertised value cannot park the process indefinitely.
     """
     raw = response.headers.get("Retry-After")
     if raw is None:
         return 0.0
     try:
-        return float(raw)
+        seconds = float(raw)
     except (TypeError, ValueError):
         return 0.0
+    if not response.ok:
+        return min(seconds, 120.0)
+    return max(seconds, 0.0)
 
 
-def poll_simulation(s, progress_url):
+def request_json(s, method, path, params=None, json_body=None, max_retries=4):
+    """Call BRAIN and return decoded JSON, translating failures into typed errors.
+
+    The single HTTP choke point, so every caller sees the same behaviour:
+    401/403 -> AuthError, 404 -> NotFound, repeated 429 -> RateLimited (with
+    backoff), other errors -> requests.HTTPError.
+    """
+    url = path if path.startswith("http") else BRAIN_API_URL + path
+    last = None
+    for attempt in range(1, max_retries + 1):
+        response = s.request(method, url, params=params, json=json_body)
+        if response.status_code in (401, 403):
+            raise AuthError(
+                "BRAIN rejected the session (HTTP %s) for %s %s"
+                % (response.status_code, method, url)
+            )
+        if response.status_code == 404:
+            raise NotFound("%s %s -> 404 (unknown id or endpoint)" % (method, url))
+        if response.status_code == 429:
+            wait = _retry_after_seconds(response) or min(60.0, 5.0 * attempt)
+            last = RateLimited("%s %s is rate limited" % (method, url))
+            if attempt < max_retries:
+                sleep(wait)
+                continue
+            raise last
+        if not response.ok:
+            raise ServiceError(
+                "HTTP %s from %s %s: %s"
+                % (response.status_code, method, url, response.text[:300])
+            )
+        try:
+            return response.json()
+        except ValueError:
+            return {}
+    raise last or RateLimited("%s %s" % (method, url))
+
+
+def poll_simulation(s, progress_url, on_event=None):
     """Poll one simulation progress URL until BRAIN stops asking us to retry.
 
-    Returns the final progress payload, e.g. ``{"status": "COMPLETE",
-    "alpha": "..."}``. Raises ``requests.RequestException`` on transport
-    errors.
+    Returns the final payload, e.g. ``{"status": "COMPLETE", "alpha": "..."}``.
+    ``on_event(kind, payload)``, when given, receives a ``polling`` event per
+    retry so a caller can stream progress without parsing stdout.
     """
     while True:
         progress = s.get(progress_url)
+        if progress.status_code in (401, 403):
+            raise AuthError(
+                "session rejected while polling (HTTP %s)" % progress.status_code
+            )
         progress.raise_for_status()
         retry_after = _retry_after_seconds(progress)
         if not retry_after:
             break
+        if on_event:
+            on_event("polling", {"retry_after": retry_after})
         sleep(retry_after)
-    return progress.json()
+    try:
+        return progress.json()
+    except ValueError:
+        raise SimulationError(
+            "progress endpoint returned non-JSON: %s" % progress.text[:300]
+        )
 
 
-def submit_single_simulation(s, simulation_data):
+def submit_single_simulation(s, simulation_data, max_retries=5, on_event=None):
     """POST one single-alpha simulation and return its progress URL.
 
-    Raises ``SimulationError`` when BRAIN accepts the request without a
-    Location header, and ``requests.RequestException`` on transport errors.
+    BRAIN applies a per-account submission rate limit (HTTP 429) and exposes no
+    queue to inspect, so 429 is absorbed here with the advertised backoff
+    instead of reaching the caller.
     """
-    response = s.post(BRAIN_API_URL + "/simulations", json=simulation_data)
-    response.raise_for_status()
-    location = response.headers.get("Location")
-    if not location:
-        raise SimulationError(
-            "submit response has no Location header (HTTP %s): %s"
-            % (response.status_code, response.text[:500]))
-    return location
+    for attempt in range(1, max_retries + 1):
+        response = s.post(BRAIN_API_URL + "/simulations", json=simulation_data)
+        if response.status_code == 429:
+            wait = _retry_after_seconds(response) or min(60.0, 5.0 * attempt)
+            if on_event:
+                on_event(
+                    "rate_limited",
+                    {"attempt": attempt, "wait_seconds": wait, "expression":
+                     simulation_data.get("regular")},
+                )
+            if attempt < max_retries:
+                sleep(wait)
+                continue
+            raise RateLimited(
+                "submission still rate limited after %d attempts" % max_retries
+            )
+        if response.status_code in (401, 403):
+            raise AuthError(
+                "submission rejected (HTTP %s)" % response.status_code
+            )
+        response.raise_for_status()
+        location = response.headers.get("Location")
+        if not location:
+            raise SimulationError(
+                "submit response has no Location header (HTTP %s): %s"
+                % (response.status_code, response.text[:500])
+            )
+        return location
 
 
-def fetch_alpha_metrics(s, alpha_id):
-    """Read one alpha's settings and in-sample metrics back from BRAIN.
+def fetch_alpha_metrics(s, alpha_id, on_event=None):
+    """Read one alpha's settings, in-sample metrics and platform checks.
 
-    Returns ``{"alpha_id", "expression", "settings", "is"}`` where ``is`` is
-    the raw in-sample block (sharpe, fitness, turnover, ..., checks). This is
-    the data ``single_simulate`` used to discard. Raises
-    ``requests.RequestException`` on transport errors.
+    Returns the raw ``GET /alphas/{id}`` payload (``regular``, ``settings``,
+    ``is``, ``checks``, ...). Quota-free: it never consumes a simulation slot.
+    Raises ``NotFound`` for an unknown id.
     """
     while True:
         response = s.get(BRAIN_API_URL + "/alphas/" + alpha_id)
+        if response.status_code == 404:
+            raise NotFound("alpha %s not found" % alpha_id)
         response.raise_for_status()
         retry_after = _retry_after_seconds(response)
         if not retry_after:
             break
+        if on_event:
+            on_event("polling", {"retry_after": retry_after})
         sleep(retry_after)
-    payload = response.json()
-    return {
-        "alpha_id": alpha_id,
-        "expression": (payload.get("regular") or {}).get("code"),
-        "settings": payload.get("settings"),
-        "is": payload.get("is"),
-    }
+    try:
+        return response.json()
+    except ValueError:
+        raise SimulationError(
+            "alpha endpoint returned non-JSON: %s" % response.text[:300]
+        )
 
 
-def _single_simulation_data(alpha, decay, neut, region, universe):
-    # 3 single alphas in each task
-    return {
-        'type': 'REGULAR',
-        'settings': {
-            'instrumentType': 'EQUITY',
-            'region': region,
-            'universe': universe,
-            'delay': 1,
-            'decay': decay,
-            'neutralization': neut,
-            'truncation': 0.08,
-            'pasteurization': 'ON',
-            'testPeriod': 'P0Y',
-            'unitHandling': 'VERIFY',
-            'nanHandling': 'ON',
-            'language': 'FASTEXPR',
-            'visualization': False,
-        },
-        'regular': alpha,
-    }
+def resolve_settings(overrides=None):
+    """Merge ``overrides`` onto :data:`DEFAULT_SETTINGS` and validate the result.
 
-
-def single_simulate(alpha_pool, neut, region, universe, start):
-    """Submit and poll batches of single-alpha simulations.
-
-    Returns one record per expression, in submission order::
-
-        {"expression", "decay", "alpha_id", "status", "metrics", "error"}
-
-    ``status`` is the BRAIN simulation status ("COMPLETE"/"WARNING"/...);
-    ``metrics`` is the ``fetch_alpha_metrics`` payload for completed alphas,
-    so callers can rank results without a second request. ``error`` holds a
-    message when an expression could not be submitted, polled or read back,
-    and is None otherwise. Failures are reported per expression instead of
-    being swallowed, and an expired session is re-established once before
-    giving up on an expression.
+    Returns a fresh dict. Raises ``ValueError`` on an unknown region,
+    neutralization or delay so callers fail before spending quota.
     """
-    s = login()
+    settings = dict(DEFAULT_SETTINGS)
+    for key, value in (overrides or {}).items():
+        if value is not None:
+            settings[key] = value
+    if settings["region"] not in REGIONS:
+        raise ValueError(
+            "unknown region %r (known: %s)" % (settings["region"], ", ".join(REGIONS))
+        )
+    if settings["neutralization"] not in NEUTRALIZATIONS:
+        raise ValueError(
+            "unknown neutralization %r (known: %s)"
+            % (settings["neutralization"], ", ".join(NEUTRALIZATIONS))
+        )
+    if settings["delay"] not in (0, 1):
+        raise ValueError("delay must be 0 or 1, got %r" % (settings["delay"],))
+    return settings
 
-    results = []
 
-    for x, task in enumerate(alpha_pool):
-        if x < start: continue
+def _single_simulation_data(expression, decay, settings):
+    """Build one ``POST /simulations`` payload from a resolved settings dict."""
+    body = dict(settings)
+    body["decay"] = decay
+    return {"type": "REGULAR", "settings": body, "regular": expression}
+
+
+def normalize_alphas(alphas, settings):
+    """Normalize a research-file ``alphas`` entry list into ``(expr, decay)`` pairs.
+
+    Accepts plain strings, ``{"expression": ..., "decay": ...}`` dicts, or
+    ``(expression, decay)`` tuples. The default decay comes from ``settings``.
+    """
+    default_decay = settings.get("decay", DEFAULT_SETTINGS["decay"])
+    normalized = []
+    for index, item in enumerate(alphas):
+        if isinstance(item, str):
+            expression, decay = item, default_decay
+        elif isinstance(item, dict):
+            expression = item.get("expression")
+            decay = item.get("decay", default_decay)
+        elif isinstance(item, (list, tuple)) and item:
+            expression, decay = item[0], (item[1] if len(item) > 1 else default_decay)
+        else:
+            raise ValueError("alphas[%d] is not a usable expression entry" % index)
+        if not isinstance(expression, str) or not expression.strip():
+            raise ValueError("alphas[%d] has an empty or non-string expression" % index)
+        if not isinstance(decay, int) or isinstance(decay, bool) or decay < 0:
+            raise ValueError("alphas[%d] has an invalid decay %r" % (index, decay))
+        normalized.append((expression.strip(), decay))
+    return normalized
+
+
+def simulate_alphas(s, alphas, settings=None, batch_size=3, dry_run=False,
+                    on_event=None):
+    """Simulate a list of alphas and return one record per expression.
+
+    Each record is ``{"expression", "decay", "alpha_id", "status", "metrics",
+    "checks", "error"}``. ``metrics`` is the in-sample block from
+    ``GET /alphas/{id}`` for completed runs; ``checks`` maps platform check
+    names to ``{"result", "limit", "value"}``. A failed expression is recorded
+    with a populated ``error`` instead of aborting the run.
+
+    ``dry_run`` validates and builds the payloads but never touches the network
+    (and requires no credentials). ``on_event(kind, payload)`` receives
+    ``submitted`` / ``polling`` / ``rate_limited`` / ``completed`` events.
+    Feeding it the result of ``resolve_settings`` is the caller's job.
+    """
+    settings = resolve_settings(settings)
+    pairs = alphas if alphas and isinstance(alphas[0], tuple) else normalize_alphas(
+        alphas, settings
+    )
+
+    if dry_run:
+        return [
+            {
+                "expression": expression,
+                "decay": decay,
+                "alpha_id": None,
+                "status": "DRY_RUN",
+                "metrics": None,
+                "checks": None,
+                "error": None,
+                "payload": _single_simulation_data(expression, decay, settings),
+            }
+            for expression, decay in pairs
+        ]
+
+    records = []
+    for start in range(0, len(pairs), batch_size):
+        batch = pairs[start:start + batch_size]
         submitted = []
-        for alpha, decay in task:
+        for offset, (expression, decay) in enumerate(batch):
+            index = start + offset
             record = {
-                "expression": alpha,
+                "expression": expression,
                 "decay": decay,
                 "alpha_id": None,
                 "status": None,
                 "metrics": None,
+                "checks": None,
                 "error": None,
             }
-            simulation_data = _single_simulation_data(alpha, decay, neut, region, universe)
+            records.append(record)
             try:
-                location = submit_single_simulation(s, simulation_data)
-            except requests.HTTPError as exc:
-                status_code = exc.response.status_code if exc.response is not None else None
-                if status_code not in (401, 403):
-                    record["error"] = "submit failed: %s" % exc
-                    results.append(record)
-                    continue
-                # Session expired: log in again and retry this expression once.
-                s = login()
-                try:
-                    location = submit_single_simulation(s, simulation_data)
-                except (requests.RequestException, SimulationError) as retry_exc:
-                    record["error"] = "submit failed after re-login: %s" % retry_exc
-                    results.append(record)
-                    continue
-            except (requests.RequestException, SimulationError) as exc:
-                record["error"] = "submit failed: %s" % exc
-                results.append(record)
+                location = submit_single_simulation(
+                    s, _single_simulation_data(expression, decay, settings),
+                    on_event=on_event,
+                )
+            except AuthError:
+                raise
+            except BrainError as exc:
+                record["status"] = "FAILED"
+                record["error"] = "%s: %s" % (exc.code, exc)
                 continue
-            record["status"] = "SUBMITTED"
-            submitted.append((record, location))
+            except requests.HTTPError as exc:
+                record["status"] = "FAILED"
+                record["error"] = "submit failed: %s" % exc
+                continue
+            if on_event:
+                on_event("submitted", {"index": index, "expression": expression})
+            submitted.append((index, record, location))
 
-        print("task %d post done"%(x))
-
-        for record, progress_url in submitted:
+        for index, record, location in submitted:
             try:
-                payload = poll_simulation(s, progress_url)
-                status = payload.get("status")
-                record["status"] = status
-                alpha_id = payload.get("alpha")
-                if status in ("COMPLETE", "WARNING") and alpha_id:
-                    record["alpha_id"] = alpha_id
-                    try:
-                        record["metrics"] = fetch_alpha_metrics(s, alpha_id)
-                    except requests.RequestException as exc:
-                        record["error"] = "metrics fetch failed: %s" % exc
-                else:
-                    record["error"] = payload.get("message") or ("status=%s" % status)
-                    print("Not complete : %s (%s)"%(progress_url, record["error"]))
-            except (requests.RequestException, ValueError) as exc:
+                progress = poll_simulation(s, location, on_event=on_event)
+            except Exception as exc:  # polling failure must not kill the batch
+                record["status"] = "FAILED"
                 record["error"] = "poll failed: %s" % exc
-                print("look into: %s (%s)"%(progress_url, exc))
-            results.append(record)
+                continue
+            record["status"] = progress.get("status") or "UNKNOWN"
+            record["alpha_id"] = progress.get("alpha")
+            if progress.get("status") == "ERROR" or progress.get("message"):
+                record["error"] = progress.get("message") or "simulation error"
+            if record["alpha_id"]:
+                try:
+                    payload = fetch_alpha_metrics(s, record["alpha_id"], on_event=on_event)
+                except Exception as exc:
+                    record["error"] = "metrics fetch failed: %s" % exc
+                else:
+                    record["metrics"] = payload.get("is")
+                    record["checks"] = _extract_checks(payload)
+            if on_event:
+                on_event("completed", {"index": index, "status": record["status"]})
 
-        print("task %d simulate done"%(x))
+    return records
 
-    print("Simulate done")
-    return results
+
+def _extract_checks(alpha_payload):
+    """Flatten the platform checks of an alpha payload into a name -> info map."""
+    checks = {}
+    for check in (alpha_payload.get("is") or {}).get("checks") or []:
+        name = check.get("name")
+        if not name:
+            continue
+        checks[name] = {
+            "result": check.get("result"),
+            "limit": check.get("limit"),
+            "value": check.get("value"),
+        }
+    return checks or None
+
+
+def single_simulate(alpha_pool, neut="SUBINDUSTRY", region="USA", universe="TOP3000",
+                    start=0, settings=None, dry_run=False, on_event=None):
+    """Back-compat wrapper: simulate nested pools of ``(expression, decay)``.
+
+    ``alpha_pool`` is a list of batches (as produced by ``load_task_pool_single``).
+    Prefer :func:`simulate_alphas` for new code. ``start`` is accepted and
+    ignored for call compatibility.
+    """
+    merged = dict(settings or {})
+    merged.setdefault("neutralization", neut)
+    merged.setdefault("region", region)
+    merged.setdefault("universe", universe)
+    merged = resolve_settings(merged)
+
+    pairs = []
+    for batch in alpha_pool:
+        pairs.extend(normalize_alphas(batch, merged))
+
+    if dry_run:
+        session = None
+    else:
+        session = login()
+    return simulate_alphas(
+        session, pairs, settings=merged, dry_run=dry_run, on_event=on_event
+    )
 
 
 def set_alpha_properties(
@@ -453,88 +888,76 @@ def set_alpha_properties(
     )
 
 
-def get_alphas(start_date, end_date, sharpe_th, fitness_th, region, alpha_num, usage):
-    s = login()
-    output = []
-    # 3E large 3C less
-    count = 0
-    for i in range(0, alpha_num, 100):
-        print(i)
-        url_e = "https://api.worldquantbrain.com/users/self/alphas?limit=100&offset=%d"%(i) \
-                + "&status=UNSUBMITTED%1FIS_FAIL&dateCreated%3E=2025-" + start_date  \
-                + "T00:00:00-04:00&dateCreated%3C2025-" + end_date \
-                + "T00:00:00-04:00&is.fitness%3E" + str(fitness_th) + "&is.sharpe%3E" \
-                + str(sharpe_th) + "&settings.region=" + region + "&order=-is.sharpe&hidden=false&type!=SUPER"
-        url_c = "https://api.worldquantbrain.com/users/self/alphas?limit=100&offset=%d"%(i) \
-                + "&status=UNSUBMITTED%1FIS_FAIL&dateCreated%3E=2025-" + start_date  \
-                + "T00:00:00-04:00&dateCreated%3C2025-" + end_date \
-                + "T00:00:00-04:00&is.fitness%3C-" + str(fitness_th) + "&is.sharpe%3C-" \
-                + str(sharpe_th) + "&settings.region=" + region + "&order=is.sharpe&hidden=false&type!=SUPER"
-        urls = [url_e]
-        if usage != "submit":
-            urls.append(url_c)
-        for url in urls:
-            response = s.get(url)
-            #print(response.json())
-            try:
-                alpha_list = response.json()["results"]
-                #print(response.json())
-                for j in range(len(alpha_list)):
-                    alpha_id = alpha_list[j]["id"]
-                    name = alpha_list[j]["name"]
-                    dateCreated = alpha_list[j]["dateCreated"]
-                    sharpe = alpha_list[j]["is"]["sharpe"]
-                    fitness = alpha_list[j]["is"]["fitness"]
-                    turnover = alpha_list[j]["is"]["turnover"]
-                    margin = alpha_list[j]["is"]["margin"]
-                    longCount = alpha_list[j]["is"]["longCount"]
-                    shortCount = alpha_list[j]["is"]["shortCount"]
-                    decay = alpha_list[j]["settings"]["decay"]
-                    exp = alpha_list[j]['regular']['code']
-                    count += 1
-                    #if (sharpe > 1.2 and sharpe < 1.6) or (sharpe < -1.2 and sharpe > -1.6):
-                    if (longCount + shortCount) > 100:
-                        if sharpe < -sharpe_th:
-                            exp = "-%s"%exp
-                        rec = [alpha_id, exp, sharpe, turnover, fitness, margin, dateCreated, decay]
-                        print(rec)
-                        if turnover > 0.7:
-                            rec.append(decay*4)
-                        elif turnover > 0.6:
-                            rec.append(decay*3+3)
-                        elif turnover > 0.5:
-                            rec.append(decay*3)
-                        elif turnover > 0.4:
-                            rec.append(decay*2)
-                        elif turnover > 0.35:
-                            rec.append(decay+4)
-                        elif turnover > 0.3:
-                            rec.append(decay+2)
-                        output.append(rec)
-            except:
-                print("%d finished re-login"%i)
-                s = login()
+def list_alphas(s, limit=100, offset=0, order="-is.sharpe", status="UNSUBMITTED",
+                region=None, universe=None, min_sharpe=None, min_fitness=None,
+                alpha_type_not="SUPER", hidden=False, search=None):
+    """List the account's own alphas (``GET /users/self/alphas``) as ``list[dict]``.
 
-    print("count: %d"%count)
+    Metadata only: this never re-simulates anything and consumes no quota.
+    Filters are pushed server-side, so paging a large account stays cheap.
+    ``order`` uses the API syntax, e.g. ``-is.sharpe`` or ``is.fitness``.
+    """
+    params = {
+        "limit": min(int(limit), 100),
+        "offset": int(offset),
+        "order": order,
+        "hidden": "true" if hidden else "false",
+        "type!=": alpha_type_not,
+    }
+    if status:
+        params["status"] = status
+    if region:
+        params["settings.region"] = region
+    if universe:
+        params["settings.universe"] = universe
+    if min_sharpe is not None:
+        params["is.sharpe>"] = min_sharpe
+    if min_fitness is not None:
+        params["is.fitness>"] = min_fitness
+    if search:
+        params["search"] = search
+    payload = request_json(s, "GET", "/users/self/alphas", params=params)
+    return _as_results(payload, "alphas")
+
+
+def alpha_record_fields(record):
+    """Return ``(expression, sharpe, decay)`` from a :func:`list_alphas` record.
+
+    Also accepts the legacy tuples the old ``get_alphas`` returned, so old
+    notebooks keep working.
+    """
+    if isinstance(record, dict):
+        expression, _, _ = regular_expression(record)
+        metrics = record.get("is") or {}
+        settings = record.get("settings") or {}
+        return expression, metrics.get("sharpe"), settings.get("decay")
+    if isinstance(record, (list, tuple)) and len(record) >= 3:
+        return record[1], record[2], record[-1]
+    return None, None, None
+
+
+def prune(alpha_records, prefix, keep_num):
+    """Keep the top ``keep_num`` alphas per datafield, ordered by sharpe.
+
+    ``alpha_records`` is what :func:`list_alphas` returns. Fields are read out
+    of the expression after ``prefix`` (e.g. ``fnd6``, ``anl4``); a negative
+    sharpe goes into a separate ``-field`` bucket so one bad field cannot crowd
+    out a good one. Returns ``[[expression, decay], ...]``.
+    """
+    output = []
+    counts = defaultdict(int)
+    for record in alpha_records:
+        expression, sharpe, decay = alpha_record_fields(record)
+        if not expression:
+            continue
+        field = expression.split(prefix)[-1].split(",")[0]
+        if sharpe is not None and sharpe < 0:
+            field = "-%s" % field
+        if counts[field] < keep_num:
+            counts[field] += 1
+            output.append([expression, decay])
     return output
 
-def prune(next_alpha_recs, prefix, keep_num):
-    # prefix is the datafield prefix, fnd6, mdl175 ...
-    # keep_num is the num of top sharpe same-datafield alpha
-    output = []
-    num_dict = defaultdict(int)
-    for rec in next_alpha_recs:
-        exp = rec[1]
-        field = exp.split(prefix)[-1].split(",")[0]
-        sharpe = rec[2]
-        if sharpe < 0:
-            field = "-%s"%field
-        if num_dict[field] < keep_num:
-            num_dict[field] += 1
-            decay = rec[-1]
-            exp = rec[1]
-            output.append([exp,decay])
-    return output
 
 def get_group_second_order_factory(first_order, group_ops, region):
     second_order = []
@@ -741,90 +1164,6 @@ def locate_alpha(s, alpha_id):
             
 
 # Consultant methods
-def multi_simulate(alpha_pools, neut, region, universe, start):
-
-    s = login()
-
-    brain_api_url = 'https://api.worldquantbrain.com'
-
-    for x, pool in enumerate(alpha_pools):
-        if x < start: continue
-        progress_urls = []
-        for y, task in enumerate(pool):
-            # 10 tasks, 10 alpha in each task
-            sim_data_list = generate_sim_data(task, region, universe, neut)
-            try:
-                simulation_response = s.post('https://api.worldquantbrain.com/simulations', json=sim_data_list)
-                simulation_progress_url = simulation_response.headers['Location']
-                progress_urls.append(simulation_progress_url)
-            except:
-                print("loc key error: %s"%simulation_response.content)
-                sleep(600)
-                s = login()
-
-        print("pool %d task %d post done"%(x,y))
-
-        for j, progress in enumerate(progress_urls):
-            try:
-                while True:
-                    simulation_progress = s.get(progress)
-                    if simulation_progress.headers.get("Retry-After", 0) == 0:
-                        break
-                    #print("Sleeping for " + simulation_progress.headers["Retry-After"] + " seconds")
-                    sleep(float(simulation_progress.headers["Retry-After"]))
-
-                status = simulation_progress.json().get("status", 0)
-                if status != "COMPLETE":
-                    print("Not complete : %s"%(progress))
-
-                """
-                #alpha_id = simulation_progress.json()["alpha"]
-                children = simulation_progress.json().get("children", 0)
-                children_list = []
-                for child in children:
-                    child_progress = s.get(brain_api_url + "/simulations/" + child)
-                    alpha_id = child_progress.json()["alpha"]
-
-                    set_alpha_properties(s,
-                            alpha_id,
-                            name = "%s"%name,
-                            color = None,)
-                """
-            except KeyError:
-                print("look into: %s"%progress)
-            except Exception as e:
-                print(f"other error: {e}")
-
-
-        print("pool %d task %d simulate done"%(x, j))
-    
-    print("Simulate done")
-
-def generate_sim_data(alpha_list, region, uni, neut):
-    sim_data_list = []
-    for alpha, decay in alpha_list:
-        simulation_data = {
-            'type': 'REGULAR',
-            'settings': {
-                'instrumentType': 'EQUITY',
-                'region': region,
-                'universe': uni,
-                'delay': 1,
-                'decay': decay,
-                'neutralization': neut,
-                'truncation': 0.08,
-                'pasteurization': 'ON',
-                'testPeriod': 'P2Y',
-                'unitHandling': 'VERIFY',
-                'nanHandling': 'ON',
-                'language': 'FASTEXPR',
-                'visualization': False,
-            },
-            'regular': alpha}
-
-        sim_data_list.append(simulation_data)
-    return sim_data_list
-
 def load_task_pool(alpha_list, limit_of_children_simulations, limit_of_multi_simulations):
     '''
     Input:
@@ -886,38 +1225,21 @@ def twin_field_factory(op, field, fields):
     return output
  
 def login_hk():
-    
-    username, password = get_credentials()
-    
-    # Create a session to persistently store the headers
-    s = requests.Session()
-    
-    # Save credentials into session
-    s.auth = (username, password)
-    
-    # Send a POST request to the /authentication API
-    response = s.post('https://api.worldquantbrain.com/authentication')
-    
-    if response.status_code == requests.codes.unauthorized:
-        # Check if biometrics is required
-        if response.headers.get("WWW-Authenticate") == "persona":
-            print(
-                "Complete biometrics authentication by scanning your face. Follow the link: \n"
-                + urljoin(response.url, response.headers["Location"]) + "\n"
-            )
-            input("Press any key after you complete the biometrics authentication.")
-            
-            # Retry the authentication after biometrics
-            biometrics_response = s.post(urljoin(response.url, response.headers["Location"]))
-            
-            while biometrics_response.status_code != 201:
-                input("Biometrics authentication is not complete. Please try again and press any key when completed.")
-                biometrics_response = s.post(urljoin(response.url, response.headers["Location"]))
-                
-            print("Biometrics authentication completed.")
-        else:
-            print("\nIncorrect username or password. Please check your credentials.\n")
-    else:
-        print("Logged in successfully.")
-    
-    return s 
+    """Authenticate against the Hong Kong endpoint.
+
+    BRAIN answers the first POST with a biometrics URL instead of a session.
+    That step needs a human in a browser, so this raises with the URL rather
+    than calling ``input()`` -- an interactive prompt is a hang for any
+    automated caller.
+    """
+    session = requests.Session()
+    response = session.post("https://api.worldquantbrain.com/authentication")
+    location = response.headers.get("Location")
+    if not location:
+        return session
+    raise AuthError(
+        "Hong Kong accounts need browser authorization first: open %s, then "
+        "retry with a session created from those cookies." % location
+    )
+
+

@@ -1,6 +1,11 @@
 .alma-snapshots/
 __pycache__/
 *.py[cod]
+
+# credentials and session material -- must never be committed
 .env
 .env.*
 !.env.example
+.brain_session.json
+brain_session.json
+*.session.json

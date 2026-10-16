@@ -9,7 +9,8 @@ import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from research_cli import NEUTRALIZATIONS, REGIONS, load_research
+import machine_lib as ml
+import research_config as config_io
 
 
 class QueueWriter:
@@ -64,9 +65,9 @@ class ResearchGUI:
 
         settings = ttk.LabelFrame(root, text="模拟设置", padding=8)
         settings.grid(row=2, column=0, sticky="ew", padx=8, pady=4)
-        fields = [("Region", self.region, sorted(REGIONS)),
+        fields = [("Region", self.region, sorted(ml.REGIONS)),
                   ("Universe", self.universe, None),
-                  ("Neutralization", self.neutralization, sorted(NEUTRALIZATIONS)),
+                  ("Neutralization", self.neutralization, sorted(ml.NEUTRALIZATIONS)),
                   ("批量大小", self.batch_size, None), ("起始任务", self.start, None)]
         for col, (label, var, values) in enumerate(fields):
             ttk.Label(settings, text=label).grid(row=0, column=col, padx=4, sticky="w")
@@ -121,41 +122,34 @@ class ResearchGUI:
         alphas = self._parsed_alphas()
         try:
             batch = int(self.batch_size.get())
-            start = int(self.start.get())
         except ValueError as exc:
-            raise ValueError("批量大小和起始任务必须是整数") from exc
-        if batch <= 0 or start < 0:
-            raise ValueError("批量大小必须为正整数，起始任务必须为非负整数")
-        config = {"settings": {"region": self.region.get(), "universe": self.universe.get().strip(),
-                               "neutralization": self.neutralization.get(), "start": start}, "alphas": alphas}
-        # Keep GUI and CLI validation/defaults in sync.
-        import tempfile
-        from pathlib import Path
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
-            json.dump(config, handle)
-            validation_path = handle.name
-        try:
-            normalized = load_research(validation_path)
-        finally:
-            Path(validation_path).unlink(missing_ok=True)
-        return normalized, batch
+            raise ValueError("批量大小必须是整数") from exc
+        if batch <= 0:
+            raise ValueError("批量大小必须为正整数")
+        settings = {"region": self.region.get(), "universe": self.universe.get().strip(),
+                    "neutralization": self.neutralization.get()}
+        # Same validation path as the CLI, so both reject the same inputs.
+        resolved, pairs = config_io.build_config(settings, alphas)
+        config = {"settings": resolved,
+                  "alphas": [{"expression": e, "decay": d} for e, d in pairs]}
+        return config, batch
 
     def load(self):
         filename = filedialog.askopenfilename(filetypes=[("JSON", "*.json"), ("All files", "*.*")])
         if not filename:
             return
         try:
-            config = load_research(filename)
-        except ValueError as exc:
+            file_settings, alphas = config_io.load_research_file(filename)
+            resolved, pairs = config_io.build_config(file_settings, alphas)
+        except config_io.ResearchError as exc:
             messagebox.showerror("无法加载配置", str(exc))
             return
-        s = config["settings"]
-        self.region.set(s["region"])
-        self.universe.set(s["universe"])
-        self.neutralization.set(s["neutralization"])
-        self.start.set(str(s["start"]))
+        self.region.set(resolved["region"])
+        self.universe.set(resolved["universe"])
+        self.neutralization.set(resolved["neutralization"])
+        self.start.set("0")
         self.expression_text.delete("1.0", "end")
-        self.expression_text.insert("1.0", "\n".join(f'{a["expression"]} | {a["decay"]}' for a in config["alphas"]))
+        self.expression_text.insert("1.0", "\n".join(f"{e} | {d}" for e, d in pairs))
         self.path = filename
         self._log(f"已加载配置：{filename}")
 
@@ -207,11 +201,11 @@ class ResearchGUI:
             import io
             import machine_lib
             settings = config["settings"]
-            batches = machine_lib.load_task_pool_single(
-                [(a["expression"], a["decay"]) for a in config["alphas"]], batch_size)
+            pairs = [(a["expression"], a["decay"]) for a in config["alphas"]]
+            session = machine_lib.load_session()
             with contextlib.redirect_stdout(QueueWriter(self.events)), contextlib.redirect_stderr(QueueWriter(self.events)):
-                result = machine_lib.single_simulate(batches, settings["neutralization"],
-                                                     settings["region"], settings["universe"], settings["start"])
+                result = machine_lib.simulate_alphas(session, pairs, settings=settings,
+                                                     batch_size=batch_size)
             counts = {}
             for record in result or []:
                 key = record.get("status") or "FAILED"
