@@ -1,4 +1,5 @@
 import json
+import math
 import pickle
 import random
 import re
@@ -8,7 +9,7 @@ from itertools import combinations, product
 from os import environ
 from pathlib import Path
 from time import sleep
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 
@@ -520,12 +521,52 @@ def load_task_pool_single(alpha_list, limit_of_single_simulations):
 BRAIN_API_URL = "https://api.worldquantbrain.com"
 
 
-def _retry_after_seconds(response):
+def _validated_progress_url(location):
+    """Resolve a BRAIN Location header and reject unsafe resume targets.
+
+    Progress URLs are persisted in local checkpoints. Treat those files as
+    untrusted input: a forged URL must not make the authenticated session send
+    cookies to an arbitrary host when ``resume`` polls it.
+    """
+    if not isinstance(location, str) or not location or any(
+        ord(character) < 32 or character == "\\" for character in location
+    ):
+        raise SimulationError("invalid simulation progress URL")
+    resolved = urljoin(BRAIN_API_URL + "/", location)
+    try:
+        parsed = urlsplit(resolved)
+        port = parsed.port
+    except ValueError as exc:
+        raise SimulationError("invalid simulation progress URL") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or (parsed.hostname or "").lower() != "api.worldquantbrain.com"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or not parsed.path.startswith("/simulations/")
+        or parsed.fragment
+    ):
+        raise SimulationError(
+            "simulation progress URL must target the BRAIN HTTPS simulations endpoint"
+        )
+    return resolved
+
+
+def _request_timeout(deadline):
+    """Keep a network request within the caller's remaining wait budget."""
+    if deadline is None:
+        return 60
+    return max(0.001, min(60, deadline - time.monotonic()))
+
+
+def _retry_after_seconds(response, cap_error_wait=True):
     """Seconds BRAIN wants us to wait, or 0 when the request is ready.
 
     ``Retry-After`` drives both the progress protocol and submission rate
-    limiting. It is parsed leniently and, on non-2xx responses, capped so a
-    large advertised value cannot park the process indefinitely.
+    limiting. It is parsed leniently; callers may cap non-2xx backoff for
+    ordinary requests, while bounded simulation polling honors the full delay
+    and checkpoints instead of sleeping past its deadline.
     """
     raw = response.headers.get("Retry-After")
     if raw is None:
@@ -534,7 +575,7 @@ def _retry_after_seconds(response):
         seconds = float(raw)
     except (TypeError, ValueError):
         return 0.0
-    if not response.ok:
+    if not response.ok and cap_error_wait:
         return min(seconds, 120.0)
     return max(seconds, 0.0)
 
@@ -576,23 +617,51 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4):
     raise last or RateLimited("%s %s" % (method, url))
 
 
-def poll_simulation(s, progress_url, on_event=None):
-    """Poll one simulation progress URL until BRAIN stops asking us to retry.
+def poll_simulation(s, progress_url, on_event=None, deadline=None):
+    """Poll a simulation until completion or an optional monotonic deadline.
 
-    Returns the final payload, e.g. ``{"status": "COMPLETE", "alpha": "..."}``.
-    ``on_event(kind, payload)``, when given, receives a ``polling`` event per
-    retry so a caller can stream progress without parsing stdout.
+    If BRAIN's ``Retry-After`` would run past ``deadline``, return a resumable
+    ``PENDING`` payload instead of sleeping for hours. The progress URL is kept
+    so callers can checkpoint it and continue in a later invocation.
     """
+    progress_url = _validated_progress_url(progress_url)
     while True:
-        progress = s.get(progress_url)
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            return {
+                "status": "PENDING",
+                "progress_url": progress_url,
+                "next_poll_after_seconds": 0,
+            }
+        progress = s.get(progress_url, timeout=_request_timeout(deadline))
         if progress.status_code in (401, 403):
             raise AuthError(
                 "session rejected while polling (HTTP %s)" % progress.status_code
             )
+        retry_after = _retry_after_seconds(progress, cap_error_wait=False)
+        if progress.status_code in (429, 503) and retry_after:
+            if deadline is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                if retry_after >= remaining:
+                    return {
+                        "status": "PENDING",
+                        "progress_url": progress_url,
+                        "next_poll_after_seconds": retry_after,
+                    }
+            if on_event:
+                on_event("polling", {"retry_after": retry_after})
+            sleep(retry_after)
+            continue
         progress.raise_for_status()
-        retry_after = _retry_after_seconds(progress)
         if not retry_after:
             break
+        if deadline is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            if retry_after >= remaining:
+                return {
+                    "status": "PENDING",
+                    "progress_url": progress_url,
+                    "next_poll_after_seconds": retry_after,
+                }
         if on_event:
             on_event("polling", {"retry_after": retry_after})
         sleep(retry_after)
@@ -604,7 +673,9 @@ def poll_simulation(s, progress_url, on_event=None):
         )
 
 
-def submit_single_simulation(s, simulation_data, max_retries=5, on_event=None):
+def submit_single_simulation(
+    s, simulation_data, max_retries=5, on_event=None, deadline=None
+):
     """POST one single-alpha simulation and return its progress URL.
 
     BRAIN applies a per-account submission rate limit (HTTP 429) and exposes no
@@ -612,16 +683,29 @@ def submit_single_simulation(s, simulation_data, max_retries=5, on_event=None):
     instead of reaching the caller.
     """
     for attempt in range(1, max_retries + 1):
-        response = s.post(BRAIN_API_URL + "/simulations", json=simulation_data)
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            raise RateLimited("submission deferred by the run time limit")
+        response = s.post(
+            BRAIN_API_URL + "/simulations", json=simulation_data,
+            timeout=_request_timeout(deadline),
+        )
         if response.status_code == 429:
-            wait = _retry_after_seconds(response) or min(60.0, 5.0 * attempt)
+            wait = _retry_after_seconds(response, cap_error_wait=False) or min(
+                60.0, 5.0 * attempt
+            )
             if on_event:
                 on_event(
                     "rate_limited",
                     {"attempt": attempt, "wait_seconds": wait, "expression":
-                     simulation_data.get("regular")},
+                    simulation_data.get("regular")},
                 )
             if attempt < max_retries:
+                if deadline is not None:
+                    remaining = max(0.0, deadline - time.monotonic())
+                    if wait >= remaining:
+                        raise RateLimited(
+                            "submission deferred until after the run time limit"
+                        )
                 sleep(wait)
                 continue
             raise RateLimited(
@@ -638,24 +722,43 @@ def submit_single_simulation(s, simulation_data, max_retries=5, on_event=None):
                 "submit response has no Location header (HTTP %s): %s"
                 % (response.status_code, response.text[:500])
             )
-        return location
+        return _validated_progress_url(location)
 
 
-def fetch_alpha_metrics(s, alpha_id, on_event=None):
+def fetch_alpha_metrics(s, alpha_id, on_event=None, deadline=None):
     """Read one alpha's settings, in-sample metrics and platform checks.
 
     Returns the raw ``GET /alphas/{id}`` payload (``regular``, ``settings``,
     ``is``, ``checks``, ...). Quota-free: it never consumes a simulation slot.
-    Raises ``NotFound`` for an unknown id.
+    Raises ``NotFound`` for an unknown id. Returns a private ``_deferred``
+    sentinel when a Retry-After would exceed ``deadline``.
     """
     while True:
-        response = s.get(BRAIN_API_URL + "/alphas/" + alpha_id)
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            return {"_deferred": True, "next_poll_after_seconds": 0}
+        response = s.get(
+            BRAIN_API_URL + "/alphas/" + alpha_id,
+            timeout=_request_timeout(deadline),
+        )
         if response.status_code == 404:
             raise NotFound("alpha %s not found" % alpha_id)
+        retry_after = _retry_after_seconds(response, cap_error_wait=False)
+        if response.status_code in (429, 503) and retry_after:
+            if deadline is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                if retry_after >= remaining:
+                    return {"_deferred": True, "next_poll_after_seconds": retry_after}
+            if on_event:
+                on_event("polling", {"retry_after": retry_after})
+            sleep(retry_after)
+            continue
         response.raise_for_status()
-        retry_after = _retry_after_seconds(response)
         if not retry_after:
             break
+        if deadline is not None:
+            remaining = max(0.0, deadline - time.monotonic())
+            if retry_after >= remaining:
+                return {"_deferred": True, "next_poll_after_seconds": retry_after}
         if on_event:
             on_event("polling", {"retry_after": retry_after})
         sleep(retry_after)
@@ -724,15 +827,27 @@ def normalize_alphas(alphas, settings):
     return normalized
 
 
-def simulate_alphas(s, alphas, settings=None, batch_size=3, dry_run=False,
-                    on_event=None):
+def simulate_alphas(
+    s,
+    alphas,
+    settings=None,
+    batch_size=3,
+    dry_run=False,
+    on_event=None,
+    max_wait_seconds=None,
+    initial_records=None,
+):
     """Simulate a list of alphas and return one record per expression.
 
     Each record is ``{"expression", "decay", "alpha_id", "status", "metrics",
     "checks", "error"}``. ``metrics`` is the in-sample block from
     ``GET /alphas/{id}`` for completed runs; ``checks`` maps platform check
     names to ``{"result", "limit", "value"}``. A failed expression is recorded
-    with a populated ``error`` instead of aborting the run.
+    with a populated ``error`` instead of aborting the run. When
+    ``max_wait_seconds`` is set, unfinished work is returned as ``PENDING`` (or
+    ``QUEUED`` if it has not yet been submitted) instead of keeping the caller
+    blocked. Pass those records back as ``initial_records`` to resume without
+    resubmitting accepted jobs.
 
     ``dry_run`` validates and builds the payloads but never touches the network
     (and requires no credentials). ``on_event(kind, payload)`` receives
@@ -743,6 +858,13 @@ def simulate_alphas(s, alphas, settings=None, batch_size=3, dry_run=False,
     pairs = alphas if alphas and isinstance(alphas[0], tuple) else normalize_alphas(
         alphas, settings
     )
+
+    if batch_size < 1 or batch_size > 3:
+        raise ValueError("batch_size must be between 1 and 3")
+    if max_wait_seconds is not None and (
+        not math.isfinite(max_wait_seconds) or max_wait_seconds < 0
+    ):
+        raise ValueError("max_wait_seconds must be a finite, non-negative number")
 
     if dry_run:
         return [
@@ -759,62 +881,219 @@ def simulate_alphas(s, alphas, settings=None, batch_size=3, dry_run=False,
             for expression, decay in pairs
         ]
 
-    records = []
+    if initial_records is None:
+        records = [
+            {
+                "expression": expression,
+                "decay": decay,
+                "alpha_id": None,
+                "status": "QUEUED",
+                "metrics": None,
+                "checks": None,
+                "error": None,
+            }
+            for expression, decay in pairs
+        ]
+    else:
+        records = [dict(record) for record in initial_records]
+        if len(records) != len(pairs):
+            raise ValueError("initial_records must match the number of alphas")
+
+    deadline = (
+        time.monotonic() + max_wait_seconds
+        if max_wait_seconds is not None
+        else None
+    )
+
+    def emit(kind, index, payload=None):
+        if on_event:
+            data = dict(payload or {})
+            data["index"] = index
+            on_event(kind, data)
+
+    def fetch_metrics_record(index):
+        record = records[index]
+        next_poll_at = record.pop("next_poll_at", None)
+        if next_poll_at:
+            wait = max(0.0, float(next_poll_at) - time.time())
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and wait >= remaining:
+                record["status"] = "PENDING"
+                record["metrics_pending"] = True
+                record["poll_after_seconds"] = wait
+                record["next_poll_at"] = next_poll_at
+                emit("pending", index, record)
+                return
+            if wait:
+                sleep(wait)
+
+        def metrics_event(kind, payload):
+            emit(kind, index, payload)
+
+        try:
+            payload = fetch_alpha_metrics(
+                s,
+                record["alpha_id"],
+                on_event=metrics_event,
+                deadline=deadline,
+            )
+        except AuthError as exc:
+            record["status"] = "PENDING"
+            record["metrics_pending"] = True
+            record["error"] = str(exc)
+            emit("pending", index, record)
+            return
+        except Exception as exc:
+            record["error"] = "metrics fetch failed: %s" % exc
+        else:
+            if payload.get("_deferred"):
+                wait = max(0.0, float(payload.get("next_poll_after_seconds") or 0))
+                record["status"] = "PENDING"
+                record["metrics_pending"] = True
+                record["poll_after_seconds"] = wait
+                if wait:
+                    record["next_poll_at"] = time.time() + wait
+                emit("pending", index, record)
+                return
+            record["metrics"] = payload.get("is")
+            record["checks"] = _extract_checks(payload)
+
+        record["status"] = record.pop("simulation_status", record.get("status"))
+        record.pop("metrics_pending", None)
+        record.pop("next_poll_at", None)
+        record.pop("poll_after_seconds", None)
+        emit("completed", index, record)
+
+    def poll_record(index):
+        record = records[index]
+        progress_url = record.get("progress_url")
+        if not progress_url:
+            return
+
+        next_poll_at = record.pop("next_poll_at", None)
+        if next_poll_at:
+            wait = max(0.0, float(next_poll_at) - time.time())
+            remaining = deadline - time.monotonic() if deadline is not None else None
+            if remaining is not None and wait >= remaining:
+                record["status"] = "PENDING"
+                record["poll_after_seconds"] = wait
+                record["next_poll_at"] = next_poll_at
+                emit("pending", index, record)
+                return
+            if wait:
+                sleep(wait)
+
+        def poll_event(kind, payload):
+            emit(kind, index, payload)
+
+        try:
+            progress = poll_simulation(
+                s, progress_url, on_event=poll_event, deadline=deadline
+            )
+            if progress.get("status") == "PENDING":
+                wait = max(
+                    0.0, float(progress.get("next_poll_after_seconds") or 0)
+                )
+                record["status"] = "PENDING"
+                record["progress_url"] = progress_url
+                record["poll_after_seconds"] = wait
+                if wait:
+                    record["next_poll_at"] = time.time() + wait
+                emit("pending", index, record)
+                return
+
+            record["status"] = progress.get("status") or "UNKNOWN"
+            record["alpha_id"] = progress.get("alpha")
+            if progress.get("status") == "ERROR" or progress.get("message"):
+                record["error"] = progress.get("message") or "simulation error"
+            if record["alpha_id"]:
+                record["simulation_status"] = record["status"]
+                record["metrics_pending"] = True
+            record.pop("progress_url", None)
+            if record.get("metrics_pending"):
+                fetch_metrics_record(index)
+            else:
+                record.pop("next_poll_at", None)
+                record.pop("poll_after_seconds", None)
+                emit("completed", index, record)
+        except AuthError as exc:
+            record["status"] = "PENDING"
+            record["error"] = str(exc)
+            record["progress_url"] = progress_url
+            emit("pending", index, record)
+        except Exception as exc:  # preserve the accepted job for a later resume
+            record["status"] = "FAILED"
+            record["error"] = "poll failed: %s" % exc
+            record["progress_url"] = progress_url
+            emit("failed", index, record)
+
+    # Resume accepted jobs first. An unresolved job still occupies one of the
+    # platform's limited active slots, so do not submit the next batch yet.
+    for index, record in enumerate(records):
+        if record.get("progress_url"):
+            poll_record(index)
+        elif record.get("metrics_pending"):
+            fetch_metrics_record(index)
+    if any(
+        record.get("progress_url") or record.get("metrics_pending")
+        for record in records
+    ):
+        return records
+
     for start in range(0, len(pairs), batch_size):
         batch = pairs[start:start + batch_size]
         submitted = []
         for offset, (expression, decay) in enumerate(batch):
             index = start + offset
             record = {
-                "expression": expression,
-                "decay": decay,
-                "alpha_id": None,
-                "status": None,
-                "metrics": None,
-                "checks": None,
-                "error": None,
+                **records[index],
             }
-            records.append(record)
+            if record.get("status") not in {"QUEUED", None}:
+                continue
+            if deadline is not None and deadline - time.monotonic() <= 0:
+                break
             try:
                 location = submit_single_simulation(
                     s, _single_simulation_data(expression, decay, settings),
-                    on_event=on_event,
+                    on_event=lambda kind, payload, i=index: emit(kind, i, payload),
+                    deadline=deadline,
                 )
+            except RateLimited as exc:
+                record["status"] = "QUEUED"
+                record["error"] = "%s: %s" % (exc.code, exc)
+                records[index] = record
+                emit("deferred", index, record)
+                break
             except AuthError:
                 raise
             except BrainError as exc:
                 record["status"] = "FAILED"
                 record["error"] = "%s: %s" % (exc.code, exc)
+                records[index] = record
+                emit("failed", index, record)
                 continue
             except requests.HTTPError as exc:
                 record["status"] = "FAILED"
                 record["error"] = "submit failed: %s" % exc
+                records[index] = record
+                emit("failed", index, record)
                 continue
-            if on_event:
-                on_event("submitted", {"index": index, "expression": expression})
-            submitted.append((index, record, location))
+            record["status"] = "PENDING"
+            record["progress_url"] = location
+            record["error"] = None
+            records[index] = record
+            emit("submitted", index, record)
+            submitted.append(index)
 
-        for index, record, location in submitted:
-            try:
-                progress = poll_simulation(s, location, on_event=on_event)
-            except Exception as exc:  # polling failure must not kill the batch
-                record["status"] = "FAILED"
-                record["error"] = "poll failed: %s" % exc
-                continue
-            record["status"] = progress.get("status") or "UNKNOWN"
-            record["alpha_id"] = progress.get("alpha")
-            if progress.get("status") == "ERROR" or progress.get("message"):
-                record["error"] = progress.get("message") or "simulation error"
-            if record["alpha_id"]:
-                try:
-                    payload = fetch_alpha_metrics(s, record["alpha_id"], on_event=on_event)
-                except Exception as exc:
-                    record["error"] = "metrics fetch failed: %s" % exc
-                else:
-                    record["metrics"] = payload.get("is")
-                    record["checks"] = _extract_checks(payload)
-            if on_event:
-                on_event("completed", {"index": index, "status": record["status"]})
+        for index in submitted:
+            poll_record(index)
+        if any(
+            records[index].get("progress_url")
+            or records[index].get("metrics_pending")
+            for index in submitted
+        ):
+            # Avoid exceeding the platform's concurrent simulation limit.
+            break
 
     return records
 
@@ -1241,5 +1520,3 @@ def login_hk():
         "Hong Kong accounts need browser authorization first: open %s, then "
         "retry with a session created from those cookies." % location
     )
-
-

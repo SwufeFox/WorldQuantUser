@@ -9,3 +9,4 @@ __pycache__/
 .brain_session.json
 brain_session.json
 *.session.json
+.brain_checkpoints/

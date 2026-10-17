@@ -30,7 +30,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -140,6 +144,18 @@ def _add_session_args(parser):
                         help="Force a fresh login even if the cache looks valid.")
 
 
+def _positive_seconds(value):
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(
+            "must be a finite number of seconds greater than zero"
+        )
+    return seconds
+
+
 def _add_settings_args(parser):
     parser.add_argument("--region", choices=ml.REGIONS,
                         help="BRAIN region.")
@@ -239,6 +255,11 @@ def build_parser():
     _add_settings_args(sim)
     sim.add_argument("--batch-size", type=int, default=3,
                      help="Concurrent submissions per batch (BRAIN allows 3).")
+    sim.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
+                     help="Maximum wall time per invocation; longer Retry-After waits "
+                          "are saved as pending work (default: 300).")
+    sim.add_argument("--checkpoint", default=None,
+                     help="Checkpoint path; pending work is saved automatically if omitted.")
     sim.add_argument("--dry-run", action="store_true",
                      help="Validate and print payloads without contacting BRAIN.")
     sim.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
@@ -251,6 +272,22 @@ def build_parser():
                      help="With --stream, also emit per-poll events.")
     _add_session_args(sim)
     sim.set_defaults(func=cmd_simulate)
+
+    resume = sub.add_parser(
+        "resume", help="Resume pending/queued simulations from a checkpoint.")
+    resume.add_argument("checkpoint", help="Checkpoint JSON produced by simulate/resume.")
+    resume.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
+                        help="Maximum wall time for this resume invocation (default: 300).")
+    resume.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
+                        help="Sort results by this metric, best first.")
+    resume.add_argument("--top", type=int, default=None,
+                        help="Keep only the first N results after sorting.")
+    resume.add_argument("--stream", action="store_true",
+                        help="Emit JSON Lines progress events on stderr.")
+    resume.add_argument("--verbose", action="store_true",
+                        help="With --stream, also emit per-poll events.")
+    _add_session_args(resume)
+    resume.set_defaults(func=cmd_resume)
 
     alpha = sub.add_parser("alpha", help="Inspect the account's alphas (quota-free).")
     alpha_sub = alpha.add_subparsers(dest="subcommand", metavar="<action>",
@@ -285,6 +322,8 @@ def _type_name(action):
     if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
         return "boolean"
     if action.type is not None:
+        if action.type is _positive_seconds:
+            return "number"
         return getattr(action.type, "__name__", str(action.type))
     return "string"
 
@@ -401,6 +440,11 @@ def summarize(records):
         "total": len(records),
         "completed": len(completed),
         "failed": len(failed),
+        "pending": sum(
+            r.get("status") == "PENDING" or bool(r.get("progress_url"))
+            for r in records
+        ),
+        "queued": sum(r.get("status") == "QUEUED" for r in records),
         "other": len(records) - len(completed) - len(failed),
         "ranking": ranking,
         "best": ranking[0] if ranking else None,
@@ -571,7 +615,136 @@ def cmd_catalog_categories(args, _sink):
     return data
 
 
+def _write_simulation_checkpoint(path, checkpoint):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".%s." % path.name, suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(checkpoint, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _simulation_checkpoint_callback(path, checkpoint, sink):
+    def on_event(kind, payload):
+        if kind in {"submitted", "pending", "completed", "failed", "deferred"}:
+            index = payload.get("index")
+            if isinstance(index, int) and 0 <= index < len(checkpoint["records"]):
+                checkpoint["records"][index] = {
+                    key: value for key, value in payload.items() if key != "index"
+                }
+                _write_simulation_checkpoint(path, checkpoint)
+        if sink:
+            sink(kind, payload)
+
+    return on_event
+
+
+def _sort_simulation_results(records, args):
+    for record in records:
+        _compact_metrics(record)
+    if args.sort != "none":
+        records.sort(key=lambda r: _metric_value(r, args.sort), reverse=True)
+    if args.top is not None:
+        records = records[:args.top]
+    return records
+
+
+def _simulation_result(records, settings, checkpoint_path=None, dry_run=False):
+    summary = summarize(records)
+    if summary["pending"] or summary["queued"]:
+        status = "PENDING"
+    elif summary["failed"]:
+        status = "PARTIAL" if summary["completed"] else "FAILED"
+    else:
+        status = "COMPLETE"
+    result = {
+        "status": status,
+        "dry_run": dry_run,
+        "settings": settings,
+        "summary": summary,
+        "results": records,
+    }
+    if checkpoint_path is not None and Path(checkpoint_path).exists():
+        result["checkpoint"] = str(Path(checkpoint_path))
+    return result
+
+
+def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg):
+    if checkpoint_arg:
+        path = Path(checkpoint_arg).expanduser().resolve()
+        if path.exists():
+            raise CliError(
+                "INVALID_INPUT",
+                "checkpoint already exists; use `resume` or choose another path",
+                str(path),
+            )
+    else:
+        path = Path(".brain_checkpoints") / ("simulate-%s.json" % uuid.uuid4().hex)
+        path = path.resolve()
+    records = [
+        {
+            "expression": expression,
+            "decay": decay,
+            "alpha_id": None,
+            "status": "QUEUED",
+            "metrics": None,
+            "checks": None,
+            "error": None,
+        }
+        for expression, decay in pairs
+    ]
+    checkpoint = {
+        "format": "worldquantuser.simulation-checkpoint",
+        "version": 1,
+        "settings": settings,
+        "batch_size": batch_size,
+        "records": records,
+    }
+    _write_simulation_checkpoint(path, checkpoint)
+    return path, checkpoint
+
+
+def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, explicit):
+    checkpoint["records"] = [dict(record) for record in records]
+    _write_simulation_checkpoint(checkpoint_path, checkpoint)
+    has_unfinished = any(
+        record.get("progress_url")
+        or record.get("status") in {"PENDING", "QUEUED"}
+        for record in records
+    )
+    if not explicit and not has_unfinished:
+        Path(checkpoint_path).unlink(missing_ok=True)
+        checkpoint_path = None
+
+    records = _sort_simulation_results(records, args)
+    summary = summarize(records)
+    if summary["completed"] == 0 and summary["total"] and not (
+        summary["pending"] or summary["queued"]
+    ):
+        first_error = next(
+            (r.get("error") for r in records if r.get("error")), "unknown error"
+        )
+        raise CliError(
+            "SIMULATION_FAILED",
+            "all %d simulations failed" % summary["total"],
+            str(first_error),
+        )
+    return _simulation_result(records, settings, checkpoint_path)
+
+
 def cmd_simulate(args, sink):
+    if not 1 <= args.batch_size <= 3:
+        raise CliError("INVALID_INPUT", "--batch-size must be between 1 and 3")
     file_settings, alphas = collect_alphas(args)
     settings = merge_settings(file_settings, args)
     try:
@@ -582,28 +755,91 @@ def cmd_simulate(args, sink):
     if args.dry_run:
         records = ml.simulate_alphas(None, pairs, settings=settings, dry_run=True)
         return {
+            "status": "DRY_RUN",
             "dry_run": True,
             "settings": settings,
             "summary": {"total": len(records), "payloads": len(records)},
             "results": records,
         }
 
-    records = with_session(args, lambda s: ml.simulate_alphas(
-        s, pairs, settings=settings, batch_size=args.batch_size, on_event=sink))
-    for record in records:
-        _compact_metrics(record)
+    checkpoint_path, checkpoint = _prepare_simulation_run(
+        settings, pairs, args.batch_size, args.checkpoint
+    )
+    on_event = _simulation_checkpoint_callback(checkpoint_path, checkpoint, sink)
+    records = with_session(
+        args,
+        lambda s: ml.simulate_alphas(
+            s,
+            pairs,
+            settings=settings,
+            batch_size=args.batch_size,
+            on_event=on_event,
+            max_wait_seconds=args.max_wait_seconds,
+            initial_records=checkpoint["records"],
+        ),
+    )
+    return _finalize_simulation(
+        records,
+        settings,
+        args,
+        checkpoint_path,
+        checkpoint,
+        explicit=bool(args.checkpoint),
+    )
 
-    if args.sort != "none":
-        records.sort(key=lambda r: _metric_value(r, args.sort), reverse=True)
-    if args.top is not None:
-        records = records[:args.top]
 
-    summary = summarize(records)
-    if summary["completed"] == 0 and summary["total"]:
-        first_error = next((r.get("error") for r in records if r.get("error")), "unknown error")
-        raise CliError("SIMULATION_FAILED",
-                       "all %d simulations failed" % summary["total"], first_error)
-    return {"dry_run": False, "settings": settings, "summary": summary, "results": records}
+def cmd_resume(args, sink):
+    path = Path(args.checkpoint).expanduser().resolve()
+    try:
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CliError("INVALID_INPUT", "cannot read simulation checkpoint", str(exc))
+    if (
+        not isinstance(checkpoint, dict)
+        or checkpoint.get("format") != "worldquantuser.simulation-checkpoint"
+        or checkpoint.get("version") != 1
+        or not isinstance(checkpoint.get("records"), list)
+    ):
+        raise CliError("INVALID_INPUT", "unsupported or malformed simulation checkpoint")
+
+    records = checkpoint["records"]
+    try:
+        pairs = [(record["expression"], record.get("decay")) for record in records]
+    except (KeyError, TypeError) as exc:
+        raise CliError("INVALID_INPUT", "checkpoint is missing alpha inputs", str(exc))
+    settings = checkpoint.get("settings") or ml.default_settings()
+    batch_size = checkpoint.get("batch_size", 3)
+    if not any(
+        record.get("progress_url")
+        or record.get("metrics_pending")
+        or record.get("status") == "QUEUED"
+        for record in records
+        if isinstance(record, dict)
+    ):
+        return _finalize_simulation(
+            records, settings, args, path, checkpoint, explicit=True
+        )
+    on_event = _simulation_checkpoint_callback(path, checkpoint, sink)
+    records = with_session(
+        args,
+        lambda s: ml.simulate_alphas(
+            s,
+            pairs,
+            settings=settings,
+            batch_size=batch_size,
+            on_event=on_event,
+            max_wait_seconds=args.max_wait_seconds,
+            initial_records=checkpoint["records"],
+        ),
+    )
+    return _finalize_simulation(
+        records,
+        settings,
+        args,
+        path,
+        checkpoint,
+        explicit=True,
+    )
 
 
 def cmd_alpha_get(args, _sink):

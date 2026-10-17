@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -60,12 +62,13 @@ class SchemaContractTests(unittest.TestCase):
     def test_schema_lists_every_command_and_its_options(self):
         commands = parse(run_cli("schema"))["data"]["commands"]["subcommands"]
         self.assertEqual(
-            set(commands), {"schema", "auth", "catalog", "simulate", "alpha"},
+            set(commands), {"schema", "auth", "catalog", "simulate", "resume", "alpha"},
         )
         simulate = commands["simulate"]
         flags = {flag for option in simulate["options"] for flag in option["flags"]}
         self.assertIn("--dry-run", flags)
         self.assertIn("--sort", flags)
+        self.assertIn("--max-wait-seconds", flags)
         catalog = commands["catalog"]["subcommands"]
         self.assertIn("--dataset", {f for o in catalog["fields"]["options"] for f in o["flags"]})
 
@@ -340,6 +343,307 @@ class SummaryTests(unittest.TestCase):
         ])
         self.assertEqual(summary["ranking"], [])
         self.assertIsNone(summary["best"])
+
+    def test_failed_record_with_progress_url_is_still_resumable(self):
+        summary = cli.summarize([
+            {"status": "FAILED", "progress_url": "https://api.worldquantbrain.com/simulations/1"},
+        ])
+        self.assertEqual(summary["pending"], 1)
+        self.assertEqual(summary["failed"], 1)
+
+
+class SimulationResumeTests(unittest.TestCase):
+    class Response:
+        def __init__(self, status_code=200, headers=None, payload=None):
+            self.status_code = status_code
+            self.ok = status_code < 400
+            self.headers = headers or {}
+            self.payload = payload or {}
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError("HTTP %s" % self.status_code)
+
+        def json(self):
+            return self.payload
+
+    class Session:
+        def __init__(self, get_responses=None, post_responses=None):
+            self.get_responses = list(get_responses or [])
+            self.post_responses = list(post_responses or [])
+            self.get_calls = []
+            self.post_calls = []
+
+        def get(self, url, **kwargs):
+            self.get_calls.append(url)
+            return self.get_responses.pop(0)
+
+        def post(self, url, **kwargs):
+            self.post_calls.append((url, kwargs))
+            return self.post_responses.pop(0)
+
+    def test_checkpoint_is_atomic_and_private(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "checkpoint.json"
+            cli._write_simulation_checkpoint(path, {"records": []})
+            self.assertEqual(json.loads(path.read_text()), {"records": []})
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            self.assertEqual(list(path.parent.glob(".checkpoint.json.*.tmp")), [])
+
+    def test_progress_url_rejects_untrusted_hosts_before_authenticated_get(self):
+        unsafe_urls = [
+            "http://api.worldquantbrain.com/simulations/1",
+            "https://evil.example/simulations/1",
+            "https://api.worldquantbrain.com.evil.example/simulations/1",
+            "https://user:pass@api.worldquantbrain.com/simulations/1",
+            "https://api.worldquantbrain.com:444/simulations/1",
+            "https://api.worldquantbrain.com/alphas/1",
+        ]
+        for url in unsafe_urls:
+            with self.subTest(url=url):
+                session = self.Session()
+                with self.assertRaises(ml.SimulationError):
+                    ml.poll_simulation(session, url)
+                self.assertEqual(session.get_calls, [])
+
+    def test_submit_resolves_relative_location_and_rejects_external_location(self):
+        session = self.Session(post_responses=[self.Response(
+            status_code=201, headers={"Location": "/simulations/123"},
+        )])
+        progress_url = ml.submit_single_simulation(session, {"regular": "rank(cap)"})
+        self.assertEqual(
+            progress_url,
+            "https://api.worldquantbrain.com/simulations/123",
+        )
+
+        bad_session = self.Session(post_responses=[self.Response(
+            status_code=201,
+            headers={"Location": "https://evil.example/simulations/123"},
+        )])
+        with self.assertRaises(ml.SimulationError):
+            ml.submit_single_simulation(bad_session, {"regular": "rank(cap)"})
+
+    def test_auth_error_during_submit_stops_batch_for_safe_retry(self):
+        session = self.Session(post_responses=[self.Response(status_code=401)])
+        with self.assertRaises(ml.AuthError):
+            ml.simulate_alphas(
+                session,
+                [("rank(cap)", 1), ("rank(volume)", 1)],
+                batch_size=2,
+                max_wait_seconds=10,
+            )
+        self.assertEqual(len(session.post_calls), 1)
+
+    def test_auth_error_during_poll_preserves_accepted_progress_url(self):
+        record = {
+            "expression": "rank(cap)",
+            "decay": 1,
+            "status": "SUBMITTED",
+            "progress_url": "https://api.worldquantbrain.com/simulations/1",
+        }
+        with mock.patch.object(ml, "poll_simulation", side_effect=ml.AuthError("expired")):
+            results = ml.simulate_alphas(
+                self.Session(),
+                [("rank(cap)", 1)],
+                max_wait_seconds=10,
+                initial_records=[record],
+            )
+        self.assertEqual(results[0]["status"], "PENDING")
+        self.assertEqual(results[0]["progress_url"], record["progress_url"])
+
+    def test_auth_error_fetching_metrics_keeps_checkpoint_retryable(self):
+        record = {
+            "expression": "rank(cap)",
+            "decay": 1,
+            "alpha_id": "alpha-1",
+            "status": "PENDING",
+            "simulation_status": "COMPLETE",
+            "metrics_pending": True,
+        }
+        events = []
+        with mock.patch.object(
+            ml, "fetch_alpha_metrics", side_effect=ml.AuthError("expired session")
+        ):
+            results = ml.simulate_alphas(
+                self.Session(),
+                [("rank(cap)", 1)],
+                max_wait_seconds=10,
+                initial_records=[record],
+                on_event=lambda event, data: events.append(event),
+            )
+        self.assertEqual(results[0]["status"], "PENDING")
+        self.assertTrue(results[0]["metrics_pending"])
+        self.assertIn("pending", events)
+
+    def test_long_retry_after_returns_pending_without_sleeping(self):
+        session = self.Session([self.Response(headers={"Retry-After": "7200"})])
+        with mock.patch.object(ml, "sleep") as sleep:
+            result = ml.poll_simulation(
+                session,
+                "https://api.worldquantbrain.com/simulations/1",
+                deadline=time.monotonic() + 10,
+            )
+        self.assertEqual(result["status"], "PENDING")
+        self.assertEqual(
+            result["progress_url"],
+            "https://api.worldquantbrain.com/simulations/1",
+        )
+        self.assertEqual(result["next_poll_after_seconds"], 7200)
+        sleep.assert_not_called()
+        self.assertEqual(len(session.get_calls), 1)
+
+    def test_rate_limited_progress_response_uses_server_delay_without_retrying(self):
+        session = self.Session([
+            self.Response(status_code=429, headers={"Retry-After": "7200"}),
+        ])
+        with mock.patch.object(ml, "sleep") as sleep:
+            result = ml.poll_simulation(
+                session,
+                "https://api.worldquantbrain.com/simulations/1",
+                deadline=time.monotonic() + 10,
+            )
+        self.assertEqual(result["status"], "PENDING")
+        self.assertEqual(result["next_poll_after_seconds"], 7200)
+        sleep.assert_not_called()
+        self.assertEqual(len(session.get_calls), 1)
+
+    def test_delayed_metrics_fetch_is_checkpointed_and_resumable(self):
+        pairs = [("rank(cap)", 4)]
+        checkpoint = [{
+            "expression": "rank(cap)",
+            "decay": 4,
+            "alpha_id": None,
+            "status": "PENDING",
+            "progress_url": "https://api.worldquantbrain.com/simulations/1",
+        }]
+        first_session = self.Session([
+            self.Response(payload={"status": "COMPLETE", "alpha": "A123"}),
+            self.Response(headers={"Retry-After": "7200"}),
+        ])
+        with mock.patch.object(ml, "sleep") as sleep:
+            pending = ml.simulate_alphas(
+                first_session,
+                pairs,
+                max_wait_seconds=10,
+                initial_records=checkpoint,
+            )
+        self.assertEqual(pending[0]["status"], "PENDING")
+        self.assertTrue(pending[0]["metrics_pending"])
+        self.assertNotIn("progress_url", pending[0])
+        sleep.assert_not_called()
+
+        pending[0]["next_poll_at"] = time.time() - 1
+        resume_session = self.Session([
+            self.Response(payload={"is": {"sharpe": 1.2}}),
+        ])
+        complete = ml.simulate_alphas(
+            resume_session,
+            pairs,
+            max_wait_seconds=10,
+            initial_records=pending,
+        )
+        self.assertEqual(complete[0]["status"], "COMPLETE")
+        self.assertEqual(complete[0]["metrics"], {"sharpe": 1.2})
+        self.assertEqual(resume_session.post_calls, [])
+
+    def test_pending_checkpoint_resumes_without_resubmitting_accepted_job(self):
+        session = self.Session([
+            self.Response(payload={"status": "COMPLETE", "alpha": "A123"}),
+        ])
+        pairs = [("rank(cap)", 4)]
+        checkpoint = [{
+            "expression": "rank(cap)",
+            "decay": 4,
+            "alpha_id": None,
+            "status": "PENDING",
+            "progress_url": "https://api.worldquantbrain.com/simulations/1",
+        }]
+        with mock.patch.object(
+            ml, "fetch_alpha_metrics", return_value={"is": {"sharpe": 1.2}}
+        ):
+            records = ml.simulate_alphas(
+                session,
+                pairs,
+                max_wait_seconds=10,
+                initial_records=checkpoint,
+            )
+        self.assertEqual(records[0]["status"], "COMPLETE")
+        self.assertEqual(records[0]["alpha_id"], "A123")
+        self.assertEqual(session.post_calls, [])
+
+    def test_unresolved_job_prevents_duplicate_or_extra_batch_submissions(self):
+        session = self.Session([self.Response(headers={"Retry-After": "7200"})])
+        pairs = [("rank(cap)", 4), ("rank(volume)", 5)]
+        checkpoint = [
+            {
+                "expression": expression,
+                "decay": decay,
+                "status": "PENDING" if index == 0 else "QUEUED",
+                "progress_url": "https://api.worldquantbrain.com/simulations/1" if index == 0 else None,
+            }
+            for index, (expression, decay) in enumerate(pairs)
+        ]
+        with mock.patch.object(ml, "sleep") as sleep:
+            records = ml.simulate_alphas(
+                session,
+                pairs,
+                max_wait_seconds=10,
+                initial_records=checkpoint,
+            )
+        self.assertEqual(records[0]["status"], "PENDING")
+        self.assertEqual(records[1]["status"], "QUEUED")
+        self.assertEqual(session.post_calls, [])
+        sleep.assert_not_called()
+
+    def test_cli_checkpoint_can_be_resumed_without_new_submission(self):
+        original_directory = Path.cwd()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            os.chdir(temporary_directory)
+            try:
+                parser = cli.build_parser()
+                simulate_args = parser.parse_args([
+                    "simulate", "--expr", "rank(cap)", "--max-wait-seconds", "1",
+                ])
+                first_session = self.Session(
+                    get_responses=[self.Response(headers={"Retry-After": "7200"})],
+                    post_responses=[self.Response(
+                        status_code=201,
+                        headers={
+                            "Location": "https://api.worldquantbrain.com/simulations/1"
+                        },
+                    )],
+                )
+                with mock.patch.object(
+                    cli, "with_session", side_effect=lambda _args, work: work(first_session)
+                ):
+                    pending = cli.cmd_simulate(simulate_args, None)
+                self.assertEqual(pending["status"], "PENDING")
+                checkpoint_path = Path(pending["checkpoint"])
+                checkpoint = json.loads(checkpoint_path.read_text())
+                self.assertEqual(checkpoint["records"][0]["status"], "PENDING")
+                checkpoint["records"][0]["next_poll_at"] = time.time() - 1
+                cli._write_simulation_checkpoint(checkpoint_path, checkpoint)
+
+                resume_args = parser.parse_args([
+                    "resume", str(checkpoint_path), "--max-wait-seconds", "1",
+                ])
+                resume_session = self.Session([
+                    self.Response(payload={"status": "COMPLETE", "alpha": "A123"}),
+                ])
+                with (
+                    mock.patch.object(
+                        cli, "with_session", side_effect=lambda _args, work: work(resume_session)
+                    ),
+                    mock.patch.object(
+                        ml, "fetch_alpha_metrics", return_value={"is": {"sharpe": 1.2}}
+                    ),
+                ):
+                    resumed = cli.cmd_resume(resume_args, None)
+                self.assertEqual(resumed["status"], "COMPLETE")
+                self.assertEqual(resumed["summary"]["completed"], 1)
+                self.assertEqual(resume_session.post_calls, [])
+            finally:
+                os.chdir(original_directory)
 
 
 if __name__ == "__main__":

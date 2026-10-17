@@ -122,6 +122,15 @@ contains one record per expression (`expression`, `decay`, `alpha_id`,
 `status`, `metrics`, `checks`, `error`) plus a `summary` with counts, a
 `ranking` sorted by sharpe, and `best`.
 
+Simulation commands have a 5-minute wall-time budget by default. If a server
+`Retry-After` would exceed that budget, the command returns `PENDING` rather
+than sleeping past the four-hour session-cache lifetime. Accepted jobs and
+unsubmitted expressions are atomically saved in a mode-0600 checkpoint under
+`.brain_checkpoints/` (or the path passed to `--checkpoint`); continue later
+with `python research_cli.py resume <checkpoint>`. Resume polls accepted jobs
+before submitting any queued work, so it does not duplicate already accepted
+simulations. `--max-wait-seconds` adjusts the budget for either command.
+
 A failed expression is reported in its own record instead of aborting the run;
 the command only fails outright when *every* expression failed.
 
