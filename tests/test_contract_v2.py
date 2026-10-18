@@ -501,3 +501,41 @@ class ResearchPathTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OutOfSampleSplitTests(unittest.TestCase):
+    """BRAIN's train/test split is the only OOS evidence the API exposes."""
+
+    def test_extract_split_reads_train_and_test_blocks(self):
+        import machine_lib as ml
+
+        payload = {
+            "settings": {"testPeriod": "P1Y"},
+            "is": {"sharpe": 1.65},
+            "train": {"sharpe": 1.94, "fitness": 1.71, "startDate": "2019-01-01"},
+            "test": {"sharpe": 0.43, "fitness": 0.16, "turnover": 0.043,
+                     "startDate": "2022-12-31", "endDate": "2023-12-31"},
+        }
+        split = ml.extract_split(payload)
+        self.assertEqual(split["test_period"], "P1Y")
+        self.assertAlmostEqual(split["train"]["sharpe"], 1.94)
+        self.assertAlmostEqual(split["test"]["sharpe"], 0.43)
+        self.assertEqual(split["test"]["startDate"], "2022-12-31")
+        # Keys outside the metric allow-list must not leak through.
+        self.assertNotIn("is", split)
+
+    def test_extract_split_returns_none_without_a_split(self):
+        import machine_lib as ml
+
+        # testPeriod P0Y leaves no train/test blocks: there is nothing to report.
+        self.assertIsNone(ml.extract_split({"settings": {"testPeriod": "P0Y"}, "is": {}}))
+        self.assertIsNone(ml.extract_split(None))
+
+    def test_registry_keeps_out_of_sample(self):
+        split = {"test_period": "P1Y", "train": {"sharpe": 1.94}, "test": {"sharpe": 0.43}}
+        entry = alpha_registry.build_entry(
+            {"alpha_id": "abc123", "expression": "rank(close)", "status": "UNSUBMITTED",
+             "metrics": {"sharpe": 1.65, "fitness": 1.27}, "checks": [], "out_of_sample": split},
+            idea="Idea 57", mechanism="stability", verdict="candidate",
+        )
+        self.assertEqual(entry["out_of_sample"], split)

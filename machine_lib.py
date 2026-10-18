@@ -1348,6 +1348,9 @@ def simulate_alphas(
                 return
             record["metrics"] = payload.get("is")
             record["checks"] = _extract_checks(payload)
+            split = extract_split(payload)
+            if split:
+                record["out_of_sample"] = split
 
         record["status"] = record.pop("simulation_status", record.get("status"))
         record.pop("metrics_pending", None)
@@ -1953,3 +1956,49 @@ def login_hk():
         "Hong Kong accounts need browser authorization first: open %s, then "
         "retry with a session created from those cookies." % location
     )
+
+
+# ---------------------------------------------------------------------------
+# Out-of-sample split
+# ---------------------------------------------------------------------------
+SPLIT_METRIC_KEYS = (
+    "sharpe", "fitness", "turnover", "returns", "drawdown", "margin",
+    "longCount", "shortCount", "pnl",
+)
+
+
+def extract_split(payload):
+    """Pull BRAIN's own train/test split out of an alpha payload.
+
+    A regular simulation always runs the platform's fixed window (this account
+    reports 2019-01-01..2023-12-31; ``startDate``/``endDate`` in the settings
+    are assigned by BRAIN and are silently ignored when a caller sends their
+    own). The only out-of-sample evidence the API exposes is ``testPeriod``:
+    the tail of that window becomes ``test`` and everything before it ``train``.
+
+    Returns ``{"test_period", "train", "test"}`` with ``None`` blocks when the
+    alpha was simulated with ``testPeriod: P0Y`` (no split exists).
+    """
+    if not isinstance(payload, dict):
+        return None
+    settings = payload.get("settings") or {}
+    train = payload.get("train")
+    test = payload.get("test")
+    if not isinstance(train, dict) and not isinstance(test, dict):
+        return None
+
+    def block(source):
+        if not isinstance(source, dict):
+            return None
+        picked = {k: source.get(k) for k in SPLIT_METRIC_KEYS if k in source}
+        for key in ("startDate", "endDate"):
+            value = source.get(key)
+            if value is not None:
+                picked[key] = value
+        return picked or None
+
+    return {
+        "test_period": settings.get("testPeriod"),
+        "train": block(train),
+        "test": block(test),
+    }

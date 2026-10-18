@@ -159,6 +159,11 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
     }
     if extra:
         entry["extra"] = extra
+    split = alpha.get("out_of_sample")
+    if isinstance(split, dict):
+        # BRAIN's own train/test split is the only out-of-sample evidence the
+        # API exposes, so keep it next to the full-window metrics.
+        entry["out_of_sample"] = split
     return entry
 
 
@@ -205,6 +210,7 @@ def _comparable(entry):
         "expression": " ".join((entry.get("expression") or "").split()),
         "settings": entry.get("settings") or {},
         "metrics": entry.get("metrics") or {},
+        "out_of_sample": entry.get("out_of_sample") or {},
         "failing_checks": entry.get("failing_checks") or [],
     }
 

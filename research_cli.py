@@ -1179,6 +1179,9 @@ def cmd_alpha_get(args, _sink):
         "metrics": {k: in_sample.get(k) for k in METRIC_KEYS if k in in_sample},
         "checks": ml._extract_checks(payload),
     }
+    split = ml.extract_split(payload)
+    if split:
+        document["out_of_sample"] = split
     _maybe_save(args, document)
     return document
 
@@ -1479,6 +1482,7 @@ def _record_simulation(records, settings, args):
                 "settings": settings,
                 "metrics": record.get("metrics"),
                 "checks": record.get("checks"),
+                "out_of_sample": record.get("out_of_sample"),
                 "status": record.get("status"),
                 "error": record.get("error"),
             },
