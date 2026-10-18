@@ -55,6 +55,10 @@ OPERATORS = [
     {"name": "vec_sum", "category": "Vector", "definition": "vec_sum(x)"},
     {"name": "bucket", "category": "Group",
      "definition": 'bucket(rank(x), range="0, 1, 0.1", skipBoth = false, NaNGroup = false)'},
+    # ``max`` spells its variadic marker with TWO dots, not three. A lint that
+    # only recognised ``...`` counted the marker as a required parameter and
+    # rejected the legal two-argument call ``max(a, b)``.
+    {"name": "max", "category": "Arithmetic", "definition": "max(x, y, ..)"},
 ]
 
 
@@ -193,6 +197,22 @@ class ExpressionLintTests(unittest.TestCase):
             operator_index=self.index)
         codes = [w["code"] for w in report["warnings"]]
         self.assertIn("arity_suspicious", codes)
+
+    def test_two_dot_variadic_marker_is_not_a_parameter(self):
+        # ``max(x, y, ..)`` documents "at least 2 inputs". Counting the ``..``
+        # marker as a required parameter made the legal call max(a, b) warn.
+        report = expression_lint.lint_expression(
+            "rank(max(close, open))", operator_index=self.index)
+        codes = [w["code"] for w in report["warnings"]]
+        self.assertNotIn("arity_suspicious", codes)
+        self.assertEqual(self.index["max"]["min_arity"], 2)
+        self.assertIsNone(self.index["max"]["max_arity"])
+
+    def test_three_dot_variadic_marker_also_accepted(self):
+        index = expression_lint.build_operator_index(
+            [{"name": "max", "definition": "max(x, y, ...)"}])
+        self.assertEqual(index["max"]["min_arity"], 2)
+        self.assertIsNone(index["max"]["max_arity"])
 
     def test_signature_parsing_marks_optional_parameters(self):
         index = expression_lint.build_operator_index(

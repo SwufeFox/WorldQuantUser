@@ -364,7 +364,7 @@ def build_parser():
                      help="Validate and print payloads without contacting BRAIN.")
     sim.add_argument("--record", action="store_true",
                      help="Append every finished result to the alpha registry "
-                          "(git-tracked JSONL) with an automatic verdict.")
+                          "(outside the git work tree) with an automatic verdict.")
     sim.add_argument("--idea", default=None,
                      help="Idea label recorded in the registry, e.g. 'Idea 47'.")
     sim.add_argument("--mechanism", default=None,
@@ -432,7 +432,7 @@ def build_parser():
     a_list.set_defaults(func=cmd_alpha_list)
 
     a_rec = alpha_sub.add_parser(
-        "record", help="Persist one alpha into the git-tracked registry.")
+        "record", help="Persist one alpha into the append-only registry.")
     a_rec.add_argument("alpha_id")
     a_rec.add_argument("--idea", default=None, help="e.g. 'Idea 47'.")
     a_rec.add_argument("--mechanism", default=None)

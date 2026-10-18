@@ -71,7 +71,11 @@ def _parse_signature(definition):
 
     Definitions look like ``add(x, y, filter = false), x + y`` -- the parameter
     list is the first balanced parenthesised group. Parameters carrying ``=`` are
-    optional; a trailing ``...`` means variadic.
+    optional; a trailing variadic marker means "more arguments allowed".
+
+    The variadic marker is spelled ``..`` in some catalogue records (``max(x, y,
+    ..)``) and ``...`` in others, so treat any run of two or more dots as the
+    marker rather than only the three-dot form.
     """
     if not isinstance(definition, str) or "(" not in definition:
         return None, None, None
@@ -99,7 +103,7 @@ def _parse_signature(definition):
     for param in params:
         if not param:
             continue
-        if param in {"...", "*args", "*"}:
+        if param in {"...", "..", "*args", "*"} or (set(param) == {"."} and len(param) >= 2):
             variadic = True
             continue
         if "=" in param:
