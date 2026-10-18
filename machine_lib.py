@@ -1006,6 +1006,7 @@ def simulate_alphas(
             record["alpha_id"] = progress.get("alpha")
             if progress.get("status") == "ERROR" or progress.get("message"):
                 record["error"] = progress.get("message") or "simulation error"
+                note_operator_rejection(record.get("expression"), record["error"])
             if record["alpha_id"]:
                 record["simulation_status"] = record["status"]
                 record["metrics_pending"] = True
@@ -1069,12 +1070,14 @@ def simulate_alphas(
             except BrainError as exc:
                 record["status"] = "FAILED"
                 record["error"] = "%s: %s" % (exc.code, exc)
+                note_operator_rejection(record.get("expression"), record["error"])
                 records[index] = record
                 emit("failed", index, record)
                 continue
             except requests.HTTPError as exc:
                 record["status"] = "FAILED"
                 record["error"] = "submit failed: %s" % exc
+                note_operator_rejection(record.get("expression"), record["error"])
                 records[index] = record
                 emit("failed", index, record)
                 continue
@@ -1096,6 +1099,45 @@ def simulate_alphas(
             break
 
     return records
+
+
+_OPERATOR_MENTION = re.compile(r"[Oo]perator\s+[`'\"]?([A-Za-z_][A-Za-z0-9_]*)")
+_OPERATOR_FATAL = re.compile(
+    r"unknown operator|not a valid operator|operator .{0,40}(not found|does not "
+    r"exist|is not supported|not available|not permitted|is not allowed)",
+    re.IGNORECASE,
+)
+
+
+def note_operator_rejection(expression, message, context=None):
+    """Learn an operator-level rejection so the linter flags it next time.
+
+    BRAIN answers some rejections with ``Operator <name> ...``. Two flavours
+    matter and they are not equally severe:
+
+    * the operator is unknown or unavailable in this config -- ``block``;
+    * the operator exists but does not accept this kind of input, e.g.
+      ``Operator subtract does not support event inputs`` -- ``warn``.
+
+    Blanket-denying the second kind would disable perfectly good operators, so
+    the two are stored with different severities.
+    """
+    if not message:
+        return None
+    match = _OPERATOR_MENTION.search(message)
+    if not match:
+        return None
+    operator = match.group(1)
+    severity = "block" if _OPERATOR_FATAL.search(message) else "warn"
+    try:
+        import expression_lint
+        return expression_lint.record_rejection(
+            operator, message, severity=severity,
+            context=context or {"expression": expression},
+        )
+    except Exception:
+        # Learning from a rejection must never break a simulation run.
+        return None
 
 
 def _extract_checks(alpha_payload):

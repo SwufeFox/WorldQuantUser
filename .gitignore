@@ -10,3 +10,7 @@ __pycache__/
 brain_session.json
 *.session.json
 .brain_checkpoints/
+
+# transient per-run checkpoints written next to research files
+research/*-checkpoint.json
+research/*.checkpoint.json

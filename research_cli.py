@@ -41,8 +41,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import machine_lib as ml  # noqa: E402
 import research_config as config_io  # noqa: E402
+import alpha_registry  # noqa: E402
+import expression_lint  # noqa: E402
+import field_contract  # noqa: E402
 
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 #: Stable process exit codes. Callers branch on these, so the mapping from an
 #: error code to an exit code is part of the contract.
@@ -92,11 +95,14 @@ class JsonArgumentParser(argparse.ArgumentParser):
 class CliError(Exception):
     """A failure we can explain: stable ``code``, message and optional hint."""
 
-    def __init__(self, code, message, hint=None):
+    def __init__(self, code, message, hint=None, details=None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.hint = hint
+        # Optional structured payload so a caller can act on the failure without
+        # re-deriving it from the message text.
+        self.details = details
 
     @property
     def exit_code(self):
@@ -106,6 +112,15 @@ class CliError(Exception):
 # ---------------------------------------------------------------------------
 # Output plumbing
 # ---------------------------------------------------------------------------
+def _error_body(exc):
+    """Build the error object, including details when the raiser supplied them."""
+    body = {"code": exc.code, "message": exc.message, "hint": exc.hint}
+    details = getattr(exc, "details", None)
+    if details is not None:
+        body["details"] = details
+    return body
+
+
 def emit(payload):
     """Write the single JSON document that is this process's stdout."""
     json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, default=str)
@@ -245,6 +260,53 @@ def build_parser():
     _add_session_args(cat_c)
     cat_c.set_defaults(func=cmd_catalog_categories)
 
+    cat_audit = cat.add_parser(
+        "field-audit",
+        help="Audit a field set's period/unit/sign contract before combining.")
+    cat_audit.add_argument("--fields", default="",
+                           help="Comma-separated datafield ids to audit.")
+    cat_audit.add_argument("--dataset", default=None,
+                           help="Audit a whole dataset, or resolve --fields "
+                                "inside it first.")
+    cat_audit.add_argument("--operation", choices=list(field_contract.OPERATIONS),
+                           default=None,
+                           help="The combination you intend to run; decides the "
+                                "verdict.")
+    cat_audit.add_argument("--search", default="")
+    cat_audit.add_argument("--limit", type=int, default=None)
+    cat_audit.add_argument("--region", default="USA")
+    cat_audit.add_argument("--universe", default="TOP3000")
+    cat_audit.add_argument("--delay", type=int, default=1, choices=[0, 1])
+    cat_audit.add_argument("--instrument-type", default="EQUITY")
+    cat_audit.add_argument("--save")
+    _add_session_args(cat_audit)
+    cat_audit.set_defaults(func=cmd_catalog_field_audit)
+
+    lint = sub.add_parser(
+        "lint",
+        help="Pre-flight expressions against the operator catalog (quota-free).")
+    lint.add_argument("expression", nargs="?",
+                      help="Expression to lint, e.g. 'rank(ts_delta(close, 5))'.")
+    lint.add_argument("--file", default=None,
+                      help="Research file (JSON or one expression per line).")
+    lint.add_argument("--offline", action="store_true",
+                      help="Skip the operator catalog; check structure and the "
+                           "learned denylist only.")
+    lint.add_argument("--dataset", default=None,
+                      help="Treat this dataset's fields as known so unknown "
+                           "identifiers are flagged.")
+    lint.add_argument("--strict-fields", action="store_true",
+                      help="Treat unknown identifiers as errors, not warnings.")
+    lint.add_argument("--region", default="USA")
+    lint.add_argument("--universe", default="TOP3000")
+    lint.add_argument("--delay", type=int, default=1, choices=[0, 1])
+    lint.add_argument("--instrument-type", default="EQUITY")
+    lint.add_argument("--denylist", default=None,
+                      help="Override the learned denylist path.")
+    lint.add_argument("--save")
+    _add_session_args(lint)
+    lint.set_defaults(func=cmd_lint)
+
     sim = sub.add_parser(
         "simulate", help="Simulate alphas (spends simulation quota unless --dry-run).")
     sim.add_argument("file", nargs="?",
@@ -262,6 +324,20 @@ def build_parser():
                      help="Checkpoint path; pending work is saved automatically if omitted.")
     sim.add_argument("--dry-run", action="store_true",
                      help="Validate and print payloads without contacting BRAIN.")
+    sim.add_argument("--record", action="store_true",
+                     help="Append every finished result to the alpha registry "
+                          "(git-tracked JSONL) with an automatic verdict.")
+    sim.add_argument("--idea", default=None,
+                     help="Idea label recorded in the registry, e.g. 'Idea 47'.")
+    sim.add_argument("--mechanism", default=None,
+                     help="One-line economic mechanism for the registry.")
+    sim.add_argument("--note", default=None,
+                     help="Free-text note stored with each registry entry.")
+    sim.add_argument("--registry", default=None,
+                     help="Override the alpha registry path.")
+    sim.add_argument("--allow-lint-errors", action="store_true",
+                     help="Submit even when the operator lint fails (the previous "
+                          "behaviour). Not recommended: the failure costs quota.")
     sim.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
                      help="Sort results by this metric, best first.")
     sim.add_argument("--top", type=int, default=None,
@@ -296,6 +372,7 @@ def build_parser():
     a_get = alpha_sub.add_parser("get", help="Fetch one alpha's metrics and checks.")
     a_get.add_argument("alpha_id")
     _add_session_args(a_get)
+    a_get.add_argument("--save")
     a_get.set_defaults(func=cmd_alpha_get)
 
     a_list = alpha_sub.add_parser("list", help="List the account's alphas.")
@@ -313,7 +390,32 @@ def build_parser():
     a_list.add_argument("--all", action="store_true",
                         help="Include hidden and SUPER alphas.")
     _add_session_args(a_list)
+    a_list.add_argument("--save")
     a_list.set_defaults(func=cmd_alpha_list)
+
+    a_rec = alpha_sub.add_parser(
+        "record", help="Persist one alpha into the git-tracked registry.")
+    a_rec.add_argument("alpha_id")
+    a_rec.add_argument("--idea", default=None, help="e.g. 'Idea 47'.")
+    a_rec.add_argument("--mechanism", default=None)
+    a_rec.add_argument("--verdict", choices=list(alpha_registry.VERDICTS),
+                       default="watch")
+    a_rec.add_argument("--note", default=None)
+    a_rec.add_argument("--registry", default=None)
+    _add_session_args(a_rec)
+    a_rec.set_defaults(func=cmd_alpha_record)
+
+    a_reg = alpha_sub.add_parser(
+        "registry", help="Read the durable alpha ledger (no network needed).")
+    a_reg.add_argument("--verdict", action="append", default=[],
+                       choices=list(alpha_registry.VERDICTS),
+                       help="Keep only these verdicts; repeatable.")
+    a_reg.add_argument("--idea", default=None)
+    a_reg.add_argument("--min-sharpe", type=float, default=None)
+    a_reg.add_argument("--format", choices=["json", "markdown"], default="json")
+    a_reg.add_argument("--registry", default=None)
+    a_reg.add_argument("--save")
+    a_reg.set_defaults(func=cmd_alpha_registry)
 
     return parser
 
@@ -739,7 +841,57 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
             "all %d simulations failed" % summary["total"],
             str(first_error),
         )
-    return _simulation_result(records, settings, checkpoint_path)
+    result = _simulation_result(records, settings, checkpoint_path)
+    if getattr(args, "record", False):
+        result["registry"] = _record_simulation(records, settings, args)
+    return result
+
+
+def _preflight_lint(session, pairs, args):
+    """Lint against the operator catalog before spending simulation quota.
+
+    Raises ``INVALID_INPUT`` on a hard lint failure unless the caller passed
+    ``--allow-lint-errors``; a clean pass is reported on stderr as an event so
+    stdout stays a single JSON document.
+    """
+    operator_index = None
+    catalog_note = "checked"
+    try:
+        operator_index = _operator_index_from_catalog(session)
+    except Exception as exc:  # noqa: BLE001
+        # The operator list is metadata. A hiccup there must not block a run that
+        # is otherwise fine, but the degradation is announced rather than hidden
+        # so nobody mistakes a partial lint for a full one.
+        catalog_note = "unavailable: %s: %s" % (type(exc).__name__, exc)
+        note("lint: operator catalog %s; continuing with the learned denylist only"
+             % catalog_note)
+    report = expression_lint.lint_all(
+        pairs,
+        operator_index=operator_index,
+        denylist=expression_lint.load_denylist(),
+    )
+    report["operator_catalog_size"] = len(operator_index or {})
+    report["operator_catalog"] = catalog_note
+    if report["ok"]:
+        return report
+    if getattr(args, "allow_lint_errors", False):
+        return report
+    unknown = sorted({item.get("operator") for item in report["errors"]
+                      if item.get("code") == "unknown_operator"})
+    hint = "fix the expressions, or pass --allow-lint-errors to submit anyway"
+    if unknown:
+        hint = ("operator(s) %s are not in the BRAIN operator list; a docs page "
+                "existing does not make them simulatable" % ", ".join(unknown))
+    raise CliError(
+        "INVALID_INPUT",
+        "expression lint failed; nothing was submitted",
+        hint,
+        details={
+            "operator_catalog_size": report["operator_catalog_size"],
+            "errors": report["errors"],
+            "warnings": report["warnings"],
+        },
+    )
 
 
 def cmd_simulate(args, sink):
@@ -754,13 +906,32 @@ def cmd_simulate(args, sink):
 
     if args.dry_run:
         records = ml.simulate_alphas(None, pairs, settings=settings, dry_run=True)
+        # Offline lint: catches structural problems and learned rejections. The
+        # authoritative operator check needs the catalog, so it runs on `lint`
+        # and on a real submission below, not here.
+        offline_lint = expression_lint.lint_all(
+            pairs,
+            denylist=expression_lint.load_denylist(),
+        )
         return {
             "status": "DRY_RUN",
             "dry_run": True,
             "settings": settings,
             "summary": {"total": len(records), "payloads": len(records)},
+            "lint": {
+                "operator_catalog_checked": False,
+                "hint": "run `lint` for the authoritative operator check",
+                "ok": offline_lint["ok"],
+                "errors": offline_lint["errors"],
+                "warnings": offline_lint["warnings"],
+            },
             "results": records,
         }
+
+    # Real submission: lint against the operator catalog first. An unknown
+    # operator would otherwise burn a submission slot and a polling wait before
+    # BRAIN rejected it -- exactly how `regression_neut` cost a round trip.
+    with_session(args, lambda s: _preflight_lint(s, pairs, args))
 
     checkpoint_path, checkpoint = _prepare_simulation_run(
         settings, pairs, args.batch_size, args.checkpoint
@@ -846,7 +1017,7 @@ def cmd_alpha_get(args, _sink):
     payload = with_session(args, lambda s: ml.fetch_alpha_metrics(s, args.alpha_id))
     in_sample = payload.get("is") or {}
     code, description, operator_count = ml.regular_expression(payload)
-    return {
+    document = {
         "alpha_id": payload.get("id", args.alpha_id),
         "expression": code,
         "expression_description": description,
@@ -858,6 +1029,8 @@ def cmd_alpha_get(args, _sink):
         "metrics": {k: in_sample.get(k) for k in METRIC_KEYS if k in in_sample},
         "checks": ml._extract_checks(payload),
     }
+    _maybe_save(args, document)
+    return document
 
 
 def cmd_alpha_list(args, _sink):
@@ -887,7 +1060,9 @@ def cmd_alpha_list(args, _sink):
             "grade": alpha.get("grade"),
             "date_created": alpha.get("dateCreated"),
         })
-    return {"count": len(compact), "offset": args.offset, "alphas": compact}
+    document = {"count": len(compact), "offset": args.offset, "alphas": compact}
+    _maybe_save(args, document)
+    return document
 
 
 # ---------------------------------------------------------------------------
@@ -908,12 +1083,342 @@ def run(argv=None):
     return EXIT_CODES["OK"]
 
 
+# ---------------------------------------------------------------------------
+# lint -- expression pre-flight
+# ---------------------------------------------------------------------------
+
+def _collect_lint_pairs(args):
+    """Return ``(settings, [(expression, decay), ...])`` for the lint target."""
+    if getattr(args, "file", None):
+        file_settings, alphas = config_io.load_research_file(args.file)
+        return config_io.build_config(file_settings, alphas)
+    expression = getattr(args, "expression", None)
+    if not expression:
+        raise CliError(
+            "USAGE", "lint needs an expression or --file",
+            "pass it positionally, e.g. `lint 'rank(ts_delta(close, 5))'`")
+    return {}, [(expression, None)]
+
+
+def _operator_index_from_catalog(session):
+    return expression_lint.build_operator_index(ml.fetch_operators(session))
+
+
+def _known_field_ids(session, args):
+    """Field ids of ``--dataset``, so unknown identifiers can be flagged."""
+    dataset = getattr(args, "dataset", None)
+    if not dataset:
+        return None
+    records = ml.get_datafields(
+        session,
+        instrument_type=getattr(args, "instrument_type", "EQUITY"),
+        region=getattr(args, "region", "USA"),
+        delay=getattr(args, "delay", 1),
+        universe=getattr(args, "universe", "TOP3000"),
+        dataset_id=dataset,
+    )
+    return {record.get("id") for record in records if record.get("id")}
+
+
+def cmd_lint(args, sink):
+    settings, pairs = _collect_lint_pairs(args)
+    denylist = expression_lint.load_denylist(getattr(args, "denylist", None))
+    operator_index = None
+    known_fields = None
+    catalog_checked = False
+    if not getattr(args, "offline", False):
+        def work(session):
+            return (_operator_index_from_catalog(session),
+                    _known_field_ids(session, args))
+
+        operator_index, known_fields = with_session(args, work)
+        catalog_checked = operator_index is not None
+
+    results = []
+    for expression, decay in pairs:
+        report = expression_lint.lint_expression(
+            expression,
+            operator_index=operator_index,
+            denylist=denylist,
+            known_fields=known_fields,
+            strict_fields=getattr(args, "strict_fields", False),
+        )
+        report["expression"] = expression
+        if decay is not None:
+            report["decay"] = decay
+        results.append(report)
+
+    failed = [item for item in results if not item["ok"]]
+    document = {
+        "expressions": len(results),
+        "ok": not failed,
+        "catalog_checked": catalog_checked,
+        "operator_catalog_size": len(operator_index or {}),
+        "denylist_size": len(denylist),
+        "known_field_count": None if known_fields is None else len(known_fields),
+        "settings": settings or None,
+        "summary": {
+            "errors": sum(len(item["errors"]) for item in results),
+            "warnings": sum(len(item["warnings"]) for item in results),
+        },
+        "results": results,
+    }
+    _maybe_save(args, document)
+    if failed:
+        raise CliError(
+            "INVALID_INPUT",
+            "%d of %d expression(s) failed lint" % (len(failed), len(results)),
+            "see data.results[].errors; `unknown_operator` means the operator is "
+            "not in the BRAIN operator list even when a documentation page exists",
+            details=document,
+        )
+    return document
+
+
+# ---------------------------------------------------------------------------
+# catalog field-audit -- field contract before combining fields
+# ---------------------------------------------------------------------------
+
+def _fetch_raw_fields(session, args, dataset=None, search=""):
+    return ml.get_datafields(
+        session,
+        instrument_type=getattr(args, "instrument_type", "EQUITY"),
+        region=getattr(args, "region", "USA"),
+        delay=getattr(args, "delay", 1),
+        universe=getattr(args, "universe", "TOP3000"),
+        dataset_id=dataset or "",
+        search=search,
+        limit=getattr(args, "limit", None),
+    )
+
+
+def _resolve_fields_by_id(session, args, field_ids):
+    """Locate raw catalog records for specific field ids.
+
+    Tries ``--dataset`` first, then walks the region's datasets until every id
+    is found. Dataset listing and field listing are both quota-free, so a miss
+    costs a request rather than simulation quota.
+    """
+    wanted = list(field_ids)
+    found = []
+    if getattr(args, "dataset", None):
+        records = _fetch_raw_fields(session, args, dataset=args.dataset)
+        by_id = {record.get("id"): record for record in records}
+        found = [by_id[field_id] for field_id in wanted if field_id in by_id]
+        remaining = [field_id for field_id in wanted if field_id not in by_id]
+        if not remaining:
+            return found, []
+        wanted = remaining
+
+    datasets = ml.get_datasets(
+        session,
+        instrument_type=getattr(args, "instrument_type", "EQUITY"),
+        region=getattr(args, "region", "USA"),
+        delay=getattr(args, "delay", 1),
+        universe=getattr(args, "universe", "TOP3000"),
+    )
+    remaining = set(wanted)
+    for dataset in datasets:
+        dataset_id = dataset.get("id")
+        if not dataset_id or not remaining:
+            continue
+        records = _fetch_raw_fields(session, args, dataset=dataset_id)
+        for record in records:
+            field_id = record.get("id")
+            if field_id in remaining:
+                found.append(record)
+                remaining.discard(field_id)
+        if not remaining:
+            break
+    order = {field_id: index for index, field_id in enumerate(wanted)}
+    found.sort(key=lambda record: order.get(record.get("id"), len(order)))
+    return found, sorted(remaining)
+
+
+def cmd_catalog_field_audit(args, sink):
+    field_ids = [item.strip()
+                 for item in (getattr(args, "fields", "") or "").split(",")
+                 if item.strip()]
+    if not field_ids and not getattr(args, "dataset", None):
+        raise CliError(
+            "USAGE", "field-audit needs --fields and/or --dataset",
+            "e.g. `catalog field-audit --fields fnd6_newa1v1300_capx,"
+            "fnd6_newa2v1300_oancf --operation ratio`")
+
+    def work(session):
+        if field_ids:
+            return _resolve_fields_by_id(session, args, field_ids)
+        return _fetch_raw_fields(session, args), []
+
+    raw_records, missing = with_session(args, work)
+    if not raw_records:
+        raise CliError(
+            "NOT_FOUND", "no matching datafields",
+            "check the field ids and the region/universe/delay; field listing is "
+            "quota-free, so a wrong id costs a retry rather than a simulation")
+
+    document = field_contract.audit_fields(
+        raw_records, operation=getattr(args, "operation", None))
+    document["catalog"] = {
+        "region": getattr(args, "region", "USA"),
+        "universe": getattr(args, "universe", "TOP3000"),
+        "delay": getattr(args, "delay", 1),
+        "instrument_type": getattr(args, "instrument_type", "EQUITY"),
+    }
+    if field_ids:
+        document["requested_fields"] = field_ids
+    if missing:
+        document["missing_fields"] = missing
+    _maybe_save(args, document)
+    return document
+
+
+# ---------------------------------------------------------------------------
+# alpha record / alpha registry -- the durable ledger
+# ---------------------------------------------------------------------------
+
+def _auto_verdict(record):
+    """Classify a simulation record without pretending to be a researcher.
+
+    Only the default for ``simulate --record``: it keeps the ledger useful when
+    nobody has written a judgement yet. Anything that cleared the usual bar is a
+    ``candidate``; anything that failed a platform check is ``rejected``; the
+    rest stays ``watch`` until someone decides.
+    """
+    if record.get("status") != "COMPLETE":
+        return "rejected"
+    checks = record.get("checks") or {}
+    if isinstance(checks, dict):
+        results = [str((value or {}).get("result") or "").upper()
+                   if isinstance(value, dict) else str(value).upper()
+                   for value in checks.values()]
+    else:
+        results = [str((value or {}).get("result") or "").upper()
+                   for value in checks if isinstance(value, dict)]
+    if any(result in {"FAIL", "ERROR"} for result in results):
+        return "rejected"
+    metrics = record.get("metrics") or {}
+    sharpe = metrics.get("sharpe")
+    fitness = metrics.get("fitness")
+    if isinstance(sharpe, (int, float)) and isinstance(fitness, (int, float)):
+        if sharpe >= 1.25 and fitness >= 1.0:
+            return "candidate"
+    return "watch"
+
+
+def _record_simulation(records, settings, args):
+    """Append finished simulation records to the registry."""
+    registry_path = (getattr(args, "registry", None)
+                     or alpha_registry.default_registry_path())
+    entries = []
+    written = 0
+    for record in records:
+        entry = alpha_registry.build_entry(
+            {
+                "alpha_id": record.get("alpha_id"),
+                "expression": record.get("expression"),
+                "decay": record.get("decay"),
+                "settings": settings,
+                "metrics": record.get("metrics"),
+                "checks": record.get("checks"),
+                "status": record.get("status"),
+                "error": record.get("error"),
+            },
+            idea=getattr(args, "idea", None),
+            mechanism=getattr(args, "mechanism", None),
+            verdict=_auto_verdict(record),
+            note=getattr(args, "note", None),
+            source="simulate",
+        )
+        _, did_write = alpha_registry.record_entry(entry, registry_path)
+        written += 1 if did_write else 0
+        entries.append(entry)
+    return {
+        "registry": registry_path,
+        "recorded": len(entries),
+        "appended": written,
+        "by_verdict": {
+            verdict: sum(1 for entry in entries if entry["verdict"] == verdict)
+            for verdict in alpha_registry.VERDICTS
+        },
+    }
+
+
+def cmd_alpha_record(args, sink):
+    alpha_id = getattr(args, "alpha_id", None)
+    if not alpha_id:
+        raise CliError(
+            "USAGE", "alpha record needs an alpha id",
+            "use `alpha list` to find one; a record without an alpha id has no "
+            "metrics to persist")
+
+    def work(session):
+        return ml.fetch_alpha_metrics(session, alpha_id)
+
+    payload = with_session(args, work)
+    in_sample = payload.get("is") or {}
+    expression, _, _ = ml.regular_expression(payload)
+    entry = alpha_registry.build_entry(
+        {
+            "alpha_id": payload.get("id") or alpha_id,
+            "expression": expression,
+            "settings": payload.get("settings") or {},
+            "metrics": in_sample,
+            "checks": in_sample.get("checks") or {},
+            "status": payload.get("status") or "UNSUBMITTED",
+        },
+        idea=getattr(args, "idea", None),
+        mechanism=getattr(args, "mechanism", None),
+        verdict=getattr(args, "verdict", "watch"),
+        note=getattr(args, "note", None),
+        source="record",
+    )
+    registry_path = (getattr(args, "registry", None)
+                     or alpha_registry.default_registry_path())
+    stored, written = alpha_registry.record_entry(entry, registry_path)
+    return {
+        "registry": registry_path,
+        "appended": written,
+        "entry": stored,
+    }
+
+
+def cmd_alpha_registry(args, sink):
+    registry_path = (getattr(args, "registry", None)
+                     or alpha_registry.default_registry_path())
+    entries = alpha_registry.load_entries(registry_path)
+    verdicts = set(getattr(args, "verdict", None) or [])
+    idea = getattr(args, "idea", None)
+    min_sharpe = getattr(args, "min_sharpe", None)
+    selected = []
+    for entry in entries:
+        if verdicts and entry.get("verdict") not in verdicts:
+            continue
+        if idea and entry.get("idea") != idea:
+            continue
+        if min_sharpe is not None:
+            sharpe = (entry.get("metrics") or {}).get("sharpe")
+            if not isinstance(sharpe, (int, float)) or sharpe < min_sharpe:
+                continue
+        selected.append(entry)
+    document = {
+        "registry": registry_path,
+        "filtered": len(selected),
+        "summary": alpha_registry.summarize(selected),
+    }
+    if getattr(args, "format", "json") == "markdown":
+        document["markdown"] = alpha_registry.render_markdown(selected)
+    document["entries"] = selected
+    _maybe_save(args, document)
+    return document
+
+
 def main(argv=None):
     try:
         return run(argv)
     except CliError as exc:
         emit({"ok": False, "command": _command_of(argv),
-              "error": {"code": exc.code, "message": exc.message, "hint": exc.hint}})
+              "error": _error_body(exc)})
         note("%s: %s" % (exc.code, exc.message))
         return exc.exit_code
     except ml.BrainError as exc:

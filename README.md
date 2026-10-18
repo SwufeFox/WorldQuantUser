@@ -19,8 +19,12 @@ research_cli.py schema      # the whole contract, as JSON
 | `research_cli.py` | The machine-readable CLI. stdout is always one JSON document. |
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and GUI. |
 | `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
+| `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
+| `field_contract.py` | Field contracts: declared vs inferred period/unit/sign, verdicts. |
+| `alpha_registry.py` | Append-only ledger of alphas worth remembering (`research/alpha-registry.jsonl`). |
 | `research_gui.py` | Small tkinter wrapper for interactive use. |
 | `Alpha Machine.ipynb` | Worked example, first-order → second-order → third-order alphas. |
+| `tools/backfill_registry.py` | One-off seed of the registry from the account and `research/`. |
 | `tests/` | Offline contract tests. No account required. |
 
 ## Install
@@ -69,6 +73,10 @@ if not result["ok"]:
 Progress goes to stderr, never stdout. Failures carry a stable `error.code` and
 a process exit code (`USAGE`/`INVALID_INPUT` 2, `AUTH_*` 3, `RATE_LIMITED`/
 `SERVICE_ERROR` 4, `NOT_FOUND` 5, `SIMULATION_FAILED` 6).
+
+A failure can also carry `error.details`: the structured findings behind it, for
+example every lint error per expression, so a caller can act without scraping the
+message text.
 
 ### Discover the surface
 
@@ -143,6 +151,72 @@ python research_cli.py alpha list --min-sharpe 1.5 --limit 20
 
 Both are quota-free.
 
+### Lint before you spend a simulation
+
+```bash
+python research_cli.py lint 'rank(ts_delta(close, 5))'
+python research_cli.py lint --file my_batch.json --dataset fundamental6
+python research_cli.py lint --offline 'rank(close)'      # no account needed
+```
+
+The operator names in an expression are checked against `GET /operators`, the
+authoritative list -- not the documentation site, which describes operators the
+simulator does not accept. (`regression_neut` is the cautionary example: a docs
+page exists, the operator does not.) `simulate` runs the same check before
+submitting and refuses to spend quota on an expression that cannot work; pass
+`--allow-lint-errors` to override. Exit code is `2` on a lint failure and the
+error envelope carries every finding under `error.details`.
+
+Rejections the simulator reports are written back to
+`research/operator-denylist.json` with a severity: `block` when the operator is
+unknown or unavailable, `warn` when it merely rejects that kind of input (for
+example `subtract` refusing event inputs). Commit that file so the lesson
+survives the next session.
+
+### Audit a field set before combining fields
+
+```bash
+python research_cli.py catalog field-audit \
+    --fields fnd6_newa1v1300_capx,fnd6_newa2v1300_oancf,fnd6_newa1v1300_at \
+    --operation ratio
+```
+
+The catalog tells you a field's coverage and delay; it does not tell you the
+unit, the currency, the fiscal period, the sign convention or how corporate
+actions are handled. Those unknowns -- not the economics -- are what sink ideas,
+so they are made explicit per field as `declared`, `inferred` (with the rule that
+produced it) or `unknown`, and the operation is then judged:
+
+| verdict | meaning |
+| --- | --- |
+| `ready` | period and unit are known and consistent; no caveats |
+| `needs_review` | usable, but fiscal alignment or sign convention is unverified |
+| `blocked` | a critical attribute is unknown; do not compute on it yet |
+
+Operations: `ts_difference` (one field over time), `ratio`, `difference`, `sum`.
+Differencing a share count is blocked outright because no split basis is
+declared; a sum or difference of fields with undeclared sign is blocked because
+one negative stored value inverts the signal. Quota-free.
+
+### Remember what you found
+
+```bash
+python research_cli.py simulate batch.json --record --idea "Idea 50" \
+    --mechanism "external financing gap"
+python research_cli.py alpha record P0Mq0wEM --idea "leverage, size-bucketed" \
+    --verdict candidate --note "why it mattered"
+python research_cli.py alpha registry --format markdown --min-sharpe 1.25
+```
+
+`research/alpha-registry.jsonl` is an append-only ledger, one alpha per line,
+committed to git so findings outlive a chat window. Each entry is self-contained:
+the expression, the full settings, the in-sample metrics, the platform checks,
+the idea it belongs to, a verdict (`candidate` / `watch` / `rejected` / `no_go`)
+and a note. Re-recording the same alpha replaces it on read without rewriting
+history. `simulate --record` classifies automatically (clears the bar →
+`candidate`, fails a check → `rejected`, otherwise `watch`); `alpha record` takes
+an explicit verdict when you have actually decided something.
+
 ## Research files
 
 ```json
@@ -192,6 +266,17 @@ Errors are typed and subclass `machine_lib.BrainError`: `MissingCredentials`,
   rejected before any request is made.
 * **No interactive prompts.** `login_hk()` raises with the authorization URL
   instead of blocking on `input()`.
+* **Field contracts are partly inferred.** No BRAIN endpoint declares a field's
+  unit, currency, fiscal period or sign convention. `field_contract` labels
+  every attribute `declared` / `inferred` / `unknown` and never guesses a value
+  silently, but an `inferred` period is a heuristic on the field id and should
+  be checked against the economics before it is trusted.
+* **Lint is not a correctness proof.** It catches unknown or unavailable
+  operators, unbalanced syntax, arity mismatches and unknown field ids. It
+  cannot know that a syntactically valid expression is economically meaningless.
+* **The registry records alphas, not conclusions.** `verdict` and `note` are
+  judgement; the expression, settings and metrics next to them are re-read from
+  the platform so the numbers cannot drift.
 
 ## Tests
 
@@ -202,3 +287,8 @@ python -m unittest discover -s tests -v
 Fully offline: schema, dry-run payloads, research-file parsing, credential
 precedence, error envelopes, and a guard that no credential file is tracked by
 git.
+
+`tests/test_contract_v2.py` covers the v2 additions: field-contract inference and
+verdicts (including the exact share-count and fiscal-alignment blockers from the
+research notes), lint operator/arity/denylist behaviour, and registry
+append/replace/merge semantics.
