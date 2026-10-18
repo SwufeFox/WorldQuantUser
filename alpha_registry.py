@@ -1,10 +1,14 @@
-"""A durable, git-tracked ledger of alphas worth remembering.
+"""A durable ledger of alphas worth remembering.
 
 Research findings kept only in a chat window are lost the moment the context is
 compacted: the alpha id, the expression that produced it, the settings it was
 measured under, and *why it mattered*. This module keeps that in an append-only
 JSONL ledger so a later session can reload the state of the research instead of
 re-deriving it.
+
+The ledger is deliberately stored **outside the git working tree** (see
+``research_paths``): the repository versions the tool, not the research output.
+It is still a plain file that can be backed up, moved or diffed on its own.
 
 Design notes:
 
@@ -17,7 +21,8 @@ Design notes:
   in-sample metrics, the platform checks, the idea it belongs to and the verdict
   plus a short note. That is everything needed to judge it again later without
   re-running anything.
-* **JSONL so it diffs sanely** in git: one alpha per line, no reformatting churn.
+* **JSONL**: one alpha per line, so the file stays greppable and append-only
+  edits never rewrite earlier records.
 """
 
 from __future__ import annotations
@@ -26,6 +31,8 @@ import datetime
 import hashlib
 import json
 import os
+
+import research_paths
 
 __all__ = [
     "VERDICTS",
@@ -50,9 +57,8 @@ _FAILING_CHECK_RESULTS = frozenset({"FAIL", "ERROR"})
 
 
 def default_registry_path():
-    """Registry location: ``<repo>/research/alpha-registry.jsonl``."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, "research", "alpha-registry.jsonl")
+    """Registry location: ``<research_dir>/alpha-registry.jsonl``."""
+    return research_paths.resolve("alpha-registry.jsonl")
 
 
 def expression_hash(expression):

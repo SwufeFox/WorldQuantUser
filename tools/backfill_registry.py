@@ -29,8 +29,9 @@ sys.path.insert(0, ROOT)
 
 import alpha_registry  # noqa: E402
 import machine_lib as ml  # noqa: E402
+import research_paths  # noqa: E402
 
-RESEARCH = os.path.join(ROOT, "research")
+RESEARCH = research_paths.research_dir()
 
 # Alphas worth remembering, with the annotation that makes them meaningful.
 # Expressions were re-read from the platform, so these labels sit next to the

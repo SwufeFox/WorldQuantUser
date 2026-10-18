@@ -21,11 +21,27 @@ research_cli.py schema      # the whole contract, as JSON
 | `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
 | `field_contract.py` | Field contracts: declared vs inferred period/unit/sign, verdicts. |
-| `alpha_registry.py` | Append-only ledger of alphas worth remembering (`research/alpha-registry.jsonl`). |
+| `research_paths.py` | Resolves where results go -- always outside this working tree. |
+| `alpha_registry.py` | Append-only ledger of alphas worth remembering. |
 | `research_gui.py` | Small tkinter wrapper for interactive use. |
 | `Alpha Machine.ipynb` | Worked example, first-order → second-order → third-order alphas. |
-| `tools/backfill_registry.py` | One-off seed of the registry from the account and `research/`. |
+| `tools/backfill_registry.py` | One-off seed of the registry from the account and existing result files. |
 | `tests/` | Offline contract tests. No account required. |
+
+**This repository versions the tool, not the research.** Simulation results,
+field-catalog snapshots, the alpha registry and the learned operator denylist
+all live in a results directory outside the working tree, resolved by
+`research_paths.py`:
+
+1. `$BRAIN_RESEARCH_DIR` if set;
+2. otherwise `<persistent workspace>/worldquant-research` (`/data/worldquant-research`
+   on this deployment -- `$HOME` is often an ephemeral container layer, and a
+   registry that evaporates is no better than one never written);
+3. otherwise `$XDG_DATA_HOME/worldquant-research`, then `~/.local/share/worldquant-research`.
+
+`research_cli.py schema` reports the resolved path under `research_paths`. A
+`research/` directory inside the repo is git-ignored as a guard rail, so a stray
+run cannot quietly add data to the history.
 
 ## Install
 
@@ -168,10 +184,10 @@ submitting and refuses to spend quota on an expression that cannot work; pass
 error envelope carries every finding under `error.details`.
 
 Rejections the simulator reports are written back to
-`research/operator-denylist.json` with a severity: `block` when the operator is
-unknown or unavailable, `warn` when it merely rejects that kind of input (for
-example `subtract` refusing event inputs). Commit that file so the lesson
-survives the next session.
+`<research_dir>/operator-denylist.json` with a severity: `block` when the operator
+is unknown or unavailable, `warn` when it merely rejects that kind of input (for
+example `subtract` refusing event inputs). The file persists across sessions, so
+the lesson survives even though it is not in git.
 
 ### Audit a field set before combining fields
 
@@ -208,8 +224,10 @@ python research_cli.py alpha record P0Mq0wEM --idea "leverage, size-bucketed" \
 python research_cli.py alpha registry --format markdown --min-sharpe 1.25
 ```
 
-`research/alpha-registry.jsonl` is an append-only ledger, one alpha per line,
-committed to git so findings outlive a chat window. Each entry is self-contained:
+`<research_dir>/alpha-registry.jsonl` is an append-only ledger, one alpha per
+line, kept outside git so findings outlive a chat window without turning the
+repository into a data dump. Back that file up like any other result; it is the
+durable memory of the research. Each entry is self-contained:
 the expression, the full settings, the in-sample metrics, the platform checks,
 the idea it belongs to, a verdict (`candidate` / `watch` / `rejected` / `no_go`)
 and a note. Re-recording the same alpha replaces it on read without rewriting

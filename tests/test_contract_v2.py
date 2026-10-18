@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 import alpha_registry  # noqa: E402
 import expression_lint  # noqa: E402
 import field_contract  # noqa: E402
+import research_paths  # noqa: E402
 
 
 def datafield(field_id, description, dataset="fundamental6", delay=1,
@@ -400,6 +401,63 @@ class AlphaRegistryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(
                 alpha_registry.load_entries(os.path.join(tmp, "nope.jsonl")), [])
+
+
+class ResearchPathTests(unittest.TestCase):
+    """Results must land outside the git working tree, on a persistent volume."""
+
+    def test_env_var_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "custom-results")
+            old = os.environ.get(research_paths.ENV_VAR)
+            os.environ[research_paths.ENV_VAR] = target
+            try:
+                self.assertEqual(research_paths.research_dir(), target)
+                self.assertEqual(research_paths.source(), "env:" + research_paths.ENV_VAR)
+                self.assertEqual(research_paths.resolve("x.json"),
+                                 os.path.join(target, "x.json"))
+            finally:
+                if old is None:
+                    del os.environ[research_paths.ENV_VAR]
+                else:
+                    os.environ[research_paths.ENV_VAR] = old
+
+    def test_default_is_outside_the_repository(self):
+        old = os.environ.pop(research_paths.ENV_VAR, None)
+        try:
+            path = os.path.abspath(research_paths.research_dir())
+        finally:
+            if old is not None:
+                os.environ[research_paths.ENV_VAR] = old
+        repo = str(ROOT)
+        self.assertFalse(
+            path == repo or path.startswith(repo + os.sep),
+            "research output must not live inside the git working tree: " + path)
+
+    def test_ensure_dir_creates_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, "nested", "results")
+            old = os.environ.get(research_paths.ENV_VAR)
+            os.environ[research_paths.ENV_VAR] = target
+            try:
+                self.assertFalse(os.path.isdir(target))
+                self.assertEqual(research_paths.ensure_dir(), target)
+                self.assertTrue(os.path.isdir(target))
+            finally:
+                if old is None:
+                    del os.environ[research_paths.ENV_VAR]
+                else:
+                    os.environ[research_paths.ENV_VAR] = old
+
+    def test_default_paths_follow_the_shared_root(self):
+        old = os.environ.pop(research_paths.ENV_VAR, None)
+        try:
+            base = research_paths.research_dir()
+        finally:
+            if old is not None:
+                os.environ[research_paths.ENV_VAR] = old
+        self.assertTrue(alpha_registry.default_registry_path().startswith(base))
+        self.assertTrue(expression_lint.default_denylist_path().startswith(base))
 
 
 if __name__ == "__main__":

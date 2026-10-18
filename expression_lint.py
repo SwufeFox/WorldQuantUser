@@ -29,6 +29,8 @@ import json
 import os
 import re
 
+import research_paths
+
 __all__ = [
     "build_operator_index",
     "lint_all",
@@ -190,9 +192,8 @@ def extract_identifiers(expression):
 
 
 def default_denylist_path():
-    """Denylist location: ``<repo>/research/operator-denylist.json``."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, "research", "operator-denylist.json")
+    """Denylist location: ``<research_dir>/operator-denylist.json``."""
+    return research_paths.resolve("operator-denylist.json")
 
 
 def load_denylist(path=None):

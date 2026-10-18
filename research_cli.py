@@ -44,6 +44,7 @@ import research_config as config_io  # noqa: E402
 import alpha_registry  # noqa: E402
 import expression_lint  # noqa: E402
 import field_contract  # noqa: E402
+import research_paths  # noqa: E402
 
 VERSION = "2.1.0"
 
@@ -601,6 +602,7 @@ def cmd_schema(args, _sink):
             "path": str(ml.session_cache_path()),
             "note": "cookies are reused until shortly before expiry; git-ignored",
         },
+        "research_paths": research_paths.describe(),
         "commands": described,
     }
     if args.name:
