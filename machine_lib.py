@@ -1218,6 +1218,26 @@ def normalize_alphas(alphas, settings):
     return normalized
 
 
+def alpha_labels(alphas, count):
+    """Per-expression labels from a config, aligned with the normalized pairs.
+
+    A config entry may carry ``mechanism`` / ``label`` / ``name``. When the
+    shapes do not line up with the normalized pairs (an entry expanded into
+    several expressions, plain strings, tuples) the labels are dropped rather
+    than mis-assigned: a wrong label in the ledger is worse than no label.
+    """
+    if not alphas or not isinstance(alphas[0], dict):
+        return [None] * count
+    labels = [
+        item.get("mechanism") or item.get("label") or item.get("name")
+        for item in alphas
+        if isinstance(item, dict)
+    ]
+    if len(labels) != count:
+        return [None] * count
+    return labels
+
+
 def simulate_alphas(
     s,
     alphas,
@@ -1227,6 +1247,7 @@ def simulate_alphas(
     on_event=None,
     max_wait_seconds=None,
     initial_records=None,
+    labels=None,
 ):
     """Simulate a list of alphas and return one record per expression.
 
@@ -1249,6 +1270,10 @@ def simulate_alphas(
     pairs = alphas if alphas and isinstance(alphas[0], tuple) else normalize_alphas(
         alphas, settings
     )
+    if labels is None:
+        labels = alpha_labels(alphas, len(pairs))
+    elif len(labels) != len(pairs):
+        labels = [None] * len(pairs)
 
     if batch_size < 1 or batch_size > 3:
         raise ValueError("batch_size must be between 1 and 3")
@@ -1262,6 +1287,7 @@ def simulate_alphas(
             {
                 "expression": expression,
                 "decay": decay,
+                "mechanism": labels[index],
                 "alpha_id": None,
                 "status": "DRY_RUN",
                 "metrics": None,
@@ -1269,7 +1295,7 @@ def simulate_alphas(
                 "error": None,
                 "payload": _single_simulation_data(expression, decay, settings),
             }
-            for expression, decay in pairs
+            for index, (expression, decay) in enumerate(pairs)
         ]
 
     if initial_records is None:
@@ -1277,13 +1303,14 @@ def simulate_alphas(
             {
                 "expression": expression,
                 "decay": decay,
+                "mechanism": labels[index],
                 "alpha_id": None,
                 "status": "QUEUED",
                 "metrics": None,
                 "checks": None,
                 "error": None,
             }
-            for expression, decay in pairs
+            for index, (expression, decay) in enumerate(pairs)
         ]
     else:
         records = [dict(record) for record in initial_records]

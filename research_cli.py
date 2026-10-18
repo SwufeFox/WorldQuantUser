@@ -362,9 +362,13 @@ def build_parser():
                      help="Checkpoint path; pending work is saved automatically if omitted.")
     sim.add_argument("--dry-run", action="store_true",
                      help="Validate and print payloads without contacting BRAIN.")
-    sim.add_argument("--record", action="store_true",
+    sim.add_argument("--record", dest="record", action="store_true", default=True,
                      help="Append every finished result to the alpha registry "
-                          "(outside the git work tree) with an automatic verdict.")
+                          "(outside the git work tree) with an automatic verdict. "
+                          "On by default so results are never lost when a caller "
+                          "forgets the flag.")
+    sim.add_argument("--no-record", dest="record", action="store_false",
+                     help="Skip writing results to the alpha registry.")
     sim.add_argument("--idea", default=None,
                      help="Idea label recorded in the registry, e.g. 'Idea 47'.")
     sim.add_argument("--mechanism", default=None,
@@ -1053,9 +1057,12 @@ def cmd_simulate(args, sink):
         settings, pairs = config_io.build_config(settings, alphas)
     except config_io.ResearchError as exc:
         raise CliError("INVALID_INPUT", str(exc))
+    labels = ml.alpha_labels(alphas, len(pairs))
 
     if args.dry_run:
-        records = ml.simulate_alphas(None, pairs, settings=settings, dry_run=True)
+        records = ml.simulate_alphas(
+            None, pairs, settings=settings, dry_run=True, labels=labels
+        )
         # Offline lint: catches structural problems and learned rejections. The
         # authoritative operator check needs the catalog, so it runs on `lint`
         # and on a real submission below, not here.
@@ -1097,6 +1104,7 @@ def cmd_simulate(args, sink):
             on_event=on_event,
             max_wait_seconds=args.max_wait_seconds,
             initial_records=checkpoint["records"],
+            labels=labels,
         ),
     )
     return _finalize_simulation(
@@ -1128,6 +1136,12 @@ def cmd_resume(args, sink):
         pairs = [(record["expression"], record.get("decay")) for record in records]
     except (KeyError, TypeError) as exc:
         raise CliError("INVALID_INPUT", "checkpoint is missing alpha inputs", str(exc))
+    # Keep the per-expression labels recorded in the checkpoint; a resumed run
+    # must not silently drop the mechanism tags gathered before the pause.
+    labels = [
+        record.get("mechanism") if isinstance(record, dict) else None
+        for record in records
+    ]
     settings = checkpoint.get("settings") or ml.default_settings()
     batch_size = checkpoint.get("batch_size", 3)
     if not any(
@@ -1151,6 +1165,7 @@ def cmd_resume(args, sink):
             on_event=on_event,
             max_wait_seconds=args.max_wait_seconds,
             initial_records=checkpoint["records"],
+            labels=labels,
         ),
     )
     return _finalize_simulation(
@@ -1487,7 +1502,9 @@ def _record_simulation(records, settings, args):
                 "error": record.get("error"),
             },
             idea=getattr(args, "idea", None),
-            mechanism=getattr(args, "mechanism", None),
+            # A per-expression label beats the run-wide default so a batch that
+            # spans several mechanisms still lands labelled per entry.
+            mechanism=record.get("mechanism") or getattr(args, "mechanism", None),
             verdict=_auto_verdict(record),
             note=getattr(args, "note", None),
             source="simulate",
@@ -1528,6 +1545,7 @@ def cmd_alpha_record(args, sink):
             "metrics": in_sample,
             "checks": in_sample.get("checks") or {},
             "status": payload.get("status") or "UNSUBMITTED",
+            "out_of_sample": ml.extract_split(payload),
         },
         idea=getattr(args, "idea", None),
         mechanism=getattr(args, "mechanism", None),

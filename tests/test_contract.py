@@ -651,3 +651,39 @@ class SimulationResumeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RegistryLabelContractTests(unittest.TestCase):
+    """Results must be persisted by default and keep their mechanism labels."""
+
+    def test_record_is_on_by_default_and_can_be_disabled(self):
+        parser = cli.build_parser()
+        default = parser.parse_args(["simulate", "x.json", "--dry-run"])
+        self.assertTrue(default.record, "results must persist unless opted out")
+        opted_out = parser.parse_args(["simulate", "x.json", "--dry-run", "--no-record"])
+        self.assertFalse(opted_out.record)
+
+    def test_per_expression_mechanism_survives_dry_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps({"alphas": [
+                {"expression": "rank(close)", "decay": 4, "mechanism": "alpha-family"},
+                {"expression": "rank(open)", "decay": 0, "mechanism": "beta-family"},
+            ]}))
+            proc = run_cli("simulate", str(path), "--dry-run")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            results = parse(proc)["data"]["results"]
+            self.assertEqual([r["mechanism"] for r in results],
+                             ["alpha-family", "beta-family"])
+            self.assertEqual([r["decay"] for r in results], [4, 0])
+
+    def test_labels_are_dropped_rather_than_misassigned(self):
+        # One entry expanding into two expressions cannot be mapped 1:1, so a
+        # wrong label would be worse than none.
+        labels = ml.alpha_labels(
+            [{"expression": "rank(close);rank(open)", "label": "x"}], 2
+        )
+        self.assertEqual(labels, [None, None])
+        self.assertEqual(
+            ml.alpha_labels([("rank(close)", 4)], 1), [None]
+        )
