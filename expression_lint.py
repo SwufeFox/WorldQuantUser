@@ -157,6 +157,42 @@ def _count_args(text, open_index):
     return (commas + 1 if has_content else 0), None
 
 
+def _count_kwargs(text, open_index, close_index):
+    """Count top-level ``name=`` keyword arguments between the call parentheses.
+
+    The documented signature lists optional parameters too, so a call that
+    supplies ``range="0.1,1,0.1"`` legitimately passes fewer positional
+    arguments than the signature's parameter count. Counting keywords lets the
+    arity check avoid flagging that as a missing argument.
+    """
+    depth = 0
+    count = 0
+    for position in range(open_index, close_index + 1):
+        char = text[position]
+        if char == "(":
+            depth += 1
+            continue
+        if char == ")":
+            depth -= 1
+            continue
+        if char != "=" or depth != 1:
+            continue
+        if position + 1 < len(text) and text[position + 1] in "=~":
+            continue
+        # Walk back over whitespace to confirm an identifier precedes the '='.
+        cursor = position - 1
+        while cursor > open_index and text[cursor].isspace():
+            cursor -= 1
+        end = cursor
+        while cursor > open_index and (
+            text[cursor].isalnum() or text[cursor] == "_"
+        ):
+            cursor -= 1
+        if end > cursor:
+            count += 1
+    return count
+
+
 def extract_calls(expression):
     """Return every function call in the expression as ``{name, arg_count, offset}``.
 
@@ -172,8 +208,18 @@ def extract_calls(expression):
             position += 1
         if position >= len(masked) or masked[position] != "(":
             continue
-        arg_count, _ = _count_args(masked, position)
-        calls.append({"name": name, "arg_count": arg_count, "offset": match.start()})
+        arg_count, close_index = _count_args(masked, position)
+        kwarg_count = (
+            _count_kwargs(masked, position, close_index)
+            if close_index is not None
+            else 0
+        )
+        calls.append({
+            "name": name,
+            "arg_count": arg_count,
+            "kwarg_count": kwarg_count,
+            "offset": match.start(),
+        })
     return calls
 
 
@@ -345,7 +391,16 @@ def lint_expression(expression, operator_index=None, denylist=None,
                 minimum = meta.get("min_arity")
                 maximum = meta.get("max_arity")
                 count = call["arg_count"]
-                if minimum is not None and count < minimum:
+                # The documented signature includes optional parameters, so a
+                # call using keyword arguments (e.g. bucket(x, range=...)) has
+                # fewer positional arguments than the parameter count without
+                # being wrong. Only enforce the lower bound when no keywords
+                # are present.
+                if (
+                    minimum is not None
+                    and count < minimum
+                    and not call.get("kwarg_count")
+                ):
                     warnings.append({
                         "code": "arity_suspicious",
                         "operator": name,

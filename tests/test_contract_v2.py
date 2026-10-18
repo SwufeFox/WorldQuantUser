@@ -53,6 +53,8 @@ OPERATORS = [
     {"name": "add", "category": "Arithmetic", "definition": "add(x, y, filter = false)"},
     {"name": "subtract", "category": "Arithmetic", "definition": "subtract(x, y, filter = false)"},
     {"name": "vec_sum", "category": "Vector", "definition": "vec_sum(x)"},
+    {"name": "bucket", "category": "Group",
+     "definition": 'bucket(rank(x), range="0, 1, 0.1", skipBoth = false, NaNGroup = false)'},
 ]
 
 
@@ -174,6 +176,23 @@ class ExpressionLintTests(unittest.TestCase):
             'group_neutralize(x, bucket(rank(cap), range="0.1,1,0.1"))')
         self.assertEqual([call["name"] for call in calls],
                          ["group_neutralize", "bucket", "rank"])
+
+    def test_keyword_argument_does_not_trigger_arity_warning(self):
+        # bucket's documented signature lists optional parameters, so passing
+        # range= as a keyword legitimately leaves only two positional
+        # arguments. Flagging that as a missing argument is a false positive.
+        report = expression_lint.lint_expression(
+            'group_neutralize(rank(cap), bucket(rank(cap), range="0.1,1,0.1"))',
+            operator_index=self.index)
+        codes = [w["code"] for w in report["warnings"]]
+        self.assertNotIn("arity_suspicious", codes)
+
+    def test_positional_arity_warning_still_fires(self):
+        report = expression_lint.lint_expression(
+            "rank(ts_delta(close))",
+            operator_index=self.index)
+        codes = [w["code"] for w in report["warnings"]]
+        self.assertIn("arity_suspicious", codes)
 
     def test_signature_parsing_marks_optional_parameters(self):
         index = expression_lint.build_operator_index(
