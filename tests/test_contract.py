@@ -62,7 +62,8 @@ class SchemaContractTests(unittest.TestCase):
     def test_schema_lists_every_command_and_its_options(self):
         commands = parse(run_cli("schema"))["data"]["commands"]["subcommands"]
         self.assertEqual(
-            set(commands), {"schema", "auth", "catalog", "simulate", "resume", "alpha", "lint"},
+            set(commands), {"schema", "auth", "catalog", "simulate", "resume",
+                            "alpha", "lint", "cache"},
         )
         simulate = commands["simulate"]
         flags = {flag for option in simulate["options"] for flag in option["flags"]}
@@ -71,6 +72,8 @@ class SchemaContractTests(unittest.TestCase):
         self.assertIn("--max-wait-seconds", flags)
         catalog = commands["catalog"]["subcommands"]
         self.assertIn("--dataset", {f for o in catalog["fields"]["options"] for f in o["flags"]})
+        cache = commands["cache"]["subcommands"]
+        self.assertEqual(set(cache), {"info", "clear"})
 
     def test_schema_can_describe_one_command(self):
         payload = parse(run_cli("schema", "simulate"))["data"]

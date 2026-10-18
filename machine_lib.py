@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 import pickle
@@ -11,12 +12,43 @@ from pathlib import Path
 from time import sleep
 from urllib.parse import urljoin, urlsplit
 
+import sys
+from datetime import datetime, timezone
+
 import requests
+
+import cache_store
+import research_paths
 
 try:  # pandas is optional: only the dataframe helpers and the notebook need it
     import pandas as pd
 except ImportError:  # pragma: no cover - exercised only when pandas is absent
     pd = None
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+#
+# stdout is reserved for the single JSON document the CLI prints, so anything
+# narrative goes to stderr. The CLI installs its own handler to emit structured
+# events; a plain library user gets readable lines.
+# ---------------------------------------------------------------------------
+_diagnostic_handler = None
+
+
+def set_diagnostic_handler(handler):
+    """Route this module's diagnostics through ``handler`` (``None`` resets)."""
+    global _diagnostic_handler
+    _diagnostic_handler = handler
+
+
+def note(message):
+    """Emit one diagnostic line. Never writes to stdout."""
+    handler = _diagnostic_handler
+    if handler is not None:
+        handler(message)
+    else:
+        print(message, file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -220,54 +252,348 @@ def regular_expression(alpha):
 
 
 def session_cache_path():
-    """Where a reused BRAIN session cookie is kept (git-ignored)."""
+    """Where a reused BRAIN session cookie is kept.
+
+    Lives under the cache root (outside the git working tree, on the persistent
+    volume) rather than next to this module, and is written mode ``0600``: the
+    file holds live session cookies, which are credentials.
+    """
+    return Path(research_paths.session_path())
+
+
+def legacy_session_cache_path():
+    """Pre-2.0 location, kept only so an existing session can be migrated."""
     return Path(__file__).resolve().parent / ".brain_session.json"
 
 
-def save_session(session, info=None, path=None):
-    """Persist an authenticated session's cookies so later calls can reuse it."""
-    info = info or {}
-    target = Path(path or session_cache_path())
-    target.write_text(json.dumps({
+def _session_payload(session, info):
+    return {
         "cookies": requests.utils.dict_from_cookiejar(session.cookies),
-        "saved_at": time.time(),
-        "expiry_seconds": info.get("token_expiry"),
-        "user_id": info.get("user_id"),
-        "permissions": info.get("permissions"),
-    }, indent=2))
+        "user_id": (info or {}).get("user_id"),
+        "permissions": (info or {}).get("permissions"),
+        "token_expiry": (info or {}).get("token_expiry"),
+    }
+
+
+def save_session(session, info=None, path=None):
+    """Persist an authenticated session's cookies so later calls can reuse it.
+
+    Atomic and mode ``0600``. Research runs do get killed mid-write, and a
+    half-written cache used to look like "no session", which in turn triggered a
+    fresh login -- and repeated logins are what BRAIN answers with a captcha.
+    """
+    target = Path(path or session_cache_path())
+    ttl = None
+    expiry = (info or {}).get("token_expiry")
+    if isinstance(expiry, (int, float)) and expiry > 0:
+        ttl = float(expiry)
+    entry = cache_store.build_entry(
+        "brain-session", _session_payload(session, info), ttl=ttl, source="login")
+    cache_store.write_json_atomic(target, entry, mode=0o600)
     return target
 
 
-def load_session(cache_path=None, use_cache=True, refresh=False):
-    """Return an authenticated session, reusing a cached cookie when still valid.
+def _migrate_legacy_session(target):
+    """Move a pre-2.0 session file into the new location without re-logging in.
 
-    BRAIN issues sessions that last hours, but challenges repeated logins with a
-    captcha -- so re-authenticating on every CLI call is both slow and fragile.
-    With ``use_cache`` a saved cookie is reused until shortly before it expires;
-    ``refresh`` forces a fresh login. The cache file is git-ignored.
+    The old file was a flat ``{cookies, saved_at, expiry_seconds, ...}`` record.
+    Converting it is worth the few lines: dropping it would force one extra
+    login, and that is exactly the request that gets captcha-challenged.
     """
-    path = Path(cache_path or session_cache_path())
-    if use_cache and not refresh and path.is_file():
-        try:
-            cached = json.loads(path.read_text())
-            saved_at = float(cached.get("saved_at") or 0)
-            expiry = float(cached.get("expiry_seconds") or 0)
-            if expiry and time.time() < saved_at + expiry - 60:
-                session = requests.Session()
-                session.auth = get_credentials()
-                session.cookies.update(cached.get("cookies") or {})
-                return session
-        except (OSError, ValueError, TypeError, MissingCredentials):
-            pass  # fall through to a fresh login
-    session, info = authenticate()
+    legacy = Path(legacy_session_cache_path())
+    if target.exists() or not legacy.is_file():
+        return None
+    data, error = cache_store.load_json(legacy)
+    if error or not isinstance(data, dict) or not data.get("cookies"):
+        cache_store.quarantine(legacy)
+        return None
+    saved_at = data.get("saved_at")
+    expiry = data.get("expiry_seconds")
     try:
-        save_session(session, info, path)
+        created = (datetime.fromtimestamp(float(saved_at), timezone.utc)
+                   if saved_at else cache_store.utc_now())
+    except (TypeError, ValueError, OSError):
+        created = cache_store.utc_now()
+    ttl = None
+    if isinstance(expiry, (int, float)) and expiry > 0:
+        ttl = float(expiry)
+    entry = cache_store.build_entry(
+        "brain-session",
+        {
+            "cookies": data.get("cookies") or {},
+            "user_id": data.get("user_id"),
+            "permissions": data.get("permissions"),
+            "token_expiry": expiry,
+        },
+        ttl=ttl,
+        source="legacy-migration",
+        now=created,
+    )
+    try:
+        cache_store.write_json_atomic(target, entry, mode=0o600)
     except OSError:
-        pass  # a read-only checkout must not break a working session
+        return None
+    try:
+        legacy.unlink()
+    except OSError:
+        pass
+    return str(legacy)
+
+
+def _session_from_entry(payload):
+    session = requests.Session()
+    session.auth = get_credentials()
+    session.cookies.update(payload.get("cookies") or {})
     return session
 
 
+def session_status(cache_path=None):
+    """Describe the cached session without touching the network.
+
+    Used by `auth check` and `cache info` so a caller can see whether a session
+    is cached, how long it has left, and why it would be re-created -- instead
+    of inferring all that from a file mtime.
+    """
+    path = Path(cache_path or session_cache_path())
+    entry = cache_store.read_entry(path)
+    payload = entry.get("payload") or {}
+    expires_in = entry.get("expires_in")
+    status = {
+        "path": str(path),
+        "present": entry["present"],
+        "fresh": entry["fresh"],
+        "created_at": entry.get("created_at"),
+        "expires_at": entry.get("expires_at"),
+        "age_seconds": None if entry.get("age_seconds") is None
+        else round(entry["age_seconds"], 1),
+        "expires_in_seconds": None if expires_in is None else round(expires_in, 1),
+        "user_id": payload.get("user_id"),
+        "permissions": payload.get("permissions"),
+        "has_cookies": bool(payload.get("cookies")),
+        "source": entry.get("source"),
+        "error": entry.get("error"),
+        "legacy_present": Path(legacy_session_cache_path()).is_file(),
+    }
+    return status
+
+
+def invalidate_session(cache_path=None):
+    """Drop the cached session (e.g. after BRAIN rejected it). Returns True if removed."""
+    return cache_store.remove(Path(cache_path or session_cache_path()))
+
+
+def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
+    """Return an authenticated session, reusing a cached cookie when still valid.
+
+    BRAIN issues sessions that last hours but challenges repeated logins with a
+    captcha, so re-authenticating on every CLI call is both slow and fragile.
+    With ``use_cache`` a saved cookie is reused until just before it expires and
+    ``refresh`` forces a fresh login.
+
+    The login itself is single-flight: concurrent callers take a file lock, and
+    the ones that lose the race re-check the cache and reuse the winner's
+    session instead of adding a second login. Pass ``meta`` (a dict) to receive
+    ``cached``/``migrated_from``/``reason`` for diagnostics.
+    """
+    meta = meta if meta is not None else {}
+    path = Path(cache_path or session_cache_path())
+    if cache_path is None:
+        migrated = _migrate_legacy_session(path)
+        if migrated:
+            meta["migrated_from"] = migrated
+            note("session cache: migrated %s -> %s" % (migrated, path))
+
+    def _reuse():
+        entry = cache_store.read_entry(path)
+        if entry["present"] and entry["fresh"]:
+            meta.update({"cached": True, "reason": "reused-cache",
+                         "cache_state": "fresh",
+                         "expires_in": entry.get("expires_in")})
+            return _session_from_entry(entry["payload"])
+        if entry["present"]:
+            meta.setdefault("cache_state", "expired")
+        elif entry.get("error") not in (None, "missing"):
+            # Keep a sample instead of quietly dropping it: a truncated file is
+            # a bug worth seeing, not a fact to hide behind a fresh login.
+            quarantined = cache_store.quarantine(path)
+            # setdefault: the retry inside the lock sees the file gone and would
+            # otherwise relabel a corrupt cache as an empty one.
+            meta.setdefault("cache_state", "corrupt")
+            if quarantined:
+                meta["quarantined_to"] = quarantined
+                note("session cache was unusable (%s); moved to %s"
+                     % (entry.get("error"), quarantined))
+        else:
+            meta.setdefault("cache_state", "empty")
+        return None
+
+    if use_cache and not refresh:
+        reused = _reuse()
+        if reused is not None:
+            return reused
+
+    timeout = float(environ.get("BRAIN_LOGIN_LOCK_TIMEOUT", "60") or 60)
+    try:
+        with cache_store.file_lock(research_paths.lock_path("brain-session"),
+                                   timeout=timeout):
+            if use_cache and not refresh:
+                reused = _reuse()  # someone else may have logged in while we waited
+                if reused is not None:
+                    meta["reason"] = "waited-for-other-login"
+                    return reused
+            session, info = authenticate()
+            try:
+                save_session(session, info, path)
+            except OSError:
+                pass  # a read-only volume must not break a working session
+            meta.update({"cached": False, "reason": "logged-in",
+                         "user_id": (info or {}).get("user_id")})
+            return session
+    except cache_store.LockTimeout as exc:
+        note("session cache: %s; logging in anyway" % exc)
+        session, info = authenticate()
+        try:
+            save_session(session, info, path)
+        except OSError:
+            pass
+        meta.update({"cached": False, "reason": "lock-timeout-login"})
+        return session
+
+
+
+# ---------------------------------------------------------------------------
+# Metadata cache
+#
+# Catalog responses are quota-free but slow: the USA field catalog is 4367 rows
+# over fourteen paginated calls, and one field audit plus a preflight lint reads
+# most of it. Those answers also change on the order of days, not seconds. So
+# they are cached with a TTL, and a stale snapshot is served when the network
+# fails -- a flaky link should degrade into "older catalog", not into "the audit
+# could not run at all".
+# ---------------------------------------------------------------------------
+DEFAULT_METADATA_TTL = float(environ.get("BRAIN_METADATA_TTL", 24 * 3600) or 0)
+
+_metadata_policy = {"enabled": True, "max_age": DEFAULT_METADATA_TTL, "refresh": False}
+
+
+def configure_metadata_cache(max_age=None, refresh=None, enabled=None):
+    """Set the process-wide catalog cache policy (the CLI maps its flags here)."""
+    if max_age is not None:
+        _metadata_policy["max_age"] = float(max_age)
+    if refresh is not None:
+        _metadata_policy["refresh"] = bool(refresh)
+    if enabled is not None:
+        _metadata_policy["enabled"] = bool(enabled)
+    return dict(_metadata_policy)
+
+
+def metadata_cache_policy():
+    """Current catalog cache policy, for `cache info` and `schema`."""
+    return dict(_metadata_policy)
+
+
+def metadata_cache_path(kind, params):
+    """Deterministic path for one cached catalog response.
+
+    The key is a hash of the query parameters, so different regions/universes/
+    datasets never collide, while a repeat of the same query lands on the same
+    file and hits.
+    """
+    blob = json.dumps({"kind": kind, "params": params}, sort_keys=True, default=str)
+    digest = hashlib.sha1(blob.encode("utf-8")).hexdigest()[:16]
+    label = re.sub(r"[^A-Za-z0-9_.-]+", "_", kind)[:40] or "meta"
+    return Path(research_paths.metadata_root()) / label / (digest + ".json")
+
+
+def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None):
+    """Return ``{"data": ..., "cache": {...}}`` for one catalog query.
+
+    ``fetch`` runs only on a miss, on an expired entry, or when ``refresh`` is
+    set. If it raises :class:`BrainError` while a stale snapshot exists, the
+    stale snapshot wins and the report says ``stale``/``degraded``: the catalog
+    is descriptive, so yesterday's copy is worth more than no answer.
+
+    Pass ``report`` (a dict) to also receive the cache report, so a CLI command
+    can tell its caller whether the answer was cached and how old it is.
+    """
+    policy = _metadata_policy
+    ttl = policy["max_age"] if max_age is None else float(max_age)
+    do_refresh = policy["refresh"] if refresh is None else bool(refresh)
+    path = metadata_cache_path(kind, params)
+    status = {
+        "kind": kind,
+        "path": str(path),
+        "hit": False,
+        "stale": False,
+        "degraded": False,
+        "disabled": False,
+        "age_seconds": None,
+        "expires_in_seconds": None,
+        "refreshed_at": None,
+        "error": None,
+    }
+
+    def done(data):
+        if isinstance(report, dict):
+            report.clear()
+            report.update(status)
+        return {"data": data, "cache": status}
+
+    if not policy["enabled"] or ttl <= 0:
+        status["disabled"] = True
+        return done(fetch())
+
+    entry = cache_store.read_entry(path)
+    if entry["present"] and not do_refresh:
+        age = entry.get("age_seconds")
+        status["age_seconds"] = None if age is None else round(age, 1)
+        remaining = entry.get("expires_in")
+        status["expires_in_seconds"] = None if remaining is None else round(remaining, 1)
+        if entry["fresh"]:
+            status["hit"] = True
+            return done(entry["payload"])
+        status["stale"] = True
+    elif entry.get("error") not in (None, "missing"):
+        cache_store.quarantine(path)
+
+    try:
+        data = fetch()
+    except BrainError as exc:
+        if entry["present"]:
+            status.update({"hit": True, "stale": True, "degraded": True,
+                           "error": exc.code})
+            note("metadata cache: serving stale %s snapshot (%s)" % (kind, exc.code))
+            return done(entry["payload"])
+        raise
+    try:
+        cache_store.write_json_atomic(
+            path, cache_store.build_entry(kind, data, ttl=ttl, source="brain-api"))
+    except OSError as exc:
+        note("metadata cache: could not write %s (%s)" % (path, exc))
+    status["refreshed_at"] = cache_store.read_entry(path).get("created_at")
+    status["age_seconds"] = 0.0
+    status["expires_in_seconds"] = ttl
+    return done(data)
+
+
 def get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
+                 universe="TOP3000", limit=None, refresh=None, report=None):
+    """List datasets available for a region/universe/delay as ``list[dict]``.
+
+    Quota-free and cached (see :func:`cached_metadata`). Returns ``[]`` when the
+    account has no data for that combination, which is what a TUTORIAL account
+    sees outside USA.
+    """
+    params = {"instrumentType": instrument_type, "region": region,
+              "delay": delay, "universe": universe, "limit": limit}
+    return cached_metadata(
+        "datasets", params,
+        lambda: _get_datasets(s, instrument_type, region, delay, universe, limit),
+        refresh=refresh, report=report,
+    )["data"]
+
+
+def _get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
                  universe="TOP3000", limit=None):
     """List datasets available for a region/universe/delay as ``list[dict]``.
 
@@ -307,7 +633,26 @@ def _as_results(payload, *keys):
     return []
 
 
-def fetch_operators(s, search="", group=""):
+def fetch_operators(s, search="", group="", refresh=None, report=None):
+    """List FASTEXPR operators as ``list[dict]`` (``name``, ``category``, ...).
+
+    Quota-free and cached. ``search`` matches name or description, ``group``
+    selects an exact category such as ``Time Series``.
+    """
+    operators = cached_metadata(
+        "operators", {}, lambda: _fetch_operators(s), refresh=refresh, report=report)["data"]
+    if group:
+        operators = [o for o in operators if (o.get("category") or "") == group]
+    if search:
+        needle = search.lower()
+        operators = [
+            o for o in operators
+            if needle in ((o.get("name") or "") + " " + (o.get("description") or "")).lower()
+        ]
+    return operators
+
+
+def _fetch_operators(s, search="", group=""):
     """List FASTEXPR operators as ``list[dict]`` (``name``, ``category``, ...).
 
     Quota-free. ``search`` matches the name or description, ``group`` an exact
@@ -325,12 +670,38 @@ def fetch_operators(s, search="", group=""):
     return operators
 
 
-def fetch_operator_doc(s, name):
+def fetch_operator_doc(s, name, refresh=None, report=None):
+    """Return one operator's documentation page (markdown body + metadata).
+
+    Cached: the wording changes rarely and this is the most repeated lookup in
+    expression work.
+    """
+    return cached_metadata(
+        "operator-doc", {"name": name},
+        lambda: _fetch_operator_doc(s, name), refresh=refresh, report=report)["data"]
+
+
+def _fetch_operator_doc(s, name):
     """Return one operator's documentation page (markdown body + metadata)."""
     return request_json(s, "GET", "/operators/" + name)
 
 
-def fetch_data_categories(s, region="USA", universe="TOP3000", delay=1):
+def fetch_data_categories(s, region="USA", universe="TOP3000", delay=1,
+                          refresh=None, report=None):
+    """Return data categories with their field/alpha counts and value score.
+
+    ``alphaCount`` is a rough crowding signal: a high count means many people
+    have already mined that category. Cached.
+    """
+    params = {"region": region, "universe": universe, "delay": delay}
+    return cached_metadata(
+        "data-categories", params,
+        lambda: _fetch_data_categories(s, region, universe, delay),
+        refresh=refresh, report=report,
+    )["data"]
+
+
+def _fetch_data_categories(s, region="USA", universe="TOP3000", delay=1):
     """Return the data categories with their field/alpha counts and value score.
 
     ``alphaCount`` is a rough crowding signal: high counts mean "many people
@@ -344,6 +715,26 @@ def fetch_data_categories(s, region="USA", universe="TOP3000", delay=1):
 
 
 def get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
+                   universe="TOP3000", dataset_id="", search="", field_type=None,
+                   limit=None, refresh=None, report=None):
+    """List datafields as ``list[dict]`` (``id``, ``description``, ``type``, ...).
+
+    Paginates over ``GET /data-fields`` and stops once ``limit`` rows are
+    collected. ``field_type`` filters on the BRAIN type (MATRIX, VECTOR, GROUP).
+    Quota-free and cached per query, so re-auditing 4367 fields costs nothing.
+    """
+    params = {"instrumentType": instrument_type, "region": region, "delay": delay,
+              "universe": universe, "dataset": dataset_id, "search": search,
+              "type": field_type, "limit": limit}
+    return cached_metadata(
+        "datafields", params,
+        lambda: _get_datafields(s, instrument_type, region, delay, universe,
+                                dataset_id, search, field_type, limit),
+        refresh=refresh, report=report,
+    )["data"]
+
+
+def _get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
                    universe="TOP3000", dataset_id="", search="", field_type=None,
                    limit=None):
     """List datafields as ``list[dict]`` (``id``, ``description``, ``type``, ...).

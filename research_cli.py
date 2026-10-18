@@ -45,8 +45,9 @@ import alpha_registry  # noqa: E402
 import expression_lint  # noqa: E402
 import field_contract  # noqa: E402
 import research_paths  # noqa: E402
+import cache_store  # noqa: E402
 
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 #: Stable process exit codes. Callers branch on these, so the mapping from an
 #: error code to an exit code is part of the contract.
@@ -158,6 +159,25 @@ def _add_session_args(parser):
                         help="Ignore the cached session and re-authenticate.")
     parser.add_argument("--relogin", action="store_true",
                         help="Force a fresh login even if the cache looks valid.")
+    parser.add_argument("--meta-max-age", type=_non_negative_seconds, default=None,
+                        metavar="SECONDS",
+                        help="Accept cached catalog metadata up to this age "
+                             "(default 86400; 0 disables the catalog cache).")
+    parser.add_argument("--refresh-meta", action="store_true",
+                        help="Ignore cached catalog metadata and refetch it.")
+
+
+def _non_negative_seconds(value):
+    """Seconds for TTL-style options, where 0 is meaningful (means "disabled")."""
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from exc
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError(
+            "must be a finite number of seconds, zero or greater"
+        )
+    return seconds
 
 
 def _positive_seconds(value):
@@ -212,6 +232,23 @@ def build_parser():
         "check", help="Verify credentials and report account permissions.")
     _add_session_args(auth_check)
     auth_check.set_defaults(func=cmd_auth_check)
+
+    auth_logout = auth_sub.add_parser(
+        "logout", help="Forget the cached session cookie (local only).")
+    auth_logout.set_defaults(func=cmd_auth_logout)
+
+    cache = sub.add_parser(
+        "cache", help="Inspect or clear local caches (session, catalog metadata).")
+    cache_sub = cache.add_subparsers(dest="subcommand", metavar="<action>",
+                                     parser_class=JsonArgumentParser)
+    cache_info = cache_sub.add_parser(
+        "info", help="Where caches live, what they hold, and how stale they are.")
+    cache_info.set_defaults(func=cmd_cache_info)
+    cache_clear = cache_sub.add_parser(
+        "clear", help="Drop cached data. Locks are kept for running processes.")
+    cache_clear.add_argument("--kind", choices=["session", "metadata", "all"],
+                             default="all", help="What to clear (default: all).")
+    cache_clear.set_defaults(func=cmd_cache_clear)
 
     catalog = sub.add_parser(
         "catalog", help="Quota-free metadata: operators, datasets, fields.")
@@ -600,7 +637,26 @@ def cmd_schema(args, _sink):
         },
         "session_cache": {
             "path": str(ml.session_cache_path()),
-            "note": "cookies are reused until shortly before expiry; git-ignored",
+            "format": "cache envelope, mode 0600",
+            "single_flight": "concurrent CLI calls share one login (file lock)",
+            "note": ("cookies are reused until just before expiry and the file "
+                     "lives outside the git working tree"),
+        },
+        "cache": {
+            "root": research_paths.cache_root(),
+            "layout": {
+                "session": str(ml.session_cache_path()),
+                "metadata": research_paths.metadata_root(),
+                "locks": os.path.join(research_paths.cache_root(), "locks"),
+            },
+            "metadata_policy": ml.metadata_cache_policy(),
+            "metadata_ttl_env": "BRAIN_METADATA_TTL (seconds; 0 disables)",
+            "metadata_kinds": ["datasets", "datafields", "operators",
+                               "operator-doc", "data-categories"],
+            "stale_on_error": ("a failed refetch serves the last snapshot with "
+                               "cache.stale=true instead of failing the command"),
+            "commands": ["cache info", "cache clear --kind session|metadata|all",
+                         "auth logout"],
         },
         "research_paths": research_paths.describe(),
         "commands": described,
@@ -620,19 +676,10 @@ def cmd_schema(args, _sink):
 
 
 def cmd_auth_check(args, _sink):
-    session = ml.load_session(use_cache=not args.no_cache, refresh=args.relogin)
-    info = {"user_id": None, "permissions": None, "token_expiry": None}
-    cache = ml.session_cache_path()
-    if cache.is_file():
-        try:
-            cached = json.loads(cache.read_text())
-        except ValueError:
-            cached = {}
-        info = {
-            "user_id": cached.get("user_id"),
-            "permissions": cached.get("permissions"),
-            "token_expiry": cached.get("expiry_seconds"),
-        }
+    meta = {}
+    session = ml.load_session(use_cache=not args.no_cache, refresh=args.relogin,
+                              meta=meta)
+    info = ml.session_status()
     regions = []
     for region in ml.REGIONS:
         try:
@@ -644,9 +691,100 @@ def cmd_auth_check(args, _sink):
         "authenticated": True,
         "user_id": info.get("user_id"),
         "permissions": info.get("permissions"),
-        "token_expiry": info.get("token_expiry"),
+        "token_lifetime_seconds": info.get("expires_in_seconds"),
         "data_regions": regions,
+        "session": {
+            "cached": meta.get("cached"),
+            "reason": meta.get("reason"),
+            "cache_state": meta.get("cache_state"),
+            "source": info.get("source"),
+            "path": info.get("path"),
+            "expires_at": info.get("expires_at"),
+            "expires_in_seconds": info.get("expires_in_seconds"),
+            "age_seconds": info.get("age_seconds"),
+            "migrated_from": meta.get("migrated_from"),
+        },
+        "metadata_cache": ml.metadata_cache_policy(),
         "note": "regions outside data_regions return no datasets for this account",
+    }
+
+
+def cmd_auth_logout(args, _sink):
+    """Forget the cached session. Does not revoke it server-side."""
+    removed = ml.invalidate_session()
+    return {
+        "logged_out": removed,
+        "session_path": str(ml.session_cache_path()),
+        "note": ("Removed only the local cookie cache; the BRAIN session itself "
+                 "stays valid until it expires server-side."),
+    }
+
+
+def cmd_cache_info(args, _sink):
+    """Describe what is cached, how fresh it is, and where it lives."""
+    root = research_paths.cache_root()
+    stats = cache_store.cache_stats(root)
+    catalog = {}
+    meta_root = research_paths.metadata_root()
+    if os.path.isdir(meta_root):
+        for kind in sorted(os.listdir(meta_root)):
+            kind_dir = os.path.join(meta_root, kind)
+            if not os.path.isdir(kind_dir):
+                continue
+            entries = []
+            for name in sorted(os.listdir(kind_dir)):
+                if not name.endswith(".json"):
+                    continue
+                entry = cache_store.read_entry(os.path.join(kind_dir, name))
+                entries.append({
+                    "file": name,
+                    "fresh": entry["fresh"],
+                    "age_seconds": None if entry.get("age_seconds") is None
+                    else round(entry["age_seconds"], 1),
+                    "expires_in_seconds": None if entry.get("expires_in") is None
+                    else round(entry["expires_in"], 1),
+                    "error": entry.get("error"),
+                })
+            catalog[kind] = {
+                "entries": len(entries),
+                "fresh": sum(1 for e in entries if e["fresh"]),
+                "oldest_age_seconds": max(
+                    [e["age_seconds"] for e in entries
+                     if e["age_seconds"] is not None] or [None])
+                if entries else None,
+            }
+    return {
+        "cache_root": root,
+        "policy": {
+            "metadata": ml.metadata_cache_policy(),
+            "session": {
+                "single_flight": True,
+                "file_mode": "0600",
+                "lock_timeout_seconds": float(
+                    os.environ.get("BRAIN_LOGIN_LOCK_TIMEOUT", "60") or 60),
+            },
+        },
+        "session": ml.session_status(),
+        "metadata": catalog,
+        "stats": stats,
+    }
+
+
+def cmd_cache_clear(args, _sink):
+    """Drop cached data. Locks are kept so a running process is not disturbed."""
+    root = research_paths.cache_root()
+    scope = args.kind
+    removed = {"session": 0, "metadata": 0}
+    if scope in ("all", "session"):
+        removed["session"] = 1 if ml.invalidate_session() else 0
+    if scope in ("all", "metadata"):
+        removed["metadata"] = cache_store.clear_dir(research_paths.metadata_root(),
+                                                   keep_locks=True)
+    return {
+        "cleared": scope,
+        "removed": removed,
+        "cache_root": root,
+        "kept_locks": True,
     }
 
 
@@ -658,9 +796,13 @@ def _maybe_save(args, data):
 
 
 def cmd_catalog_operators(args, _sink):
+    cache_report = {}
+
     def work(session):
-        operators = ml.fetch_operators(session, search=args.search, group=args.group)
-        data = {"count": len(operators), "operators": operators}
+        operators = ml.fetch_operators(session, search=args.search, group=args.group,
+                                       report=cache_report)
+        data = {"count": len(operators), "operators": operators,
+                "cache": cache_report}
         if args.docs:
             data["docs"] = {n: ml.fetch_operator_doc(session, n) for n in args.docs}
         return data
@@ -671,13 +813,15 @@ def cmd_catalog_operators(args, _sink):
 
 
 def cmd_catalog_datasets(args, _sink):
+    cache_report = {}
     datasets = with_session(args, lambda s: ml.get_datasets(
         s, instrument_type=args.instrument_type, region=args.region,
         delay=args.delay, universe=args.universe, limit=args.limit,
+        report=cache_report,
     ))
     data = {
         "region": args.region, "universe": args.universe, "delay": args.delay,
-        "count": len(datasets), "datasets": datasets,
+        "count": len(datasets), "datasets": datasets, "cache": cache_report,
     }
     if not datasets:
         data["hint"] = ("no datasets for this combination; the account may lack "
@@ -687,10 +831,12 @@ def cmd_catalog_datasets(args, _sink):
 
 
 def cmd_catalog_fields(args, _sink):
+    cache_report = {}
     fields = with_session(args, lambda s: ml.get_datafields(
         s, instrument_type=args.instrument_type, region=args.region,
         delay=args.delay, universe=args.universe, dataset_id=args.dataset,
         search=args.search, field_type=args.field_type, limit=args.limit,
+        report=cache_report,
     ))
     data = {
         "dataset": args.dataset, "region": args.region, "universe": args.universe,
@@ -699,7 +845,7 @@ def cmd_catalog_fields(args, _sink):
             kind: len([f for f in fields if f.get("type") == kind])
             for kind in ("MATRIX", "VECTOR", "GROUP")
         },
-        "fields": fields,
+        "fields": fields, "cache": cache_report,
     }
     if args.expressions:
         data["expressions"] = ml.process_datafields(fields)
@@ -708,11 +854,13 @@ def cmd_catalog_fields(args, _sink):
 
 
 def cmd_catalog_categories(args, _sink):
+    cache_report = {}
     categories = with_session(args, lambda s: ml.fetch_data_categories(
-        s, region=args.region, universe=args.universe, delay=args.delay))
+        s, region=args.region, universe=args.universe, delay=args.delay,
+        report=cache_report))
     data = {
         "region": args.region, "universe": args.universe, "delay": args.delay,
-        "count": len(categories), "categories": categories,
+        "count": len(categories), "categories": categories, "cache": cache_report,
         "note": "alphaCount is a crowding signal: higher means more mined",
     }
     _maybe_save(args, data)
@@ -1080,6 +1228,14 @@ def run(argv=None):
         raise CliError("USAGE", "`%s` needs a subcommand" % args.command,
                        "known subcommands: %s" % ", ".join(children))
     sink = make_event_sink(getattr(args, "stream", False), getattr(args, "verbose", False))
+    # Catalog caching is on by default; the flags only tune it. Library
+    # diagnostics are routed through the same stderr channel as our own notes,
+    # so stdout stays a single JSON document.
+    ml.set_diagnostic_handler(note)
+    ml.configure_metadata_cache(
+        max_age=getattr(args, "meta_max_age", None),
+        refresh=getattr(args, "refresh_meta", None),
+    )
     data = args.func(args, sink)
     emit({"ok": True, "command": args.command, "data": data})
     return EXIT_CODES["OK"]
@@ -1425,6 +1581,11 @@ def main(argv=None):
         return exc.exit_code
     except ml.BrainError as exc:
         code = getattr(exc, "code", "SERVICE_ERROR")
+        if str(code).startswith("AUTH"):
+            # The cookie is known-bad; keeping it would make every later call
+            # replay the same rejection instead of logging in again.
+            if ml.invalidate_session():
+                note("session cache cleared after %s" % code)
         hint = getattr(exc, "hint", None)
         emit({"ok": False, "command": _command_of(argv),
               "error": {"code": code, "message": str(exc), "hint": hint}})

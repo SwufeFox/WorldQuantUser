@@ -33,6 +33,7 @@ import json
 import os
 
 import research_paths
+import cache_store
 
 __all__ = [
     "VERDICTS",
@@ -216,16 +217,23 @@ def record_entry(entry, path=None, skip_unchanged=True):
     syncs from growing the file on every run. Returns ``(entry, written)``.
     """
     path = path or default_registry_path()
-    if skip_unchanged:
-        existing = {item["key"]: item for item in load_entries(path)}
-        current = existing.get(entry.get("key"))
-        if current is not None and _comparable(current) == _comparable(entry):
-            return current, False
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, sort_keys=True, ensure_ascii=False))
-        handle.write("\n")
-    return entry, True
+    # The dedupe check and the append have to happen under one lock: two
+    # concurrent CLI calls otherwise both see "not present" and both append.
+    # JSONL appends stay line-atomic because each record is written in a single
+    # unbuffered write, so a reader never sees half a line.
+    with cache_store.file_lock(path + ".lock", timeout=30):
+        if skip_unchanged:
+            existing = {item["key"]: item for item in load_entries(path)}
+            current = existing.get(entry.get("key"))
+            if current is not None and _comparable(current) == _comparable(entry):
+                return current, False
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, sort_keys=True, ensure_ascii=False))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        return entry, True
 
 
 def summarize(entries):

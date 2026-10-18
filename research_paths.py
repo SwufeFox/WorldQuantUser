@@ -21,13 +21,32 @@ Resolution order:
 4. ``~/.local/share/worldquant-research``.
 
 :func:`research_dir` only resolves the path; :func:`ensure_dir` creates it.
+
+Derived locations share that resolution:
+
+* :func:`cache_root` -- ``<research_dir>/cache``
+* :func:`session_path` -- ``<cache_root>/session.json`` (cookies, mode 0600)
+* :func:`metadata_root` -- ``<cache_root>/metadata`` (catalog snapshots)
+
+Keeping caches next to the results rather than in the working tree means the
+repository stays diff-clean and `cache clear` has exactly one directory to own.
 """
 
 from __future__ import annotations
 
 import os
 
-__all__ = ["research_dir", "ensure_dir", "resolve", "describe", "source"]
+__all__ = [
+    "research_dir",
+    "ensure_dir",
+    "resolve",
+    "describe",
+    "source",
+    "cache_root",
+    "session_path",
+    "metadata_root",
+    "lock_path",
+]
 
 APP_DIR_NAME = "worldquant-research"
 ENV_VAR = "BRAIN_RESEARCH_DIR"
@@ -92,3 +111,24 @@ def describe():
             "volume; the repository holds code only."
         ),
     }
+
+
+def cache_root():
+    """Directory holding every cache file (session, catalog snapshots, locks)."""
+    return os.path.join(research_dir(), "cache")
+
+
+def session_path():
+    """Where the cached BRAIN session cookie lives. Contains credentials."""
+    return os.path.join(cache_root(), "session.json")
+
+
+def metadata_root():
+    """Directory holding cached catalog responses."""
+    return os.path.join(cache_root(), "metadata")
+
+
+def lock_path(name):
+    """Path of a named lock file under the cache directory."""
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in name)
+    return os.path.join(cache_root(), "locks", safe + ".lock")

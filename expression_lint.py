@@ -30,6 +30,7 @@ import os
 import re
 
 import research_paths
+import cache_store
 
 __all__ = [
     "build_operator_index",
@@ -229,37 +230,37 @@ def record_rejection(operator, message, context=None, path=None, severity="block
     if severity not in {"block", "warn"}:
         raise ValueError("severity must be 'block' or 'warn', got %r" % (severity,))
     path = path or default_denylist_path()
-    entries = load_denylist(path)
     stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-    existing = entries.get(operator)
-    if existing:
-        existing["count"] = int(existing.get("count", 1)) + 1
-        existing["last_seen"] = stamp
-        existing["message"] = message
-        # A hard rejection outranks a soft one; never soften an existing block.
-        if severity == "block":
-            existing["severity"] = "block"
-    else:
-        entries[operator] = {
-            "reason": "rejected by the BRAIN simulator",
-            "message": message,
-            "severity": severity,
-            "context": context or {},
-            "first_seen": stamp,
-            "last_seen": stamp,
-            "count": 1,
+
+    # Read-modify-write under a lock, and replace atomically. Two concurrent
+    # CLI calls used to share one fixed ".tmp" name, which lost the counter bump
+    # (or worse, one writer's os.replace failing after the other moved the file).
+    with cache_store.file_lock(path + ".lock", timeout=30):
+        entries = load_denylist(path)
+        existing = entries.get(operator)
+        if existing:
+            existing["count"] = int(existing.get("count", 1)) + 1
+            existing["last_seen"] = stamp
+            existing["message"] = message
+            # A hard rejection outranks a soft one; never soften an existing block.
+            if severity == "block":
+                existing["severity"] = "block"
+        else:
+            entries[operator] = {
+                "reason": "rejected by the BRAIN simulator",
+                "message": message,
+                "severity": severity,
+                "context": context or {},
+                "first_seen": stamp,
+                "last_seen": stamp,
+                "count": 1,
+            }
+        document = {
+            "_comment": "Learned operator denylist. Written by expression_lint."
+                        "record_rejection when the simulator rejects an operator.",
+            "operators": entries,
         }
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    document = {
-        "_comment": "Learned operator denylist. Written by expression_lint."
-                    "record_rejection when the simulator rejects an operator.",
-        "operators": entries,
-    }
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(document, handle, indent=2, sort_keys=True, ensure_ascii=False)
-        handle.write("\n")
-    os.replace(temporary, path)
+        cache_store.write_json_atomic(path, document, mode=0o644, indent=2)
     return entries[operator]
 
 

@@ -71,10 +71,27 @@ export BRAIN_PASSWORD=...
 `machine_lib.get_credentials()` raises `MissingCredentials` when either is
 absent — nothing silently sends an empty login.
 
-Sessions are cached in `.brain_session.json` (also git-ignored). BRAIN sessions
-last hours but challenges rapid repeated logins with a captcha, so the cache is
-what keeps a sequence of CLI calls cheap. Use `--relogin` to force a new login
-or `--no-cache` to ignore the cache for one call.
+BRAIN sessions last hours but challenges rapid repeated logins with a captcha,
+so the session cookie is cached and reused. It lives in
+`<research_dir>/cache/session.json` — outside the git working tree, mode `0600`,
+written atomically so a killed run cannot leave a truncated file behind.
+Concurrent CLI calls take a file lock and share one login instead of racing
+each other into a captcha. Use `--relogin` to force a new login, `--no-cache` to
+ignore the cache for one call, or `auth logout` to forget it.
+
+Catalog metadata (operators, fields, datasets, categories, operator docs) is
+cached too, under `<research_dir>/cache/metadata/`. It is quota-free but slow —
+the USA field catalog is 4367 rows over fourteen paginated calls — and it
+changes on the order of days. Default TTL is 24 h (`--meta-max-age`, or
+`BRAIN_METADATA_TTL=0` to disable); `--refresh-meta` refetches. Every catalog
+response carries a `cache` report (`hit`, `age_seconds`,
+`expires_in_seconds`), and if a refetch fails while an older snapshot exists the
+cached copy is served with `stale: true` instead of failing the command.
+
+```bash
+python research_cli.py cache info                  # what is cached, how stale
+python research_cli.py cache clear --kind metadata # drop catalog snapshots
+```
 
 ## Driving it from a script or an agent
 

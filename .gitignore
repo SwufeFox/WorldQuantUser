@@ -10,10 +10,15 @@ __pycache__/
 brain_session.json
 *.session.json
 .brain_checkpoints/
+cache/
+
+# Catalog metadata snapshots are cache, not results: never versioned either.
+metadata/
 
 # Research output is not versioned here: this repository holds the tool only.
 # Results (simulation JSON, field-catalog snapshots, the alpha registry, the
-# learned operator denylist) live in $BRAIN_RESEARCH_DIR, which defaults to
+# learned operator denylist) live in $BRAIN_RESEARCH_DIR, which resolves to the
+# persistent volume (/data/worldquant-research) before falling back to
 # ~/.local/share/worldquant-research. This rule is a guard rail so a stray run
 # inside the working tree cannot silently add data to the repo.
 research/
