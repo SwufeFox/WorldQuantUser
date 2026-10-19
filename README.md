@@ -184,6 +184,31 @@ python research_cli.py alpha list --min-sharpe 1.5 --limit 20
 
 Both are quota-free.
 
+### Read the checks that matter (including self-correlation)
+
+`alpha get` returns the **cached** check snapshot embedded in the alpha body,
+where `SELF_CORRELATION` is usually `PENDING` or missing. That is a caching
+artefact, not a permission limit: `GET /alphas/{id}/check` triggers the
+computation and replies with `Retry-After` until the job finishes.
+
+```bash
+python research_cli.py alpha check d5K0Pod2          # compute and print live checks
+python research_cli.py alpha check d5K0Pod2 --max-wait 300
+```
+
+### Submit (and the "test submission")
+
+There is **no separate test-submission endpoint**. The pre-submission test *is*
+the check flow above; the only write action is `POST /alphas/{id}/submit`.
+`alpha submit` therefore defaults to a dry-run that runs the live checks and
+reports the correlation that would decide the submission, and only writes with
+`--yes`:
+
+```bash
+python research_cli.py alpha submit RRA1jdmb          # dry-run, nothing written
+python research_cli.py alpha submit RRA1jdmb --yes    # irreversible
+```
+
 ### Lint before you spend a simulation
 
 ```bash
