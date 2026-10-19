@@ -427,6 +427,17 @@ def build_parser():
     a_chk.add_argument("--save")
     a_chk.set_defaults(func=cmd_alpha_check)
 
+    a_sub = alpha_sub.add_parser(
+        "submit",
+        help="Submit one alpha to its competition (dry-run unless --yes).")
+    a_sub.add_argument("alpha_id")
+    a_sub.add_argument("--yes", action="store_true",
+                       help="Actually submit. Without it nothing is written.")
+    a_sub.add_argument("--max-wait", type=float, default=180.0)
+    _add_session_args(a_sub)
+    a_sub.add_argument("--save")
+    a_sub.set_defaults(func=cmd_alpha_submit)
+
     a_list = alpha_sub.add_parser("list", help="List the account's alphas.")
     a_list.add_argument("--limit", type=int, default=20)
     a_list.add_argument("--offset", type=int, default=0)
@@ -1236,6 +1247,20 @@ def cmd_alpha_check(args, _sink):
     }
     _maybe_save(args, document)
     return document
+
+
+def cmd_alpha_submit(args, _sink):
+    """Submit an alpha, or show exactly what would be sent.
+
+    Irreversible, so ``--yes`` is required; otherwise this behaves like the
+    platform's "test submission", which is simply the check flow.
+    """
+    if args.max_wait is not None and args.max_wait < 0:
+        raise UsageError("--max-wait must be non-negative")
+    result = with_session(args, lambda s: ml.submit_alpha(
+        s, args.alpha_id, confirm=args.yes, max_wait_seconds=args.max_wait))
+    _maybe_save(args, result)
+    return result
 
 
 def cmd_alpha_list(args, _sink):

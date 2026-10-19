@@ -1627,6 +1627,67 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
     }
 
 
+def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=None):
+    """Submit one alpha to its competition, or report what would happen.
+
+    BRAIN exposes no separate "test submission": the pre-submission test *is*
+    ``GET /alphas/{id}/check`` (see :func:`fetch_alpha_checks`), and the only
+    write action is ``POST /alphas/{id}/submit``. Submission is irreversible
+    from a user's point of view, so ``confirm`` must be True to send it;
+    otherwise a dry-run document describing the current checks is returned.
+    """
+    current = fetch_alpha_metrics(s, alpha_id)
+    status = current.get("status")
+    document = {
+        "alpha_id": alpha_id,
+        "status": status,
+        "submitted": False,
+    }
+    if status in ("ACTIVE", "SUBMITTED"):
+        document["checks"] = _extract_checks(current) or {}
+        document["reason"] = "already %s; nothing to do" % status
+        return document
+    if not confirm:
+        # the platform has no separate test-submission call: the test *is* the
+        # check flow, so run it live instead of echoing the cached snapshot.
+        live = fetch_alpha_checks(s, alpha_id,
+                                  max_wait_seconds=max_wait_seconds,
+                                  on_event=on_event)
+        document["checks"] = live.get("checks")
+        document["self_correlation"] = live.get("self_correlation")
+        document["checks_complete"] = live.get("complete")
+        document["reason"] = "confirmation required: rerun with --yes"
+        return document
+    deadline = time.monotonic() + (max_wait_seconds or 0)
+    url = BRAIN_API_URL + "/alphas/" + alpha_id + "/submit"
+    response = s.post(url, timeout=_request_timeout(deadline))
+    retry_after = _retry_after_seconds(response, cap_error_wait=False)
+    if on_event:
+        on_event({"event": "submit_sent", "alpha_id": alpha_id,
+                  "status_code": response.status_code,
+                  "retry_after_seconds": retry_after})
+    while retry_after and time.monotonic() < deadline:
+        time.sleep(min(retry_after, max(0.0, deadline - time.monotonic())))
+        response = s.get(url, timeout=_request_timeout(deadline))
+        retry_after = _retry_after_seconds(response, cap_error_wait=False)
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    if response.status_code >= 400:
+        raise ServiceError(
+            "submission rejected with HTTP %s: %s"
+            % (response.status_code, json.dumps(payload)[:300])
+        )
+    refreshed = fetch_alpha_metrics(s, alpha_id)
+    document.update({
+        "submitted": True,
+        "status": refreshed.get("status"),
+        "response": payload,
+    })
+    return document
+
+
 def single_simulate(alpha_pool, neut="SUBINDUSTRY", region="USA", universe="TOP3000",
                     start=0, settings=None, dry_run=False, on_event=None):
     """Back-compat wrapper: simulate nested pools of ``(expression, decay)``.
