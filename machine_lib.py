@@ -1576,6 +1576,57 @@ def _extract_checks(alpha_payload):
     return checks or None
 
 
+def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
+    """Return live platform checks, including computed SELF_CORRELATION.
+
+    ``GET /alphas/{id}`` embeds a *cached* check snapshot, which reports
+    SELF_CORRELATION as PENDING or omits it entirely. The dedicated
+    ``GET /alphas/{id}/check`` endpoint triggers the computation and answers
+    with ``Retry-After`` until the job finishes, so it is the only way to read
+    the real correlation value. This polls it within a bounded budget.
+
+    Returns ``{"alpha_id", "checks", "self_correlation", "complete"}``.
+    ``complete`` is False when the budget expired before a finished payload.
+    """
+    if max_wait_seconds is not None and max_wait_seconds < 0:
+        raise ValueError("max_wait_seconds must be non-negative")
+    deadline = time.monotonic() + (max_wait_seconds or 0)
+    url = BRAIN_API_URL + "/alphas/" + alpha_id + "/check"
+    payload = None
+    while True:
+        response = s.get(url, timeout=_request_timeout(deadline))
+        if response.status_code == 404:
+            raise NotFound("alpha %s not found" % alpha_id)
+        retry_after = _retry_after_seconds(response, cap_error_wait=False)
+        if response.status_code in (429, 503) or retry_after:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            wait = retry_after if retry_after else 5.0
+            if on_event:
+                on_event({"event": "check_pending", "alpha_id": alpha_id,
+                          "retry_after_seconds": wait})
+            time.sleep(min(wait, remaining))
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if (payload or {}).get("is", {}).get("checks"):
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(5.0, remaining))
+    checks = _extract_checks(payload or {})
+    return {
+        "alpha_id": alpha_id,
+        "checks": checks,
+        "self_correlation": (checks or {}).get("SELF_CORRELATION"),
+        "complete": bool(checks),
+    }
+
+
 def single_simulate(alpha_pool, neut="SUBINDUSTRY", region="USA", universe="TOP3000",
                     start=0, settings=None, dry_run=False, on_event=None):
     """Back-compat wrapper: simulate nested pools of ``(expression, decay)``.

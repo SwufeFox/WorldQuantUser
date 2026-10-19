@@ -417,6 +417,16 @@ def build_parser():
     a_get.add_argument("--save")
     a_get.set_defaults(func=cmd_alpha_get)
 
+    a_chk = alpha_sub.add_parser(
+        "check",
+        help="Compute live checks (incl. SELF_CORRELATION). 'get' only shows cached values.")
+    a_chk.add_argument("alpha_id")
+    a_chk.add_argument("--max-wait", type=float, default=180.0,
+                       help="Seconds to wait for the async check job (default 180).")
+    _add_session_args(a_chk)
+    a_chk.add_argument("--save")
+    a_chk.set_defaults(func=cmd_alpha_check)
+
     a_list = alpha_sub.add_parser("list", help="List the account's alphas.")
     a_list.add_argument("--limit", type=int, default=20)
     a_list.add_argument("--offset", type=int, default=0)
@@ -1197,6 +1207,33 @@ def cmd_alpha_get(args, _sink):
     split = ml.extract_split(payload)
     if split:
         document["out_of_sample"] = split
+    _maybe_save(args, document)
+    return document
+
+
+def cmd_alpha_check(args, _sink):
+    """Force the platform to compute checks and return the real values.
+
+    ``alpha get`` reads the cached snapshot embedded in the alpha body, where
+    SELF_CORRELATION is usually PENDING or absent. This command hits
+    ``/alphas/{id}/check``, which runs the job (answering with Retry-After) and
+    then returns the computed correlation.
+    """
+    if args.max_wait is not None and args.max_wait < 0:
+        raise UsageError("--max-wait must be non-negative")
+    result = with_session(args, lambda s: ml.fetch_alpha_checks(
+        s, args.alpha_id, max_wait_seconds=args.max_wait))
+    if not result.get("complete"):
+        raise CliError(
+            "SERVICE_ERROR",
+            "platform did not finish computing checks within %.0fs" % (args.max_wait or 0),
+            hint="Retry, or raise --max-wait; the job keeps running server-side.",
+        )
+    document = {
+        "alpha_id": result["alpha_id"],
+        "self_correlation": result.get("self_correlation"),
+        "checks": result.get("checks"),
+    }
     _maybe_save(args, document)
     return document
 
