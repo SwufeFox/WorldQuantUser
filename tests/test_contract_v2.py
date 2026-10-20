@@ -663,3 +663,12 @@ class RegistryQueryTests(unittest.TestCase):
 
     def test_no_filters_returns_everything(self):
         self.assertEqual(len(alpha_registry.find_entries(self.ENTRIES)), 3)
+
+    def test_falsified_is_a_distinct_verdict(self):
+        # A refuted pre-registration is a result, not a failure: it must stay
+        # distinguishable from "the expression underperformed" so a later round
+        # does not re-open the mechanism by accident.
+        self.assertIn("falsified", alpha_registry.VERDICTS)
+        self.assertIn("rejected", alpha_registry.VERDICTS)
+        found = alpha_registry.find_entries(self.ENTRIES, verdicts=["falsified"])
+        self.assertEqual(found, [])

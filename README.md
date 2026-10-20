@@ -212,6 +212,20 @@ python research_cli.py alpha find --mechanism revision --verdict rejected
 `already_tested: true` in the output means a prior entry mentions that field;
 read its verdict and metrics before writing a new expression.
 
+Verdicts are not all failure states:
+
+| verdict | meaning |
+|---|---|
+| `candidate` | passed the gates; keep it |
+| `watch` | interesting but below threshold, or correlation unverified |
+| `rejected` | the expression underperformed; the hypothesis was never on trial |
+| `falsified` | a pre-registered hypothesis was tested with controls and the controls won — a result, not a failure |
+| `no_go` | abandoned before a fair test (data blocked, unusable fields) |
+
+`falsified` is the one worth protecting: it is what stops a later round from
+re-opening a mechanism that was already ruled out, so put the deciding control
+in the note.
+
 ### Read the checks that matter (including self-correlation)
 
 `alpha get` returns the **cached** check snapshot embedded in the alpha body,

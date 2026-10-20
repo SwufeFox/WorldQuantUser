@@ -45,7 +45,15 @@ __all__ = [
     "summarize",
 ]
 
-VERDICTS = ("candidate", "watch", "rejected", "no_go")
+# ``rejected``  - the alpha underperformed; the expression is dead, the
+#                 hypothesis was never properly on trial.
+# ``falsified`` - a pre-registered hypothesis was put on trial with controls
+#                 and the controls won. This is a *result*, not a failure: it
+#                 tells a later round not to re-open the mechanism, and it is
+#                 the reason `alpha find` exists. Keep the note specific about
+#                 which control killed it.
+# ``no_go``     - abandoned before a fair test (data blocked, unusable fields).
+VERDICTS = ("candidate", "watch", "rejected", "falsified", "no_go")
 
 # Metric keys kept from the in-sample block, in reporting order.
 _METRIC_KEYS = (
