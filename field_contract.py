@@ -51,6 +51,17 @@ _SHARE_COUNT_UNITS = frozenset({"share_count"})
 
 # Ordered; first match wins. Each entry is (regex on field id, period, rule id).
 _PERIOD_RULES = (
+    # ``analyst4`` spells the frequency inline instead of using a family
+    # token: ``..._basic_af_v4_nd_eps_mean`` (annual frequency),
+    # ``..._estimate_1qf_v4_nd_cfo_mean`` (quarterly frequency). Without
+    # these rules the whole dataset audits as "period unknown" and every
+    # cross-field operation is blocked for the wrong reason. The rules are
+    # anchored to ``anl4_`` on purpose: an unanchored ``_af_`` also matches
+    # unrelated ids and would silently claim a period for them.
+    (r"^anl4_af(?:v\d+|_)", "annual", "id_anl4_af_lead"),
+    (r"^anl4_qf_", "quarterly", "id_anl4_qf_lead"),
+    (r"^anl4_.*_af(?:v\d+|_)", "annual", "id_anl4_af"),
+    (r"^anl4_.*_1?qf(?:v\d+|_)", "quarterly", "id_anl4_qf"),
     # ``fnd6_newqv1300_cshopq`` / ``fnd6_newa2v1300_oancf``: family token, an
     # optional statement counter and an optional ``vNNNN`` version segment.
     (r"newq\d*(?:v\d+)?_", "quarterly", "id_family_newq"),

@@ -78,6 +78,32 @@ class FieldContractTests(unittest.TestCase):
         self.assertEqual(contract["attributes"]["period"]["value"], "quarterly")
         self.assertEqual(contract["attributes"]["period"]["rule"], "id_family_newq")
 
+    def test_period_inferred_from_analyst4_frequency_token(self):
+        # ``analyst4`` writes the frequency inline (``af`` annual, ``qf``
+        # quarterly) instead of using a family prefix. Missing this rule made
+        # every analyst4 field audit as "period unknown", which blocked the
+        # cash-flow-forecast coverage ratio for the wrong reason.
+        annual = datafield(
+            "anl4_fs_detail_estimates_basic_af_v4_nd_cfps_number",
+            "Cash Flow Per Share - number of estimates for the annual period",
+        )
+        contract = field_contract.audit_field(annual)
+        period = contract["attributes"]["period"]
+        self.assertEqual(period["state"], "inferred")
+        self.assertEqual(period["value"], "annual")
+
+        quarterly = datafield(
+            "anl4_fs_detail_estimate_1qf_v4_nd_cfo_mean",
+            "Cash Flow From Operations - mean estimate for the quarterly period",
+        )
+        contract = field_contract.audit_field(quarterly)
+        self.assertEqual(contract["attributes"]["period"]["value"], "quarterly")
+
+    def test_analyst4_frequency_token_is_not_applied_to_other_datasets(self):
+        # A stray ``_af_`` outside analyst4 must not silently become "annual".
+        contract = field_contract.audit_field(datafield("pv1_af_demo", "demo"))
+        self.assertNotEqual(contract["attributes"]["period"].get("rule"), "id_anl4_af")
+
     def test_unit_and_currency_inferred(self):
         record = datafield("fnd6_newa1v1300_at", "Total Assets")
         contract = field_contract.audit_field(record)
