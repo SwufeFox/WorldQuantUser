@@ -55,6 +55,30 @@ __all__ = [
 # ``no_go``     - abandoned before a fair test (data blocked, unusable fields).
 VERDICTS = ("candidate", "watch", "rejected", "falsified", "no_go")
 
+# Second-level grouping: which return source an alpha draws on. ``mechanism``
+# is deliberately specific (one label per construction), so counting labels
+# overstates diversity -- thirteen book alphas carry eleven labels but only
+# four families, and six of the labels are the same overnight/intraday bet.
+# ``family`` is the number to quote when the question is "how many independent
+# bets do I have".
+#
+# This is a *declared* field, never inferred. Keyword inference looked
+# tempting and is wrong in practice: an alpha built on analyst forward-EPS
+# fields is a value bet, not an analyst-revision bet, so guessing from the
+# field prefix silently mislabels it.
+FAMILIES = (
+    "oi",         # overnight vs intraday price formation
+    "quality",    # value / profitability / valuation fundamentals
+    "leverage",   # balance-sheet leverage, fixed vs operating cost structure
+    "option",     # implied volatility level, spread, skew
+    "analyst",    # estimate revisions, coverage, dispersion
+    "event",      # news, earnings and other dated events
+    "reversal",   # short-horizon price reversal
+    "momentum",   # price trend continuation
+    "attention",  # social volume, short interest, liquidity
+    "other",
+)
+
 # Metric keys kept from the in-sample block, in reporting order.
 _METRIC_KEYS = (
     "sharpe", "fitness", "turnover", "returns", "drawdown", "margin",
@@ -128,16 +152,22 @@ def _failing_checks(checks):
 
 
 def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
-                source="manual", extra=None):
+                source="manual", extra=None, family=None):
     """Build one ledger entry from a normalized alpha fact.
 
     ``alpha`` is expected to carry ``alpha_id``, ``expression``, ``decay``,
     ``settings``, ``metrics`` and ``checks``. Missing pieces are tolerated, so a
     rejected expression with no alpha id can still be recorded.
+
+    ``family`` groups entries by return source; see ``FAMILIES``. It is
+    declared by the caller and never guessed from the expression.
     """
     if verdict not in VERDICTS:
         raise ValueError("verdict must be one of %s, got %r"
                          % (", ".join(VERDICTS), verdict))
+    if family is not None and family not in FAMILIES:
+        raise ValueError("family must be one of %s, got %r"
+                         % (", ".join(FAMILIES), family))
     expression = alpha.get("expression") or ""
     alpha_id = alpha.get("alpha_id")
     metrics = _pick_metrics(alpha.get("metrics"))
@@ -152,6 +182,7 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
         "alpha_id": alpha_id,
         "idea": idea,
         "mechanism": mechanism,
+        "family": family,
         "verdict": verdict,
         "note": note,
         "expression": expression,
@@ -214,6 +245,11 @@ def _comparable(entry):
         "verdict": entry.get("verdict"),
         "idea": entry.get("idea"),
         "mechanism": entry.get("mechanism"),
+        # ``family`` is a curated annotation, not derived from anything else,
+        # so it has to count as a change on its own. Leaving it out silently
+        # dropped the first attempt to classify the book: nine of thirteen
+        # records were skipped as "unchanged" when only the family differed.
+        "family": entry.get("family"),
         "note": entry.get("note"),
         "expression": " ".join((entry.get("expression") or "").split()),
         "settings": entry.get("settings") or {},
@@ -251,7 +287,8 @@ def record_entry(entry, path=None, skip_unchanged=True):
 
 
 def find_entries(entries, field=None, mechanism=None, idea=None,
-                 expression=None, verdicts=None, min_fitness=None):
+                 expression=None, verdicts=None, min_fitness=None,
+                 family=None):
     """Filter ledger entries by field usage, mechanism, idea or expression.
 
     ``field`` is matched as a substring of the recorded expression, which is
@@ -264,6 +301,7 @@ def find_entries(entries, field=None, mechanism=None, idea=None,
     needle_idea = (idea or "").lower()
     needle_expression = (expression or "").lower()
     wanted_verdicts = {str(v).lower() for v in (verdicts or [])}
+    wanted_family = (family or "").lower()
 
     matched = []
     for entry in entries:
@@ -276,6 +314,8 @@ def find_entries(entries, field=None, mechanism=None, idea=None,
                 entry.get("mechanism") or "").lower():
             continue
         if needle_idea and needle_idea not in (entry.get("idea") or "").lower():
+            continue
+        if wanted_family and (entry.get("family") or "").lower() != wanted_family:
             continue
         if wanted_verdicts and (entry.get("verdict") or "").lower() not in wanted_verdicts:
             continue
@@ -291,11 +331,18 @@ def summarize(entries):
     """Aggregate counts and the headline list, for a quick orientation read."""
     by_verdict = {verdict: 0 for verdict in VERDICTS}
     by_idea = {}
+    by_family = {}
+    unclassified = 0
     for entry in entries:
         verdict = entry.get("verdict") or "watch"
         by_verdict[verdict] = by_verdict.get(verdict, 0) + 1
         idea = entry.get("idea") or "unassigned"
         by_idea[idea] = by_idea.get(idea, 0) + 1
+        family = entry.get("family")
+        if family:
+            by_family[family] = by_family.get(family, 0) + 1
+        else:
+            unclassified += 1
 
     def sharpe_key(entry):
         value = (entry.get("metrics") or {}).get("sharpe")
@@ -306,6 +353,9 @@ def summarize(entries):
         "total": len(entries),
         "by_verdict": by_verdict,
         "by_idea": dict(sorted(by_idea.items())),
+        "by_family": dict(sorted(by_family.items())),
+        "family_count": len(by_family),
+        "unclassified_family": unclassified,
         "best": [
             {
                 "alpha_id": entry.get("alpha_id"),

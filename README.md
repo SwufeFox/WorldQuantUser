@@ -226,6 +226,26 @@ Verdicts are not all failure states:
 re-opening a mechanism that was already ruled out, so put the deciding control
 in the note.
 
+### Mechanism labels overstate diversity — read the family count
+
+`mechanism` is specific on purpose: one label per construction. That makes it a
+bad diversity metric. The current book has **13 alphas, 11 mechanism labels,
+but only 4 families**, because six labels are variations of the same
+overnight/intraday bet.
+
+`family` is the declared second level (`oi`, `quality`, `leverage`, `option`,
+`analyst`, `event`, `reversal`, `momentum`, `attention`, `other`) and it is
+never inferred: a keyword guess would label an analyst forward-EPS alpha as
+`analyst` when it is really a `quality` bet.
+
+```bash
+python research_cli.py alpha book           # book_size / mechanism_count / family_count
+python research_cli.py alpha find --family quality
+```
+
+Quote `family_count` when the question is "how many independent bets do I
+have"; quote `mechanism` only when you need to tell two constructions apart.
+
 ### Read the checks that matter (including self-correlation)
 
 `alpha get` returns the **cached** check snapshot embedded in the alpha body,

@@ -47,7 +47,7 @@ import field_contract  # noqa: E402
 import research_paths  # noqa: E402
 import cache_store  # noqa: E402
 
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 #: Stable process exit codes. Callers branch on these, so the mapping from an
 #: error code to an exit code is part of the contract.
@@ -464,6 +464,8 @@ def build_parser():
     a_rec.add_argument("--verdict", choices=list(alpha_registry.VERDICTS),
                        default="watch")
     a_rec.add_argument("--note", default=None)
+    a_rec.add_argument("--family", default=None, choices=list(alpha_registry.FAMILIES),
+                       help="Return-source grouping; declared, never inferred.")
     a_rec.add_argument("--registry", default=None)
     _add_session_args(a_rec)
     a_rec.set_defaults(func=cmd_alpha_record)
@@ -495,6 +497,9 @@ def build_parser():
     a_find.add_argument("--verdict", action="append", default=[],
                         choices=list(alpha_registry.VERDICTS),
                         help="Keep only these verdicts; repeatable.")
+    a_find.add_argument("--family", default=None,
+                        choices=list(alpha_registry.FAMILIES),
+                        help="Return-source grouping declared at record time.")
     a_find.add_argument("--min-fitness", type=float, default=None)
     a_find.add_argument("--registry", default=None)
     a_find.add_argument("--limit", type=int, default=50)
@@ -1649,6 +1654,7 @@ def cmd_alpha_record(args, sink):
         mechanism=getattr(args, "mechanism", None),
         verdict=getattr(args, "verdict", "watch"),
         note=getattr(args, "note", None),
+        family=getattr(args, "family", None),
         source="record",
     )
     registry_path = (getattr(args, "registry", None)
@@ -1673,6 +1679,7 @@ def cmd_alpha_find(args, sink):
         expression=getattr(args, "expression", None),
         verdicts=getattr(args, "verdict", None),
         min_fitness=getattr(args, "min_fitness", None),
+        family=getattr(args, "family", None),
     )
     matched.sort(
         key=lambda e: ((e.get("metrics") or {}).get("fitness") or float("-inf")),
@@ -1685,9 +1692,12 @@ def cmd_alpha_find(args, sink):
         key = entry.get("verdict") or "unknown"
         verdict_counts[key] = verdict_counts.get(key, 0) + 1
     mechanisms = {}
+    families = {}
     for entry in matched:
         key = entry.get("mechanism") or "unlabelled"
         mechanisms[key] = mechanisms.get(key, 0) + 1
+        fam = entry.get("family") or "unclassified"
+        families[fam] = families.get(fam, 0) + 1
     document = {
         "registry": registry_path,
         "registry_entries": len(entries),
@@ -1703,6 +1713,7 @@ def cmd_alpha_find(args, sink):
         },
         "verdict_counts": verdict_counts,
         "mechanism_counts": mechanisms,
+        "family_counts": families,
         "already_tested": bool(matched),
         "alphas": shown,
     }
@@ -1734,6 +1745,8 @@ def cmd_alpha_book(args, sink):
     items = []
     unknown = []
     mechanism_counts = {}
+    family_counts = {}
+    unclassified = 0
     for alpha in alphas:
         alpha_id = alpha.get("id")
         metrics = alpha.get("is") or {}
@@ -1741,11 +1754,16 @@ def cmd_alpha_book(args, sink):
         entry = by_id.get(alpha_id) or by_hash.get(
             alpha_registry.expression_hash(code)) if code else by_id.get(alpha_id)
         mechanism = (entry or {}).get("mechanism")
+        family = (entry or {}).get("family")
         if not mechanism:
             unknown.append(alpha_id)
             mechanism = None
         else:
             mechanism_counts[mechanism] = mechanism_counts.get(mechanism, 0) + 1
+        if family:
+            family_counts[family] = family_counts.get(family, 0) + 1
+        else:
+            unclassified += 1
         items.append({
             "alpha_id": alpha_id,
             "status": alpha.get("status"),
@@ -1753,6 +1771,7 @@ def cmd_alpha_book(args, sink):
             "fitness": metrics.get("fitness"),
             "turnover": metrics.get("turnover"),
             "mechanism": mechanism,
+            "family": family,
             "idea": (entry or {}).get("idea"),
             "expression": code,
         })
@@ -1762,6 +1781,9 @@ def cmd_alpha_book(args, sink):
         "book_size": len(items),
         "mechanism_count": len(mechanism_counts),
         "mechanism_counts": mechanism_counts,
+        "family_count": len(family_counts),
+        "family_counts": family_counts,
+        "unclassified_family": unclassified,
         "unlabelled": unknown,
         "alphas": items,
     }

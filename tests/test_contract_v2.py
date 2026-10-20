@@ -664,6 +664,40 @@ class RegistryQueryTests(unittest.TestCase):
     def test_no_filters_returns_everything(self):
         self.assertEqual(len(alpha_registry.find_entries(self.ENTRIES)), 3)
 
+    def test_family_is_declared_and_validated(self):
+        # ``family`` is the number to quote when the question is "how many
+        # independent bets", so it must be a closed vocabulary: mechanism
+        # labels overstate diversity (13 book alphas, 11 labels, 4 families).
+        self.assertIn("oi", alpha_registry.FAMILIES)
+        self.assertIn("quality", alpha_registry.FAMILIES)
+        entry = alpha_registry.build_entry(
+            {"alpha_id": "Z1", "expression": "rank(cashflow_op/cap)"},
+            verdict="candidate", mechanism="value_quality", family="quality")
+        self.assertEqual(entry["family"], "quality")
+        with self.assertRaises(ValueError):
+            alpha_registry.build_entry(
+                {"alpha_id": "Z2", "expression": "x"}, family="value-ish")
+
+    def test_find_filters_by_family(self):
+        entries = [
+            dict(self.ENTRIES[0], family="quality"),
+            dict(self.ENTRIES[1], family="attention"),
+            dict(self.ENTRIES[2], family="analyst"),
+        ]
+        found = alpha_registry.find_entries(entries, family="quality")
+        self.assertEqual([e["alpha_id"] for e in found], ["A1"])
+
+    def test_summarize_counts_families_and_unclassified(self):
+        entries = [
+            dict(self.ENTRIES[0], family="quality"),
+            dict(self.ENTRIES[1], family="quality"),
+            dict(self.ENTRIES[2]),
+        ]
+        summary = alpha_registry.summarize(entries)
+        self.assertEqual(summary["by_family"], {"quality": 2})
+        self.assertEqual(summary["family_count"], 1)
+        self.assertEqual(summary["unclassified_family"], 1)
+
     def test_falsified_is_a_distinct_verdict(self):
         # A refuted pre-registration is a result, not a failure: it must stay
         # distinguishable from "the expression underperformed" so a later round
