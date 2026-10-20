@@ -1787,6 +1787,12 @@ def list_alphas(s, limit=100, offset=0, order="-is.sharpe", status="UNSUBMITTED"
     Metadata only: this never re-simulates anything and consumes no quota.
     Filters are pushed server-side, so paging a large account stays cheap.
     ``order`` uses the API syntax, e.g. ``-is.sharpe`` or ``is.fitness``.
+
+    Careful: ``status`` defaults to ``"UNSUBMITTED"``, which **hides the
+    submitted book**. Paging the default filter and then reporting "every alpha
+    is unsubmitted" is a wrong conclusion that has already cost one analysis
+    pass. Pass ``status="ACTIVE"`` to read what is actually submitted, or
+    ``status=None`` for no filter at all.
     """
     params = {
         "limit": min(int(limit), 100),

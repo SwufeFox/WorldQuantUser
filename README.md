@@ -184,6 +184,13 @@ python research_cli.py alpha list --min-sharpe 1.5 --limit 20
 
 Both are quota-free.
 
+`alpha list` filters on `status=UNSUBMITTED` by default, so it will not show
+what you have already submitted. Read the live book with:
+
+```bash
+python research_cli.py alpha list --status ACTIVE --limit 30
+```
+
 ### Read the checks that matter (including self-correlation)
 
 `alpha get` returns the **cached** check snapshot embedded in the alpha body,
