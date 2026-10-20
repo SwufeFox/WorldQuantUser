@@ -45,6 +45,26 @@ __all__ = [
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _LITERALS = frozenset({"true", "false", "nan", "inf", "null", "none"})
 
+# Variable names the simulator refuses to let an expression assign to. The
+# catalog documents none of these; the entry below came from a live rejection
+# ("Variable eps is reserved and cannot be assigned"), which cost one full
+# simulation round because the offline lint had no way to know.
+_RESERVED_IDENTIFIERS = frozenset({"eps"})
+
+_ASSIGNMENT_TARGET = re.compile(
+    r"(?:^|;)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)"
+)
+
+
+def _assignment_targets(masked):
+    """Return assignment targets in order, without duplicates."""
+    seen = []
+    for match in _ASSIGNMENT_TARGET.finditer(masked or ""):
+        name = match.group(1)
+        if name not in seen:
+            seen.append(name)
+    return seen
+
 
 def _mask_strings(expression):
     """Blank out string literals so commas/parens inside them are ignored.
@@ -340,6 +360,19 @@ def lint_expression(expression, operator_index=None, denylist=None,
     if unterminated:
         errors.append({"code": "unbalanced_string",
                        "message": "a quoted string literal is never closed"})
+
+    # Assignment targets that the simulator reserves for itself. Learned from
+    # a live rejection: ``eps=ts_backfill(...)`` fails with "Variable eps is
+    # reserved and cannot be assigned". Nothing in the catalog says so, so the
+    # list has to be carried here.
+    for name in _assignment_targets(masked):
+        if name.lower() in _RESERVED_IDENTIFIERS:
+            errors.append({
+                "code": "reserved_identifier",
+                "identifier": name,
+                "message": "%r is reserved by the simulator; rename the variable"
+                           % name,
+            })
 
     depth = 0
     for char in masked:
