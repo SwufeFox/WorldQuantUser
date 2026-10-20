@@ -47,7 +47,7 @@ import field_contract  # noqa: E402
 import research_paths  # noqa: E402
 import cache_store  # noqa: E402
 
-VERSION = "2.2.0"
+VERSION = "2.3.0"
 
 #: Stable process exit codes. Callers branch on these, so the mapping from an
 #: error code to an exit code is part of the contract.
@@ -479,6 +479,42 @@ def build_parser():
     a_reg.add_argument("--registry", default=None)
     a_reg.add_argument("--save")
     a_reg.set_defaults(func=cmd_alpha_registry)
+
+    a_find = alpha_sub.add_parser(
+        "find",
+        help="Search the ledger before spending a simulation (offline).",
+        description="Answer 'have I already tested this field / mechanism?' "
+                    "from the durable ledger. No network, no quota.")
+    a_find.add_argument("--field", default=None,
+                        help="Datafield id to look for inside recorded expressions.")
+    a_find.add_argument("--mechanism", default=None,
+                        help="Substring of the recorded mechanism label.")
+    a_find.add_argument("--idea", default=None)
+    a_find.add_argument("--expression", default=None,
+                        help="Substring of a recorded expression.")
+    a_find.add_argument("--verdict", action="append", default=[],
+                        choices=list(alpha_registry.VERDICTS),
+                        help="Keep only these verdicts; repeatable.")
+    a_find.add_argument("--min-fitness", type=float, default=None)
+    a_find.add_argument("--registry", default=None)
+    a_find.add_argument("--limit", type=int, default=50)
+    a_find.add_argument("--save")
+    a_find.set_defaults(func=cmd_alpha_find)
+
+    a_book = alpha_sub.add_parser(
+        "book",
+        help="Read what is actually submitted, with mechanism labels.",
+        description="Lists ACTIVE alphas (the real book) joined with the "
+                    "ledger, optionally reporting how a candidate would "
+                    "correlate with it. `alpha list` hides this by default.")
+    a_book.add_argument("--limit", type=int, default=50)
+    a_book.add_argument("--check", default=None, metavar="ALPHA_ID",
+                        help="Also report this candidate's self-correlation "
+                             "against the whole book.")
+    a_book.add_argument("--registry", default=None)
+    _add_session_args(a_book)
+    a_book.add_argument("--save")
+    a_book.set_defaults(func=cmd_alpha_book)
 
     return parser
 
@@ -1623,6 +1659,129 @@ def cmd_alpha_record(args, sink):
         "appended": written,
         "entry": stored,
     }
+
+
+def cmd_alpha_find(args, sink):
+    registry_path = (getattr(args, "registry", None)
+                     or alpha_registry.default_registry_path())
+    entries = alpha_registry.load_entries(registry_path)
+    matched = alpha_registry.find_entries(
+        entries,
+        field=getattr(args, "field", None),
+        mechanism=getattr(args, "mechanism", None),
+        idea=getattr(args, "idea", None),
+        expression=getattr(args, "expression", None),
+        verdicts=getattr(args, "verdict", None),
+        min_fitness=getattr(args, "min_fitness", None),
+    )
+    matched.sort(
+        key=lambda e: ((e.get("metrics") or {}).get("fitness") or float("-inf")),
+        reverse=True,
+    )
+    limit = getattr(args, "limit", None)
+    shown = matched[:limit] if limit else matched
+    verdict_counts = {}
+    for entry in matched:
+        key = entry.get("verdict") or "unknown"
+        verdict_counts[key] = verdict_counts.get(key, 0) + 1
+    mechanisms = {}
+    for entry in matched:
+        key = entry.get("mechanism") or "unlabelled"
+        mechanisms[key] = mechanisms.get(key, 0) + 1
+    document = {
+        "registry": registry_path,
+        "registry_entries": len(entries),
+        "matched": len(matched),
+        "shown": len(shown),
+        "query": {
+            "field": getattr(args, "field", None),
+            "mechanism": getattr(args, "mechanism", None),
+            "idea": getattr(args, "idea", None),
+            "expression": getattr(args, "expression", None),
+            "verdict": list(getattr(args, "verdict", None) or []),
+            "min_fitness": getattr(args, "min_fitness", None),
+        },
+        "verdict_counts": verdict_counts,
+        "mechanism_counts": mechanisms,
+        "already_tested": bool(matched),
+        "alphas": shown,
+    }
+    _maybe_save(args, document)
+    return document
+
+
+def cmd_alpha_book(args, sink):
+    registry_path = (getattr(args, "registry", None)
+                     or alpha_registry.default_registry_path())
+    entries = alpha_registry.load_entries(registry_path)
+
+    by_id = {}
+    by_hash = {}
+    for entry in entries:
+        alpha_id = entry.get("alpha_id")
+        if alpha_id:
+            by_id.setdefault(alpha_id, entry)
+        digest = entry.get("expression_hash")
+        if digest:
+            by_hash.setdefault(digest, entry)
+
+    def load(session):
+        return ml.list_alphas(session, limit=getattr(args, "limit", 50),
+                              status="ACTIVE", alpha_type_not="")
+
+    alphas = with_session(args, load)
+
+    items = []
+    unknown = []
+    mechanism_counts = {}
+    for alpha in alphas:
+        alpha_id = alpha.get("id")
+        metrics = alpha.get("is") or {}
+        code, _, _ = ml.regular_expression(alpha)
+        entry = by_id.get(alpha_id) or by_hash.get(
+            alpha_registry.expression_hash(code)) if code else by_id.get(alpha_id)
+        mechanism = (entry or {}).get("mechanism")
+        if not mechanism:
+            unknown.append(alpha_id)
+            mechanism = None
+        else:
+            mechanism_counts[mechanism] = mechanism_counts.get(mechanism, 0) + 1
+        items.append({
+            "alpha_id": alpha_id,
+            "status": alpha.get("status"),
+            "sharpe": metrics.get("sharpe"),
+            "fitness": metrics.get("fitness"),
+            "turnover": metrics.get("turnover"),
+            "mechanism": mechanism,
+            "idea": (entry or {}).get("idea"),
+            "expression": code,
+        })
+
+    document = {
+        "registry": registry_path,
+        "book_size": len(items),
+        "mechanism_count": len(mechanism_counts),
+        "mechanism_counts": mechanism_counts,
+        "unlabelled": unknown,
+        "alphas": items,
+    }
+
+    candidate_id = getattr(args, "check", None)
+    if candidate_id:
+        checks = with_session(args, lambda s: ml.fetch_alpha_checks(
+            s, candidate_id,
+            max_wait_seconds=getattr(args, "max_wait", 180) or 180))
+        self_correlation = checks.get("self_correlation") or {}
+        document["candidate"] = {
+            "alpha_id": candidate_id,
+            "self_correlation": self_correlation,
+            "clear": (self_correlation.get("value") is not None
+                      and self_correlation.get("limit") is not None
+                      and self_correlation["value"] <= self_correlation["limit"]),
+        }
+
+    _maybe_save(args, document)
+    return document
 
 
 def cmd_alpha_registry(args, sink):

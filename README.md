@@ -191,6 +191,27 @@ what you have already submitted. Read the live book with:
 python research_cli.py alpha list --status ACTIVE --limit 30
 ```
 
+Or ask for the book directly — it joins each submitted alpha with the ledger's
+mechanism label, and can report how a candidate would sit against it:
+
+```bash
+python research_cli.py alpha book
+python research_cli.py alpha book --check P0M7171K
+```
+
+### Check the ledger before spending a simulation
+
+The most expensive mistake in this workflow is re-testing a field that was
+already falsified. `alpha find` answers that offline, with no network call:
+
+```bash
+python research_cli.py alpha find --field anl4_cfo_number
+python research_cli.py alpha find --mechanism revision --verdict rejected
+```
+
+`already_tested: true` in the output means a prior entry mentions that field;
+read its verdict and metrics before writing a new expression.
+
 ### Read the checks that matter (including self-correlation)
 
 `alpha get` returns the **cached** check snapshot embedded in the alpha body,

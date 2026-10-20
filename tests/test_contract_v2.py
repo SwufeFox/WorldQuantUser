@@ -622,3 +622,44 @@ class CheckReconciliationTests(unittest.TestCase):
             "CONCENTRATED_WEIGHT", {"value": None, "limit": None, "result": "PASS"}))
         self.assertIsNone(machine_lib.reconcile_check(
             "SELF_CORRELATION", {"value": None, "limit": None, "result": "PENDING"}))
+
+
+class RegistryQueryTests(unittest.TestCase):
+    """`alpha find` exists so a field is not re-tested by accident."""
+
+    ENTRIES = [
+        {"alpha_id": "A1", "verdict": "candidate", "idea": "Idea 70",
+         "mechanism": "value_quality", "expression": "rank(cashflow_op/cap)",
+         "metrics": {"sharpe": 1.5, "fitness": 1.4}},
+        {"alpha_id": "A2", "verdict": "rejected", "idea": "Idea 71",
+         "mechanism": "short_interest", "expression": "rank(-news_short_interest)",
+         "metrics": {"sharpe": -0.9, "fitness": -0.3}},
+        {"alpha_id": "A3", "verdict": "rejected", "idea": "Idea 72",
+         "mechanism": "revision_gap",
+         "expression": "rank(ts_delta(anl4_cfo_number,63))",
+         "metrics": {"fitness": 0.2}},
+    ]
+
+    def test_field_match_finds_prior_use(self):
+        found = alpha_registry.find_entries(self.ENTRIES, field="anl4_cfo_number")
+        self.assertEqual([e["alpha_id"] for e in found], ["A3"])
+
+    def test_field_match_is_case_insensitive(self):
+        self.assertEqual(
+            len(alpha_registry.find_entries(self.ENTRIES, field="CASHFLOW_OP")), 1)
+
+    def test_verdict_and_fitness_filters_stack(self):
+        rejected = alpha_registry.find_entries(self.ENTRIES, verdicts=["rejected"])
+        self.assertEqual(len(rejected), 2)
+        strong = alpha_registry.find_entries(self.ENTRIES, min_fitness=1.0)
+        self.assertEqual([e["alpha_id"] for e in strong], ["A1"])
+        both = alpha_registry.find_entries(
+            self.ENTRIES, verdicts=["rejected"], min_fitness=1.0)
+        self.assertEqual(both, [])
+
+    def test_mechanism_substring(self):
+        found = alpha_registry.find_entries(self.ENTRIES, mechanism="interest")
+        self.assertEqual([e["alpha_id"] for e in found], ["A2"])
+
+    def test_no_filters_returns_everything(self):
+        self.assertEqual(len(alpha_registry.find_entries(self.ENTRIES)), 3)

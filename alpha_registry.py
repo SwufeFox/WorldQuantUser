@@ -242,6 +242,43 @@ def record_entry(entry, path=None, skip_unchanged=True):
         return entry, True
 
 
+def find_entries(entries, field=None, mechanism=None, idea=None,
+                 expression=None, verdicts=None, min_fitness=None):
+    """Filter ledger entries by field usage, mechanism, idea or expression.
+
+    ``field`` is matched as a substring of the recorded expression, which is
+    the practical way to answer "has this datafield already been tested?"
+    without spending a simulation to find out. Matching is case-insensitive
+    and every supplied filter must agree (AND).
+    """
+    needle_field = (field or "").lower()
+    needle_mechanism = (mechanism or "").lower()
+    needle_idea = (idea or "").lower()
+    needle_expression = (expression or "").lower()
+    wanted_verdicts = {str(v).lower() for v in (verdicts or [])}
+
+    matched = []
+    for entry in entries:
+        code = (entry.get("expression") or "").lower()
+        if needle_field and needle_field not in code:
+            continue
+        if needle_expression and needle_expression not in code:
+            continue
+        if needle_mechanism and needle_mechanism not in (
+                entry.get("mechanism") or "").lower():
+            continue
+        if needle_idea and needle_idea not in (entry.get("idea") or "").lower():
+            continue
+        if wanted_verdicts and (entry.get("verdict") or "").lower() not in wanted_verdicts:
+            continue
+        if min_fitness is not None:
+            fitness = (entry.get("metrics") or {}).get("fitness")
+            if not isinstance(fitness, (int, float)) or fitness < min_fitness:
+                continue
+        matched.append(entry)
+    return matched
+
+
 def summarize(entries):
     """Aggregate counts and the headline list, for a quick orientation read."""
     by_verdict = {verdict: 0 for verdict in VERDICTS}
