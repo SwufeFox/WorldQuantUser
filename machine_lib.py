@@ -1561,6 +1561,38 @@ def note_operator_rejection(expression, message, context=None):
         return None
 
 
+# Checks whose limit is a ceiling: PASS when value <= limit. Every other check
+# in the catalog uses a floor (value >= limit). BRAIN sometimes serves a cached
+# ``result`` beside a refreshed ``value``, so the two can contradict each other
+# -- observed values 0.7526 and 0.7911 both labelled PASS against limit 0.7.
+# ``reconcile_check`` recomputes the verdict from the number so a decision is
+# never made on a stale label.
+_CEILING_CHECKS = frozenset({
+    "SELF_CORRELATION",
+    "CONCENTRATED_WEIGHT",
+    "HIGH_TURNOVER",
+})
+
+
+def reconcile_check(name, check):
+    """Recompute a check's verdict from its value and limit.
+
+    Returns ``{"expected", "consistent"}``, or None when the check carries no
+    value/limit pair to compare (CONCENTRATED_WEIGHT often has neither) or is
+    still pending.
+    """
+    check = check or {}
+    value = check.get("value")
+    limit = check.get("limit")
+    result = check.get("result")
+    if value is None or limit is None or result in (None, "PENDING"):
+        return None
+    lower_is_better = (name or "").upper() in _CEILING_CHECKS
+    passed = value <= limit if lower_is_better else value >= limit
+    expected = "PASS" if passed else "FAIL"
+    return {"expected": expected, "consistent": expected == result}
+
+
 def _extract_checks(alpha_payload):
     """Flatten the platform checks of an alpha payload into a name -> info map."""
     checks = {}
@@ -1568,11 +1600,16 @@ def _extract_checks(alpha_payload):
         name = check.get("name")
         if not name:
             continue
-        checks[name] = {
+        info = {
             "result": check.get("result"),
             "limit": check.get("limit"),
             "value": check.get("value"),
         }
+        verdict = reconcile_check(name, info)
+        if verdict is not None:
+            info["expected_result"] = verdict["expected"]
+            info["value_consistent"] = verdict["consistent"]
+        checks[name] = info
     return checks or None
 
 

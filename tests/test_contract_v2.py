@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 import alpha_registry  # noqa: E402
 import expression_lint  # noqa: E402
 import field_contract  # noqa: E402
+import machine_lib  # noqa: E402
 import research_paths  # noqa: E402
 
 
@@ -583,3 +584,41 @@ class OutOfSampleSplitTests(unittest.TestCase):
             idea="Idea 57", mechanism="stability", verdict="candidate",
         )
         self.assertEqual(entry["out_of_sample"], split)
+
+
+class CheckReconciliationTests(unittest.TestCase):
+    """BRAIN can serve a cached verdict beside a refreshed value.
+
+    Observed live: SELF_CORRELATION with value 0.7526, limit 0.7 and result
+    "PASS". A decision must follow the number, not the stale label.
+    """
+
+    def test_ceiling_check_contradiction_is_flagged(self):
+        verdict = machine_lib.reconcile_check(
+            "SELF_CORRELATION",
+            {"value": 0.7526, "limit": 0.7, "result": "PASS"},
+        )
+        self.assertEqual(verdict["expected"], "FAIL")
+        self.assertFalse(verdict["consistent"])
+
+    def test_ceiling_check_agreement(self):
+        verdict = machine_lib.reconcile_check(
+            "SELF_CORRELATION",
+            {"value": 0.6212, "limit": 0.7, "result": "PASS"},
+        )
+        self.assertEqual(verdict["expected"], "PASS")
+        self.assertTrue(verdict["consistent"])
+
+    def test_floor_check_uses_the_opposite_direction(self):
+        low = machine_lib.reconcile_check(
+            "LOW_SHARPE", {"value": 0.5, "limit": 1.25, "result": "PASS"})
+        self.assertEqual(low["expected"], "FAIL")
+        good = machine_lib.reconcile_check(
+            "LOW_SHARPE", {"value": 2.1, "limit": 1.25, "result": "PASS"})
+        self.assertTrue(good["consistent"])
+
+    def test_checks_without_value_are_not_reconciled(self):
+        self.assertIsNone(machine_lib.reconcile_check(
+            "CONCENTRATED_WEIGHT", {"value": None, "limit": None, "result": "PASS"}))
+        self.assertIsNone(machine_lib.reconcile_check(
+            "SELF_CORRELATION", {"value": None, "limit": None, "result": "PENDING"}))
