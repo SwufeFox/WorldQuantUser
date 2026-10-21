@@ -20,6 +20,7 @@ research_cli.py schema      # the whole contract, as JSON
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and GUI. |
 | `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
+| `field_index.py` | Live field-name verification and vocabulary-free variant grouping. |
 | `field_contract.py` | Field contracts: declared vs inferred period/unit/sign, verdicts. |
 | `research_paths.py` | Resolves where results go -- always outside this working tree. |
 | `alpha_registry.py` | Append-only ledger of alphas worth remembering. |
@@ -139,6 +140,28 @@ python research_cli.py catalog fields --dataset fundamental6 --type MATRIX \
 
 `--expressions` also emits ready-to-paste snippets, already winsorized and
 backfilled. Add `--save out.json` to keep a snapshot for offline use.
+
+### Check field names and compare variants (quota-free)
+
+```bash
+python research_cli.py catalog verify --fields cfps_mean,anl4_afv4_cfps_mean --strict
+python research_cli.py catalog concepts --dataset analyst4 --search cfps --min-spread 0.1
+```
+
+`catalog verify` answers one question: does this identifier exist in the live
+catalog for this scope? A name typed from memory is not an operator, so the
+operator catalog cannot see it, and the first symptom is a simulator error after
+the submission has been spent. `simulate` now runs this check itself before
+submitting anything and refuses to start on an unknown name.
+
+`catalog concepts` groups fields that differ only in family boilerplate and shows
+their coverage side by side. Two ids for the same quantity can differ by a third
+of the universe, and nothing in the ids says so, so the choice is made on the
+number. The grouping carries **no built-in vocabulary**: `--tail-tokens N`
+compares only the trailing words, `--ignore-words` drops words you name, and
+`--drop-numeric` ignores vintage numbers. Nothing about BRAIN's naming is
+hard-coded, so the tool cannot rot into mis-grouping after a family is renamed.
+
 
 ### Simulate
 

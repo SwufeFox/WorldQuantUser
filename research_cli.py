@@ -44,6 +44,7 @@ import research_config as config_io  # noqa: E402
 import alpha_registry  # noqa: E402
 import expression_lint  # noqa: E402
 import field_contract  # noqa: E402
+import field_index  # noqa: E402
 import research_paths  # noqa: E402
 import cache_store  # noqa: E402
 
@@ -289,6 +290,53 @@ def build_parser():
     cat_f.add_argument("--save")
     _add_session_args(cat_f)
     cat_f.set_defaults(func=cmd_catalog_fields)
+
+    cat_cc = cat.add_parser(
+        "concepts",
+        help="Group fields by concept and show variants side by side.")
+    cat_cc.add_argument("--dataset", default=None,
+                        help="Limit to one dataset id, e.g. analyst4.")
+    cat_cc.add_argument("--region", default="USA")
+    cat_cc.add_argument("--universe", default="TOP3000")
+    cat_cc.add_argument("--delay", type=int, default=1, choices=[0, 1])
+    cat_cc.add_argument("--instrument-type", default="EQUITY")
+    cat_cc.add_argument("--type", dest="field_type",
+                        choices=["MATRIX", "VECTOR", "GROUP"],
+                        help="Keep only this BRAIN field type.")
+    cat_cc.add_argument("--tail-tokens", type=int, default=2,
+                        help="Compare only the trailing N tokens, i.e. treat leading "
+                             "words as family boilerplate (0 = use every token).")
+    cat_cc.add_argument("--drop-numeric", action="store_true",
+                        help="Ignore purely numeric tokens (e.g. vintage suffixes). "
+                             "A mechanical rule, not catalog knowledge; off by default.")
+    cat_cc.add_argument("--ignore-words", nargs="*", default=[],
+                        help="Tokens to ignore when grouping, e.g. dataset family "
+                             "words. No vocabulary is built in; supply it here.")
+    cat_cc.add_argument("--search", default="",
+                        help="Filter on concept token or any member id.")
+    cat_cc.add_argument("--min-members", type=int, default=2,
+                        help="Only concepts with at least this many variants.")
+    cat_cc.add_argument("--min-spread", type=float, default=0.0,
+                        help="Only concepts whose coverage spread is at least this.")
+    cat_cc.add_argument("--limit", type=int, default=40)
+    cat_cc.add_argument("--save")
+    _add_session_args(cat_cc)
+    cat_cc.set_defaults(func=cmd_catalog_concepts)
+
+    cat_vf = cat.add_parser(
+        "verify",
+        help="Check field ids against the live catalog (catches typed-from-memory names).")
+    cat_vf.add_argument("--fields", nargs="+", default=[],
+                        help="Field ids, comma or space separated.")
+    cat_vf.add_argument("--region", default="USA")
+    cat_vf.add_argument("--universe", default="TOP3000")
+    cat_vf.add_argument("--delay", type=int, default=1, choices=[0, 1])
+    cat_vf.add_argument("--instrument-type", default="EQUITY")
+    cat_vf.add_argument("--strict", action="store_true",
+                        help="Exit with INVALID_INPUT when any name is unknown.")
+    cat_vf.add_argument("--save")
+    _add_session_args(cat_vf)
+    cat_vf.set_defaults(func=cmd_catalog_verify)
 
     cat_c = cat.add_parser("categories", help="Data categories with crowding stats.")
     cat_c.add_argument("--region", default="USA")
@@ -919,6 +967,94 @@ def cmd_catalog_fields(args, _sink):
     return data
 
 
+def cmd_catalog_concepts(args, _sink):
+    """Group fields by shared tokens and show coverage side by side.
+
+    The tool brings no vocabulary of its own: pass ``--ignore-words`` for the
+    boilerplate tokens of the family you are looking at, and everything left is
+    compared literally. Baking catalog knowledge into the source would encode one
+    snapshot of the naming and rot silently, so the judgment stays here at the
+    command line.
+    """
+    records = with_session(args, lambda s: field_index.fetch_all_fields(
+        s, region=args.region, universe=args.universe, delay=args.delay,
+        instrument_type=args.instrument_type,
+        dataset_ids=[args.dataset] if args.dataset else None,
+    ))
+    concepts = field_index.duplicate_concepts(
+        records, ignore_words=args.ignore_words,
+        min_members=args.min_members, min_spread=args.min_spread,
+        field_type=args.field_type, drop_numeric=args.drop_numeric,
+        tail_tokens=args.tail_tokens,
+    )
+    if args.search:
+        needle = args.search.lower()
+        concepts = [
+            item for item in concepts
+            if needle in item["concept"]
+            or any(needle in member["id"].lower() for member in item["fields"])
+        ]
+    limit = args.limit or len(concepts)
+    data = {
+        "region": args.region, "universe": args.universe, "delay": args.delay,
+        "dataset": args.dataset,
+        "ignore_words": list(args.ignore_words or []),
+        "drop_numeric": bool(args.drop_numeric),
+        "tail_tokens": args.tail_tokens,
+        "fields_scanned": len(records),
+        "concepts_with_variants": len(concepts),
+        "shown": min(limit, len(concepts)),
+        "concepts": concepts[:limit],
+        "note": ("grouping is literal token matching after --ignore-words; "
+                 "coverage_spread is best minus worst member"),
+    }
+    _maybe_save(args, data)
+    return data
+
+
+def cmd_catalog_verify(args, _sink):
+    """Check field identifiers against the live catalog, quota-free.
+
+    This is the check that catches a name typed from memory. Such a name is not
+    an operator, so the operator catalog cannot see it, and the first symptom is
+    a simulator error after the submission has already been spent.
+    """
+    wanted = []
+    for chunk in args.fields or []:
+        for piece in chunk.replace(",", " ").split():
+            if piece and piece not in wanted:
+                wanted.append(piece)
+    if not wanted:
+        raise CliError("USAGE", "nothing to verify",
+                       "pass --fields with one or more field ids, comma or space separated")
+
+    known = with_session(args, lambda s: field_index.field_ids(
+        field_index.fetch_all_fields(
+            s, region=args.region, universe=args.universe, delay=args.delay,
+            instrument_type=args.instrument_type,
+        )
+    ))
+    unknown = [name for name in wanted if name not in known]
+    found = [name for name in wanted if name in known]
+    data = {
+        "region": args.region, "universe": args.universe, "delay": args.delay,
+        "catalog_size": len(known),
+        "checked": len(wanted),
+        "found": found,
+        "unknown": unknown,
+        "verdict": "ok" if not unknown else "unknown_fields",
+    }
+    if unknown and args.strict:
+        raise CliError(
+            "INVALID_INPUT",
+            "field name(s) not present in the live catalog: %s" % ", ".join(unknown),
+            "run `catalog concepts --search <word>` to see the real variants for that idea",
+            details=data,
+        )
+    _maybe_save(args, data)
+    return data
+
+
 def cmd_catalog_categories(args, _sink):
     cache_report = {}
     categories = with_session(args, lambda s: ml.fetch_data_categories(
@@ -1066,6 +1202,13 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
 def _preflight_lint(session, pairs, args):
     """Lint against the operator catalog before spending simulation quota.
 
+    Two catalogs are consulted, not one. The operator index catches
+    ``regression_neut``-style names that have docs but cannot be simulated. The
+    field index catches identifiers that were typed from memory and never
+    existed, which the operator list cannot see because such a name is not an
+    operator at all -- one such typo cost a full simulation round trip before
+    this check existed.
+
     Raises ``INVALID_INPUT`` on a hard lint failure unless the caller passed
     ``--allow-lint-errors``; a clean pass is reported on stderr as an event so
     stdout stays a single JSON document.
@@ -1081,29 +1224,61 @@ def _preflight_lint(session, pairs, args):
         catalog_note = "unavailable: %s: %s" % (type(exc).__name__, exc)
         note("lint: operator catalog %s; continuing with the learned denylist only"
              % catalog_note)
+
+    known_fields = None
+    field_note = "unavailable"
+    try:
+        known_fields = field_index.field_ids(field_index.fetch_all_fields(
+            session,
+            # `simulate` leaves these as None so a research file's settings win.
+            # Passing None straight through makes /data-fields answer
+            # "Invalid query", so each falls back on a falsy check rather than a
+            # plain getattr default.
+            region=getattr(args, "region", None) or "USA",
+            universe=getattr(args, "universe", None) or "TOP3000",
+            delay=getattr(args, "delay", None) if getattr(args, "delay", None) is not None else 1,
+            instrument_type=getattr(args, "instrument_type", None) or "EQUITY",
+        ))
+        field_note = "checked (%d names)" % len(known_fields)
+    except Exception as exc:  # noqa: BLE001
+        field_note = "unavailable: %s: %s" % (type(exc).__name__, exc)
+        note("lint: field catalog unavailable (%s); field names are NOT verified "
+             "for this run, so a typo will only surface at the simulator" % exc)
+
     report = expression_lint.lint_all(
         pairs,
         operator_index=operator_index,
         denylist=expression_lint.load_denylist(),
+        known_fields=known_fields,
+        strict_fields=bool(known_fields),
     )
     report["operator_catalog_size"] = len(operator_index or {})
     report["operator_catalog"] = catalog_note
+    report["field_catalog"] = field_note
     if report["ok"]:
         return report
     if getattr(args, "allow_lint_errors", False):
         return report
     unknown = sorted({item.get("operator") for item in report["errors"]
                       if item.get("code") == "unknown_operator"})
+    unknown_fields = sorted({item.get("identifier") for item in report["errors"]
+                             if item.get("code") == "unknown_identifier"})
     hint = "fix the expressions, or pass --allow-lint-errors to submit anyway"
     if unknown:
         hint = ("operator(s) %s are not in the BRAIN operator list; a docs page "
                 "existing does not make them simulatable" % ", ".join(unknown))
+    if unknown_fields:
+        hint = ("field name(s) %s do not exist in the live catalog for this scope; "
+                "run `catalog concepts --search <word>` to find the real variants "
+                "instead of typing a name from memory" % ", ".join(unknown_fields))
     raise CliError(
         "INVALID_INPUT",
         "expression lint failed; nothing was submitted",
         hint,
         details={
             "operator_catalog_size": report["operator_catalog_size"],
+            "field_catalog": field_note,
+            "unknown_fields": unknown_fields,
             "errors": report["errors"],
             "warnings": report["warnings"],
         },
@@ -1120,10 +1295,12 @@ def cmd_simulate(args, sink):
     except config_io.ResearchError as exc:
         raise CliError("INVALID_INPUT", str(exc))
     labels = ml.alpha_labels(alphas, len(pairs))
+    families = ml.alpha_families(alphas, len(pairs))
 
     if args.dry_run:
         records = ml.simulate_alphas(
-            None, pairs, settings=settings, dry_run=True, labels=labels
+            None, pairs, settings=settings, dry_run=True, labels=labels,
+            families=families,
         )
         # Offline lint: catches structural problems and learned rejections. The
         # authoritative operator check needs the catalog, so it runs on `lint`
@@ -1167,6 +1344,7 @@ def cmd_simulate(args, sink):
             max_wait_seconds=args.max_wait_seconds,
             initial_records=checkpoint["records"],
             labels=labels,
+            families=families,
         ),
     )
     return _finalize_simulation(
@@ -1608,6 +1786,7 @@ def _record_simulation(records, settings, args):
             # A per-expression label beats the run-wide default so a batch that
             # spans several mechanisms still lands labelled per entry.
             mechanism=record.get("mechanism") or getattr(args, "mechanism", None),
+            family=record.get("family") or getattr(args, "family", None),
             verdict=_auto_verdict(record),
             note=getattr(args, "note", None),
             source="simulate",
