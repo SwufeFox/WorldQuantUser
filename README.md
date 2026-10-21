@@ -381,6 +381,33 @@ history. `simulate --record` classifies automatically (clears the bar →
 `candidate`, fails a check → `rejected`, otherwise `watch`); `alpha record` takes
 an explicit verdict when you have actually decided something.
 
+## Test an independence claim
+
+`SELF_CORRELATION` reports one opaque number and never names the counterpart, so
+it cannot tell you whether two candidates are two bets or one. `alpha corr` works
+on the daily PnL series instead:
+
+```bash
+python research_cli.py alpha corr A B C                 # pairwise matrix
+python research_cli.py alpha corr A --vs-book           # max against ACTIVE
+python research_cli.py alpha corr A B --control CDE     # residual correlation
+```
+
+Every pair is reported, not just each candidate's maximum: two alphas that each
+look independent of the book can still be 0.6 with each other, and that is the
+pair that decides whether you have two bets. Pairs that overlap for fewer than
+`--min-overlap` trading days are listed as skipped rather than dropped, because a
+missing correlation and a zero correlation mean different things.
+
+`--control` removes a shared carrier first: regress the control's PnL out of each
+series, then correlate the residuals. If a resemblance disappears, the two had
+the same factor and the same risk; if it survives, the resemblance is real.
+
+Daily PnL is cached under the results tree, so re-running a comparison costs
+nothing. The endpoint returns 200 with an empty body when polled too quickly;
+that is retried rather than recorded as "no PnL", which would otherwise leave
+correlation tables missing exactly the rows fetched fastest.
+
 ## Check an idea against the literature
 
 A field name tells you the data exists. It does not tell you whether the economic

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import math
+import os
 import pickle
 import random
 import re
@@ -1705,6 +1706,79 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
         "self_correlation": (checks or {}).get("SELF_CORRELATION"),
         "complete": bool(checks),
     }
+
+
+def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
+                    page_limit=10000, attempts=3):
+    """Return ``{date: pnl}`` for one alpha from the daily-pnl recordset.
+
+    This is the only view of an alpha's returns the platform exposes, and it is
+    what makes an independence claim testable instead of a guess. The
+    ``SELF_CORRELATION`` check reports one number against an opaque comparison
+    set and never names the counterpart, so reasoning about a pool needs the
+    series itself.
+
+    The endpoint answers 200 with an empty body when called too quickly in
+    succession. An empty reply is retried rather than returned as "this alpha has
+    no PnL", because treating throttling as absence silently produces correlation
+    tables that are missing exactly the rows that were fetched fastest.
+
+    ``cache_dir`` keeps a successful fetch for ``max_age_hours``: the series is
+    immutable history, and re-pulling it for every comparison wastes requests.
+    """
+    if cache_dir:
+        path = Path(cache_dir) / (alpha_id + ".json")
+        if path.is_file():
+            age = time.time() - path.stat().st_mtime
+            if age < max_age_hours * 3600:
+                try:
+                    cached = json.loads(path.read_text(encoding="utf-8"))
+                    if cached:
+                        return {k: float(v) for k, v in cached.items()}
+                except (OSError, ValueError, TypeError):
+                    pass
+
+    out = {}
+    offset = 0
+    remaining = attempts
+    while True:
+        url = BRAIN_API_URL + "/alphas/" + alpha_id + "/recordsets/daily-pnl"
+        params = {"limit": page_limit, "offset": offset} if offset else {}
+        response = s.get(url, params=params, timeout=_request_timeout(None))
+        if response.status_code != 200 or not response.text.strip():
+            if not out and remaining > 1:
+                remaining -= 1
+                time.sleep(3)
+                continue
+            break
+        try:
+            payload = response.json()
+        except ValueError:
+            break
+        records = payload.get("records") or []
+        for row in records:
+            if not row:
+                continue
+            value = row[1] if len(row) > 1 else None
+            if isinstance(value, (int, float)):
+                out[row[0]] = float(value)
+        if len(records) < page_limit:
+            break
+        offset += len(records)
+
+    if cache_dir and out:
+        try:
+            path = Path(cache_dir) / (alpha_id + ".json")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".json.tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(out, handle)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    return out
 
 
 def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=None):

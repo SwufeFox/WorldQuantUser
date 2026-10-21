@@ -49,6 +49,7 @@ import field_search  # noqa: E402
 import research_paths  # noqa: E402
 import cache_store  # noqa: E402
 import deepseek_search  # noqa: E402
+import correlation  # noqa: E402
 
 VERSION = "2.4.0"
 
@@ -595,6 +596,30 @@ def build_parser():
     a_find.add_argument("--limit", type=int, default=50)
     a_find.add_argument("--save")
     a_find.set_defaults(func=cmd_alpha_find)
+
+    a_corr = alpha_sub.add_parser(
+        "corr",
+        help="Daily-PnL correlation between alphas (quota-free).",
+        description="Correlation on daily PnL, optionally against the submitted "
+                    "book and optionally after removing a shared carrier. The "
+                    "platform's SELF_CORRELATION check reports one opaque number "
+                    "and never names the counterpart.")
+    a_corr.add_argument("alpha_id", nargs="+",
+                        help="Two or more alpha ids.")
+    a_corr.add_argument("--vs-book", action="store_true",
+                        help="Also report each alpha's maximum against ACTIVE alphas.")
+    a_corr.add_argument("--control", default=None,
+                        help="Regress this alpha's PnL out first, then correlate "
+                             "the residuals.")
+    a_corr.add_argument("--min-overlap", type=int, default=200,
+                        help="Minimum shared trading days (default 200).")
+    a_corr.add_argument("--threshold", type=float, default=0.7,
+                        help="Flag pairs at or above this absolute value (default 0.7).")
+    a_corr.add_argument("--max-age-hours", type=float, default=24.0,
+                        help="Reuse cached PnL younger than this (default 24).")
+    a_corr.add_argument("--save")
+    _add_session_args(a_corr)
+    a_corr.set_defaults(func=cmd_alpha_corr)
 
     a_book = alpha_sub.add_parser(
         "book",
@@ -2130,6 +2155,102 @@ def cmd_alpha_find(args, sink):
     }
     _maybe_save(args, document)
     return document
+
+
+def cmd_alpha_corr(args, sink):
+    """Correlation on daily PnL: the evidence independence claims need.
+
+    Three questions this answers that nothing else in the toolkit could:
+    whether a pair is really two bets, whether a candidate matches anything in
+    the submitted book, and whether a resemblance survives removing the leg both
+    sides share.
+    """
+    ids = []
+    for value in args.alpha_id:
+        for part in str(value).replace(",", " ").split():
+            if part and part not in ids:
+                ids.append(part)
+    if len(ids) < 2 and not args.vs_book:
+        raise CliError("USAGE", "at least two alpha ids are needed",
+                       "pass two or more ids, or one id with --vs-book")
+
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+
+    def load(session):
+        series = {}
+        for alpha_id in ids:
+            series[alpha_id] = ml.fetch_daily_pnl(
+                session, alpha_id, cache_dir=pnl_dir,
+                max_age_hours=args.max_age_hours)
+        book = {}
+        if args.vs_book:
+            for entry in ml.list_alphas(session, limit=200, status="ACTIVE",
+                                        alpha_type_not=""):
+                book_id = entry.get("id")
+                if book_id and book_id not in series:
+                    book[book_id] = ml.fetch_daily_pnl(
+                        session, book_id, cache_dir=pnl_dir,
+                        max_age_hours=args.max_age_hours)
+        control = None
+        if args.control:
+            control = ml.fetch_daily_pnl(
+                session, args.control, cache_dir=pnl_dir,
+                max_age_hours=args.max_age_hours)
+        return series, book, control
+
+    series, book, control = with_session(args, load)
+
+    empty = [name for name, data in series.items() if not data]
+    if empty:
+        raise CliError(
+            "NOT_FOUND",
+            "no daily PnL for %s" % ", ".join(sorted(empty)),
+            "the recordset is only populated for alphas that completed a "
+            "simulation; check the id with `alpha get`")
+
+    dates = sorted(set.intersection(*(set(v) for v in series.values())))
+    matrix = correlation.matrix(series, min_overlap=args.min_overlap)
+    high = [p for p in matrix["pairs"] if abs(p["r"]) >= args.threshold]
+    data = {
+        "ids": ids,
+        "window": {
+            "start": dates[0] if dates else None,
+            "end": dates[-1] if dates else None,
+            "shared_days": len(dates),
+        },
+        "matrix": matrix,
+        "flagged": high,
+        "threshold": args.threshold,
+        "independent": not high,
+    }
+
+    if book:
+        against = {}
+        for alpha_id, values in series.items():
+            if not values:
+                continue
+            against[alpha_id] = correlation.max_against(
+                values, book, min_overlap=args.min_overlap)
+        data["vs_book"] = {
+            "book_size": len(book),
+            "per_alpha": against,
+        }
+
+    if control:
+        residuals = {}
+        for alpha_id, values in series.items():
+            if values:
+                residuals[alpha_id] = correlation.residualize(
+                    values, control, min_overlap=args.min_overlap)
+        residual_matrix = correlation.matrix(residuals,
+                                             min_overlap=args.min_overlap)
+        data["residual"] = {
+            "control": args.control,
+            "matrix": residual_matrix,
+        }
+
+    _maybe_save(args, data)
+    return data
 
 
 def cmd_alpha_book(args, sink):

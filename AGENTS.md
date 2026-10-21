@@ -84,6 +84,16 @@ quality) and `authority` (3+ is authoritative), so prefer the paper over a post
 about it. Cached for a week; `--no-cache` bypasses. Queries are limited to 128
 characters, rejected locally.
 
+Test whether two alphas are really two bets:
+
+```bash
+python research_cli.py alpha corr A B C --vs-book
+python research_cli.py alpha corr A B --control CDE
+```
+
+The platform's `SELF_CORRELATION` is one number against an unnamed pool; this
+reads the daily PnL instead. Report every pair, not just each maximum.
+
 Diagnose a single alpha:
 
 ```bash
