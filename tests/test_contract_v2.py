@@ -863,8 +863,15 @@ class TranspileOneOhOneTests(unittest.TestCase):
             transpile_101.transpile("ts_min(low, 5)")
         self.assertIn("ts_min", str(ctx.exception))
 
-    def test_wider_adv_window_is_declared_as_adapted(self):
-        out, notes = transpile_101.transpile("rank(volume / adv180)")
+    def test_wider_adv_window_is_refused_by_default(self):
+        # Substituting a different averaging window changes what the formula
+        # measures, so it must be an explicit choice, not a silent rewrite.
+        with self.assertRaises(ValueError) as ctx:
+            transpile_101.transpile("rank(volume / adv180)")
+        self.assertIn("adv180", str(ctx.exception))
+
+    def test_wider_adv_window_can_be_opted_into(self):
+        out, notes = transpile_101.transpile("rank(volume / adv180)", adapt_adv=True)
         self.assertIn("adv20", out)
         self.assertTrue(notes)
 

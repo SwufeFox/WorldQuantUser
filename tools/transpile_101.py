@@ -164,9 +164,10 @@ def normalize_syntax(expr):
 
 
 #: The paper writes ``adv50``/``adv81``/``adv180``; this platform only publishes
-#: ``adv20``. Substituting a different averaging window changes the formula, so the
-#: substitution is declared here and the variant is tagged as adapted rather than
-#: being presented as the paper's alpha.
+#: ``adv20``. Substituting a different averaging window changes what the formula
+#: measures, so by default such a formula is REFUSED. ``--adapt-adv`` opts into the
+#: substitution and tags the variant, because a silent rewrite would be recorded as a
+#: test of the paper's claim when it is a test of a different one.
 ADV_FALLBACK = {"adv50", "adv60", "adv81", "adv120", "adv150", "adv180"}
 
 
@@ -186,8 +187,12 @@ def canonical_case(text):
     return _CALL.sub(swap, text)
 
 
-def transpile(expr):
-    """Return ``(fastexpr, notes)``; raise ``ValueError`` when not translatable."""
+def transpile(expr, adapt_adv=False):
+    """Return ``(fastexpr, notes)``; raise ``ValueError`` when not translatable.
+
+    ``adapt_adv`` is opt-in: without it, a formula using a wider adv window is
+    refused rather than quietly measured with a different window.
+    """
     text = strip_appendix(normalize_syntax(expr))
     used = {name.lower() for name in _CALL.findall(text)}
     absent = sorted(used & ABSENT)
@@ -202,9 +207,14 @@ def transpile(expr):
     adapted = []
     for name in sorted(ADV_FALLBACK):
         pattern = r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(name)
-        if re.search(pattern, text):
-            text = re.sub(pattern, "adv20", text)
-            adapted.append(name + "->adv20")
+        if not re.search(pattern, text):
+            continue
+        if not adapt_adv:
+            raise ValueError("uses %s, which this platform does not publish; "
+                             "pass --adapt-adv to substitute adv20 and label the "
+                             "result as adapted" % name)
+        text = re.sub(pattern, "adv20", text)
+        adapted.append(name + "->adv20")
     # Single quotes around numbers are not valid here.
     text = text.replace("'", "")
     return text, adapted
@@ -257,6 +267,9 @@ def main(argv=None):
                         help="Decays to generate per formula (comma separated).")
     parser.add_argument("--jitter", type=float, default=0.0,
                         help="Relative constant jitter, e.g. 0.25.")
+    parser.add_argument("--adapt-adv", action="store_true",
+                        help="Substitute adv20 for the wider windows the platform "
+                             "does not publish, tagging the result as adapted.")
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args(argv)
 
@@ -265,7 +278,7 @@ def main(argv=None):
     ok, refused, adaptations = {}, {}, {}
     for number in sorted(formulas):
         try:
-            expr, adapted = transpile(formulas[number])
+            expr, adapted = transpile(formulas[number], adapt_adv=args.adapt_adv)
         except ValueError as exc:
             refused[number] = str(exc)
             continue
