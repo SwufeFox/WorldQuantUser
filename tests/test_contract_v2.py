@@ -23,7 +23,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import alpha_registry  # noqa: E402
-import expression_lint  # noqa: E402
+import expression_lint
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import probe_units  # noqa: E402  # noqa: E402
 import field_contract  # noqa: E402
 import machine_lib  # noqa: E402
 import research_paths  # noqa: E402
@@ -801,3 +803,35 @@ class OperatorBudgetTests(unittest.TestCase):
         codes = {item.get("code") for item in result["errors"]}
         self.assertIn("operator_budget", codes)
         self.assertGreater(result["operator_estimate"], expression_lint.OPERATOR_LIMIT)
+
+
+class UnitProbeTests(unittest.TestCase):
+    """Probe interpretation, pinned to the simulator's own wording.
+
+    The first version read the "found" side of
+    ``expected "Unit[TSPrice:1]", found "Unit[]"`` and therefore recorded every
+    price-denominated field as dimensionless. Only printing the raw error showed it.
+    """
+
+    def test_expected_side_is_the_field_unit(self):
+        record = {"status": "WARNING",
+                  "error": 'Incompatible unit for input of "add" at index 1, '
+                           'expected "Unit[TSPrice:1]", found "Unit[]".'}
+        unit, _note = probe_units.interpret(record)
+        self.assertEqual(unit, "Unit[TSPrice:1]")
+
+    def test_clean_probe_means_dimensionless(self):
+        self.assertEqual(probe_units.interpret({"status": "COMPLETE", "error": None})[0],
+                         "dimensionless")
+
+    def test_unknown_field_is_not_a_unit(self):
+        unit, note = probe_units.interpret(
+            {"status": "ERROR", "error": "Attempted to use unknown variable foo"})
+        self.assertIsNone(unit)
+        self.assertIn("does not exist", note)
+
+    def test_raw_error_is_kept_for_other_failures(self):
+        unit, note = probe_units.interpret(
+            {"status": "ERROR", "error": "some other rejection"})
+        self.assertIsNone(unit)
+        self.assertIn("some other rejection", note)
