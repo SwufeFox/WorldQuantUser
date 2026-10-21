@@ -514,6 +514,15 @@ def build_parser():
                      help="Comma list from full, loo, solo (default all three).")
     abl.add_argument("--decay", type=int, default=None,
                      help="Override decay for every variant.")
+    abl.add_argument("--universe", default=None,
+                     help="Override the universe for the ablation file.")
+    abl.add_argument("--neutralization", default=None,
+                     choices=ml.NEUTRALIZATIONS,
+                     help="Override neutralisation for the ablation file.")
+    abl.add_argument("--region", default=None, choices=ml.REGIONS)
+    abl.add_argument("--delay", type=int, default=None, choices=[0, 1])
+    abl.add_argument("--test-period", default=None,
+                     help="P0Y / P1Y / P2Y / P3Y; the only split the platform honours.")
     abl.add_argument("--out", default=None,
                      help="Write the research file here instead of only reporting it.")
     abl.add_argument("--save")
@@ -1397,9 +1406,14 @@ def cmd_ablate(args, _sink):
     """
     expression = args.expr
     decay = args.decay
+    # Settings must be carried explicitly. An ablation file without a settings
+    # block falls back to the defaults, so a TOP500 study would silently run on
+    # TOP3000 and the comparison would be across two universes.
+    settings = {}
+    settings_source = "defaults"
     if args.file:
-        settings, alphas = config_io.load_research_file(args.file)
-        pairs = ml.normalize_alphas(alphas, settings)
+        loaded_settings, alphas = config_io.load_research_file(args.file)
+        pairs = ml.normalize_alphas(alphas, loaded_settings)
         if len(pairs) != 1 and not expression:
             raise CliError(
                 "INVALID_INPUT",
@@ -1410,6 +1424,24 @@ def cmd_ablate(args, _sink):
             expression = pairs[0][0]
         if decay is None:
             decay = pairs[0][1]
+        settings = dict(loaded_settings)
+        settings_source = args.file
+
+    overrides = {
+        "universe": getattr(args, "universe", None),
+        "neutralization": getattr(args, "neutralization", None),
+        "region": getattr(args, "region", None),
+        "delay": getattr(args, "delay", None),
+        "testPeriod": getattr(args, "test_period", None),
+    }
+    applied = {key: value for key, value in overrides.items() if value is not None}
+    if applied:
+        settings.update(applied)
+        settings_source = "flags"
+    # Resolve against the documented defaults so the emitted file is complete
+    # rather than relying on whatever the simulator happens to fill in.
+    resolved = dict(ml.DEFAULT_SETTINGS)
+    resolved.update(settings)
 
     if not expression:
         raise CliError("USAGE", "nothing to ablate",
@@ -1433,7 +1465,7 @@ def cmd_ablate(args, _sink):
         if decay is not None:
             entry["decay"] = decay
         alphas.append(entry)
-    document = {"alphas": alphas}
+    document = {"settings": resolved, "alphas": alphas}
 
     if args.out:
         Path(args.out).write_text(json.dumps(document, ensure_ascii=False, indent=2))
@@ -1444,6 +1476,8 @@ def cmd_ablate(args, _sink):
         "modes": modes,
         "variants": plan,
         "count": len(plan),
+        "settings": resolved,
+        "settings_source": settings_source,
         "written_to": args.out,
         "next": ("run with `simulate %s`, then `compare <results> --contributions`"
                  % (args.out or "<file>")),

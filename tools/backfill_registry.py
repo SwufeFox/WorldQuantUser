@@ -27,85 +27,48 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
+import argparse  # noqa: E402
+from pathlib import Path  # noqa: E402
+
 import alpha_registry  # noqa: E402
 import machine_lib as ml  # noqa: E402
 import research_paths  # noqa: E402
 
 RESEARCH = research_paths.research_dir()
 
-# Alphas worth remembering, with the annotation that makes them meaningful.
-# Expressions were re-read from the platform, so these labels sit next to the
-# real expression and can be checked against it.
-ACCOUNT_ALPHAS = {
-    "d5KVgrbJ": {
-        "idea": "main line",
-        "mechanism": "overnight/intraday reversal composite plus liabilities/assets",
-        "verdict": "candidate",
-        "note": "Main research line: 10d/42d overnight-minus-intraday reversal, "
-                "subindustry neutralized, plus a raw liabilities/assets leg. "
-                "Strongest known member of the existing family.",
-    },
-    "3qVNpxkX": {
-        "idea": "main line / decomposition",
-        "mechanism": "overnight-minus-intraday reversal only",
-        "verdict": "candidate",
-        "note": "Ablation of d5KVgrbJ: the reversal leg alone, no leverage term. "
-                "Kept to show how much of the composite comes from price structure.",
-    },
-    "2rjnEe1J": {
-        "idea": "main line / decomposition",
-        "mechanism": "liabilities/assets level",
-        "verdict": "candidate",
-        "note": "Ablation of d5KVgrbJ: the leverage leg alone. Very low turnover "
-                "(0.017), which is why it survived fit checks.",
-    },
-    "d51oN1O2": {
-        "idea": "IV skew x leverage",
-        "mechanism": "implied-vol call-put spread modulated by a leverage proxy",
-        "verdict": "rejected",
-        "note": "High headline numbers but fails CONCENTRATED_WEIGHT and "
-                "LOW_SUB_UNIVERSE_SHARPE: the signal is carried by a small group, "
-                "so it is not a usable standalone despite the score.",
-    },
-    "6XAY8n0E": {
-        "idea": "Idea 30 (leverage x FCF revision)",
-        "mechanism": "leverage level gated by FCFPS estimate revision",
-        "verdict": "candidate",
-        "note": "Adding the high-leverage x positive-revision interaction to the "
-                "additive baseline. The interaction alone scored far lower; the "
-                "value is in the interaction, not the standalone part.",
-    },
-    "XgRYr31m": {
-        "idea": "Idea 30 (leverage x FCF revision, lagged)",
-        "mechanism": "same interaction with leverage frozen 63 days earlier",
-        "verdict": "candidate",
-        "note": "Lagging the leverage term to 63 days back changed nothing "
-                "materially: evidence the interaction is not a same-day artifact.",
-    },
-    "P0Mq0wEM": {
-        "idea": "leverage level, size-bucketed",
-        "mechanism": "liabilities/assets, neutralized inside market-cap deciles",
-        "verdict": "candidate",
-        "note": "Minimal reference alpha used to verify the toolchain end to end. "
-                "Group-neutralizing by size bucket rather than subindustry keeps "
-                "the leverage ordering but removes the size bet.",
-    },
-    "xA19XpVn": {
-        "idea": "Idea 44 round 1",
-        "mechanism": "63-day FCF-per-share estimate revision",
-        "verdict": "watch",
-        "note": "Best field idea of the round-1 sweep but still below the bar "
-                "(sharpe 0.80). Recorded because the field pair itself is usable; "
-                "the expression is what failed, not the data.",
-    },
-    "88v7gGzm": {
-        "idea": "round 1 (customer/supplier graph)",
-        "mechanism": "customer count relative to competitor count",
-        "verdict": "watch",
-        "note": "Second-best round-1 idea at 0.73 with very low turnover. The "
-                "relationship fields are legitimate; the level form is too weak.",
-    },
-}
+def load_annotations(path):
+    """Read per-alpha annotations from a JSON file outside the repository.
+
+    Why the annotations are not a constant in this file: they are research
+    conclusions, and conclusions belong in the ledger this script fills, not in
+    git-tracked code. Baking them in once made this module a second source of
+    truth that had to be edited and re-run to correct a label, and it put
+    "which alphas matter and why" into the tool itself. Keeping them as data
+    means the tool stays generic and the judgement stays where it is queryable.
+    """
+    if not path:
+        return {}
+    try:
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise SystemExit("cannot read annotations %s: %s" % (path, exc))
+    except ValueError as exc:
+        raise SystemExit("annotations %s is not valid JSON: %s" % (path, exc))
+    if not isinstance(raw, dict):
+        raise SystemExit("annotations %s must be an object keyed by alpha id" % path)
+    cleaned = {}
+    for alpha_id, annotation in raw.items():
+        if not isinstance(annotation, dict):
+            raise SystemExit("annotation for %s must be an object" % alpha_id)
+        missing = [k for k in ("idea", "mechanism", "verdict", "note")
+                   if k not in annotation]
+        if missing:
+            raise SystemExit("annotation for %s is missing %s"
+                             % (alpha_id, ", ".join(missing)))
+        cleaned[alpha_id] = annotation
+    return cleaned
+
+
 
 # research file prefix -> idea label
 FILE_IDEAS = {
@@ -221,10 +184,10 @@ def record_research_files(session, registry_path):
     return added
 
 
-def record_account_alphas(session, registry_path):
+def record_account_alphas(session, registry_path, annotations):
     """Seed from the platform, re-reading every value instead of trusting notes."""
     added = 0
-    for alpha_id, annotation in ACCOUNT_ALPHAS.items():
+    for alpha_id, annotation in annotations.items():
         try:
             payload = ml.fetch_alpha_metrics(session, alpha_id)
         except Exception as exc:  # noqa: BLE001 - a missing alpha must not abort
@@ -335,15 +298,28 @@ def record_account_scan(session, registry_path, min_sharpe=1.25, min_fitness=1.0
 
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Seed the alpha ledger from the platform and from saved "
+                    "research files. Annotations are data, not code: pass a JSON "
+                    "file mapping alpha id to idea/mechanism/verdict/note.")
+    parser.add_argument("--annotations", default=None,
+                        help="JSON file of per-alpha annotations (outside the repo).")
+    args = parser.parse_args(argv)
+
     registry_path = alpha_registry.default_registry_path()
     print("registry:", registry_path)
     session = ml.load_session()
     if session is None:
         session = ml.authenticate()
 
-    print("account alphas:")
-    account_added = record_account_alphas(session, registry_path)
+    account_added = 0
+    annotations = load_annotations(args.annotations)
+    if annotations:
+        print("account alphas (%d annotated):" % len(annotations))
+        account_added = record_account_alphas(session, registry_path, annotations)
+    else:
+        print("account alphas: skipped (no --annotations file given)")
     print("research files:")
     research_added = record_research_files(session, registry_path)
     print("account scan (clean alphas above the bar):")
