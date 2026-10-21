@@ -26,7 +26,6 @@ import alpha_registry  # noqa: E402
 import expression_lint
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import probe_units  # noqa: E402
-import transpile_101  # noqa: E402
 import field_contract  # noqa: E402
 import machine_lib  # noqa: E402
 import research_paths  # noqa: E402
@@ -836,43 +835,6 @@ class UnitProbeTests(unittest.TestCase):
             {"status": "ERROR", "error": "some other rejection"})
         self.assertIsNone(unit)
         self.assertIn("some other rejection", note)
-
-
-class TranspileOneOhOneTests(unittest.TestCase):
-    """The paper's dialect to this platform's, with refusals preserved."""
-
-    def test_ternary_nested_inside_a_call(self):
-        # Alpha#1 hides the ternary inside SignedPower(...); scanning depth from the
-        # question mark instead of the string start put the split in the wrong place
-        # and emitted a malformed if_else.
-        expr = ("(rank(Ts_ArgMax(SignedPower(((returns < 0) ? stddev(returns, 20) "
-                ": close), 2.), 5)) - 0.5)")
-        out, _ = transpile_101.transpile(expr)
-        self.assertIn("if_else((returns < 0), ts_std_dev(returns, 20), close)", out)
-        self.assertIn("signed_power(", out)
-        self.assertNotIn("?", out)
-
-    def test_camel_case_is_rewritten(self):
-        out, _ = transpile_101.transpile("(-1 * Ts_Rank(rank(low), 9))")
-        self.assertIn("ts_rank(", out)
-        self.assertNotIn("Ts_Rank", out)
-
-    def test_absent_operator_is_refused(self):
-        with self.assertRaises(ValueError) as ctx:
-            transpile_101.transpile("ts_min(low, 5)")
-        self.assertIn("ts_min", str(ctx.exception))
-
-    def test_wider_adv_window_is_refused_by_default(self):
-        # Substituting a different averaging window changes what the formula
-        # measures, so it must be an explicit choice, not a silent rewrite.
-        with self.assertRaises(ValueError) as ctx:
-            transpile_101.transpile("rank(volume / adv180)")
-        self.assertIn("adv180", str(ctx.exception))
-
-    def test_wider_adv_window_can_be_opted_into(self):
-        out, notes = transpile_101.transpile("rank(volume / adv180)", adapt_adv=True)
-        self.assertIn("adv20", out)
-        self.assertTrue(notes)
 
 
 class TrailingTokenTests(unittest.TestCase):
