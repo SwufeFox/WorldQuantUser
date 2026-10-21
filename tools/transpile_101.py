@@ -260,7 +260,9 @@ def load_formulas(path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--source", default="/tmp/alphas101.txt")
+    parser.add_argument("--source", default=None,
+                        help="Formula list, one 'N<TAB>formula' per line "
+                             "(default: <results tree>/paper-101-formulas.txt).")
     parser.add_argument("--out", default=None,
                         help="Write a research JSON of the translatable formulas.")
     parser.add_argument("--salts", default="4,8,12",
@@ -273,7 +275,13 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args(argv)
 
-    formulas = load_formulas(args.source)
+    source = args.source
+    if source is None:
+        import research_paths
+        source = os.path.join(research_paths.ensure_dir(), "paper-101-formulas.txt")
+    if not os.path.exists(source):
+        raise SystemExit("no formula list at %s; extract the appendix first" % source)
+    formulas = load_formulas(source)
     decays = [int(part) for part in args.salts.split(",") if part.strip()]
     ok, refused, adaptations = {}, {}, {}
     for number in sorted(formulas):

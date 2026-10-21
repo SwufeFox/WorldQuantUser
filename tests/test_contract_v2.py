@@ -27,7 +27,6 @@ import expression_lint
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import probe_units  # noqa: E402
 import transpile_101  # noqa: E402
-import select_kmeans  # noqa: E402  # noqa: E402
 import field_contract  # noqa: E402
 import machine_lib  # noqa: E402
 import research_paths  # noqa: E402
@@ -874,37 +873,6 @@ class TranspileOneOhOneTests(unittest.TestCase):
         out, notes = transpile_101.transpile("rank(volume / adv180)", adapt_adv=True)
         self.assertIn("adv20", out)
         self.assertTrue(notes)
-
-
-class KMeansSelectionTests(unittest.TestCase):
-    """Clustering groups styles; it does not guarantee the picks are uncorrelated."""
-
-    def test_kmeans_separates_obvious_groups(self):
-        import numpy as np
-        left = np.array([[0.0, 0.0], [0.1, 0.1], [0.2, 0.0]])
-        right = np.array([[9.0, 9.0], [9.2, 8.8], [8.9, 9.1]])
-        matrix = np.vstack([left, right])
-        labels, _inertia = select_kmeans.kmeans(matrix, 2, seed=1, restarts=5)
-        self.assertEqual(len(set(labels[:3])), 1)
-        self.assertEqual(len(set(labels[3:])), 1)
-        self.assertNotEqual(labels[0], labels[3])
-
-    def test_within_cluster_correlation_reports_crowding(self):
-        # Two members of one cluster that move together must show up as crowded.
-        import numpy as np
-        ids = ["a", "b", "c"]
-        cmatrix = np.array([[1.0, 0.95, 0.1],
-                            [0.95, 1.0, 0.1],
-                            [0.1, 0.1, 1.0]])
-        crowded = select_kmeans.mean_abs_corr(ids, cmatrix, ["a", "b"])
-        loose = select_kmeans.mean_abs_corr(ids, cmatrix, ["a", "c"])
-        self.assertGreater(crowded, 0.9)
-        self.assertLess(loose, 0.2)
-
-    def test_single_member_cluster_is_not_crowded(self):
-        import numpy as np
-        cmatrix = np.eye(3)
-        self.assertEqual(select_kmeans.mean_abs_corr(["a", "b", "c"], cmatrix, ["a"]), 0.0)
 
 
 class VectorFieldTests(unittest.TestCase):

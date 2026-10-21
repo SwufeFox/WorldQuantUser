@@ -8,7 +8,8 @@ return and pairwise correlation across its whole pool, and the correlation
 
 The point is that per-alpha reporting hides what a pool is. Two pools can share a
 best alpha and differ completely in spread: one narrow and correlated, one broad and
-independent. The paper's 101 alphas come from price and volume alone and still show a
+independent. The paper's 101 alphas are "mostly price-volume" - it also uses some
+fundamental input, market cap, and an industry classification - and still show a
 median pairwise correlation of 14.3 percent, which is only visible in a table like
 this.
 
@@ -165,7 +166,7 @@ def main(argv=None):
               % (labels[key], stats["min"], stats["q1"], stats["median"],
                  stats["mean"], stats["q3"], stats["max"]))
     print()
-    print("for comparison, Kakushadze (2015) reports over 101 price-volume alphas:")
+    print("for comparison, Kakushadze (2015) reports over its 101 alphas")
     print("  sharpe median 2.224, turnover median 0.4752, holding 2.10 days,")
     print("  pairwise correlation median 0.1431, mean 0.1586, max 0.8733")
 
