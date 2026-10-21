@@ -642,6 +642,54 @@ def build_parser():
     a_find.add_argument("--save")
     a_find.set_defaults(func=cmd_alpha_find)
 
+    a_lbl = alpha_sub.add_parser(
+        "label",
+        help="Set family / verdict / mechanism on an existing ledger entry (offline).",
+        description="Fill in the judgement columns without editing JSONL by hand. "
+                    "A new record is appended under the same key, so history is kept.")
+    a_lbl.add_argument("alpha_id")
+    a_lbl.add_argument("--family", default=None, choices=list(alpha_registry.FAMILIES))
+    a_lbl.add_argument("--verdict", default=None, choices=list(alpha_registry.VERDICTS))
+    a_lbl.add_argument("--mechanism", default=None)
+    a_lbl.add_argument("--idea", default=None)
+    a_lbl.add_argument("--note", default=None)
+    a_lbl.add_argument("--registry", default=None)
+    a_lbl.add_argument("--save")
+    a_lbl.set_defaults(func=cmd_alpha_label)
+
+    a_imp = alpha_sub.add_parser(
+        "impact",
+        help="Which other alphas stand on the same legs (offline).",
+        description="Leg names are positional, so exposure is matched on the leg "
+                    "body: the same sub-expression, not the same letter.")
+    a_imp.add_argument("alpha_id")
+    a_imp.add_argument("--min-shared", type=int, default=1)
+    a_imp.add_argument("--limit", type=int, default=25)
+    a_imp.add_argument("--registry", default=None)
+    a_imp.add_argument("--save")
+    a_imp.set_defaults(func=cmd_alpha_impact)
+
+    a_lin = alpha_sub.add_parser(
+        "lineage",
+        help="Walk the parent edges of an alpha (offline).",
+        description="Shows where a variant came from and by which operation.")
+    a_lin.add_argument("alpha_id")
+    a_lin.add_argument("--registry", default=None)
+    a_lin.add_argument("--save")
+    a_lin.set_defaults(func=cmd_alpha_lineage)
+
+    a_cov = alpha_sub.add_parser(
+        "coverage",
+        help="How much of the ledger still lacks labels (offline).",
+        description="Independence is counted on the family column; this reports "
+                    "how far that column is from being usable.")
+    a_cov.add_argument("--registry", default=None)
+    a_cov.add_argument("--list-missing", action="store_true",
+                       help="Also list keys missing a family, most recent first.")
+    a_cov.add_argument("--limit", type=int, default=40)
+    a_cov.add_argument("--save")
+    a_cov.set_defaults(func=cmd_alpha_coverage)
+
     a_corr = alpha_sub.add_parser(
         "corr",
         help="Daily-PnL correlation between alphas (quota-free).",
@@ -2370,6 +2418,117 @@ def cmd_alpha_find(args, sink):
     }
     _maybe_save(args, document)
     return document
+
+
+def _ledger(args):
+    path = (getattr(args, "registry", None)
+            or alpha_registry.default_registry_path())
+    return path, alpha_registry.load_entries(path)
+
+
+def cmd_alpha_label(args, _sink):
+    """Rewrite the judgement columns of one entry.
+
+    Appends rather than edits: the ledger is append-only and the newest record for
+    a key wins, so a relabel keeps the earlier judgement visible.
+    """
+    path, entries = _ledger(args)
+    target = alpha_registry.resolve(entries, args.alpha_id)
+    if target is None:
+        raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id,
+                       "run `alpha find` or `alpha registry` to see what is recorded")
+    if all(getattr(args, name, None) is None
+           for name in ("family", "verdict", "mechanism", "idea", "note")):
+        raise CliError("USAGE", "nothing to change",
+                       "pass at least one of --family/--verdict/--mechanism/"
+                       "--idea/--note")
+    try:
+        updated = alpha_registry.relabel(
+            target, family=args.family, verdict=args.verdict,
+            mechanism=args.mechanism, idea=args.idea, note=args.note)
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc)) from exc
+    _, written = alpha_registry.record_entry(updated, path)
+    data = {
+        "key": updated.get("key"),
+        "alpha_id": updated.get("alpha_id"),
+        "written": written,
+        "family": updated.get("family"),
+        "verdict": updated.get("verdict"),
+        "mechanism": updated.get("mechanism"),
+        "before": {"family": target.get("family"),
+                   "verdict": target.get("verdict")},
+    }
+    _maybe_save(args, data)
+    return data
+
+
+def cmd_alpha_impact(args, _sink):
+    """Alphas that share a leg body with the given one."""
+    _path, entries = _ledger(args)
+    target = alpha_registry.resolve(entries, args.alpha_id)
+    if target is None:
+        raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id)
+    bodies = alpha_registry.leg_bodies(target)
+    rows = alpha_registry.shared_legs(entries, args.alpha_id,
+                                      min_shared=args.min_shared)
+    data = {
+        "alpha_id": target.get("alpha_id"),
+        "key": target.get("key"),
+        "legs": [{"name": name, "body": body}
+                 for name, body in bodies.items()],
+        "shared_count": len(rows),
+        "rows": rows[: args.limit],
+        "note": ("legs are matched on the sub-expression body; a shared letter "
+                 "means nothing on its own"),
+    }
+    _maybe_save(args, data)
+    return data
+
+
+def cmd_alpha_lineage(args, _sink):
+    """Parent chain for one alpha."""
+    _path, entries = _ledger(args)
+    chain = alpha_registry.lineage(entries, args.alpha_id)
+    if not chain:
+        raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id)
+    children = alpha_registry.descendants(entries, args.alpha_id)
+    data = {
+        "alpha_id": args.alpha_id,
+        "depth": len(chain),
+        "chain": [
+            {"key": item.get("key"), "alpha_id": item.get("alpha_id"),
+             "op": item.get("op"), "verdict": item.get("verdict"),
+             "family": item.get("family"),
+             "fitness": (item.get("metrics") or {}).get("fitness")}
+            for item in chain
+        ],
+        "children": [{"key": item.get("key"), "alpha_id": item.get("alpha_id")}
+                     for item in children],
+        "note": ("lineage is recorded, never inferred; an empty op means the "
+                 "record predates lineage capture"),
+    }
+    _maybe_save(args, data)
+    return data
+
+
+def cmd_alpha_coverage(args, _sink):
+    """How far the ledger is from having a countable family column."""
+    _path, entries = _ledger(args)
+    summary = alpha_registry.unlabeled_summary(entries)
+    data = {"summary": summary}
+    if args.list_missing:
+        missing = [entry for entry in entries if not entry.get("family")]
+        missing.sort(key=lambda entry: entry.get("recorded_at") or "", reverse=True)
+        data["missing"] = [
+            {"key": entry.get("key"), "alpha_id": entry.get("alpha_id"),
+             "verdict": entry.get("verdict"),
+             "fitness": (entry.get("metrics") or {}).get("fitness"),
+             "mechanism": entry.get("mechanism")}
+            for entry in missing[: args.limit]
+        ]
+    _maybe_save(args, data)
+    return data
 
 
 def cmd_alpha_corr(args, sink):

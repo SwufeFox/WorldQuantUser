@@ -493,11 +493,18 @@ class AlphaRegistryTests(unittest.TestCase):
         entry = alpha_registry.build_entry(self._alpha(checks=checks))
         self.assertEqual(entry["failing_checks"], ["CONCENTRATED_WEIGHT"])
 
-    def test_entry_without_alpha_id_is_keyed_by_expression(self):
+    def test_entry_without_alpha_id_is_keyed_by_expression_and_settings(self):
+        # Keying on the expression alone conflated one formula run under two
+        # universes, so the second record silently replaced the first.
         alpha = self._alpha(alpha_id=None)
         entry = alpha_registry.build_entry(alpha, verdict="rejected")
         self.assertTrue(entry["key"].startswith("expr:"))
-        self.assertEqual(entry["key"], entry["expression_hash"])
+        self.assertTrue(entry["key"].startswith(entry["expression_hash"]))
+        self.assertIn("@", entry["key"])
+        other = alpha_registry.build_entry(
+            dict(alpha, settings={"universe": "TOP500", "decay": 12}),
+            verdict="rejected")
+        self.assertNotEqual(entry["key"], other["key"])
 
     def test_invalid_verdict_rejected(self):
         with self.assertRaises(ValueError):

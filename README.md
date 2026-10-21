@@ -381,6 +381,33 @@ history. `simulate --record` classifies automatically (clears the bar →
 `candidate`, fails a check → `rejected`, otherwise `watch`); `alpha record` takes
 an explicit verdict when you have actually decided something.
 
+## Track how alphas relate
+
+The ledger records what each alpha is and how it scored. These commands cover the
+other half — how they relate — and all of them work offline.
+
+```bash
+python research_cli.py alpha coverage                 # how much lacks a family label
+python research_cli.py alpha label ABC12345 --family quality --verdict candidate
+python research_cli.py alpha impact ABC12345          # who else stands on these legs
+python research_cli.py alpha lineage ABC12345         # where a variant came from
+```
+
+`alpha impact` matches on the **leg body**, not the leg name: leg names are
+positional, so `a` means whatever the author put there and a shared letter carries
+no information. Two alphas sharing a body are the same exposure even when their
+PnL is uncorrelated, and that is the question correlation cannot answer.
+
+`alpha label` appends a new record under the same key rather than rewriting, so a
+superseded judgement stays visible. `alpha coverage` exists because independence is
+counted on the `family` column, and that column being partly empty is itself a
+finding rather than something to paper over.
+
+Record identity also changed: an entry with no alpha id is now keyed on the
+expression **and** a fingerprint of the settings that alter results (universe,
+region, delay, decay, neutralisation, truncation, test period). Keying on the
+expression alone silently merged the same formula run under two universes.
+
 ## Ask whether a leg earns its place
 
 Adding a leg felt productive and was often a loss: a five-leg version scored below

@@ -102,6 +102,44 @@ def expression_hash(expression):
     return "expr:" + digest[:16]
 
 
+#: Settings that change what an expression measures. A record without an alpha id
+#: used to key on the expression alone, so the same formula run on TOP3000 and
+#: TOP500 collapsed into one entry and the second silently overwrote the first.
+_FINGERPRINT_KEYS = ("universe", "region", "delay", "decay", "neutralization",
+                     "truncation", "testPeriod", "instrumentType")
+
+
+def settings_fingerprint(settings):
+    """Short hash of the settings that decide what a simulation measures.
+
+    Only the inputs that alter results are included; cosmetic keys such as
+    ``language`` or ``visualization`` would make two identical experiments look
+    different.
+    """
+    if not settings:
+        return "nosettings"
+    parts = []
+    for key in _FINGERPRINT_KEYS:
+        if key in settings and settings[key] is not None:
+            value = settings[key]
+            if isinstance(value, float):
+                value = round(value, 6)
+            parts.append("%s=%s" % (key, value))
+    if not parts:
+        return "nosettings"
+    digest = hashlib.sha256(";".join(parts).encode("utf-8")).hexdigest()
+    return digest[:8]
+
+
+def placeholder_key(expression, settings):
+    """Key for a record that has no alpha id yet.
+
+    Combines the expression with the settings fingerprint so two runs of one
+    formula under different universes or decays stay distinct.
+    """
+    return "%s@%s" % (expression_hash(expression), settings_fingerprint(settings))
+
+
 def _now():
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
 
@@ -179,7 +217,9 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
         settings["decay"] = alpha["decay"]
 
     entry = {
-        "key": alpha_id or expression_hash(expression),
+        # A record without an id used to key on the expression alone, so the same
+        # formula at a different universe or decay overwrote the earlier one.
+        "key": alpha_id or placeholder_key(expression, settings),
         "alpha_id": alpha_id,
         "idea": idea,
         "mechanism": mechanism,
@@ -189,6 +229,7 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
         "expression": expression,
         "expression_hash": expression_hash(expression),
         "settings": settings,
+        "settings_fingerprint": settings_fingerprint(settings),
         "metrics": metrics,
         "failing_checks": _failing_checks(checks),
         "checks": checks,
@@ -199,6 +240,18 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
     }
     if extra:
         entry["extra"] = extra
+    # Lineage is recorded, never inferred: an ablation variant knows which
+    # composite it came from and by which operation, and a research file knows
+    # nothing, so the field stays absent rather than guessed.
+    parent = alpha.get("parent")
+    if parent:
+        entry["parent"] = parent
+    operation = alpha.get("op")
+    if operation:
+        entry["op"] = operation
+    legs = alpha.get("legs")
+    if legs:
+        entry["legs"] = list(legs)
     split = alpha.get("out_of_sample")
     if isinstance(split, dict):
         # BRAIN's own train/test split is the only out-of-sample evidence the
@@ -407,3 +460,186 @@ def render_markdown(entries, title="Alpha registry"):
             note or "—",
         ))
     return "\n".join(lines) + "\n"
+
+
+def relabel(entry, family=None, verdict=None, mechanism=None, idea=None,
+            note=None):
+    """Return a copy of ``entry`` with labels replaced.
+
+    Labels are the only part of a record that is judgement rather than
+    measurement, and they are the part that had to be filled in by editing the
+    JSONL by hand: 318 of 481 keys carried no ``family``, which made "how many
+    independent mechanisms" unanswerable from the ledger. Changing a label
+    appends a new record under the same key, so history is preserved and the
+    newest record wins.
+    """
+    updated = dict(entry)
+    if family is not None:
+        if family not in FAMILIES:
+            raise ValueError("family must be one of %s, got %r"
+                             % (", ".join(FAMILIES), family))
+        updated["family"] = family
+    if verdict is not None:
+        if verdict not in VERDICTS:
+            raise ValueError("verdict must be one of %s, got %r"
+                             % (", ".join(VERDICTS), verdict))
+        updated["verdict"] = verdict
+    if mechanism is not None:
+        updated["mechanism"] = mechanism
+    if idea is not None:
+        updated["idea"] = idea
+    if note is not None:
+        updated["note"] = note
+    updated["recorded_at"] = _now()
+    updated["source"] = "relabel"
+    return updated
+
+
+def derive_legs(expression):
+    """Leg names parsed from an expression, or an empty list.
+
+    Derived on demand rather than migrated into every record: the ledger predates
+    the legs column, and a backfill would have to be re-run whenever the parser
+    improves. Parsing is cheap and the grammar is the same one the ablation uses.
+    """
+    try:
+        import ablation
+        return list(ablation.parse(expression)["used"])
+    except Exception:  # noqa: BLE001 - an unparseable expression simply has no legs
+        return []
+
+
+def legs_of(entry):
+    """Declared legs, falling back to parsing the recorded expression."""
+    legs = entry.get("legs")
+    if legs:
+        return list(legs)
+    return derive_legs(entry.get("expression"))
+
+
+def leg_bodies(entry):
+    """``{leg_name: normalized_body}`` for an expression.
+
+    Leg names are positional — ``a`` means whatever the author put there — so a
+    name is not an identity. Comparing bodies is what makes "the same leg" mean
+    the same sub-expression.
+    """
+    try:
+        import ablation
+        parsed = ablation.parse(entry.get("expression"))
+    except Exception:  # noqa: BLE001 - no legs means no leg-level exposure
+        return {}
+    return {name: " ".join(body.split())
+            for name, body in parsed["legs"].items()}
+
+
+def shared_legs(entries, reference, min_shared=1):
+    """Other entries that stand on the same leg bodies as ``reference``.
+
+    This is the exposure view correlation cannot give: two alphas can have
+    uncorrelated PnL and still both stand on the deferred-revenue ratio, in which
+    case a judgement about that leg applies to both.
+    """
+    target = resolve(entries, reference)
+    if target is None:
+        return []
+    target_bodies = {}
+    for name, body in leg_bodies(target).items():
+        target_bodies[body] = name
+    rows = []
+    for entry in entries:
+        if entry.get("key") == target.get("key"):
+            continue
+        matched = [body for body in leg_bodies(entry).values()
+                   if body in target_bodies]
+        if len(matched) >= min_shared:
+            rows.append({
+                "key": entry.get("key"),
+                "alpha_id": entry.get("alpha_id"),
+                "verdict": entry.get("verdict"),
+                "shared_legs": len(matched),
+                "bodies": matched,
+            })
+    rows.sort(key=lambda row: row["shared_legs"], reverse=True)
+    return rows
+
+
+def leg_index(entries):
+    """Map each normalized leg body to the keys that use it."""
+    index = {}
+    for entry in entries:
+        for body in leg_bodies(entry).values():
+            index.setdefault(body, []).append(entry.get("key"))
+    return {body: sorted(set(keys)) for body, keys in index.items()}
+
+
+def entries_with_leg(entries, needle):
+    """Entries whose expression contains a leg body matching ``needle``."""
+    needle_lower = (needle or "").lower()
+    out = []
+    for entry in entries:
+        for body in leg_bodies(entry).values():
+            if needle_lower in body.lower():
+                out.append(entry)
+                break
+    return out
+
+
+def resolve(entries, reference):
+    """Find one entry by alpha id, ledger key or expression hash."""
+    if not reference:
+        return None
+    for entry in entries:
+        if reference in (entry.get("alpha_id"), entry.get("key"),
+                         entry.get("expression_hash")):
+            return entry
+    return None
+
+
+def lineage(entries, reference, max_depth=32):
+    """Walk parent edges from ``reference`` upward.
+
+    Returns the chain from the entry itself to the oldest ancestor. A broken or
+    missing parent ends the walk instead of looping: the ledger is append-only and
+    a record may predate lineage being recorded at all.
+    """
+    chain = []
+    seen = set()
+    current = resolve(entries, reference)
+    while current is not None and len(chain) < max_depth:
+        key = current.get("key") or current.get("alpha_id")
+        if key in seen:
+            break
+        seen.add(key)
+        chain.append(current)
+        parent = current.get("parent")
+        current = resolve(entries, parent) if parent else None
+    return chain
+
+
+def descendants(entries, reference):
+    """Every entry that reaches ``reference`` through parent edges."""
+    target = resolve(entries, reference)
+    if target is None:
+        return []
+    target_key = target.get("key")
+    target_hash = target.get("expression_hash")
+    out = []
+    for entry in entries:
+        parent = entry.get("parent")
+        if parent and parent in (target_key, target_hash, target.get("alpha_id")):
+            out.append(entry)
+    return out
+
+
+def unlabeled_summary(entries):
+    """How much of the ledger still lacks the columns independence is counted on."""
+    total = len(entries)
+    missing_family = sum(1 for e in entries if not e.get("family"))
+    missing_mechanism = sum(1 for e in entries if not e.get("mechanism"))
+    return {
+        "total": total,
+        "missing_family": missing_family,
+        "missing_mechanism": missing_mechanism,
+        "family_coverage": round(1 - missing_family / total, 3) if total else None,
+    }
