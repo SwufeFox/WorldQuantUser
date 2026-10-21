@@ -415,6 +415,34 @@ def _call_arguments(expression):
     return found
 
 
+_TRAILING = re.compile(r"\)\s*([0-9A-Za-z_])")
+
+
+def trailing_token_findings(expression):
+    """Flag a token sitting immediately after a closing parenthesis.
+
+    A PDF extraction glued page numbers onto eight of the 101 formulas, producing
+    ``(if_else(...)) 9``. Nothing else objected: the parentheses balance, every
+    operator is known, and a bare digit is not an unknown identifier, so the
+    expression reached the simulator and came back as "Unexpected character '9'".
+
+    The test is deliberately narrow - a closing parenthesis followed by whitespace
+    and then a digit or letter - because that position requires an operator. An
+    earlier version cut at the first balanced group and therefore flagged the
+    perfectly valid ``rank(close) - 0.5``, which its own unit test caught.
+    """
+    found = []
+    for match in _TRAILING.finditer(expression or ""):
+        found.append({
+            "code": "trailing_token",
+            "severity": "error",
+            "offset": match.start(),
+            "message": ("%r follows a closing parenthesis with no operator between "
+                        "them" % match.group(1)),
+        })
+    return found
+
+
 def vector_findings(expression, field_types, strict=False):
     """Flag VECTOR fields handed to operators that cannot read them."""
     if not field_types:
@@ -614,6 +642,9 @@ def lint_expression(expression, operator_index=None, denylist=None,
             errors.append(finding)
         else:
             warnings.append(finding)
+
+    for finding in trailing_token_findings(expression):
+        errors.append(finding)
 
     # VECTOR ("event-driven") fields are a third of the catalogue and most operators
     # cannot read them; a template batch that ignores this fails en masse.

@@ -875,6 +875,23 @@ class TranspileOneOhOneTests(unittest.TestCase):
         self.assertTrue(notes)
 
 
+class TrailingTokenTests(unittest.TestCase):
+    """PDF extraction glued page numbers onto eight of the 101 formulas."""
+
+    def test_trailing_digit_is_an_error(self):
+        report = expression_lint.lint_expression("(if_else((adv20 < volume), 1, -1)) 9")
+        codes = {item.get("code") for item in report["errors"]}
+        self.assertIn("trailing_token", codes)
+
+    def test_clean_expression_has_no_finding(self):
+        self.assertEqual(
+            expression_lint.trailing_token_findings("(if_else((adv20 < volume), 1, -1))"),
+            [])
+
+    def test_plain_expression_without_parens_is_fine(self):
+        self.assertEqual(expression_lint.trailing_token_findings("rank(close) - 0.5"), [])
+
+
 class VectorFieldTests(unittest.TestCase):
     """A third of the catalogue is VECTOR, and most operators cannot read it.
 
