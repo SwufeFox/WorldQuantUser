@@ -48,6 +48,7 @@ import field_index  # noqa: E402
 import field_search  # noqa: E402
 import research_paths  # noqa: E402
 import cache_store  # noqa: E402
+import deepseek_search  # noqa: E402
 
 VERSION = "2.4.0"
 
@@ -410,6 +411,29 @@ def build_parser():
     lint.add_argument("--save")
     _add_session_args(lint)
     lint.set_defaults(func=cmd_lint)
+
+    lit = sub.add_parser(
+        "search",
+        help="Literature search and page fetch via the DeepSeek Search API.")
+    lit.add_argument("query", nargs="?",
+                     help="Search query. Supports site:, \"exact phrase\", "
+                          "lang:, after:, before: and -exclude.")
+    lit.add_argument("--fetch", dest="fetch_url", default=None,
+                     help="Fetch one URL as Markdown instead of searching.")
+    lit.add_argument("--count", type=int, default=10,
+                     help="Number of results, 1-50 (default 10).")
+    lit.add_argument("--content", action="store_true",
+                     help="Ask the API to include page content in results.")
+    lit.add_argument("--min-score", type=float, default=0.0,
+                     help="Drop results below this rerank_score (1.5+ is high quality).")
+    lit.add_argument("--min-authority", type=int, default=None,
+                     help="Drop results below this authority level (3+ is authoritative).")
+    lit.add_argument("--max-age-hours", type=float, default=168.0,
+                     help="Reuse a cached answer younger than this (default 168).")
+    lit.add_argument("--no-cache", action="store_true",
+                     help="Ignore and do not write the cache.")
+    lit.add_argument("--save")
+    lit.set_defaults(func=cmd_search)
 
     sim = sub.add_parser(
         "simulate", help="Simulate alphas (spends simulation quota unless --dry-run).")
@@ -1304,6 +1328,106 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
     return result
 
 
+def _search_failure(exc):
+    """Map a DeepSeek search error onto the CLI's documented codes."""
+    if isinstance(exc, deepseek_search.MissingSearchKey):
+        return CliError(
+            "AUTH_MISSING", str(exc),
+            "put DEEPSEEK_API_KEY in .env next to machine_lib.py, or export it; "
+            "never paste the key into chat or a commit")
+    if isinstance(exc, deepseek_search.SearchAuthError):
+        return CliError("AUTH_FAILED", str(exc),
+                        "check that the key is valid and the account can use the "
+                        "Search API")
+    if isinstance(exc, deepseek_search.SearchInsufficientBalance):
+        return CliError("SERVICE_ERROR", str(exc),
+                        "top up the DeepSeek account; Search and Fetch are free "
+                        "until billing starts on 2026-11-01 Beijing time")
+    if isinstance(exc, deepseek_search.SearchRateLimited):
+        return CliError("RATE_LIMITED", str(exc), "wait a moment and retry")
+    if isinstance(exc, deepseek_search.SearchBlocked):
+        return CliError("NOT_FOUND", str(exc),
+                        "the page was refused or had no usable text; try another "
+                        "source")
+    return CliError("SERVICE_ERROR", str(exc), "retry, or narrow the query")
+
+
+def cmd_search(args, _sink):
+    """Literature search or single-page fetch, quota-free on the BRAIN side.
+
+    Kept in this CLI rather than a browser because the point is to connect a
+    mechanism idea to the paper that tests it, and to leave a record of what was
+    read. Results keep the provider's ranking and its ``rerank_score`` /
+    ``authority`` / ``date`` fields so a journal article can be preferred over a
+    blog restating it.
+    """
+    if not deepseek_search.available():
+        raise _search_failure(deepseek_search.MissingSearchKey(
+            "No DeepSeek key configured (DEEPSEEK_API_KEY)"))
+
+    if args.fetch_url:
+        try:
+            page = deepseek_search.fetch(args.fetch_url)
+        except deepseek_search.DeepSeekSearchError as exc:
+            raise _search_failure(exc) from exc
+        content = page.get("content") or ""
+        data = {
+            "mode": "fetch",
+            "url": args.fetch_url,
+            "title": page.get("title"),
+            "content": content,
+            "chars": len(content),
+        }
+        _maybe_save(args, data)
+        return data
+
+    if not args.query:
+        raise CliError("USAGE", "nothing to search",
+                       "pass a query, or --fetch URL to read one page")
+
+    cached = False
+    try:
+        if args.no_cache:
+            results = deepseek_search.search(
+                args.query, count=args.count, need_content=args.content)
+        else:
+            results, cached = deepseek_search.search_cached(
+                research_paths.ensure_dir(), args.query, count=args.count,
+                need_content=args.content, max_age_hours=args.max_age_hours)
+    except deepseek_search.DeepSeekSearchError as exc:
+        raise _search_failure(exc) from exc
+
+    total = len(results)
+    kept = deepseek_search.high_quality(
+        results, min_score=args.min_score, min_authority=args.min_authority)
+    data = {
+        "mode": "search",
+        "query": args.query,
+        "total": total,
+        "returned": len(kept),
+        "cached": cached,
+        "filters": {"min_score": args.min_score,
+                    "min_authority": args.min_authority},
+        "results": [
+            {
+                "title": item.get("title"),
+                "url": item.get("url"),
+                "summary": item.get("summary"),
+                "site_name": item.get("site_name"),
+                "date": item.get("date"),
+                "rerank_score": item.get("rerank_score"),
+                "authority": item.get("authority"),
+                "content": item.get("content") if args.content else None,
+            }
+            for item in kept
+        ],
+        "note": ("rerank_score 1.5+ is high quality and authority 3+ is "
+                 "authoritative; prefer the paper over posts about it"),
+    }
+    _maybe_save(args, data)
+    return data
+
+
 def _preflight_lint(session, pairs, args):
     """Lint against the operator catalog before spending simulation quota.
 
@@ -1667,19 +1791,22 @@ def _operator_index_from_catalog(session):
 
 
 def _known_field_ids(session, args):
-    """Field ids of ``--dataset``, so unknown identifiers can be flagged."""
-    dataset = getattr(args, "dataset", None)
-    if not dataset:
-        return None
-    records = ml.get_datafields(
+    """Every field id in scope, for flagging unknown identifiers.
+
+    The whole catalog, not ``--dataset``. Expressions routinely mix datasets --
+    a footnote ratio divided by total assets from fundamental6, ranked inside a
+    group defined in pv1 -- so scoping verification to one dataset reports real
+    fields as unknown and trains the caller to ignore the check. ``--dataset``
+    stays a listing filter for `catalog fields`, where narrowing is the point.
+    """
+    records = field_index.fetch_all_fields(
         session,
-        instrument_type=getattr(args, "instrument_type", "EQUITY"),
-        region=getattr(args, "region", "USA"),
-        delay=getattr(args, "delay", 1),
-        universe=getattr(args, "universe", "TOP3000"),
-        dataset_id=dataset,
+        region=getattr(args, "region", None) or "USA",
+        universe=getattr(args, "universe", None) or "TOP3000",
+        delay=getattr(args, "delay", None) if getattr(args, "delay", None) is not None else 1,
+        instrument_type=getattr(args, "instrument_type", None) or "EQUITY",
     )
-    return {record.get("id") for record in records if record.get("id")}
+    return field_index.field_ids(records)
 
 
 def cmd_lint(args, sink):

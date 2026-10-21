@@ -72,6 +72,18 @@ python research_cli.py catalog fields --dataset fundamental6 --type MATRIX \
     --search liability --limit 50 --expressions --save /tmp/fnd6.json
 ```
 
+Check a mechanism against the literature before spending quota on it:
+
+```bash
+python research_cli.py search "post-earnings announcement drift accruals" --min-authority 3
+python research_cli.py search --fetch https://example.org/paper.pdf
+```
+
+Requires `DEEPSEEK_API_KEY` in `.env`. Results carry `rerank_score` (1.5+ is high
+quality) and `authority` (3+ is authoritative), so prefer the paper over a post
+about it. Cached for a week; `--no-cache` bypasses. Queries are limited to 128
+characters, rejected locally.
+
 Diagnose a single alpha:
 
 ```bash

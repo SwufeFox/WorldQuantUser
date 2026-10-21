@@ -22,6 +22,7 @@ research_cli.py schema      # the whole contract, as JSON
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
 | `field_index.py` | Live field-name verification and vocabulary-free variant grouping. |
 | `field_search.py` | Ranked local search over fields and operators: AND, exclusion, fuzzy. |
+| `deepseek_search.py` | Literature search and page fetch, so an idea can be checked against the paper. |
 | `field_contract.py` | Field contracts: declared vs inferred period/unit/sign, verdicts. |
 | `research_paths.py` | Resolves where results go -- always outside this working tree. |
 | `alpha_registry.py` | Append-only ledger of alphas worth remembering. |
@@ -379,6 +380,32 @@ and a note. Re-recording the same alpha replaces it on read without rewriting
 history. `simulate --record` classifies automatically (clears the bar →
 `candidate`, fails a check → `rejected`, otherwise `watch`); `alpha record` takes
 an explicit verdict when you have actually decided something.
+
+## Check an idea against the literature
+
+A field name tells you the data exists. It does not tell you whether the economic
+claim has already been tested and rejected. `search` closes that gap without
+leaving the CLI:
+
+```bash
+python research_cli.py search "equity method income persistence abnormal returns" --min-authority 3
+python research_cli.py search "deferred revenue anomaly" --count 20 --content
+python research_cli.py search --fetch https://www.nber.org/papers/w12345
+```
+
+Requires `DEEPSEEK_API_KEY` in `.env` (or the environment); nothing else is
+needed and the key is never written to the repo. Search and Fetch are free of
+charge until billing starts on 2026-11-01 Beijing time.
+
+Results keep the provider's ranking plus `rerank_score` (1.5+ is high quality),
+`authority` (3+ is authoritative) and `date`, so a journal article can be told
+apart from a blog post restating it. Answers are cached for a week inside the
+results tree, so re-running the same query in a later session costs nothing;
+`--no-cache` bypasses that.
+
+Query operators work as documented by the provider: `site:`, `"exact phrase"`,
+`-exclude`, `lang:`, `after:`, `before:`. Queries longer than 128 characters are
+rejected locally, because the server's error does not say what to shorten.
 
 ## Research files
 
