@@ -70,6 +70,7 @@ FAMILIES = (
     "oi",         # overnight vs intraday price formation
     "quality",    # value / profitability / valuation fundamentals
     "leverage",   # balance-sheet leverage, fixed vs operating cost structure
+    "risk",       # distress, volatility shape, risk-premium cross-sections
     "option",     # implied volatility level, spread, skew
     "analyst",    # estimate revisions, coverage, dispersion
     "event",      # news, earnings and other dated events

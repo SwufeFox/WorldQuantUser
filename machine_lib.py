@@ -1218,6 +1218,22 @@ def normalize_alphas(alphas, settings):
     return normalized
 
 
+def alpha_families(alphas, count):
+    """Per-expression ``family`` declarations from a config, aligned with pairs.
+
+    Same contract as :func:`alpha_labels`: a config entry may carry ``family``,
+    and the list is dropped wholesale when it does not line up with the
+    normalized pairs. A wrong family silently corrupts the diversity count that
+    ``alpha book`` reports, so dropping is safer than guessing.
+    """
+    if not alphas or not isinstance(alphas[0], dict):
+        return [None] * count
+    families = [item.get("family") for item in alphas if isinstance(item, dict)]
+    if len(families) != count:
+        return [None] * count
+    return families
+
+
 def alpha_labels(alphas, count):
     """Per-expression labels from a config, aligned with the normalized pairs.
 
@@ -1248,6 +1264,7 @@ def simulate_alphas(
     max_wait_seconds=None,
     initial_records=None,
     labels=None,
+    families=None,
 ):
     """Simulate a list of alphas and return one record per expression.
 
@@ -1274,6 +1291,10 @@ def simulate_alphas(
         labels = alpha_labels(alphas, len(pairs))
     elif len(labels) != len(pairs):
         labels = [None] * len(pairs)
+    if families is None:
+        families = alpha_families(alphas, len(pairs))
+    elif len(families) != len(pairs):
+        families = [None] * len(pairs)
 
     if batch_size < 1 or batch_size > 3:
         raise ValueError("batch_size must be between 1 and 3")
@@ -1288,6 +1309,7 @@ def simulate_alphas(
                 "expression": expression,
                 "decay": decay,
                 "mechanism": labels[index],
+                "family": families[index],
                 "alpha_id": None,
                 "status": "DRY_RUN",
                 "metrics": None,
@@ -1304,6 +1326,7 @@ def simulate_alphas(
                 "expression": expression,
                 "decay": decay,
                 "mechanism": labels[index],
+                "family": families[index],
                 "alpha_id": None,
                 "status": "QUEUED",
                 "metrics": None,
