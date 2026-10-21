@@ -45,6 +45,7 @@ import alpha_registry  # noqa: E402
 import expression_lint  # noqa: E402
 import field_contract  # noqa: E402
 import field_index  # noqa: E402
+import field_search  # noqa: E402
 import research_paths  # noqa: E402
 import cache_store  # noqa: E402
 
@@ -257,7 +258,14 @@ def build_parser():
                                  parser_class=JsonArgumentParser)
 
     cat_op = cat.add_parser("operators", help="FASTEXPR operators.")
-    cat_op.add_argument("--search", default="", help="Filter on name/description.")
+    cat_op.add_argument("--search", default="",
+                        help="Ranked local search. Multi-word queries are AND; "
+                             "'-word' excludes.")
+    cat_op.add_argument("--fuzzy", action="store_true",
+                        help="Allow one edit per token, for typos.")
+    cat_op.add_argument("--any-term", action="store_true",
+                        help="Match any query term instead of all of them.")
+    cat_op.add_argument("--limit", type=int, default=None)
     cat_op.add_argument("--group", default="", help="Exact category, e.g. 'Time Series'.")
     cat_op.add_argument("--docs", nargs="*", metavar="NAME",
                         help="Also fetch full documentation for these operators.")
@@ -283,7 +291,13 @@ def build_parser():
     cat_f.add_argument("--instrument-type", default="EQUITY")
     cat_f.add_argument("--type", dest="field_type", choices=["MATRIX", "VECTOR", "GROUP"],
                        help="Keep only this BRAIN field type.")
-    cat_f.add_argument("--search", default="", help="Filter on id/description.")
+    cat_f.add_argument("--search", default="",
+                       help="Ranked local search. Multi-word queries are AND; "
+                            "prefix '-word' excludes; see --fuzzy and --any-term.")
+    cat_f.add_argument("--fuzzy", action="store_true",
+                       help="Allow one edit per token, for typos.")
+    cat_f.add_argument("--any-term", action="store_true",
+                       help="Match any query term instead of all of them.")
     cat_f.add_argument("--limit", type=int, default=None)
     cat_f.add_argument("--expressions", action="store_true",
                        help="Also emit ready-to-use FASTEXPR snippets.")
@@ -313,7 +327,11 @@ def build_parser():
                         help="Tokens to ignore when grouping, e.g. dataset family "
                              "words. No vocabulary is built in; supply it here.")
     cat_cc.add_argument("--search", default="",
-                        help="Filter on concept token or any member id.")
+                        help="Ranked search over concept tokens and member ids.")
+    cat_cc.add_argument("--fuzzy", action="store_true",
+                        help="Allow one edit per token, for typos.")
+    cat_cc.add_argument("--any-term", action="store_true",
+                        help="Match any query term instead of all of them.")
     cat_cc.add_argument("--min-members", type=int, default=2,
                         help="Only concepts with at least this many variants.")
     cat_cc.add_argument("--min-spread", type=float, default=0.0,
@@ -913,10 +931,35 @@ def cmd_catalog_operators(args, _sink):
     cache_report = {}
 
     def work(session):
-        operators = ml.fetch_operators(session, search=args.search, group=args.group,
+        # Fetch the whole list and rank locally for the same reason fields are
+        # ranked locally: the endpoint matches one token, so a two-word intent
+        # could not be expressed at all.
+        operators = ml.fetch_operators(session, search="", group=args.group,
                                        report=cache_report)
-        data = {"count": len(operators), "operators": operators,
-                "cache": cache_report}
+        scanned = len(operators)
+        search_note = None
+        if args.search:
+            required, excluded = field_search.parse_query(args.search)
+            operators = field_search.search_records(
+                operators, args.search, limit=args.limit, fuzzy=args.fuzzy,
+                match_all=not args.any_term, rank_by_coverage=False)
+            absent = field_search.absent_terms(
+                operators or ml.fetch_operators(session, search="", group=args.group),
+                args.search, fuzzy=args.fuzzy) if not operators else []
+            search_note = {
+                "query": args.search, "required_terms": required,
+                "excluded_terms": excluded, "absent_terms": absent,
+                "mode": "any" if args.any_term else "all",
+                "fuzzy": bool(args.fuzzy),
+            }
+            if absent:
+                search_note["hint"] = "no operator uses these words"
+        elif args.limit:
+            operators = operators[: args.limit]
+        data = {"count": len(operators), "scanned": scanned,
+                "operators": operators, "cache": cache_report}
+        if search_note:
+            data["search"] = search_note
         if args.docs:
             data["docs"] = {n: ml.fetch_operator_doc(session, n) for n in args.docs}
         return data
@@ -945,22 +988,68 @@ def cmd_catalog_datasets(args, _sink):
 
 
 def cmd_catalog_fields(args, _sink):
+    """List a dataset's fields, with ranked local search.
+
+    Search runs here rather than on the server. The endpoint takes a single
+    token, so ``--search cfps count`` used to be a usage error and any multi-word
+    intent was impossible to express. Fetching the dataset (cached) and ranking
+    locally supports AND terms, exclusions, prefixes and typos, and reports why
+    each hit matched.
+    """
     cache_report = {}
-    fields = with_session(args, lambda s: ml.get_datafields(
+    everything = with_session(args, lambda s: ml.get_datafields(
         s, instrument_type=args.instrument_type, region=args.region,
         delay=args.delay, universe=args.universe, dataset_id=args.dataset,
-        search=args.search, field_type=args.field_type, limit=args.limit,
+        search="", field_type=args.field_type, limit=None,
         report=cache_report,
     ))
+
+    fields = everything
+    search_note = None
+    if args.search:
+        required, excluded = field_search.parse_query(args.search)
+        fields = field_search.search_records(
+            everything, args.search, limit=args.limit,
+            fuzzy=args.fuzzy, match_all=not args.any_term,
+        )
+        absent = field_search.absent_terms(
+            everything, args.search, fuzzy=args.fuzzy) if not fields else []
+        search_note = {
+            "query": args.search,
+            "required_terms": required,
+            "excluded_terms": excluded,
+            "absent_terms": absent,
+            "mode": "any" if args.any_term else "all",
+            "fuzzy": bool(args.fuzzy),
+            "note": "ranked locally: exact token > prefix > substring, id beats description",
+        }
+        if absent:
+            search_note["hint"] = (
+                "the catalog does not use these words anywhere in this dataset; "
+                "try --any-term or different wording")
+        elif not fields and len(required) > 1:
+            # Every word exists somewhere, just never together in one field. That
+            # is the common case when asking for an idea spelled across two
+            # naming families, and it deserves a different suggestion than a
+            # missing word does.
+            search_note["hint"] = (
+                "each term appears somewhere in this dataset but no single field "
+                "contains all of them; try --any-term, or search the terms one at "
+                "a time with `catalog concepts`")
+    elif args.limit:
+        fields = fields[: args.limit]
+
     data = {
         "dataset": args.dataset, "region": args.region, "universe": args.universe,
-        "delay": args.delay, "count": len(fields),
+        "delay": args.delay, "count": len(fields), "scanned": len(everything),
         "type_counts": {
             kind: len([f for f in fields if f.get("type") == kind])
             for kind in ("MATRIX", "VECTOR", "GROUP")
         },
         "fields": fields, "cache": cache_report,
     }
+    if search_note:
+        data["search"] = search_note
     if args.expressions:
         data["expressions"] = ml.process_datafields(fields)
     _maybe_save(args, data)
@@ -988,12 +1077,28 @@ def cmd_catalog_concepts(args, _sink):
         tail_tokens=args.tail_tokens,
     )
     if args.search:
-        needle = args.search.lower()
-        concepts = [
-            item for item in concepts
-            if needle in item["concept"]
-            or any(needle in member["id"].lower() for member in item["fields"])
+        # Rank concepts, not raw fields: the concept key is the thing being
+        # asked about, and the member ids are folded into the description so a
+        # query can hit either the grouping or a specific variant.
+        haystack = [
+            {
+                "id": item["concept"],
+                "description": " ".join(member["id"] for member in item["fields"]),
+                "coverage": item["best_coverage"],
+                "_concept": item,
+            }
+            for item in concepts
         ]
+        ranked = field_search.search_records(
+            haystack, args.search, limit=args.limit, fuzzy=args.fuzzy,
+            match_all=not args.any_term,
+        )
+        concepts = []
+        for hit in ranked:
+            item = dict(hit["_concept"])
+            item["score"] = hit["score"]
+            item["matched_terms"] = hit["matched_terms"]
+            concepts.append(item)
     limit = args.limit or len(concepts)
     data = {
         "region": args.region, "universe": args.universe, "delay": args.delay,

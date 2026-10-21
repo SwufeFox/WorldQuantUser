@@ -21,6 +21,7 @@ research_cli.py schema      # the whole contract, as JSON
 | `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
 | `field_index.py` | Live field-name verification and vocabulary-free variant grouping. |
+| `field_search.py` | Ranked local search over fields and operators: AND, exclusion, fuzzy. |
 | `field_contract.py` | Field contracts: declared vs inferred period/unit/sign, verdicts. |
 | `research_paths.py` | Resolves where results go -- always outside this working tree. |
 | `alpha_registry.py` | Append-only ledger of alphas worth remembering. |
@@ -140,6 +141,23 @@ python research_cli.py catalog fields --dataset fundamental6 --type MATRIX \
 
 `--expressions` also emits ready-to-paste snippets, already winsorized and
 backfilled. Add `--save out.json` to keep a snapshot for offline use.
+
+`--search` is ranked, not a substring filter, and it runs locally over the
+fetched catalogue so it can do what the endpoint cannot:
+
+```bash
+python research_cli.py catalog fields --dataset analyst4 --search "cfps number"
+python research_cli.py catalog fields --dataset analyst4 --search "cfps -median"
+python research_cli.py catalog operators --search "rank ts" --any-term
+python research_cli.py catalog fields --dataset fundamental2 --search cfpps --fuzzy
+```
+
+Multi-word queries are AND, `-word` excludes, `--any-term` relaxes to OR, and
+`--fuzzy` tolerates one edit. Hits carry `score` and `matched_terms`, so the
+ordering is explainable. When nothing matches, the reply names the `absent_terms`
+rather than quietly relaxing the query — assuming two words are synonyms is the
+one thing this search refuses to do.
+
 
 ### Check field names and compare variants (quota-free)
 
