@@ -112,6 +112,11 @@ def main(argv=None):
             continue
         if fitness < args.min_fitness:
             continue
+        if entry.get("duplicate_of"):
+            # An id whose PnL equals another id's is one strategy, not two; leaving
+            # it in inflates the header count and lets the greedy set pick the same
+            # bet twice under different ids.
+            continue
         if alpha_id not in by_id:
             by_id[alpha_id] = entry
 

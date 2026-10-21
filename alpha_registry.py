@@ -293,24 +293,28 @@ def load_entries(path=None):
     return [by_key[key] for key in order]
 
 
+#: Fields that change on every append and therefore cannot signal "content changed".
+_VOLATILE = frozenset({"recorded_at", "source"})
+
+
 def _comparable(entry):
-    """The subset of an entry that decides whether a re-record is needed."""
-    return {
-        "verdict": entry.get("verdict"),
-        "idea": entry.get("idea"),
-        "mechanism": entry.get("mechanism"),
-        # ``family`` is a curated annotation, not derived from anything else,
-        # so it has to count as a change on its own. Leaving it out silently
-        # dropped the first attempt to classify the book: nine of thirteen
-        # records were skipped as "unchanged" when only the family differed.
-        "family": entry.get("family"),
-        "note": entry.get("note"),
-        "expression": " ".join((entry.get("expression") or "").split()),
-        "settings": entry.get("settings") or {},
-        "metrics": entry.get("metrics") or {},
-        "out_of_sample": entry.get("out_of_sample") or {},
-        "failing_checks": entry.get("failing_checks") or [],
-    }
+    """Everything in an entry except the volatile bookkeeping fields.
+
+    This used to be a hand-maintained whitelist, which failed the same way three
+    times: a new field was added, the whitelist was not, and a write whose only
+    change was that field got skipped as "unchanged". ``family`` lost nine of
+    thirteen classifications that way, and ``duplicate_of`` made every dedupe mark
+    a no-op that still reported success.
+
+    Deriving the comparison from the record's own keys removes the class of bug:
+    anything stored is compared, so nothing can be silently dropped again.
+    """
+    comparable = {key: value for key, value in entry.items()
+                  if key not in _VOLATILE}
+    if "expression" in comparable:
+        comparable["expression"] = " ".join(
+            (comparable.get("expression") or "").split())
+    return comparable
 
 
 def record_entry(entry, path=None, skip_unchanged=True):
@@ -643,3 +647,36 @@ def unlabeled_summary(entries):
         "missing_mechanism": missing_mechanism,
         "family_coverage": round(1 - missing_family / total, 3) if total else None,
     }
+
+
+def mark_duplicate(entry, canonical):
+    """Record that this alpha's returns are indistinguishable from another's.
+
+    Two ids can carry the same PnL: submitting the same expression twice yields a
+    new id, and an algebraically zero term added to force a fresh simulation does
+    the same. Those are not two findings, and leaving them uncounted inflates every
+    total that matters — 494 pairs at |r| >= 0.90 were reported before this was
+    noticed. The mark is a field rather than a verdict: being a duplicate says
+    nothing about whether the alpha is any good.
+    """
+    updated = dict(entry)
+    updated["duplicate_of"] = canonical
+    updated["recorded_at"] = _now()
+    updated["source"] = "dedupe"
+    return updated
+
+
+def duplicate_groups(entries):
+    """``{canonical_id: [duplicate_ids]}`` from the recorded marks."""
+    groups = {}
+    for entry in entries:
+        canonical = entry.get("duplicate_of")
+        if not canonical:
+            continue
+        groups.setdefault(canonical, []).append(entry.get("alpha_id") or entry.get("key"))
+    return groups
+
+
+def unique_entries(entries):
+    """Entries that are not marked as a duplicate of another."""
+    return [entry for entry in entries if not entry.get("duplicate_of")]
