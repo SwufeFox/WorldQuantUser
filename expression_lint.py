@@ -459,10 +459,16 @@ def lint_expression(expression, operator_index=None, denylist=None,
 
     if known_fields is not None:
         known = set(known_fields)
+        # Variables assigned inside the expression are not datafields. Without
+        # this, any multi-line expression that names its intermediate results --
+        # which is the readable way to write a composite -- reports every local
+        # name as an unknown field.
+        masked = _mask_strings(expression)
+        locals_ = set(_assignment_targets(masked[0] if isinstance(masked, tuple) else masked))
         seen = set()
         for identifier in extract_identifiers(expression):
             name = identifier["name"]
-            if name in seen or name.lower() in _LITERALS:
+            if name in seen or name.lower() in _LITERALS or name in locals_:
                 continue
             seen.add(name)
             if name in known:

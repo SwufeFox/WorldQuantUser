@@ -325,6 +325,37 @@ class ExpressionLintTests(unittest.TestCase):
             strict_fields=True)
         self.assertFalse(strict["ok"])
 
+    def test_assigned_variables_are_not_treated_as_fields(self):
+        # A composite names its intermediate legs; those names are locals, not
+        # datafields. Flagging them made every readable multi-line expression
+        # fail strict field checking.
+        expression = (
+            "lev = liabilities / assets;"
+            "news = ts_mean(mean_news_impact_projection, 21);"
+            "group_rank(lev, subindustry) + group_rank(news, subindustry)"
+        )
+        report = expression_lint.lint_expression(
+            expression,
+            operator_index=self.index,
+            known_fields={"liabilities", "assets", "mean_news_impact_projection",
+                          "subindustry"},
+            strict_fields=True)
+        flagged = [item.get("identifier") for item in report["errors"]
+                   if item.get("code") == "unknown_identifier"]
+        self.assertEqual(flagged, [])
+        # The stub operator index does not know every call in the snippet, so the
+        # assertion stays on what this test is about: locals must not be treated
+        # as datafields, while a genuinely missing field still is.
+        typo = expression_lint.lint_expression(
+            expression + "; rank(not_a_real_field)",
+            operator_index=self.index,
+            known_fields={"liabilities", "assets", "mean_news_impact_projection",
+                          "subindustry"},
+            strict_fields=True)
+        self.assertIn("not_a_real_field",
+                      [item.get("identifier") for item in typo["errors"]
+                       if item.get("code") == "unknown_identifier"])
+
     def test_offline_mode_skips_operator_check(self):
         report = expression_lint.lint_expression(
             "rank(regression_neut(close, volume))", operator_index=None)
