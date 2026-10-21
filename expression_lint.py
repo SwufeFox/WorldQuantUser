@@ -380,13 +380,83 @@ def operator_budget_findings(expression, limit=OPERATOR_LIMIT, warn=OPERATOR_WAR
     return []
 
 
+#: Operators reported to reject VECTOR ("event-driven") fields outright. A forum
+#: report on the platform documents rank() and ts_backfill() failing with
+#: "event input" on such a field while ts_sum() works, and this account has hit
+#: "Operator multiply does not support event inputs" independently. A third of the
+#: field catalogue is VECTOR, so a template batch can fail en masse and silently.
+VECTOR_REJECTING = frozenset({
+    "rank", "ts_rank", "ts_backfill", "ts_mean", "ts_std_dev", "ts_delta",
+    "ts_delay", "ts_zscore", "ts_scale", "ts_decay_linear", "ts_corr",
+    "ts_regression", "zscore", "scale", "winsorize", "normalize", "quantile",
+    "group_rank", "group_neutralize", "group_zscore", "group_scale",
+    "group_mean", "multiply", "divide", "subtract", "add",
+})
+#: Operators that aggregate a vector instead, which is the documented workaround.
+VECTOR_ACCEPTING = frozenset({"ts_sum", "vec_avg", "vec_sum", "ts_count_nans"})
+
+
+def _call_arguments(expression):
+    """Yield ``(operator, argument_text, offset)`` for every call, innermost first."""
+    text = expression or ""
+    found = []
+    for match in _CALL.finditer(text):
+        name = match.group(1)
+        open_at = match.end() - 1
+        depth = 0
+        for index in range(open_at, len(text)):
+            if text[index] == "(":
+                depth += 1
+            elif text[index] == ")":
+                depth -= 1
+                if depth == 0:
+                    found.append((name, text[open_at + 1:index], match.start()))
+                    break
+    return found
+
+
+def vector_findings(expression, field_types, strict=False):
+    """Flag VECTOR fields handed to operators that cannot read them."""
+    if not field_types:
+        return []
+    vectors = {name for name, kind in field_types.items()
+               if str(kind).upper() == "VECTOR"}
+    if not vectors:
+        return []
+    findings = []
+    for operator, arguments, offset in _call_arguments(expression):
+        if operator in VECTOR_ACCEPTING:
+            continue
+        hit = sorted({token for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", arguments)
+                      if token in vectors})
+        if not hit:
+            continue
+        severity = "error" if strict else "warning"
+        if operator not in VECTOR_REJECTING:
+            # Unknown operators get a softer flag: the platform's rule is
+            # per-operator and this list is assembled from reports, not from docs.
+            severity = "warning"
+        findings.append({
+            "code": "vector_field_input",
+            "severity": severity,
+            "operator": operator,
+            "identifier": hit[0],
+            "offset": offset,
+            "message": ("%s reads VECTOR field %s; the platform rejects event inputs "
+                        "for this operator (aggregate first, e.g. ts_sum)"
+                        % (operator, ", ".join(hit))),
+        })
+    return findings
+
+
 def lint_expression(expression, operator_index=None, denylist=None,
-                    known_fields=None, strict_fields=False):
+                    known_fields=None, strict_fields=False, field_types=None):
     """Lint one expression. Returns ``{ok, errors, warnings, ...}``.
 
     ``operator_index`` comes from :func:`build_operator_index`; when omitted the
     operator-name check is skipped (offline use). ``known_fields`` enables the
     unknown-identifier check.
+    ``field_types`` maps field id to catalog type and enables the VECTOR check.
     """
     errors = []
     warnings = []
@@ -545,6 +615,14 @@ def lint_expression(expression, operator_index=None, denylist=None,
         else:
             warnings.append(finding)
 
+    # VECTOR ("event-driven") fields are a third of the catalogue and most operators
+    # cannot read them; a template batch that ignores this fails en masse.
+    for finding in vector_findings(expression, field_types, strict=strict_fields):
+        if finding["severity"] == "error":
+            errors.append(finding)
+        else:
+            warnings.append(finding)
+
     return {
         "ok": not errors,
         "operator_count": len(used),
@@ -557,7 +635,7 @@ def lint_expression(expression, operator_index=None, denylist=None,
     }
 
 def lint_all(pairs, operator_index=None, denylist=None, known_fields=None,
-             strict_fields=False):
+             strict_fields=False, field_types=None):
     """Lint a batch of ``(expression, decay)`` pairs.
 
     Returns ``{ok, results, errors, warnings}`` where ``errors`` and
@@ -575,6 +653,7 @@ def lint_all(pairs, operator_index=None, denylist=None, known_fields=None,
             denylist=denylist,
             known_fields=known_fields,
             strict_fields=strict_fields,
+            field_types=field_types,
         )
         report["expression"] = expression
         results.append(report)

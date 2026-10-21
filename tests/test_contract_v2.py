@@ -898,3 +898,44 @@ class KMeansSelectionTests(unittest.TestCase):
         import numpy as np
         cmatrix = np.eye(3)
         self.assertEqual(select_kmeans.mean_abs_corr(["a", "b", "c"], cmatrix, ["a"]), 0.0)
+
+
+class VectorFieldTests(unittest.TestCase):
+    """A third of the catalogue is VECTOR, and most operators cannot read it.
+
+    A forum report documents rank() and ts_backfill() failing with "event input" on
+    such a field while ts_sum() works; this account hit "Operator multiply does not
+    support event inputs" independently. Batch templating without this check fails
+    en masse.
+    """
+
+    TYPES = {"mdl109_eps_sur_decay": "VECTOR", "close": "MATRIX"}
+
+    def test_rank_on_a_vector_field_is_flagged(self):
+        findings = expression_lint.vector_findings(
+            "rank(mdl109_eps_sur_decay)", self.TYPES)
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["operator"], "rank")
+
+    def test_aggregation_is_the_documented_workaround(self):
+        self.assertEqual(
+            expression_lint.vector_findings("ts_sum(mdl109_eps_sur_decay, 90)", self.TYPES),
+            [])
+
+    def test_matrix_field_is_not_flagged(self):
+        self.assertEqual(
+            expression_lint.vector_findings("rank(close)", self.TYPES), [])
+
+    def test_strict_mode_escalates_to_error(self):
+        finding = expression_lint.vector_findings(
+            "rank(mdl109_eps_sur_decay)", self.TYPES, strict=True)[0]
+        self.assertEqual(finding["severity"], "error")
+
+    def test_no_type_information_means_no_finding(self):
+        self.assertEqual(expression_lint.vector_findings("rank(anything)", None), [])
+
+    def test_lint_surfaces_it(self):
+        report = expression_lint.lint_expression(
+            "rank(mdl109_eps_sur_decay)", field_types=self.TYPES)
+        codes = {item.get("code") for item in report["warnings"] + report["errors"]}
+        self.assertIn("vector_field_input", codes)

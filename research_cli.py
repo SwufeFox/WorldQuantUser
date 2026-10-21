@@ -1733,6 +1733,7 @@ def _preflight_lint(session, pairs, args):
              % catalog_note)
 
     known_fields = None
+    field_types = None
     field_note = "unavailable"
     try:
         known_fields = field_index.field_ids(field_index.fetch_all_fields(
@@ -1747,6 +1748,21 @@ def _preflight_lint(session, pairs, args):
             instrument_type=getattr(args, "instrument_type", None) or "EQUITY",
         ))
         field_note = "checked (%d names)" % len(known_fields)
+        # Field type decides whether an operator can read the field at all: a third
+        # of the catalogue is VECTOR and most operators reject event inputs.
+        try:
+            field_types = {record.get("id"): record.get("type")
+                           for record in field_index.fetch_all_fields(
+                               session,
+                               region=getattr(args, "region", None) or "USA",
+                               universe=getattr(args, "universe", None) or "TOP3000",
+                               delay=(getattr(args, "delay", None)
+                                      if getattr(args, "delay", None) is not None else 1),
+                               instrument_type=(getattr(args, "instrument_type", None)
+                                                or "EQUITY"))
+                           if record.get("id")}
+        except Exception:  # noqa: BLE001 - type info is a bonus, not a gate
+            field_types = None
     except Exception as exc:  # noqa: BLE001
         field_note = "unavailable: %s: %s" % (type(exc).__name__, exc)
         note("lint: field catalog unavailable (%s); field names are NOT verified "
@@ -1758,6 +1774,7 @@ def _preflight_lint(session, pairs, args):
         denylist=expression_lint.load_denylist(),
         known_fields=known_fields,
         strict_fields=bool(known_fields),
+        field_types=field_types,
     )
     report["operator_catalog_size"] = len(operator_index or {})
     report["operator_catalog"] = catalog_note
