@@ -63,7 +63,8 @@ class SchemaContractTests(unittest.TestCase):
         commands = parse(run_cli("schema"))["data"]["commands"]["subcommands"]
         self.assertEqual(
             set(commands), {"schema", "auth", "catalog", "simulate", "resume",
-                            "alpha", "lint", "cache", "search"},
+                            "alpha", "lint", "cache", "search", "ablate",
+                            "compare"},
         )
         simulate = commands["simulate"]
         flags = {flag for option in simulate["options"] for flag in option["flags"]}
@@ -75,6 +76,10 @@ class SchemaContractTests(unittest.TestCase):
         search_flags = {f for o in commands["search"]["options"] for f in o["flags"]}
         self.assertIn("--fetch", search_flags)
         self.assertIn("--min-score", search_flags)
+        ablate_flags = {f for o in commands["ablate"]["options"] for f in o["flags"]}
+        self.assertIn("--modes", ablate_flags)
+        compare_flags = {f for o in commands["compare"]["options"] for f in o["flags"]}
+        self.assertIn("--contributions", compare_flags)
         cache = commands["cache"]["subcommands"]
         self.assertEqual(set(cache), {"info", "clear"})
 

@@ -84,6 +84,18 @@ quality) and `authority` (3+ is authoritative), so prefer the paper over a post
 about it. Cached for a week; `--no-cache` bypasses. Queries are limited to 128
 characters, rejected locally.
 
+Ask whether a composite leg earns its place, without hand-writing variants:
+
+```bash
+python research_cli.py ablate --expr "a = ...; b = ...; a + b" --out /tmp/abl.json
+python research_cli.py simulate /tmp/abl.json --sort fitness --stream
+python research_cli.py compare <results> --contributions
+```
+
+A negative contribution means the composite is stronger without that leg. The
+combination must be a plain sum of named legs; products and gated legs are
+refused rather than guessed.
+
 Test whether two alphas are really two bets:
 
 ```bash

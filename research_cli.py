@@ -50,6 +50,7 @@ import research_paths  # noqa: E402
 import cache_store  # noqa: E402
 import deepseek_search  # noqa: E402
 import correlation  # noqa: E402
+import ablation  # noqa: E402
 
 VERSION = "2.4.0"
 
@@ -497,6 +498,41 @@ def build_parser():
                         help="With --stream, also emit per-poll events.")
     _add_session_args(resume)
     resume.set_defaults(func=cmd_resume)
+
+    abl = sub.add_parser(
+        "ablate",
+        help="Generate leave-one-out and solo variants of a composite (no quota).",
+        description="Answer 'does this leg earn its place?' with one batch "
+                    "instead of hand-writing each variant. Writes a research "
+                    "file; run it with `simulate`, then read it back with "
+                    "`compare --contributions`.")
+    abl.add_argument("file", nargs="?",
+                     help="Research file (JSON) holding the composite. Omit with --expr.")
+    abl.add_argument("--expr", default=None,
+                     help="Composite expression: 'a = ...; b = ...; a + b'.")
+    abl.add_argument("--modes", default="full,loo,solo",
+                     help="Comma list from full, loo, solo (default all three).")
+    abl.add_argument("--decay", type=int, default=None,
+                     help="Override decay for every variant.")
+    abl.add_argument("--out", default=None,
+                     help="Write the research file here instead of only reporting it.")
+    abl.add_argument("--save")
+    abl.set_defaults(func=cmd_ablate)
+
+    cmp_ = sub.add_parser(
+        "compare",
+        help="Compare simulation results side by side (no quota).",
+        description="Read one or more simulate result documents and print a "
+                    "single table, so variants from different batches stop being "
+                    "aligned by hand.")
+    cmp_.add_argument("files", nargs="+", help="Result JSON files from simulate.")
+    cmp_.add_argument("--min-fitness", type=float, default=None)
+    cmp_.add_argument("--sort", default="fitness",
+                      choices=["fitness", "sharpe", "turnover", "returns", "id"])
+    cmp_.add_argument("--contributions", action="store_true",
+                      help="Also compute per-leg contributions from ablate labels.")
+    cmp_.add_argument("--save")
+    cmp_.set_defaults(func=cmd_compare)
 
     alpha = sub.add_parser("alpha", help="Inspect the account's alphas (quota-free).")
     alpha_sub = alpha.add_subparsers(dest="subcommand", metavar="<action>",
@@ -1353,6 +1389,130 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
     return result
 
 
+def cmd_ablate(args, _sink):
+    """Write a research file holding full / leave-one-out / solo variants.
+
+    Deliberately does not simulate: generating and spending stay separate, so a
+    mis-specified ablation costs nothing and can be inspected first.
+    """
+    expression = args.expr
+    decay = args.decay
+    if args.file:
+        settings, alphas = config_io.load_research_file(args.file)
+        pairs = ml.normalize_alphas(alphas, settings)
+        if len(pairs) != 1 and not expression:
+            raise CliError(
+                "INVALID_INPUT",
+                "ablate takes exactly one composite expression, found %d"
+                % len(pairs),
+                "split the file, or pass --expr with one composite")
+        if not expression:
+            expression = pairs[0][0]
+        if decay is None:
+            decay = pairs[0][1]
+
+    if not expression:
+        raise CliError("USAGE", "nothing to ablate",
+                       "pass a research file or --expr")
+
+    modes = [part.strip() for part in str(args.modes).split(",") if part.strip()]
+    try:
+        plan = ablation.variants(expression, modes)
+    except ablation.AblationError as exc:
+        raise CliError("INVALID_INPUT", str(exc),
+                       "ablation needs 'name = ...; name = ...; name + name'; "
+                       "declare the legs explicitly and test by hand otherwise")
+
+    alphas = []
+    for item in plan:
+        entry = {
+            "expression": item["expression"],
+            "candidate_id": item["candidate_id"],
+            "mechanism": item["candidate_id"],
+        }
+        if decay is not None:
+            entry["decay"] = decay
+        alphas.append(entry)
+    document = {"alphas": alphas}
+
+    if args.out:
+        Path(args.out).write_text(json.dumps(document, ensure_ascii=False, indent=2))
+        note("wrote %s" % args.out)
+
+    data = {
+        "source_expression": expression,
+        "modes": modes,
+        "variants": plan,
+        "count": len(plan),
+        "written_to": args.out,
+        "next": ("run with `simulate %s`, then `compare <results> --contributions`"
+                 % (args.out or "<file>")),
+    }
+    _maybe_save(args, data)
+    return data
+
+
+def cmd_compare(args, _sink):
+    """Merge result documents into one table.
+
+    Variants used to live in separate batch files and were aligned by eye, which
+    is how a five-leg version scoring below its four-leg parent went unnoticed.
+    """
+    records = []
+    for path in args.files:
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc),
+                           "point at a file written by `simulate`") from exc
+        body = (payload.get("data")
+                if isinstance(payload, dict) and "data" in payload else payload)
+        for record in (body or {}).get("results") or []:
+            if isinstance(record, dict):
+                records.append(record)
+
+    if not records:
+        raise CliError("NOT_FOUND", "no result records in the given files",
+                       "the file must come from `simulate`")
+
+    rows = []
+    for record in records:
+        metrics = record.get("metrics") or {}
+        checks = record.get("checks") or {}
+        failed = sorted(name for name, value in checks.items()
+                        if isinstance(value, dict)
+                        and value.get("result") in ("FAIL", "ERROR"))
+        oos = record.get("out_of_sample") or {}
+        rows.append({
+            "candidate_id": record.get("candidate_id"),
+            "alpha_id": record.get("alpha_id"),
+            "decay": record.get("decay"),
+            "sharpe": metrics.get("sharpe"),
+            "fitness": metrics.get("fitness"),
+            "turnover": metrics.get("turnover"),
+            "returns": metrics.get("returns"),
+            "train_sharpe": (oos.get("train") or {}).get("sharpe"),
+            "test_sharpe": (oos.get("test") or {}).get("sharpe"),
+            "failed_checks": failed,
+        })
+
+    if args.min_fitness is not None:
+        rows = [row for row in rows
+                if isinstance(row["fitness"], (int, float))
+                and row["fitness"] >= args.min_fitness]
+
+    key = "alpha_id" if args.sort == "id" else args.sort
+    rows.sort(key=lambda row: (row[key] is None, -(row[key] or 0)
+                               if isinstance(row[key], (int, float))
+                               else str(row[key])))
+
+    data = {"files": args.files, "count": len(rows), "rows": rows}
+    if args.contributions:
+        data["contributions"] = ablation.report(records)
+    _maybe_save(args, data)
+    return data
+
+
 def _search_failure(exc):
     """Map a DeepSeek search error onto the CLI's documented codes."""
     if isinstance(exc, deepseek_search.MissingSearchKey):
@@ -1550,11 +1710,12 @@ def cmd_simulate(args, sink):
         raise CliError("INVALID_INPUT", str(exc))
     labels = ml.alpha_labels(alphas, len(pairs))
     families = ml.alpha_families(alphas, len(pairs))
+    candidates = ml.alpha_candidate_ids(alphas, len(pairs))
 
     if args.dry_run:
         records = ml.simulate_alphas(
             None, pairs, settings=settings, dry_run=True, labels=labels,
-            families=families,
+            families=families, candidates=candidates,
         )
         # Offline lint: catches structural problems and learned rejections. The
         # authoritative operator check needs the catalog, so it runs on `lint`
@@ -1599,6 +1760,7 @@ def cmd_simulate(args, sink):
             initial_records=checkpoint["records"],
             labels=labels,
             families=families,
+            candidates=candidates,
         ),
     )
     return _finalize_simulation(
@@ -1636,6 +1798,12 @@ def cmd_resume(args, sink):
         record.get("mechanism") if isinstance(record, dict) else None
         for record in records
     ]
+    # Same for the candidate id: an ablation resumed halfway must keep the
+    # variant label, or the contribution table comes out unlabelled.
+    candidates = [
+        record.get("candidate_id") if isinstance(record, dict) else None
+        for record in records
+    ]
     settings = checkpoint.get("settings") or ml.default_settings()
     batch_size = checkpoint.get("batch_size", 3)
     if not any(
@@ -1660,6 +1828,7 @@ def cmd_resume(args, sink):
             max_wait_seconds=args.max_wait_seconds,
             initial_records=checkpoint["records"],
             labels=labels,
+            candidates=candidates,
         ),
     )
     return _finalize_simulation(

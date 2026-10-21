@@ -381,6 +381,32 @@ history. `simulate --record` classifies automatically (clears the bar →
 `candidate`, fails a check → `rejected`, otherwise `watch`); `alpha record` takes
 an explicit verdict when you have actually decided something.
 
+## Ask whether a leg earns its place
+
+Adding a leg felt productive and was often a loss: a five-leg version scored below
+its four-leg parent. Seeing that required two batches and reading two files.
+`ablate` writes every variant at once:
+
+```bash
+python research_cli.py ablate --expr "a = ...; n = ...; c = ...; a + n + c" --out /tmp/abl.json
+python research_cli.py simulate /tmp/abl.json --sort fitness --stream
+python research_cli.py compare <results.json> --contributions
+```
+
+The last command reports `contribution = fitness(full) - fitness(full without
+this leg)`, so a leg that subtracts from the composite is named instead of
+inferred. `solo` arms separate a driver from a carrier: a carrier can add value
+while scoring poorly alone.
+
+Variants are generated only when the combination is a plain sum of named legs.
+A product, a gated leg like `r*(1-rank(cap))`, or a call inside the combination is
+refused with the reason, because "remove a leg" has no syntactic meaning there and
+a silently wrong variant costs quota and returns something that looks like
+evidence.
+
+`compare` also merges batches: several result files become one table sorted by
+fitness, with failing checks and the train/test split side by side.
+
 ## Test an independence claim
 
 `SELF_CORRELATION` reports one opaque number and never names the counterpart, so

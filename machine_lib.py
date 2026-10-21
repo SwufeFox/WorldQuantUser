@@ -1239,6 +1239,22 @@ def normalize_alphas(alphas, settings):
     return normalized
 
 
+def alpha_candidate_ids(alphas, count):
+    """Per-expression ``candidate_id`` declarations, aligned with pairs.
+
+    Same contract as :func:`alpha_families`: when the list does not line up with
+    the normalized pairs it is dropped wholesale. A misaligned label is worse
+    than a missing one, because it silently attaches an ablation variant's
+    numbers to the wrong leg.
+    """
+    if not alphas or not isinstance(alphas[0], dict):
+        return [None] * count
+    ids = [item.get("candidate_id") for item in alphas if isinstance(item, dict)]
+    if len(ids) != count:
+        return [None] * count
+    return ids
+
+
 def alpha_families(alphas, count):
     """Per-expression ``family`` declarations from a config, aligned with pairs.
 
@@ -1286,6 +1302,7 @@ def simulate_alphas(
     initial_records=None,
     labels=None,
     families=None,
+    candidates=None,
 ):
     """Simulate a list of alphas and return one record per expression.
 
@@ -1314,6 +1331,8 @@ def simulate_alphas(
         labels = [None] * len(pairs)
     if families is None:
         families = alpha_families(alphas, len(pairs))
+    if candidates is None:
+        candidates = alpha_candidate_ids(alphas, len(pairs))
     elif len(families) != len(pairs):
         families = [None] * len(pairs)
 
@@ -1329,6 +1348,7 @@ def simulate_alphas(
             {
                 "expression": expression,
                 "decay": decay,
+                "candidate_id": candidates[index],
                 "mechanism": labels[index],
                 "family": families[index],
                 "alpha_id": None,
@@ -1346,6 +1366,7 @@ def simulate_alphas(
             {
                 "expression": expression,
                 "decay": decay,
+                "candidate_id": candidates[index],
                 "mechanism": labels[index],
                 "family": families[index],
                 "alpha_id": None,
