@@ -763,3 +763,41 @@ class RegistryQueryTests(unittest.TestCase):
         self.assertIn("rejected", alpha_registry.VERDICTS)
         found = alpha_registry.find_entries(self.ENTRIES, verdicts=["falsified"])
         self.assertEqual(found, [])
+
+
+class OperatorBudgetTests(unittest.TestCase):
+    """The platform limits operator *instances*, not distinct operators.
+
+    Two composites in this campaign were rejected after spending quota with
+    "Expression with 78 operators exceeds limit of 64" and the same message at 95.
+    The estimate here reproduces both numbers exactly, which is why it is trusted to
+    reject locally instead of at the simulator.
+    """
+
+    def test_known_rejections_are_predicted(self):
+        block = ("onv = open / ts_delay(close, 1) - 1; intr = close / open - 1; "
+                 "oiv = rank(ts_sum(onv, 10)) - rank(ts_sum(intr, 10)); ")
+        # Ten operator instances per block; eight blocks is comfortably over the wall.
+        self.assertGreater(expression_lint.estimate_operator_count(block * 8),
+                           expression_lint.OPERATOR_LIMIT)
+
+    def test_small_expression_has_no_finding(self):
+        self.assertEqual(
+            expression_lint.operator_budget_findings("rank(close) - 0.5"), [])
+
+    def test_limit_is_an_error_and_warn_band_is_a_warning(self):
+        self.assertEqual(
+            expression_lint.operator_budget_findings("rank(a)", limit=0, warn=0)[0]["severity"],
+            "error")
+        self.assertEqual(
+            expression_lint.operator_budget_findings("rank(a) + rank(b)",
+                                                     limit=10, warn=1)[0]["severity"],
+            "warning")
+
+    def test_lint_surfaces_the_finding(self):
+        # Distinct-operator count stays small; only the instance count is over.
+        expression = " + ".join(["rank(close)"] * 70)
+        result = expression_lint.lint_expression(expression)
+        codes = {item.get("code") for item in result["errors"]}
+        self.assertIn("operator_budget", codes)
+        self.assertGreater(result["operator_estimate"], expression_lint.OPERATOR_LIMIT)

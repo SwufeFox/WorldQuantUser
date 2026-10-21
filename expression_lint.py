@@ -334,6 +334,52 @@ def record_rejection(operator, message, context=None, path=None, severity="block
     return entries[operator]
 
 
+#: The simulator rejects anything above this many operator instances.
+OPERATOR_LIMIT = 64
+#: Warn before the wall rather than at it.
+OPERATOR_WARN = 50
+
+_CALL = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_BINARY = re.compile(r"(?<![<>!=])(?:[<>!=]=|&&|\|\||[+\-*/<>^?])")
+
+
+def estimate_operator_count(expression):
+    """Approximate the total number of operators, as the simulator counts them.
+
+    ``operator_count`` elsewhere in this module is the number of *distinct*
+    operators, which says nothing about the platform's limit: two alphas can use
+    the same nine operators and one of them is rejected for using them ninety-five
+    times. This estimate counts call sites plus binary symbols, and deliberately
+    over-counts rather than under-counts, so a warning arrives early instead of a
+    failed simulation arriving after the quota is spent.
+    """
+    text = expression or ""
+    calls = [name for name in _CALL.findall(text)
+             if name.lower() not in {"if", "else"}]
+    binary = _BINARY.findall(text)
+    return len(calls) + len(binary)
+
+
+def operator_budget_findings(expression, limit=OPERATOR_LIMIT, warn=OPERATOR_WARN):
+    """Findings for an expression that is likely to exceed the operator limit."""
+    estimated = estimate_operator_count(expression)
+    if estimated > limit:
+        return [{
+            "code": "operator_budget",
+            "severity": "error",
+            "message": "about %d operator instances, above the simulator limit of %d; "
+                       "merge or drop legs before submitting" % (estimated, limit),
+        }]
+    if estimated > warn:
+        return [{
+            "code": "operator_budget",
+            "severity": "warning",
+            "message": "about %d operator instances, approaching the limit of %d"
+                       % (estimated, limit),
+        }]
+    return []
+
+
 def lint_expression(expression, operator_index=None, denylist=None,
                     known_fields=None, strict_fields=False):
     """Lint one expression. Returns ``{ok, errors, warnings, ...}``.
@@ -488,9 +534,21 @@ def lint_expression(expression, operator_index=None, denylist=None,
             else:
                 warnings.append(item)
 
+    # The simulator's limit is on operator instances, not distinct operators, so a
+    # composite that reuses a handful of functions many times can pass every other
+    # check and still be rejected ("Expression with 78 operators exceeds limit of
+    # 64"). Catching it here costs nothing; catching it at the simulator costs a
+    # round of quota.
+    for finding in operator_budget_findings(expression):
+        if finding["severity"] == "error":
+            errors.append(finding)
+        else:
+            warnings.append(finding)
+
     return {
         "ok": not errors,
         "operator_count": len(used),
+        "operator_estimate": estimate_operator_count(expression),
         "operators": used,
         "calls": [call for call in calls],
         "details": None,
