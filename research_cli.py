@@ -1332,7 +1332,8 @@ def _simulation_result(records, settings, checkpoint_path=None, dry_run=False):
     return result
 
 
-def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg):
+def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg,
+                            labels=None, families=None, candidates=None):
     if checkpoint_arg:
         path = Path(checkpoint_arg).expanduser().resolve()
         if path.exists():
@@ -1344,17 +1345,27 @@ def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg):
     else:
         path = Path(".brain_checkpoints") / ("simulate-%s.json" % uuid.uuid4().hex)
         path = path.resolve()
+    # The label columns must be written here, not only in the dry-run branch.
+    # These records are handed to simulate_alphas as initial_records, so anything
+    # omitted from this dict is lost for the whole real run: mechanism tags
+    # arrived empty in the ledger for exactly this reason.
+    labels = labels or [None] * len(pairs)
+    families = families or [None] * len(pairs)
+    candidates = candidates or [None] * len(pairs)
     records = [
         {
             "expression": expression,
             "decay": decay,
+            "candidate_id": candidates[index],
+            "mechanism": labels[index],
+            "family": families[index],
             "alpha_id": None,
             "status": "QUEUED",
             "metrics": None,
             "checks": None,
             "error": None,
         }
-        for expression, decay in pairs
+        for index, (expression, decay) in enumerate(pairs)
     ]
     checkpoint = {
         "format": "worldquantuser.simulation-checkpoint",
@@ -1779,7 +1790,8 @@ def cmd_simulate(args, sink):
     with_session(args, lambda s: _preflight_lint(s, pairs, args))
 
     checkpoint_path, checkpoint = _prepare_simulation_run(
-        settings, pairs, args.batch_size, args.checkpoint
+        settings, pairs, args.batch_size, args.checkpoint,
+        labels=labels, families=families, candidates=candidates,
     )
     on_event = _simulation_checkpoint_callback(checkpoint_path, checkpoint, sink)
     records = with_session(

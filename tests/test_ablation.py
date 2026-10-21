@@ -76,10 +76,26 @@ class VariantTests(unittest.TestCase):
         self.assertTrue(plan["loo:n"]["expression"].endswith("a + c"))
         self.assertEqual(plan["loo:n"]["removed"], "n")
 
-    def test_solo_keeps_the_assignments_and_selects_one_leg(self):
+    def test_solo_keeps_only_the_assignments_it_needs(self):
+        # The simulator rejects an expression that declares a variable and never
+        # uses it, so a solo arm must not carry the other legs' assignments.
         plan = {item["candidate_id"]: item for item in ablation.variants(COMPOSITE)}
         self.assertTrue(plan["solo:c"]["expression"].endswith("c"))
-        self.assertIn("a = rank(cap)", plan["solo:c"]["expression"])
+        self.assertNotIn("a = rank(cap)", plan["solo:c"]["expression"])
+        self.assertIn("c = rank(close)", plan["solo:c"]["expression"])
+
+    def test_shared_helper_is_kept_when_a_surviving_leg_needs_it(self):
+        expr = ("sy = ts_std_dev(returns, 21); "
+                "a = rank(cap); c = group_rank(-sy, subindustry); a + c")
+        plan = {item["candidate_id"]: item for item in ablation.variants(expr)}
+        self.assertIn("sy =", plan["solo:c"]["expression"])
+        self.assertNotIn("a = rank(cap)", plan["solo:c"]["expression"])
+
+    def test_helper_is_dropped_when_nothing_needs_it(self):
+        expr = ("sy = ts_std_dev(returns, 21); "
+                "a = rank(cap); c = group_rank(-sy, subindustry); a + c")
+        plan = {item["candidate_id"]: item for item in ablation.variants(expr)}
+        self.assertNotIn("sy =", plan["solo:a"]["expression"])
 
     def test_single_leg_has_no_leave_one_out(self):
         plan = ablation.variants("a = rank(cap); b = rank(close); a + b")

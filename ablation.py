@@ -93,9 +93,37 @@ def parse(expression):
     }
 
 
-def _rebuild(parsed, final_term):
-    head = ["%s = %s" % (name, parsed["legs"][name]) for name in parsed["order"]]
-    return "; ".join(head + [final_term])
+def _referenced(body, names):
+    """Which declared names a leg's body actually uses."""
+    return {name for name in names if re.search(r"\b%s\b" % re.escape(name), body)}
+
+
+def _needed(parsed, final_names):
+    """Transitive closure of names a final term depends on.
+
+    The simulator rejects an expression that declares a variable and never uses
+    it ("Found unused variables"), so a variant that drops a leg from the sum must
+    also drop that leg's assignment — and keep any helper that the surviving legs
+    reference, which is how a shared ``sy = ...`` avoids being stripped.
+    """
+    order = parsed["order"]
+    needed = set()
+    stack = [name for name in final_names if name in parsed["legs"]]
+    while stack:
+        name = stack.pop()
+        if name in needed:
+            continue
+        needed.add(name)
+        stack.extend(_referenced(parsed["legs"][name], order) - needed)
+    return needed
+
+
+def _rebuild(parsed, final_names):
+    """Emit only the assignments the final term needs, in declaration order."""
+    needed = _needed(parsed, final_names)
+    head = ["%s = %s" % (name, parsed["legs"][name])
+            for name in parsed["order"] if name in needed]
+    return "; ".join(head + [" + ".join(final_names)])
 
 
 def variants(expression, modes=MODES):
@@ -117,7 +145,7 @@ def variants(expression, modes=MODES):
         out.append({
             "candidate_id": "full",
             "mode": "full",
-            "expression": _rebuild(parsed, " + ".join(used)),
+            "expression": _rebuild(parsed, used),
             "legs": list(used),
         })
     if "loo" in wanted and len(used) > 1:
@@ -126,7 +154,7 @@ def variants(expression, modes=MODES):
             out.append({
                 "candidate_id": "loo:" + name,
                 "mode": "loo",
-                "expression": _rebuild(parsed, " + ".join(rest)),
+                "expression": _rebuild(parsed, rest),
                 "legs": rest,
                 "removed": name,
             })
@@ -135,7 +163,7 @@ def variants(expression, modes=MODES):
             out.append({
                 "candidate_id": "solo:" + name,
                 "mode": "solo",
-                "expression": _rebuild(parsed, name),
+                "expression": _rebuild(parsed, [name]),
                 "legs": [name],
                 "solo": name,
             })
