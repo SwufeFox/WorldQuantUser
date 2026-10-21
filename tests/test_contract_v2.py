@@ -186,6 +186,25 @@ class FieldContractTests(unittest.TestCase):
             field_contract.audit_fields(records, operation="multiply")
 
 
+class AlphaEntryValidationTests(unittest.TestCase):
+    def test_unknown_per_alpha_key_raises(self):
+        # A per-alpha key that the loader does not read must not be ignored: a
+        # config claiming to override neutralisation would otherwise test
+        # nothing while looking like it did.
+        with self.assertRaises(ValueError) as ctx:
+            machine_lib.normalize_alphas(
+                [{"expression": "rank(close)", "neutralization": "SUBINDUSTRY"}],
+                {"decay": 4})
+        self.assertIn("neutralization", str(ctx.exception))
+
+    def test_known_per_alpha_keys_still_accepted(self):
+        pairs = machine_lib.normalize_alphas(
+            [{"expression": "rank(close)", "decay": 7, "mechanism": "m",
+              "family": "quality", "candidate_id": "C1", "hypothesis": "h"}],
+            {"decay": 4})
+        self.assertEqual(pairs, [("rank(close)", 7)])
+
+
 class ExpressionLintTests(unittest.TestCase):
     def setUp(self):
         self.index = expression_lint.build_operator_index(OPERATORS)

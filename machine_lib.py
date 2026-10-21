@@ -1192,11 +1192,25 @@ def _single_simulation_data(expression, decay, settings):
     return {"type": "REGULAR", "settings": body, "regular": expression}
 
 
+#: Keys a per-alpha dict in a research file may carry. Anything else is an
+#: error rather than a silent drop: a config that says
+#: ``{"expression": ..., "neutralization": "SUBINDUSTRY"}`` looks like it
+#: overrides the setting, but neutralisation is a settings-level field, so the
+#: value would vanish and the round would quietly test nothing. Raising on the
+#: unknown key turns a wasted experiment into a message.
+_ALPHA_ENTRY_KEYS = frozenset({
+    "expression", "decay", "mechanism", "label", "name",
+    "family", "candidate_id", "idea", "hypothesis", "note",
+})
+
+
 def normalize_alphas(alphas, settings):
     """Normalize a research-file ``alphas`` entry list into ``(expr, decay)`` pairs.
 
     Accepts plain strings, ``{"expression": ..., "decay": ...}`` dicts, or
     ``(expression, decay)`` tuples. The default decay comes from ``settings``.
+    Unknown keys in a dict entry raise, because silently ignoring them lets a
+    config appear to control something it does not.
     """
     default_decay = settings.get("decay", DEFAULT_SETTINGS["decay"])
     normalized = []
@@ -1204,6 +1218,12 @@ def normalize_alphas(alphas, settings):
         if isinstance(item, str):
             expression, decay = item, default_decay
         elif isinstance(item, dict):
+            unknown = set(item) - _ALPHA_ENTRY_KEYS
+            if unknown:
+                raise ValueError(
+                    "alphas[%d] has unsupported key(s) %s; only %s are read"
+                    % (index, ", ".join(sorted(unknown)),
+                       ", ".join(sorted(_ALPHA_ENTRY_KEYS))))
             expression = item.get("expression")
             decay = item.get("decay", default_decay)
         elif isinstance(item, (list, tuple)) and item:
