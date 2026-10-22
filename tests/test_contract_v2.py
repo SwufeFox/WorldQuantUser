@@ -951,3 +951,37 @@ class AlphaMetadataTests(unittest.TestCase):
     def test_nothing_to_update_is_refused(self):
         with self.assertRaises(ValueError):
             machine_lib.set_alpha_metadata(AlphaMetadataTests._Session(), "A")
+
+
+class SelfCorrelationTests(unittest.TestCase):
+    """The platform's self-correlation view, and the substitute route's arithmetic.
+
+    A forum thread documents two things this pins: the endpoint answers 200 with an
+    empty body plus Retry-After when it is not ready (reading that as "no data" reports
+    an alpha as uncorrelated), and the rule allows a correlated alpha through when its
+    Sharpe exceeds, by the margin, the Sharpe of *every* correlated alpha.
+    """
+
+    def test_no_counterparts_above_the_limit_is_clear(self):
+        verdict = machine_lib.self_correlation_verdict(
+            {"records": [["A", None, "EQUITY", "USA", "TOP3000", 0.31, 2.0, 0.1, 0.1, 1.5, 0.001]]})
+        self.assertFalse(verdict["blocked"])
+
+    def test_bar_uses_the_highest_counterpart_sharpe_not_the_correlated_one(self):
+        # The tempting shortcut is to take the 0.90 pair's Sharpe; a second pair at
+        # 0.84 with a higher Sharpe raises the bar and the shortcut would pass it.
+        records = [
+            ["low_sharpe", None, "EQUITY", "USA", "TOP3000", 0.90, 1.50, 0.1, 0.1, 1.2, 0.001],
+            ["high_sharpe", None, "EQUITY", "USA", "TOP3000", 0.84, 2.54, 0.1, 0.1, 2.3, 0.001],
+        ]
+        verdict = machine_lib.self_correlation_verdict({"records": records})
+        self.assertTrue(verdict["blocked"])
+        self.assertAlmostEqual(verdict["sharpe_needed"], 2.794, places=3)
+
+    def test_pairs_below_the_limit_do_not_raise_the_bar(self):
+        records = [
+            ["faint", None, "EQUITY", "USA", "TOP3000", 0.20, 4.00, 0.1, 0.1, 3.0, 0.001],
+            ["real", None, "EQUITY", "USA", "TOP3000", 0.85, 2.00, 0.1, 0.1, 1.8, 0.001],
+        ]
+        verdict = machine_lib.self_correlation_verdict({"records": records})
+        self.assertAlmostEqual(verdict["sharpe_needed"], 2.2, places=3)

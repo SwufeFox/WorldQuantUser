@@ -563,6 +563,19 @@ def build_parser():
     a_chk.add_argument("--save")
     a_chk.set_defaults(func=cmd_alpha_check)
 
+    a_sc = alpha_sub.add_parser(
+        "self-corr",
+        help="The platform's own self-correlation, with the counterpart named.",
+        description="A bare maximum says a submission will be refused; naming the "
+                    "counterpart says whether the substitute route - Sharpe above the "
+                    "margin of every correlated alpha - is arithmetically available.")
+    a_sc.add_argument("alpha_id")
+    a_sc.add_argument("--limit", type=float, default=0.7)
+    a_sc.add_argument("--sharpe-margin", type=float, default=1.10)
+    a_sc.add_argument("--save")
+    _add_session_args(a_sc)
+    a_sc.set_defaults(func=cmd_alpha_self_corr)
+
     a_desc = alpha_sub.add_parser(
         "describe",
         help="Set an alpha's name, category and tags (the only writable metadata).",
@@ -2575,6 +2588,34 @@ def cmd_alpha_coverage(args, _sink):
              "mechanism": entry.get("mechanism")}
             for entry in missing[: args.limit]
         ]
+    _maybe_save(args, data)
+    return data
+
+
+def cmd_alpha_self_corr(args, _sink):
+    """Report the platform's self-correlation and the substitute route's bar."""
+    payload = with_session(
+        args, lambda s: ml.fetch_self_correlation(s, args.alpha_id))
+    verdict = ml.self_correlation_verdict(payload, limit=args.limit,
+                                          sharpe_margin=args.sharpe_margin)
+    current = with_session(args, lambda s: ml.fetch_alpha_metrics(s, args.alpha_id))
+    sharpe = (current.get("is") or {}).get("sharpe")
+    needed = verdict.get("sharpe_needed")
+    qualifies = None
+    if verdict["blocked"] and needed is not None and isinstance(sharpe, (int, float)):
+        qualifies = sharpe >= needed
+    data = {
+        "alpha_id": args.alpha_id,
+        "sharpe": sharpe,
+        "max_correlation": payload.get("max"),
+        "limit": args.limit,
+        "sharpe_margin": args.sharpe_margin,
+        "sharpe_needed": needed,
+        "qualifies_via_sharpe": qualifies,
+        "verdict": ("clear" if not verdict["blocked"]
+                    else ("sharpe route" if qualifies else "blocked")),
+        "counterparts": verdict["counterparts"],
+    }
     _maybe_save(args, data)
     return data
 

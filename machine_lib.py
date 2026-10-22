@@ -2366,3 +2366,66 @@ def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None):
     if mismatched:
         raise ServiceError("metadata did not stick: %s" % ", ".join(mismatched))
     return current
+
+def fetch_self_correlation(s, alpha_id, tries=6, max_wait=5.0):
+    """Return the platform's own self-correlation view for one alpha.
+
+    The useful part is that it names the counterpart: a bare maximum tells you a
+    submission will be refused, while knowing it collides with a Sharpe 2.54 alpha
+    tells you whether the substitute route is even arithmetically available.
+
+    The endpoint frequently answers HTTP 200 with an *empty body* plus a Retry-After
+    header. That means "not now", not "no data": reading it as absence silently
+    reports an alpha as uncorrelated. The response is retried while the body is blank.
+    """
+    deadline = time.monotonic() + max_wait * tries
+    for _ in range(tries):
+        response = s.get(BRAIN_API_URL + "/alphas/" + alpha_id + "/correlations/self",
+                         timeout=_request_timeout(None))
+        if response.text.strip():
+            payload = response.json()
+            return {
+                "alpha_id": alpha_id,
+                "max": payload.get("max"),
+                "min": payload.get("min"),
+                "records": payload.get("records") or [],
+            }
+        if time.monotonic() > deadline:
+            break
+        try:
+            wait = float(response.headers.get("Retry-After", 2) or 2)
+        except (TypeError, ValueError):
+            wait = 2.0
+        time.sleep(min(wait, max_wait))
+    raise ServiceError("self-correlation stayed empty after %d attempts" % tries)
+
+
+def self_correlation_verdict(payload, limit=0.7, sharpe_margin=1.10):
+    """Decide whether a submission is blocked, and whether the substitute route holds.
+
+    The rule allows a correlated alpha through when its Sharpe exceeds, by the margin,
+    the Sharpe of *every* alpha it correlates with above the limit - not merely the
+    worst one. Checking only the maximum correlation's counterpart is the tempting
+    shortcut and it is wrong in the direction that matters: a second, higher-Sharpe
+    counterpart raises the bar.
+    """
+    correlated = [row for row in payload.get("records") or []
+                  if len(row) > 5 and isinstance(row[5], (int, float))
+                  and abs(row[5]) > limit]
+    if not correlated:
+        return {"blocked": False, "reason": "nothing above the correlation limit",
+                "counterparts": [], "sharpe_needed": None}
+
+    sharpes = [row[6] for row in correlated if len(row) > 6 and isinstance(row[6], (int, float))]
+    needed = max(sharpes) * sharpe_margin if sharpes else None
+    return {
+        "blocked": True,
+        "reason": "self-correlation above the limit",
+        "counterparts": [
+            {"alpha_id": row[0], "name": row[1], "correlation": row[5],
+             "sharpe": row[6] if len(row) > 6 else None,
+             "fitness": row[9] if len(row) > 9 else None}
+            for row in correlated
+        ],
+        "sharpe_needed": round(needed, 4) if needed else None,
+    }
