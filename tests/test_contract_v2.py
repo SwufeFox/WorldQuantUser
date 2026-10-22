@@ -864,7 +864,8 @@ class VectorFieldTests(unittest.TestCase):
     en masse.
     """
 
-    TYPES = {"mdl109_eps_sur_decay": "VECTOR", "close": "MATRIX"}
+    TYPES = {"mdl109_eps_sur_decay": "VECTOR", "close": "MATRIX",
+             "five_minute_price_change_pct": "VECTOR"}
 
     def test_rank_on_a_vector_field_is_flagged(self):
         findings = expression_lint.vector_findings(
@@ -880,6 +881,19 @@ class VectorFieldTests(unittest.TestCase):
     def test_matrix_field_is_not_flagged(self):
         self.assertEqual(
             expression_lint.vector_findings("rank(close)", self.TYPES), [])
+
+    def test_aggregation_inside_another_call_is_accepted(self):
+        # rank(vec_avg(vector_field)) is the documented workaround. The first version
+        # scanned the outer call's whole argument text and flagged it, blocking four
+        # legitimate expressions.
+        self.assertEqual(
+            expression_lint.vector_findings(
+                "rank(vec_avg(five_minute_price_change_pct))", self.TYPES), [])
+
+    def test_direct_use_inside_a_rejecting_operator_is_flagged(self):
+        findings = expression_lint.vector_findings(
+            "rank(five_minute_price_change_pct)", self.TYPES)
+        self.assertEqual(findings[0]["operator"], "rank")
 
     def test_strict_mode_escalates_to_error(self):
         finding = expression_lint.vector_findings(

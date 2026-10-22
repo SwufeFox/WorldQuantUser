@@ -444,35 +444,48 @@ def trailing_token_findings(expression):
 
 
 def vector_findings(expression, field_types, strict=False):
-    """Flag VECTOR fields handed to operators that cannot read them."""
+    """Flag VECTOR fields read directly by an operator that cannot take them.
+
+    The check is on the *innermost* enclosing call. An earlier version scanned the
+    whole argument text of every call, so ``rank(vec_avg(vector_field))`` was flagged
+    for the outer ``rank`` even though the aggregation in between is exactly the
+    documented workaround, and four legitimate expressions were blocked.
+    """
     if not field_types:
         return []
     vectors = {name for name, kind in field_types.items()
                if str(kind).upper() == "VECTOR"}
     if not vectors:
         return []
+    calls = _call_arguments(expression)
     findings = []
-    for operator, arguments, offset in _call_arguments(expression):
-        if operator in VECTOR_ACCEPTING:
+    for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", expression or ""):
+        token = match.group(0)
+        if token not in vectors:
             continue
-        hit = sorted({token for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", arguments)
-                      if token in vectors})
-        if not hit:
+        # Innermost call whose argument span contains this occurrence.
+        best = None
+        for operator, arguments, offset in calls:
+            open_at = expression.find("(", offset)
+            if open_at < 0:
+                continue
+            close_at = open_at + 1 + len(arguments)
+            if open_at < match.start() < close_at:
+                if best is None or open_at > best[1]:
+                    best = (operator, open_at)
+        if best is None or best[0] in VECTOR_ACCEPTING:
             continue
-        severity = "error" if strict else "warning"
-        if operator not in VECTOR_REJECTING:
-            # Unknown operators get a softer flag: the platform's rule is
-            # per-operator and this list is assembled from reports, not from docs.
-            severity = "warning"
+        operator = best[0]
+        severity = "error" if (strict and operator in VECTOR_REJECTING) else "warning"
         findings.append({
             "code": "vector_field_input",
             "severity": severity,
             "operator": operator,
-            "identifier": hit[0],
-            "offset": offset,
-            "message": ("%s reads VECTOR field %s; the platform rejects event inputs "
-                        "for this operator (aggregate first, e.g. ts_sum)"
-                        % (operator, ", ".join(hit))),
+            "identifier": token,
+            "offset": match.start(),
+            "message": ("%s reads VECTOR field %s; aggregate first (ts_sum, vec_avg, "
+                        "vec_sum), the platform rejects event inputs here"
+                        % (operator, token)),
         })
     return findings
 
