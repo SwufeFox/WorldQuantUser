@@ -43,7 +43,11 @@ class ApiKeyTests(unittest.TestCase):
             self.assertEqual(ds.api_key(), "sk-test")
 
     def test_alias_key_is_accepted(self):
-        with mock.patch.dict(os.environ, {"WEBSEARCH_API_KEY": "sk-alias"}, clear=True):
+        # Clearing os.environ is not enough: api_key() falls back to .env, so once a real
+        # key exists on disk this test reads it and passes for the wrong reason. Measured
+        # exactly that when the key was configured - the assertion saw the live key.
+        with mock.patch.dict(os.environ, {"WEBSEARCH_API_KEY": "sk-alias"}, clear=True), \
+                mock.patch.object(ds.machine_lib, "_load_dotenv", lambda: None):
             self.assertEqual(ds.api_key(), "sk-alias")
 
     def test_available_reports_without_network(self):

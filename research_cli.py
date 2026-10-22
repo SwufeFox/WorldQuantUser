@@ -49,6 +49,7 @@ import field_search  # noqa: E402
 import research_paths  # noqa: E402
 import cache_store  # noqa: E402
 import deepseek_search  # noqa: E402
+import paper_search  # noqa: E402
 import correlation  # noqa: E402
 import ablation  # noqa: E402
 
@@ -436,6 +437,19 @@ def build_parser():
                      help="Ignore and do not write the cache.")
     lit.add_argument("--save")
     lit.set_defaults(func=cmd_search)
+
+    papers = sub.add_parser(
+        "paper",
+        help="Find papers via OpenAlex: journal, DOI, citations and abstract.")
+    papers.add_argument("query")
+    papers.add_argument("--limit", type=int, default=10,
+                        help="Number of papers, 1-50 (default 10).")
+    papers.add_argument("--from-year", type=int, default=None,
+                        help="Only papers published in or after this year.")
+    papers.add_argument("--min-citations", type=int, default=None,
+                        help="Drop papers with fewer citations than this.")
+    papers.add_argument("--save")
+    papers.set_defaults(func=cmd_paper)
 
     sim = sub.add_parser(
         "simulate", help="Simulate alphas (spends simulation quota unless --dry-run).")
@@ -1836,6 +1850,29 @@ def _preflight_lint(session, pairs, args):
             "warnings": report["warnings"],
         },
     )
+
+
+def cmd_paper(args, _sink):
+    """Paper search: the scholarly counterpart to `search`.
+
+    `search` is a web search with reranking and, measured over three mechanism queries,
+    returned zero to one academic domain in ten. This one talks to OpenAlex, so every row
+    carries a journal, a year and a citation count, which is what makes a result worth
+    chasing rather than inferring a formula from a blog post.
+    """
+    try:
+        data = paper_search.search_papers(args.query, limit=args.limit,
+                                          from_year=args.from_year,
+                                          min_citations=args.min_citations)
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc), "query must not be empty") from exc
+    except Exception as exc:  # noqa: BLE001 - network and DNS both land here
+        raise CliError("SERVICE_ERROR", "OpenAlex request failed: %s" % exc,
+                       "the API is public and needs no key; retry shortly") from exc
+    if args.save:
+        _write_json(args.save, data)
+        data["saved_to"] = args.save
+    return data
 
 
 def cmd_simulate(args, sink):

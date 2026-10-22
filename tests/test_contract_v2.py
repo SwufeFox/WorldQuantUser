@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 import alpha_registry  # noqa: E402
 import expression_lint
+import paper_search
 import expression_types
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import probe_units  # noqa: E402
@@ -1251,3 +1252,75 @@ class SubmissionStateTests(unittest.TestCase):
             document = machine_lib.submit_alpha(session, "A", confirm=False)
         self.assertEqual(document["submission"], "NOT_SENT")
         self.assertFalse(document["submitted"])
+
+
+class PaperSearchTests(unittest.TestCase):
+    """OpenAlex, because the web search turned out not to be a paper search.
+
+    Measured over three mechanism queries, the general search returned zero to one
+    academic domain in ten - the rest were research blogs, accounting explainers and
+    brokerage pages. Fine for a definition, useless for the source of an anomaly.
+    """
+
+    WORK = {
+        "title": " Information in balance sheets ",
+        "publication_year": 2011,
+        "doi": "https://doi.org/10.1016/j.irfa.2011.06.001",
+        "cited_by_count": 20,
+        "primary_location": {"source": {"display_name": "International Review of Financial Analysis"}},
+        "authorships": [{"author": {"display_name": "A. Author"}},
+                        {"author": {"display_name": "B. Author"}}],
+        "open_access": {"is_oa": True},
+        "abstract_inverted_index": {"Net": [0], "operating": [1], "assets": [2],
+                                    "predict": [3], "returns": [4]},
+    }
+
+    def test_inverted_index_is_reconstructed(self):
+        # OpenAlex ships abstracts as {"word": [positions]}; without reconstruction every
+        # result is a title and this stops being better than a web search.
+        self.assertEqual(paper_search.reconstruct_abstract(self.WORK),
+                         "Net operating assets predict returns")
+
+    def test_missing_abstract_stays_missing(self):
+        # Not every publisher licenses the abstract. Absent is reported as absent.
+        work = dict(self.WORK)
+        work.pop("abstract_inverted_index")
+        self.assertIsNone(paper_search.reconstruct_abstract(work))
+
+    def test_normalise_carries_journal_doi_and_citations(self):
+        paper = paper_search.normalise(self.WORK)
+        self.assertEqual(paper["title"], "Information in balance sheets")
+        self.assertEqual(paper["journal"], "International Review of Financial Analysis")
+        self.assertEqual(paper["citations"], 20)
+        self.assertEqual(len(paper["authors"]), 2)
+        self.assertTrue(paper["open_access"])
+
+    def test_empty_query_is_refused(self):
+        with self.assertRaises(ValueError):
+            paper_search.search_papers("   ")
+
+    def test_min_citations_filters_after_ranking(self):
+        # The threshold is applied here rather than as an OpenAlex filter, because the
+        # server-side filter interacts badly with relevance ranking on narrow topics.
+        payload = {"meta": {"count": 2}, "results": [
+            dict(self.WORK), dict(self.WORK, title="Low cited", cited_by_count=1)]}
+        with mock.patch.object(paper_search.urllib.request, "urlopen",
+                               return_value=_FakeResponse(payload)):
+            data = paper_search.search_papers("q", limit=10, min_citations=5)
+        self.assertEqual([paper["title"] for paper in data["papers"]],
+                         ["Information in balance sheets"])
+
+
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def read(self):
+        import json as _json
+        return _json.dumps(self._payload).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False

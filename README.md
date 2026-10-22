@@ -24,6 +24,7 @@ research_cli.py schema      # the whole contract, as JSON
 | `field_index.py` | Live field-name verification and vocabulary-free variant grouping. |
 | `field_search.py` | Ranked local search over fields and operators: AND, exclusion, fuzzy. |
 | `deepseek_search.py` | Literature search and page fetch, so an idea can be checked against the paper. |
+| `paper_search.py` | OpenAlex paper search: journal, DOI, citations, reconstructed abstract. |
 | `field_contract.py` | Field contracts: declared vs inferred period/unit/sign, verdicts. |
 | `research_paths.py` | Resolves where results go -- always outside this working tree. |
 | `alpha_registry.py` | Append-only ledger of alphas worth remembering. |
@@ -661,6 +662,33 @@ Daily PnL is cached under the results tree, so re-running a comparison costs
 nothing. The endpoint returns 200 with an empty body when polled too quickly;
 that is retried rather than recorded as "no PnL", which would otherwise leave
 correlation tables missing exactly the rows fetched fastest.
+
+## Find the paper, not the blog post
+
+`search` is a web search with reranking. Measured over three mechanism queries it
+returned zero to one academic domain in ten; the rest were research-blog posts,
+accounting explainers and brokerage pages. That is fine for looking up a definition and
+useless for finding where an anomaly comes from.
+
+`paper` asks OpenAlex instead, which is free and needs no key:
+
+```bash
+python research_cli.py paper 'net operating assets stock returns anomaly' --limit 3
+python research_cli.py paper 'analyst coverage breadth' --from-year 2010 --min-citations 50
+```
+
+Every row carries a journal, a year, a DOI and a citation count, plus the abstract when
+the publisher licensed it. Two details make it work:
+
+* results are ranked by **relevance**, not citations. Sorting by citations answers a
+  mechanism query with the most-cited finance papers ever written - the Fama-French
+  mutual fund study among them - because citation count is not relevance;
+* OpenAlex ships abstracts as an **inverted index**, `{"word": [positions]}`. It has to be
+  reconstructed, otherwise every hit is a title and the tool is no better than the web
+  search it replaces.
+
+A missing abstract means the publisher withheld it; that is reported as absent rather than
+guessed at.
 
 ## Check an idea against the literature
 

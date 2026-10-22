@@ -63,7 +63,7 @@ class SchemaContractTests(unittest.TestCase):
         commands = parse(run_cli("schema"))["data"]["commands"]["subcommands"]
         self.assertEqual(
             set(commands), {"schema", "auth", "catalog", "simulate", "resume",
-                            "alpha", "lint", "cache", "search", "ablate",
+                            "alpha", "lint", "cache", "search", "paper", "ablate",
                             "compare"},
         )
         simulate = commands["simulate"]
