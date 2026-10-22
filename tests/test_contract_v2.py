@@ -1163,3 +1163,91 @@ class LintRegressionFromTheLedgerTests(unittest.TestCase):
         inferred = expression_types.infer(
             "group_rank(gp, subindustry) + 0.25 * group_rank(gp, subindustry)", self.TYPES)
         self.assertEqual(inferred, expression_types.MATRIX)
+
+
+class SubmissionStateTests(unittest.TestCase):
+    """Four outcomes, because a 2xx from /submit is not a submission.
+
+    The old code set submitted=True whenever the HTTP status was below 400, which
+    contradicted the README's own rule that only dateSubmitted proves completion. During
+    the campaign that bug produced a false report of twenty submissions; every one of them
+    was still UNSUBMITTED.
+    """
+
+    class _Response:
+        def __init__(self, status_code, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = "{}"
+            self.headers = {}
+
+        def json(self):
+            return self._payload
+
+    class _Session:
+        def __init__(self, response):
+            self._response = response
+
+        def post(self, url, timeout=None):
+            return self._response
+
+        def get(self, url, timeout=None, params=None):
+            return self._response
+
+    def submit(self, response, read_back):
+        session = self._Session(response)
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics", side_effect=read_back):
+            return machine_lib.submit_alpha(session, "A", confirm=True, max_wait_seconds=1)
+
+    def test_confirmed_only_when_date_submitted_is_present(self):
+        responses = [{"id": "A", "status": "UNSUBMITTED", "name": "n", "category": "VOLUME"},
+                     {"id": "A", "status": "ACTIVE", "dateSubmitted": "2026-10-22T00:00:00Z"}]
+        document = self.submit(self._Response(201), responses)
+        self.assertEqual(document["submission"], "CONFIRMED")
+        self.assertTrue(document["submitted"])
+        self.assertEqual(document["date_submitted"], "2026-10-22T00:00:00Z")
+
+    def test_two_hundred_without_date_submitted_is_only_accepted(self):
+        responses = [{"id": "A", "status": "UNSUBMITTED", "name": "n", "category": "VOLUME"},
+                     {"id": "A", "status": "UNSUBMITTED", "dateSubmitted": None}]
+        document = self.submit(self._Response(201), responses)
+        self.assertEqual(document["submission"], "ACCEPTED")
+        self.assertFalse(document["submitted"])
+        self.assertIn("dateSubmitted", document["reason"])
+
+    def test_four_hundred_with_checks_is_rejected_and_names_the_failure(self):
+        checks = [{"name": "SELF_CORRELATION", "result": "FAIL", "limit": 0.7,
+                   "value": 0.8488}]
+        document = self.submit(self._Response(403, {"is": {"checks": checks}}),
+                              [{"id": "A", "status": "UNSUBMITTED"}])
+        self.assertEqual(document["submission"], "REJECTED")
+        self.assertFalse(document["submitted"])
+        self.assertEqual(document["failed_checks"], ["SELF_CORRELATION"])
+        self.assertIn("0.8488", document["reason"])
+
+    def test_read_back_failure_is_uncertain_not_success(self):
+        responses = [{"id": "A", "status": "UNSUBMITTED", "name": "n", "category": "VOLUME"},
+                     machine_lib.ServiceError("read-back broke")]
+        document = self.submit(self._Response(201), responses)
+        self.assertEqual(document["submission"], "UNCERTAIN")
+        self.assertFalse(document["submitted"])
+
+    def test_already_active_is_confirmed_without_posting(self):
+        session = self._Session(self._Response(500))
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics",
+                              return_value={"id": "A", "status": "ACTIVE",
+                                            "dateSubmitted": "2026-10-01T00:00:00Z"}):
+            document = machine_lib.submit_alpha(session, "A", confirm=True)
+        self.assertEqual(document["submission"], "CONFIRMED")
+        self.assertIn("already ACTIVE", document["reason"])
+
+    def test_dry_run_reports_not_sent(self):
+        session = self._Session(self._Response(500))
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics",
+                              return_value={"id": "A", "status": "UNSUBMITTED",
+                                            "name": "n", "category": "VOLUME"}), \
+             mock.patch.object(machine_lib, "fetch_alpha_checks",
+                               return_value={"checks": {}, "complete": True}):
+            document = machine_lib.submit_alpha(session, "A", confirm=False)
+        self.assertEqual(document["submission"], "NOT_SENT")
+        self.assertFalse(document["submitted"])

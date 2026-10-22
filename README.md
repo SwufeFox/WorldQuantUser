@@ -351,6 +351,20 @@ A first `POST` does not return the self-correlation value at all. It comes back 
 `403 selfCorr=0.8488` minutes later. Always confirm with `dateSubmitted`, never with the
 status code.
 
+`alpha submit` therefore reports a four-state `submission` field instead of a boolean:
+
+| `submission` | meaning |
+| --- | --- |
+| `CONFIRMED` | `dateSubmitted` is set; it is in the book |
+| `ACCEPTED` | the platform took the request but `dateSubmitted` is still empty - re-check before counting it |
+| `REJECTED` | refused, with `failed_checks` naming what failed and its value |
+| `UNCERTAIN` | accepted, but the read-back failed; the outcome is unknown |
+| `NOT_SENT` | dry run, nothing was written |
+
+`submitted` stays in the document and is true only for `CONFIRMED`. An earlier version set
+it whenever the HTTP status was below 400, which contradicted this very table and produced
+a false report of twenty submissions, all of which were still UNSUBMITTED.
+
 The platform's own view names the counterpart, which is what makes the substitute route
 decidable:
 

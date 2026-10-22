@@ -1819,8 +1819,13 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
         "submitted": False,
     }
     if status in ("ACTIVE", "SUBMITTED"):
-        document["checks"] = _extract_checks(current) or {}
-        document["reason"] = "already %s; nothing to do" % status
+        document.update({
+            "checks": _extract_checks(current) or {},
+            "submission": "CONFIRMED",
+            "submitted": True,
+            "date_submitted": current.get("dateSubmitted"),
+            "reason": "already %s" % status,
+        })
         return document
     if not confirm:
         # the platform has no separate test-submission call: the test *is* the
@@ -1831,6 +1836,7 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
         document["checks"] = live.get("checks")
         document["self_correlation"] = live.get("self_correlation")
         document["checks_complete"] = live.get("complete")
+        document["submission"] = "NOT_SENT"
         document["reason"] = "confirmation required: rerun with --yes"
         return document
     deadline = time.monotonic() + (max_wait_seconds or 0)
@@ -1849,17 +1855,60 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
         payload = response.json()
     except ValueError:
         payload = {}
+
+    # Four outcomes, not two. A 2xx from this endpoint means "accepted for
+    # evaluation", not "submitted": the platform answers 201 with an empty body while
+    # the checks are still being computed, and an alpha that then fails them stays
+    # UNSUBMITTED with no error anywhere. Treating the status code as success is the
+    # mistake this function used to make, and it is the same mistake that produced a
+    # false "twenty submitted" report during the campaign.
+    checks = (payload.get("is") or {}).get("checks") or []
+    failed = [check for check in checks
+              if check.get("result") not in (None, "PASS", "PENDING")]
+
     if response.status_code >= 400:
-        raise ServiceError(
-            "submission rejected with HTTP %s: %s"
-            % (response.status_code, json.dumps(payload)[:300])
-        )
-    refreshed = fetch_alpha_metrics(s, alpha_id)
+        document.update({
+            "submission": "REJECTED",
+            "submitted": False,
+            "status_code": response.status_code,
+            "checks": _extract_checks({"is": {"checks": checks}}) or {},
+            "failed_checks": [check.get("name") for check in failed],
+            "reason": ("refused: " + ", ".join(
+                "%s=%s" % (check.get("name"), check.get("value")) for check in failed)
+                if failed else "refused with HTTP %s" % response.status_code),
+            "response": payload,
+        })
+        return document
+
+    # A 2xx only buys an evaluation. The read-back decides.
+    try:
+        refreshed = fetch_alpha_metrics(s, alpha_id)
+    except BrainError as exc:
+        document.update({
+            "submission": "UNCERTAIN",
+            "submitted": False,
+            "status_code": response.status_code,
+            "reason": "accepted but the read-back failed (%s); re-check dateSubmitted "
+                      "before treating this as submitted" % type(exc).__name__,
+            "response": payload,
+        })
+        return document
+
+    date_submitted = refreshed.get("dateSubmitted")
     document.update({
-        "submitted": True,
+        "submitted": bool(date_submitted),
+        "submission": "CONFIRMED" if date_submitted else "ACCEPTED",
         "status": refreshed.get("status"),
+        "date_submitted": date_submitted,
+        "status_code": response.status_code,
+        "checks": _extract_checks(refreshed) or {},
         "response": payload,
     })
+    if not date_submitted:
+        document["reason"] = (
+            "accepted for asynchronous evaluation but dateSubmitted is still empty; "
+            "re-submit after the evaluation, or re-read dateSubmitted, before "
+            "counting this as submitted")
     return document
 
 
