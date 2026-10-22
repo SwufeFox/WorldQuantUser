@@ -27,7 +27,16 @@ research_cli.py schema      # the whole contract, as JSON
 | `research_paths.py` | Resolves where results go -- always outside this working tree. |
 | `alpha_registry.py` | Append-only ledger of alphas worth remembering. |
 | `research_gui.py` | Small tkinter wrapper for interactive use. |
-| `Alpha Machine.ipynb` | Worked example, first-order → second-order → third-order alphas. |
+| `correlation.py` | Align daily PnL on shared dates, Pearson, residualise against a control. |
+| `ablation.py` | Leave-one-out and solo variants, so a leg can be shown to earn its place. |
+| `cache_store.py` | Small JSON cache with TTL, so repeat calls do not re-fetch. |
+| `tools/expression_macros.py` | Named `def` templates, expanded in bulk, lint-gated. |
+| `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
+| `tools/pool_stats.py` | Report the pool as quartiles rather than as a best alpha. |
+| `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |
+| `tools/dedupe_ledger.py` | Find identical-PnL entries that are one alpha filed twice. |
+| `tools/derive_family.py` | Derive family labels from the datafield namespace. |
+| `tools/turnover_repair.py` | Break-even Sharpe for a smoothing decision. |
 | `tools/backfill_registry.py` | One-off seed of the registry from the account and existing result files. |
 | `tests/` | Offline contract tests. No account required. |
 
@@ -52,8 +61,7 @@ run cannot quietly add data to the history.
 pip install -r requirements.txt      # requests (required), pandas (optional)
 ```
 
-`pandas` is only needed for the notebook and `fields_to_df()`; the CLI runs
-without it.
+`pandas` is only needed by `fields_to_df()`; the CLI runs without it.
 
 ## Credentials
 
@@ -688,6 +696,12 @@ Errors are typed and subclass `machine_lib.BrainError`: `MissingCredentials`,
 * **The registry records alphas, not conclusions.** `verdict` and `note` are
   judgement; the expression, settings and metrics next to them are re-read from
   the platform so the numbers cannot drift.
+
+## License
+
+MIT, see `LICENSE`. The tool is a client for WorldQuant BRAIN and carries no market
+data; anything produced by running it belongs to whoever ran it and is subject to the
+platform's own terms.
 
 ## Tests
 
