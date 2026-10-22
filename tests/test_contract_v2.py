@@ -27,6 +27,7 @@ import alpha_registry  # noqa: E402
 import expression_lint
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import probe_units  # noqa: E402
+import expression_macros  # noqa: E402
 import field_contract  # noqa: E402
 import machine_lib  # noqa: E402
 import research_paths  # noqa: E402
@@ -999,3 +1000,73 @@ class SelfCorrelationTests(unittest.TestCase):
         ]
         verdict = machine_lib.self_correlation_verdict({"records": records})
         self.assertAlmostEqual(verdict["sharpe_needed"], 2.2, places=3)
+
+
+class ExpressionMacroTests(unittest.TestCase):
+    """Named templates, so a shape is written once and instantiated in bulk.
+
+    The campaign kept retyping the same accounting-growth shape with a new field; each
+    transcription risked a typo that only lint would sometimes catch.
+    """
+
+    SOURCE = """
+# a comment between definitions belongs to neither body
+def growth(f, w=63):
+    ts_delta(ts_backfill({f}, 252), {w}) / (abs(ts_delay(ts_backfill({f}, 252), {w})) + 1)
+
+def position():
+    (close - low) / (high - low) - 0.5
+
+def carrier(f, fast, fw=0.5, w=63):
+    -rank(growth({f}, {w})) - {fw}*rank({fast})
+
+def loop_a(x):
+    loop_b({x})
+
+def loop_b(x):
+    loop_a({x})
+"""
+
+    def setUp(self):
+        self.macros = expression_macros.parse_macros(self.SOURCE)
+
+    def test_parameters_and_defaults_parse(self):
+        self.assertEqual([p for p, _ in self.macros["growth"]["params"]], ["f", "w"])
+        self.assertEqual(self.macros["growth"]["params"][1][1], "63")
+
+    def test_comment_between_definitions_is_not_absorbed(self):
+        # Without skipping comment lines the trailing prose is glued onto the previous
+        # body and appears inside every expansion.
+        self.assertNotIn("#", self.macros["growth"]["body"])
+        self.assertNotIn("belongs to neither", self.macros["growth"]["body"])
+
+    def test_nested_macro_expands(self):
+        out = expression_macros.expand(self.macros, "carrier", ["fnd6_x", "position()"])
+        self.assertIn("ts_delta(ts_backfill(fnd6_x, 252), 63)", out)
+        self.assertIn("rank((close - low) / (high - low) - 0.5)", out)
+        self.assertNotIn("{", out)
+
+    def test_cycle_is_refused(self):
+        with self.assertRaises(expression_macros.MacroError) as ctx:
+            expression_macros.expand(self.macros, "loop_a", ["x"])
+        self.assertIn("cycle", str(ctx.exception))
+
+    def test_missing_argument_is_refused(self):
+        with self.assertRaises(expression_macros.MacroError) as ctx:
+            expression_macros.expand(self.macros, "growth", [])
+        self.assertIn("missing argument", str(ctx.exception))
+
+    def test_duplicate_expressions_are_skipped_not_resubmitted(self):
+        plan = [
+            {"macro": "position", "args": [], "decay": 4, "candidate_id": "A"},
+            {"macro": "position", "args": [], "decay": 4, "candidate_id": "B"},
+        ]
+        alphas, skipped = expression_macros.build(self.macros, plan, built=set())
+        self.assertEqual(len(alphas), 1)
+        self.assertEqual(skipped[0]["candidate_id"], "B")
+        self.assertIn("duplicate", skipped[0]["reason"])
+
+    def test_expansion_is_deterministic(self):
+        first = expression_macros.expand(self.macros, "carrier", ["f", "position()"])
+        second = expression_macros.expand(self.macros, "carrier", ["f", "position()"])
+        self.assertEqual(first, second)

@@ -313,6 +313,55 @@ python research_cli.py alpha submit RRA1jdmb          # dry-run, nothing written
 python research_cli.py alpha submit RRA1jdmb --yes    # irreversible
 ```
 
+An alpha also carries metadata, and a submission is unattributable without it. Only
+three properties are writable — `name`, `category` and `tags` — and `description` does
+**not** exist: eighteen candidate spellings all return `Unexpected property`, so none is
+invented to hold one. `alpha submit` refuses an alpha with no name or category and prints
+the exact command to fix it.
+
+```bash
+python research_cli.py alpha describe ABC12345 \
+    --name "Inventory stage growth with intraday position" --category FUNDAMENTAL
+```
+
+Categories are an enum discovered by probing, because an invalid value returns 400 without
+listing the choices: `ANALYST`, `FUNDAMENTAL`, `PRICE_VOLUME`, `SENTIMENT`, `VOLUME`.
+
+### What "submitted" actually means
+
+Three outcomes look similar and are not:
+
+| response | meaning |
+| --- | --- |
+| `403` with a check list | evaluated and refused; only here do you learn the real value |
+| `201` with an empty body | accepted for asynchronous evaluation; **not** a submission |
+| `dateSubmitted` set | the only trustworthy evidence that it went in |
+
+A first `POST` does not return the self-correlation value at all. It comes back on a
+**second** attempt once the evaluation has cached: an alpha can answer `201` and then
+`403 selfCorr=0.8488` minutes later. Always confirm with `dateSubmitted`, never with the
+status code.
+
+The platform's own view names the counterpart, which is what makes the substitute route
+decidable:
+
+```bash
+python research_cli.py alpha self-corr ABC12345
+```
+
+```
+sharpe 2.35   max_correlation 0.8593   sharpe_needed 2.475   verdict blocked
+counterparts: qMEWm7L2 (0.8593, Sharpe 2.25), XgRWJAQX (0.7896, Sharpe 2.00)
+```
+
+The margin applies to **every** counterpart above the limit, not to the most-correlated
+one — taking the counterpart of the maximum understates the bar exactly when a second,
+higher-Sharpe neighbour exists. Two related traps are handled rather than discovered:
+`/correlations/self` answers `200` with an empty body plus `Retry-After` when it is not
+ready (a blank body is retried, because reading it as "no data" reports a correlated alpha
+as clear), and the recordset we use is `/recordsets/daily-pnl`, which is already daily, so
+the documented requirement to difference a cumulative series does not apply here.
+
 ### Lint before you spend a simulation
 
 ```bash
@@ -359,6 +408,98 @@ Operations: `ts_difference` (one field over time), `ratio`, `difference`, `sum`.
 Differencing a share count is blocked outright because no split basis is
 declared; a sum or difference of fields with undeclared sign is blocked because
 one negative stored value inverts the signal. Quota-free.
+
+### Measure a unit instead of guessing it
+
+The catalogue does not declare units, and `field-audit` can only say `unknown`. There is
+one way to find out: add the field to a pure number and read the rejection.
+
+```bash
+python tools/probe_units.py --fields fnd6_newqv1300_invfgq,fnd6_newqv1300_invwipq
+```
+
+```
+fnd6_newqv1300_invfgq   Unit[TSPrice:1]   simulator named the field unit as expected
+fnd6_newqv1300_invwipq  dimensionless     add with a scalar succeeded
+```
+
+Answers are cached in `<research_dir>/field-units.json` so a probe costs one simulation
+only once. Two details are easy to get wrong and both are pinned by tests:
+
+* the simulator reports `expected "Unit[TSPrice:1]", found "Unit[]"` — the **expected**
+  side is the field and the **found** side is the bare scalar, so reading `found` inverts
+  every answer;
+* a unit mismatch can arrive as `WARNING` as well as `ERROR`, so the error text is
+  inspected before the status.
+
+This distinction is worth acting on: `unknown` is a prompt to measure, `absent` is a
+reason to stop. An audit that records a block on a measurable unknown leaves a mechanism
+unexamined for no reason, which is how four inventory fields sat untested for days.
+
+## Write a template once, instantiate it in bulk
+
+The same accounting-growth shape appeared in a dozen batches with only the field
+changing, and every transcription risked a typo that only lint would sometimes catch. A
+macro file makes the shape a named, parameterised thing:
+
+```
+def growth(f, w=63, b=252):
+    ts_delta(ts_backfill({f}, {b}), {w}) / (abs(ts_delay(ts_backfill({f}, {b}), {w})) + 1)
+
+def position():
+    (close - low) / (high - low) - 0.5
+
+def carrier2(f1, f2, fast, fw=0.5, w=63, b=252):
+    -rank(growth({f1}, {w}, {b})) - rank(growth({f2}, {w}, {b})) - {fw}*rank({fast})
+```
+
+```bash
+python tools/expression_macros.py --macros macros/carriers.macros --list
+python tools/expression_macros.py --macros macros/carriers.macros \
+    --expand 'carrier2(fnd6_newqv1300_invfgq,fnd6_newqv1300_invwipq,position(),0.5,63,126)'
+python tools/expression_macros.py --macros macros/carriers.macros \
+    --plan macros/plan-arap.json --lint --out rounds/batch.json
+```
+
+Expansion is textual, deterministic, and recursive: a macro may call another, cycles are
+refused, and a macro that leaves a placeholder unresolved is an error rather than a
+half-built expression. Determinism is what makes the ledger's expression dedupe
+meaningful — the same macro and arguments always produce the same string, so a repeat
+batch is caught instead of paid for.
+
+`--lint` runs the same checks the CLI runs (operator catalogue, VECTOR fields read by an
+operator that cannot take them, trailing tokens, operator budget) and **refuses to write
+a file that has problems**. A generator that can emit unchecked expressions is a way
+around every check built so far.
+
+`build` also drops duplicates of the ledger and of the plan itself before writing, and
+says which entries it dropped.
+
+The proof that the macros are faithful is a byte comparison, not a claim: expanding
+`carrier2` with the inventory fields and the `position` leg reproduces `rKd0g0bj` — the
+alpha that entered the book — character for character.
+
+### Report the pool as a distribution
+
+A best-alpha report hides what a pool is: two pools can share a top result and differ
+completely in spread, one narrow and correlated, one broad and independent.
+
+```bash
+python tools/pool_stats.py --min-fitness 1.25 --out pool.json
+```
+
+```
+measure                           min       q1   median     mean       q3      max
+Sharpe                         1.4100   1.7225   1.9050   1.9025   2.0700   2.5800
+turnover                       0.0125   0.0934   0.1229   0.1233   0.1580   0.3793
+holding days (1/turnover)      2.6364   6.3291   8.1400  13.0821  10.7131  80.0000
+pairwise correlation          -0.1843   0.2731   0.4213   0.4475   0.6142   1.0000
+```
+
+The correlation row is the one that matters. A pool whose median pairwise correlation is
+0.42 is one bet wearing many names, whatever its best alpha looks like. Percent-of-capital
+volatility is deliberately absent: the recordset is cumulative dollar PnL and capital is
+not exposed, so that figure cannot be computed here and is not faked.
 
 ### Remember what you found
 
