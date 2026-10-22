@@ -1123,3 +1123,43 @@ class ExpressionTypeTests(unittest.TestCase):
 
     def test_window_arguments_are_not_type_checked(self):
         self.assertEqual(self.codes("ts_delta(close, 5)"), [])
+
+
+class LintRegressionFromTheLedgerTests(unittest.TestCase):
+    """Two false positives found by replaying 717 ledger expressions through the linter.
+
+    Both were caught only because the flagged alphas had platform scores: an expression
+    the platform accepted and scored is proof that the linter is wrong, not the alpha.
+    """
+
+    TYPES = {"sixty_minute_price_change_percent": "VECTOR",
+             "shares_sold_short_count_2": "VECTOR", "close": "MATRIX",
+             "subindustry": "GROUP", "gp": "MATRIX"}
+
+    def test_comment_blocks_are_stripped(self):
+        # Two scored alphas carry `/* HYPOTHESIS: ... */`; a name scan read the prose as
+        # identifiers and reported every capitalised word.
+        text = "/* HYPOTHESIS: higher liabilities may indicate leverage */ rank(close)"
+        self.assertEqual(expression_lint.strip_comments(text).strip(), "rank(close)")
+
+    def test_hash_line_comments_are_stripped(self):
+        # An alpha opens with `# day1` and was scored normally.
+        text = "# day1\nx = ts_mean(close, 5);\nrank(x)"
+        stripped = expression_lint.strip_comments(text)
+        self.assertNotIn("#", stripped)
+        self.assertNotIn("day1", stripped)
+
+    def test_double_slash_comments_are_stripped(self):
+        self.assertNotIn("note", expression_lint.strip_comments("rank(close) // note"))
+
+    def test_inference_prefers_a_call_return_type_over_a_field_inside_it(self):
+        # `-ts_mean(vec_avg(vector_field), 5)` is a MATRIX. Taking the field type instead
+        # produced a type error on four alphas that had already been scored.
+        inferred = expression_types.infer(
+            "-ts_mean(vec_avg(sixty_minute_price_change_percent), 5)", self.TYPES)
+        self.assertEqual(inferred, expression_types.MATRIX)
+
+    def test_inference_prefers_a_call_over_a_group_argument(self):
+        inferred = expression_types.infer(
+            "group_rank(gp, subindustry) + 0.25 * group_rank(gp, subindustry)", self.TYPES)
+        self.assertEqual(inferred, expression_types.MATRIX)

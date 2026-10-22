@@ -492,6 +492,25 @@ def vector_findings(expression, field_types, strict=False):
     return findings
 
 
+_COMMENT_BLOCK = re.compile(r"/\*.*?\*/", re.S)
+_COMMENT_LINE = re.compile(r"//[^\n]*")
+_COMMENT_HASH = re.compile(r"#[^\n]*")
+
+
+def strip_comments(expression):
+    """Remove FASTEXPR comments before any name or type check.
+
+    The platform accepts `/* ... */` blocks inside an expression - two alphas in the
+    ledger carry a written hypothesis that way and were scored normally - but a name scan
+    reads the prose as identifiers and reports every capitalised word as an unknown field.
+    """
+    text = _COMMENT_BLOCK.sub(" ", expression or "")
+    text = _COMMENT_LINE.sub(" ", text)
+    # `#` starts a line comment too: an alpha in the ledger opens with `# day1` and was
+    # scored normally, so the marker is data to the platform and prose to a name scan.
+    return _COMMENT_HASH.sub(" ", text)
+
+
 def lint_expression(expression, operator_index=None, denylist=None,
                     known_fields=None, strict_fields=False, field_types=None):
     """Lint one expression. Returns ``{ok, errors, warnings, ...}``.
@@ -501,6 +520,7 @@ def lint_expression(expression, operator_index=None, denylist=None,
     unknown-identifier check.
     ``field_types`` maps field id to catalog type and enables the VECTOR check.
     """
+    expression = strip_comments(expression)
     errors = []
     warnings = []
     expression = expression or ""

@@ -183,9 +183,22 @@ def infer(expression, field_types, _depth=0):
             return str(declared).upper()
         # A bare identifier that is not a field is almost always an assigned variable.
         return UNKNOWN
-    # Arithmetic or a comparison: fall back to the first typed piece inside.
-    for token in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", text):
-        declared = (field_types or {}).get(token)
+    # A compound expression. Prefer the return type of a call over the type of a field
+    # inside it: `-ts_mean(vec_avg(vector_field), 5)` is a MATRIX, and picking the field
+    # instead produced a false type error on four alphas the platform had already scored.
+    for operator in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
+        name = operator.lower()
+        if name in SIGNATURES:
+            return SIGNATURES[name][1]
+        if name in DOCUMENTED_UNAVAILABLE:
+            return DOCUMENTED_UNAVAILABLE[name][1]
+    # No calls at all: look at bare identifiers that are not already inside one.
+    spans = [(m.start(), text.find(")", m.end()) + 1 or len(text))
+             for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*\s*\(", text)]
+    for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", text):
+        if any(start <= match.start() < end for start, end in spans):
+            continue
+        declared = (field_types or {}).get(match.group(0))
         if declared:
             return str(declared).upper()
     return UNKNOWN
