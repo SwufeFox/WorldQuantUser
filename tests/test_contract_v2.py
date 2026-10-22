@@ -17,6 +17,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -893,3 +894,60 @@ class VectorFieldTests(unittest.TestCase):
             "rank(mdl109_eps_sur_decay)", field_types=self.TYPES)
         codes = {item.get("code") for item in report["warnings"] + report["errors"]}
         self.assertIn("vector_field_input", codes)
+
+
+class AlphaMetadataTests(unittest.TestCase):
+    """name and category are writable; description does not exist.
+
+    Eighteen candidate spellings for a description all return "Unexpected property", so
+    none is invented: the rule is name and category, and tags stay available as the
+    platform's only free-text list.
+    """
+
+    class _Session:
+        def __init__(self, status=200, payload=None, echo=None):
+            self.status_code = status
+            self.payload = payload or {}
+            self.echo = echo
+            self.sent = None
+
+        def patch(self, url, json=None, timeout=None):
+            self.sent = json
+            outer = self
+
+            class _R:
+                status_code = outer.status_code
+                text = ""
+
+            return _R()
+
+    def test_invalid_category_is_refused_before_the_call(self):
+        with self.assertRaises(ValueError) as ctx:
+            machine_lib.set_alpha_metadata(AlphaMetadataTests._Session(),
+                                           "A", category="NOT_A_CATEGORY")
+        self.assertIn("category must be one of", str(ctx.exception))
+
+    def test_tags_are_sent_as_a_list(self):
+        session = AlphaMetadataTests._Session()
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics",
+                               return_value={"id": "A", "name": "n",
+                                             "category": "VOLUME",
+                                             "tags": ["t"]}):
+            machine_lib.set_alpha_metadata(session, "A", name="n",
+                                           category="VOLUME", tags=["t"])
+        self.assertIsInstance(session.sent["tags"], list)
+
+    def test_metadata_that_does_not_stick_raises(self):
+        # The API answers 200 for updates it has only accepted; the write is verified
+        # by re-reading, the same way a submission is verified by dateSubmitted.
+        session = AlphaMetadataTests._Session()
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics",
+                               return_value={"id": "A", "name": None,
+                                             "category": None, "tags": []}):
+            with self.assertRaises(machine_lib.ServiceError) as ctx:
+                machine_lib.set_alpha_metadata(session, "A", name="n")
+        self.assertIn("did not stick", str(ctx.exception))
+
+    def test_nothing_to_update_is_refused(self):
+        with self.assertRaises(ValueError):
+            machine_lib.set_alpha_metadata(AlphaMetadataTests._Session(), "A")

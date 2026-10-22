@@ -563,6 +563,22 @@ def build_parser():
     a_chk.add_argument("--save")
     a_chk.set_defaults(func=cmd_alpha_check)
 
+    a_desc = alpha_sub.add_parser(
+        "describe",
+        help="Set an alpha's name, category and tags (the only writable metadata).",
+        description="The platform accepts name, category and tags on an alpha. It has "
+                    "no description property: eighteen candidate spellings all return "
+                    "'Unexpected property', so nothing is invented to hold one.")
+    a_desc.add_argument("alpha_id")
+    a_desc.add_argument("--name", default=None)
+    a_desc.add_argument("--category", default=None, choices=list(ml.ALPHA_CATEGORIES))
+    a_desc.add_argument("--tags", default=None,
+                        help="Comma-separated tags. The platform has no description "
+                             "property, so a description has nowhere to go.")
+    a_desc.add_argument("--save")
+    _add_session_args(a_desc)
+    a_desc.set_defaults(func=cmd_alpha_describe)
+
     a_sub = alpha_sub.add_parser(
         "submit",
         help="Submit one alpha to its competition (dry-run unless --yes).")
@@ -2010,8 +2026,23 @@ def cmd_alpha_submit(args, _sink):
     """
     if args.max_wait is not None and args.max_wait < 0:
         raise UsageError("--max-wait must be non-negative")
-    result = with_session(args, lambda s: ml.submit_alpha(
-        s, args.alpha_id, confirm=args.yes, max_wait_seconds=args.max_wait))
+
+    def work(session):
+        # A submission carries metadata with it: the platform accepts a name, a
+        # category and tags, and an alpha filed without them is unattributable later.
+        # Checked before the submit call so a missing label cannot cost a submission.
+        current = ml.fetch_alpha_metrics(session, args.alpha_id)
+        missing = [field for field in ("name", "category") if not current.get(field)]
+        if missing:
+            raise CliError(
+                "INVALID_INPUT",
+                "%s has no %s" % (args.alpha_id, ", ".join(missing)),
+                "set them first: alpha describe %s --name ... --category ..."
+                % args.alpha_id)
+        return ml.submit_alpha(session, args.alpha_id, confirm=args.yes,
+                               max_wait_seconds=args.max_wait)
+
+    result = with_session(args, work)
     _maybe_save(args, result)
     return result
 
@@ -2544,6 +2575,31 @@ def cmd_alpha_coverage(args, _sink):
              "mechanism": entry.get("mechanism")}
             for entry in missing[: args.limit]
         ]
+    _maybe_save(args, data)
+    return data
+
+
+def cmd_alpha_describe(args, _sink):
+    """Write an alpha's metadata and verify it stuck."""
+    tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
+    if not any((args.name, args.category, tags)):
+        raise CliError("USAGE", "nothing to set",
+                       "pass --name, --category and/or --tags")
+
+    def work(session):
+        return ml.set_alpha_metadata(session, args.alpha_id, name=args.name,
+                                     category=args.category,
+                                     tags=tags or None)
+
+    current = with_session(args, work)
+    data = {
+        "alpha_id": current.get("id"),
+        "name": current.get("name"),
+        "category": current.get("category"),
+        "tags": current.get("tags"),
+        "verified": True,
+        "note": "the platform exposes name, category and tags; there is no description",
+    }
     _maybe_save(args, data)
     return data
 

@@ -2322,3 +2322,47 @@ def extract_split(payload):
         "train": block(train),
         "test": block(test),
     }
+
+#: Values the platform accepts for an alpha's category. Discovered by probing the
+#: API: an invalid value returns 400 without listing the choices, so the set is
+#: assembled from what is accepted.
+ALPHA_CATEGORIES = ("ANALYST", "FUNDAMENTAL", "PRICE_VOLUME", "SENTIMENT", "VOLUME")
+
+
+def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None):
+    """Set an alpha's writable metadata and return the updated payload.
+
+    Only three properties are writable on an alpha: ``name``, ``category`` and
+    ``tags``. ``description`` does not exist - eighteen candidate spellings all
+    return "Unexpected property" - so the only free-text field the platform offers is
+    the tag list, and ``tags`` must be a list, not a string.
+
+    The update is verified by re-reading rather than trusting the PATCH status, for
+    the same reason a submission is verified by ``dateSubmitted``: this API answers
+    with success codes for requests it has only accepted.
+    """
+    payload = {}
+    if name is not None:
+        payload["name"] = name
+    if category is not None:
+        if category not in ALPHA_CATEGORIES:
+            raise ValueError("category must be one of %s, got %r"
+                             % (", ".join(ALPHA_CATEGORIES), category))
+        payload["category"] = category
+    if tags is not None:
+        payload["tags"] = list(tags)
+    if not payload:
+        raise ValueError("nothing to update")
+
+    response = s.patch(BRAIN_API_URL + "/alphas/" + alpha_id, json=payload,
+                       timeout=_request_timeout(None))
+    if response.status_code != 200:
+        raise ServiceError("metadata update failed: HTTP %d %s"
+                           % (response.status_code, (response.text or "")[:200]))
+
+    current = fetch_alpha_metrics(s, alpha_id)
+    mismatched = [key for key, value in payload.items()
+                  if current.get(key) != value]
+    if mismatched:
+        raise ServiceError("metadata did not stick: %s" % ", ".join(mismatched))
+    return current
