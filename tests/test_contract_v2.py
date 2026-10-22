@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 import alpha_registry  # noqa: E402
 import expression_lint
+import expression_types
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import probe_units  # noqa: E402
 import expression_macros  # noqa: E402
@@ -905,10 +906,15 @@ class VectorFieldTests(unittest.TestCase):
         self.assertEqual(expression_lint.vector_findings("rank(anything)", None), [])
 
     def test_lint_surfaces_it(self):
+        # The handover: this used to be reported by the hand-built VECTOR denylist as
+        # `vector_field_input`. The signature table now derives the same verdict as
+        # `type_mismatch`, and the denylist only covers operators the table lacks, so the
+        # problem is reported once and with expected/actual types attached.
         report = expression_lint.lint_expression(
             "rank(mdl109_eps_sur_decay)", field_types=self.TYPES)
         codes = {item.get("code") for item in report["warnings"] + report["errors"]}
-        self.assertIn("vector_field_input", codes)
+        self.assertIn("type_mismatch", codes)
+        self.assertNotIn("vector_field_input", codes)
 
 
 class AlphaMetadataTests(unittest.TestCase):
@@ -1070,3 +1076,50 @@ def loop_b(x):
         first = expression_macros.expand(self.macros, "carrier", ["f", "position()"])
         second = expression_macros.expand(self.macros, "carrier", ["f", "position()"])
         self.assertEqual(first, second)
+
+
+class ExpressionTypeTests(unittest.TestCase):
+    """Five field types, operator signatures, and the mismatches they imply.
+
+    Before this, the VECTOR rule was a hand-built denylist assembled from error messages.
+    A signature table derives it: only the vector reducers accept a VECTOR, so `rank` on
+    one is a type error rather than a special case.
+    """
+
+    TYPES = {"five_minute_price_change_pct": "VECTOR", "close": "MATRIX",
+             "subindustry": "GROUP", "top3000": "UNIVERSE", "ticker": "SYMBOL"}
+
+    def codes(self, expression):
+        return [f["code"] for f in expression_types.type_findings(
+            expression, self.TYPES, strict=True)]
+
+    def test_vector_into_rank_is_a_type_error(self):
+        self.assertIn("type_mismatch", self.codes("rank(five_minute_price_change_pct)"))
+
+    def test_vector_reduced_first_is_accepted(self):
+        self.assertEqual(self.codes("rank(vec_avg(five_minute_price_change_pct))"), [])
+
+    def test_arithmetic_on_a_vector_is_a_type_error(self):
+        self.assertIn("type_mismatch",
+                      self.codes("multiply(five_minute_price_change_pct, 2)"))
+
+    def test_group_slot_rejects_a_matrix(self):
+        self.assertIn("type_mismatch", self.codes("group_rank(close, close)"))
+
+    def test_group_slot_accepts_a_group(self):
+        self.assertEqual(self.codes("group_rank(close, subindustry)"), [])
+
+    def test_bucket_produces_a_group(self):
+        self.assertEqual(self.codes("group_rank(close, bucket(rank(close)))"), [])
+        self.assertIn("type_mismatch", self.codes("densify(close)"))
+
+    def test_documented_but_unavailable_operator_is_named(self):
+        findings = expression_types.type_findings(
+            "rank(vec_choose(five_minute_price_change_pct, -1))", self.TYPES, strict=True)
+        self.assertIn("operator_documented_unavailable", [f["code"] for f in findings])
+
+    def test_unknown_types_are_not_guessed(self):
+        self.assertEqual(self.codes("rank(some_assigned_variable)"), [])
+
+    def test_window_arguments_are_not_type_checked(self):
+        self.assertEqual(self.codes("ts_delta(close, 5)"), [])

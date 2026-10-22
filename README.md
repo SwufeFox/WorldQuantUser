@@ -20,6 +20,7 @@ research_cli.py schema      # the whole contract, as JSON
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and GUI. |
 | `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
+| `expression_types.py` | Five field types, operator signatures, and the mismatches they imply. |
 | `field_index.py` | Live field-name verification and vocabulary-free variant grouping. |
 | `field_search.py` | Ranked local search over fields and operators: AND, exclusion, fuzzy. |
 | `deepseek_search.py` | Literature search and page fetch, so an idea can be checked against the paper. |
@@ -369,6 +370,43 @@ higher-Sharpe neighbour exists. Two related traps are handled rather than discov
 ready (a blank body is retried, because reading it as "no data" reports a correlated alpha
 as clear), and the recordset we use is `/recordsets/daily-pnl`, which is already daily, so
 the documented requirement to difference a cumulative series does not apply here.
+
+### Types: five kinds of field, and the operators that accept them
+
+The platform's field filter offers five types — `Matrix`, `Vector`, `Group`, `Universe`,
+`Symbol` — and an operator accepts specific ones. `expression_types.py` carries the
+signature table and checks arguments against it:
+
+```python
+rank(five_minute_price_change_pct)              # type_mismatch: rank expects MATRIX
+rank(vec_avg(five_minute_price_change_pct))     # ok: the vector reducer returns MATRIX
+multiply(five_minute_price_change_pct, 2)       # type_mismatch
+group_rank(close, close)                        # type_mismatch: the group slot wants GROUP
+group_rank(close, subindustry)                  # ok
+group_rank(close, bucket(rank(close)))          # ok: bucket returns GROUP
+densify(close)                                  # type_mismatch: densify wants GROUP
+```
+
+This replaces a hand-built denylist of "operators that reject VECTOR fields", which had
+been assembled from simulator error messages and was necessarily incomplete. The rule is
+now derived: only `vec_avg` and `vec_sum` accept a VECTOR, so everything else is a type
+error by construction. The denylist survives only for operators the table does not cover,
+so the same problem is never reported twice.
+
+Two details worth knowing:
+
+* `bucket` returns a **GROUP**, not a number. That is why it can be passed to a group
+  operator and nowhere else, and it is the documented way to build a custom grouping.
+* operators that the course material or the formulae paper documents but this account's
+  catalogue lacks — `vec_choose`, `ts_max`, `ts_min`, `floor` — are reported as
+  `operator_documented_unavailable` with that reason, instead of a generic unknown-operator
+  error. `vec_choose` in particular appears in WorldQuant's own short-interest example and
+  cannot run here.
+
+Inference is deliberately pragmatic: a bare field resolves to its declared type, a call to
+its return type, a literal to scalar, and anything else to the first typed piece inside it
+or `UNKNOWN`. It stays silent rather than guessing, so a variable assigned earlier in the
+expression is not mistaken for a type error.
 
 ### Lint before you spend a simulation
 

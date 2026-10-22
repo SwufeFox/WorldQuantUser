@@ -29,6 +29,8 @@ import json
 import os
 import re
 
+import expression_types
+
 import research_paths
 import cache_store
 
@@ -659,9 +661,21 @@ def lint_expression(expression, operator_index=None, denylist=None,
     for finding in trailing_token_findings(expression):
         errors.append(finding)
 
-    # VECTOR ("event-driven") fields are a third of the catalogue and most operators
-    # cannot read them; a template batch that ignores this fails en masse.
-    for finding in vector_findings(expression, field_types, strict=strict_fields):
+    # Types first: the signature table derives which operators accept which field type,
+    # including the VECTOR rule that used to be a hand-built denylist. The denylist is
+    # kept only for operators the signature table does not cover, so the same problem is
+    # never reported twice.
+    for finding in expression_types.type_findings(expression, field_types,
+                                                  strict=strict_fields):
+        if finding["severity"] == "error":
+            errors.append(finding)
+        else:
+            warnings.append(finding)
+
+    unsigned = [item for item in vector_findings(expression, field_types,
+                                                 strict=strict_fields)
+                if item.get("operator") not in expression_types.SIGNATURES]
+    for finding in unsigned:
         if finding["severity"] == "error":
             errors.append(finding)
         else:
