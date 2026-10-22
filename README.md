@@ -73,7 +73,14 @@ Copy the template and fill it in:
 cp .env.example .env
 ```
 
-`.env` is git-ignored. Real environment variables (`BRAIN_USERNAME`,
+`.env.example` is the single list of variables this tool reads: required credentials,
+the research directory, the literature-search key and its alias, and the two tuning knobs.
+It is guarded by a test that extracts environment names from the source, because that list
+had already drifted once - four variables were documented nowhere, including the one that
+decides where the ledger lives.
+
+`.env` must sit next to `machine_lib.py`; the loader resolves it relative to the module,
+so a `.env` elsewhere is silently ignored. It is git-ignored. Real environment variables (`BRAIN_USERNAME`,
 `BRAIN_PASSWORD`) take precedence over the file:
 
 ```bash

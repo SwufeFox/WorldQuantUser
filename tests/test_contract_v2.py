@@ -13,6 +13,7 @@ Run with::
 from __future__ import annotations
 
 import json
+import re
 import os
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = str(ROOT)
 sys.path.insert(0, str(ROOT))
 
 import alpha_registry  # noqa: E402
@@ -1324,3 +1326,74 @@ class _FakeResponse:
 
     def __exit__(self, *exc):
         return False
+
+
+class EnvExampleTests(unittest.TestCase):
+    """`.env.example` must document every variable the code reads.
+
+    It did not. Four were missing - BRAIN_RESEARCH_DIR, which decides where the ledger
+    lives, the WEBSEARCH_API_KEY alias, and two tuning knobs - so a new user could not
+    discover where their results go or that the alias was accepted. It also carried a
+    dated promise about DeepSeek pricing, which rots silently.
+
+    This test reads the variable names straight out of the source rather than keeping a
+    second list, because a second list drifts in exactly the same way the example did.
+    """
+
+    #: Names the operating system or the shell owns; documenting them is noise.
+    OS_OWNED = {"XDG_DATA_HOME", "HOME", "PATH", "TMPDIR", "PYTHONPATH"}
+
+    def read(self, name):
+        with open(os.path.join(REPO_ROOT, name), encoding="utf-8") as handle:
+            return handle.read()
+
+    def documented(self):
+        names = set()
+        for line in self.read(".env.example").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                names.add(line.split("=", 1)[0].strip())
+            elif line.startswith("# ") and "=" in line:
+                names.add(line[2:].split("=", 1)[0].strip())
+        # commented-out examples such as "# BRAIN_RESEARCH_DIR=..." still document a name
+        for match in re.finditer(r"^#\s*([A-Z][A-Z0-9_]{2,})\s*=", self.read(".env.example"),
+                                 re.M):
+            names.add(match.group(1))
+        return names
+
+    def test_every_env_var_the_code_reads_is_documented(self):
+        # The obvious extractor - literals inside environ.get("...") - only found two of
+        # the seven, and would have reported success while four were undocumented. The
+        # rest are reached indirectly: BRAIN_RESEARCH_DIR through a module constant,
+        # DEEPSEEK_API_KEY and its alias through a loop over a tuple, and BRAIN_USERNAME /
+        # BRAIN_PASSWORD built from a prefix inside get_credentials(). So this scans every
+        # uppercase literal that looks like an environment name instead.
+        #
+        # Limitation worth knowing: a future variable with an unusual name (no _KEY, _DIR,
+        # _TTL, _TIMEOUT, _PATH, _URL, _SECRET or _TOKEN suffix and not one of the
+        # explicit names) would escape the scan. Collapsing that risk entirely means a
+        # declared contract in each module, which is a larger change than this test needs.
+        suffixes = ("_KEY", "_DIR", "_TTL", "_TIMEOUT", "_PATH", "_URL", "_SECRET", "_TOKEN")
+        explicit = {"BRAIN_USERNAME", "BRAIN_PASSWORD"}
+        literal = re.compile(r"""["']([A-Z][A-Z0-9_]{4,})["']""")
+        used = set()
+        for name in sorted(os.listdir(REPO_ROOT)):
+            if not name.endswith(".py"):
+                continue
+            for candidate in literal.findall(self.read(name)):
+                if candidate in explicit or candidate.endswith(suffixes):
+                    used.add(candidate)
+        used -= self.OS_OWNED
+        self.assertGreaterEqual(len(used), 6,
+                                "the extractor found fewer variables than expected; stale")
+        missing = sorted(used - self.documented())
+        self.assertEqual(missing, [], "undocumented in .env.example: %s" % ", ".join(missing))
+
+    def test_no_dated_promises(self):
+        # A date written into documentation becomes a false statement on its own, on a day
+        # nobody is watching.
+        text = self.read(".env.example")
+        self.assertNotRegex(text, r"until \d{4}-\d{2}-\d{2}",
+                            "dated claims rot; describe the policy instead")
