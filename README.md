@@ -426,6 +426,32 @@ ready (a blank body is retried, because reading it as "no data" reports a correl
 as clear), and the recordset we use is `/recordsets/daily-pnl`, which is already daily, so
 the documented requirement to difference a cumulative series does not apply here.
 
+### The turnover floor, checked mechanically
+
+A shape built only from disclosure fields cannot clear the platform's 0.01 turnover floor.
+Four accounting families measured it directly: deferred tax **0.0077**, operating leases
+**0.0086**, unrecognised tax benefits **0.009**, share-based compensation **0.0083**. No
+choice of neutralisation, decay or truncation lifted any of them, because the ranking only
+changes when a filing does.
+
+`lint` now says so before a simulation is spent:
+
+```
+turnover_floor_risk: no market-data field: shapes like this measured 0.006-0.010 turnover
+against a 0.01 floor, because a ranking of disclosure fields only changes when a filing
+does; add a term that moves daily
+```
+
+The check reads **which fields carry market data**, taking that from the catalogue's
+dataset rather than from a list of names. The first attempt keyed on "has a time-series
+operator" and was wrong in both directions: `ts_backfill` is a fill, not movement, so a
+static ratio passed silently; and `close/vwap` has no window at all, so a shape that turns
+over hundreds of times a year was flagged.
+
+It is a warning, not an error: a low-turnover signal is legal, it simply cannot pass. The
+slow-dataset list lives in one visible constant (`SLOW_DATASETS`) instead of being inferred
+inside the linter, so the assumption can be read and argued with.
+
 ### Types: five kinds of field, and the operators that accept them
 
 The platform's field filter offers five types — `Matrix`, `Vector`, `Group`, `Universe`,

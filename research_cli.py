@@ -1808,9 +1808,17 @@ def _preflight_lint(session, pairs, args):
 
     known_fields = None
     field_types = None
+    market_fields = None
     field_note = "unavailable"
     try:
-        known_fields = field_index.field_ids(field_index.fetch_all_fields(
+        # One fetch, three views. Measured on this account, a shape built only from
+        # disclosure fields turned over 0.006-0.010 against a 0.01 floor - deferred tax
+        # 0.0077, operating leases 0.0086, unrecognised tax benefits 0.009, share-based
+        # compensation 0.0083 - while the same shapes with a market-data leg cleared it
+        # easily. The list below is the basis for that check and is kept here, visible,
+        # rather than buried in the linter.
+        slow_datasets = {"fundamental2", "fundamental6", "analyst4"}
+        records = field_index.fetch_all_fields(
             session,
             # `simulate` leaves these as None so a research file's settings win.
             # Passing None straight through makes /data-fields answer
@@ -1820,23 +1828,22 @@ def _preflight_lint(session, pairs, args):
             universe=getattr(args, "universe", None) or "TOP3000",
             delay=getattr(args, "delay", None) if getattr(args, "delay", None) is not None else 1,
             instrument_type=getattr(args, "instrument_type", None) or "EQUITY",
-        ))
+        )
+        known_fields = field_index.field_ids(records)
         field_note = "checked (%d names)" % len(known_fields)
         # Field type decides whether an operator can read the field at all: a third
         # of the catalogue is VECTOR and most operators reject event inputs.
-        try:
-            field_types = {record.get("id"): record.get("type")
-                           for record in field_index.fetch_all_fields(
-                               session,
-                               region=getattr(args, "region", None) or "USA",
-                               universe=getattr(args, "universe", None) or "TOP3000",
-                               delay=(getattr(args, "delay", None)
-                                      if getattr(args, "delay", None) is not None else 1),
-                               instrument_type=(getattr(args, "instrument_type", None)
-                                                or "EQUITY"))
-                           if record.get("id")}
-        except Exception:  # noqa: BLE001 - type info is a bonus, not a gate
-            field_types = None
+        field_types = {record.get("id"): record.get("type")
+                       for record in records if record.get("id")}
+        market_fields = set()
+        for record in records:
+            field_id = record.get("id")
+            if not field_id:
+                continue
+            dataset = record.get("dataset")
+            dataset_id = dataset.get("id") if isinstance(dataset, dict) else dataset
+            if dataset_id not in slow_datasets:
+                market_fields.add(field_id)
     except Exception as exc:  # noqa: BLE001
         field_note = "unavailable: %s: %s" % (type(exc).__name__, exc)
         note("lint: field catalog unavailable (%s); field names are NOT verified "
@@ -1849,6 +1856,7 @@ def _preflight_lint(session, pairs, args):
         known_fields=known_fields,
         strict_fields=bool(known_fields),
         field_types=field_types,
+        market_fields=market_fields,
     )
     report["operator_catalog_size"] = len(operator_index or {})
     report["operator_catalog"] = catalog_note
@@ -2207,6 +2215,40 @@ def _operator_index_from_catalog(session):
     return expression_lint.build_operator_index(ml.fetch_operators(session))
 
 
+#: Datasets whose fields update on a disclosure schedule rather than with the market.
+#: Measured basis for the turnover check: a shape built only from these turned over
+#: 0.006-0.010 against the platform's 0.01 floor - deferred tax 0.0077, operating leases
+#: 0.0086, unrecognised tax benefits 0.009, share-based compensation 0.0083 - and no
+#: choice of neutralisation or decay lifted it, because the ranking only changes when a
+#: filing does. Kept as a constant, and visible, rather than inferred inside the linter.
+SLOW_DATASETS = frozenset({"fundamental2", "fundamental6", "analyst4"})
+
+
+def _dataset_id(record):
+    """Dataset id from a catalogue record, which may nest it or not."""
+    dataset = record.get("dataset")
+    return dataset.get("id") if isinstance(dataset, dict) else dataset
+
+
+def _field_scope(session, args):
+    """Return ``(known_field_ids, market_field_ids)`` from one catalogue fetch.
+
+    Two views on purpose: the first answers "is this a real field", the second "does
+    anything here move with the market". Fetching twice would let them disagree.
+    """
+    records = field_index.fetch_all_fields(
+        session,
+        region=getattr(args, "region", None) or "USA",
+        universe=getattr(args, "universe", None) or "TOP3000",
+        delay=getattr(args, "delay", None) if getattr(args, "delay", None) is not None else 1,
+        instrument_type=getattr(args, "instrument_type", None) or "EQUITY",
+    )
+    known = field_index.field_ids(records)
+    market = {record.get("id") for record in records
+              if record.get("id") and _dataset_id(record) not in SLOW_DATASETS}
+    return known, market
+
+
 def _known_field_ids(session, args):
     """Every field id in scope, for flagging unknown identifiers.
 
@@ -2231,13 +2273,14 @@ def cmd_lint(args, sink):
     denylist = expression_lint.load_denylist(getattr(args, "denylist", None))
     operator_index = None
     known_fields = None
+    market_fields = None
     catalog_checked = False
     if not getattr(args, "offline", False):
         def work(session):
-            return (_operator_index_from_catalog(session),
-                    _known_field_ids(session, args))
+            known, market = _field_scope(session, args)
+            return _operator_index_from_catalog(session), known, market
 
-        operator_index, known_fields = with_session(args, work)
+        operator_index, known_fields, market_fields = with_session(args, work)
         catalog_checked = operator_index is not None
 
     results = []
@@ -2248,6 +2291,7 @@ def cmd_lint(args, sink):
             denylist=denylist,
             known_fields=known_fields,
             strict_fields=getattr(args, "strict_fields", False),
+            market_fields=market_fields,
         )
         report["expression"] = expression
         if decay is not None:

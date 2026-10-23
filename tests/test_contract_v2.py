@@ -1492,3 +1492,41 @@ class ForecastTargetAlignmentTests(unittest.TestCase):
         operation = field_contract.audit_operation(contracts, "ts_difference")
         self.assertEqual(operation["verdict"], "ready")
         self.assertEqual(operation["warnings"], [])
+
+
+class TurnoverFloorTests(unittest.TestCase):
+    """A shape built only from disclosure fields cannot clear the 0.01 turnover floor.
+
+    Measured across four accounting families - deferred tax 0.0077, operating leases 0.0086,
+    unrecognised tax benefits 0.009, share-based compensation 0.0083 - and no choice of
+    neutralisation or decay lifted them, because the ranking only changes when a filing
+    does. The check reads which fields carry market data, not what the construct looks like:
+    the first attempt keyed on "has a time-series operator" and got it backwards in both
+    directions, since ts_backfill is not movement and close/vwap has no window at all.
+    """
+
+    MARKET = {"close", "returns", "volume", "vwap"}
+    UTB = ("-rank(ts_backfill(fn_unrecognized_tax_benefits_a, 504) "
+           "/ (abs(ts_backfill(fnd6_cptnewqv1300_atq, 504)) + 1))")
+
+    def test_disclosure_only_shape_warns(self):
+        findings = expression_lint.turnover_findings(self.UTB, self.MARKET)
+        self.assertEqual([f["code"] for f in findings], ["turnover_floor_risk"])
+        self.assertIn("0.006-0.010", findings[0]["message"])
+
+    def test_a_market_field_silences_the_warning(self):
+        expr = self.UTB + " - 0.5*rank(ts_sum(returns, 5))"
+        self.assertEqual(expression_lint.turnover_findings(expr, self.MARKET), [])
+
+    def test_price_ratio_does_not_warn(self):
+        self.assertEqual(
+            expression_lint.turnover_findings("rank(close / vwap - 1)", self.MARKET), [])
+
+    def test_silent_without_a_catalogue(self):
+        # Offline there is no category view, and a guess would be worse than silence.
+        self.assertEqual(expression_lint.turnover_findings(self.UTB, None), [])
+
+    def test_reaches_lint_expression_as_a_warning_not_an_error(self):
+        report = expression_lint.lint_expression(self.UTB, market_fields=self.MARKET)
+        self.assertEqual([w["code"] for w in report["warnings"]], ["turnover_floor_risk"])
+        self.assertEqual(report["errors"], [])

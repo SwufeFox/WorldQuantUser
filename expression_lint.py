@@ -445,6 +445,46 @@ def trailing_token_findings(expression):
     return found
 
 
+#: The platform's turnover floor.
+TURNOVER_FLOOR = 0.01
+
+#: How far below the floor the measured band sits, used for the message only.
+MEASURED_BAND = (0.006, 0.010)
+
+
+def turnover_findings(expression, market_fields=None):
+    """Warn when nothing in the expression reads a market field.
+
+    A signal built only from disclosure fields barely moves: the cross-sectional order is
+    stable until the next filing. Four accounting families measured 0.006-0.010 turnover
+    against a 0.01 floor - deferred tax 0.0077, operating leases 0.0086, unrecognised tax
+    benefits 0.009, share-based compensation 0.0083 - and no choice of neutralisation or
+    decay lifted them, because the ranking itself does not change between filings.
+
+    ``market_fields`` is the set of field ids whose catalogue category carries market data,
+    supplied by the caller from the catalogue. Deriving it here would mean encoding which
+    datasets are slow, which is the assumption this project keeps out of the code. When the
+    set is absent the check is silent, because it has nothing to compare against.
+    """
+    if not market_fields:
+        return []
+    referenced = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression or ""))
+    if referenced & set(market_fields):
+        return []
+    # An expression with no field at all (a constant ladder) is not what this is about.
+    if not referenced:
+        return []
+    return [{
+        "code": "turnover_floor_risk",
+        "severity": "warning",
+        "measured_band": list(MEASURED_BAND),
+        "message": "no market-data field: shapes like this measured %.3f-%.3f turnover "
+                   "against a %.2f floor, because a ranking of disclosure fields only "
+                   "changes when a filing does; add a term that moves daily"
+                   % (MEASURED_BAND[0], MEASURED_BAND[1], TURNOVER_FLOOR),
+    }]
+
+
 def vector_findings(expression, field_types, strict=False):
     """Flag VECTOR fields read directly by an operator that cannot take them.
 
@@ -512,13 +552,16 @@ def strip_comments(expression):
 
 
 def lint_expression(expression, operator_index=None, denylist=None,
-                    known_fields=None, strict_fields=False, field_types=None):
+                    known_fields=None, strict_fields=False, field_types=None,
+                    market_fields=None):
     """Lint one expression. Returns ``{ok, errors, warnings, ...}``.
 
     ``operator_index`` comes from :func:`build_operator_index`; when omitted the
     operator-name check is skipped (offline use). ``known_fields`` enables the
     unknown-identifier check.
     ``field_types`` maps field id to catalog type and enables the VECTOR check.
+    ``market_fields`` is the set of fields whose category carries market data, and
+    enables the turnover-floor check.
     """
     expression = strip_comments(expression)
     errors = []
@@ -692,6 +735,9 @@ def lint_expression(expression, operator_index=None, denylist=None,
         else:
             warnings.append(finding)
 
+    for finding in turnover_findings(expression, market_fields):
+        warnings.append(finding)
+
     unsigned = [item for item in vector_findings(expression, field_types,
                                                  strict=strict_fields)
                 if item.get("operator") not in expression_types.SIGNATURES]
@@ -713,7 +759,8 @@ def lint_expression(expression, operator_index=None, denylist=None,
     }
 
 def lint_all(pairs, operator_index=None, denylist=None, known_fields=None,
-             strict_fields=False, field_types=None):
+             strict_fields=False, field_types=None,
+              market_fields=None):
     """Lint a batch of ``(expression, decay)`` pairs.
 
     Returns ``{ok, results, errors, warnings}`` where ``errors`` and
@@ -731,7 +778,7 @@ def lint_all(pairs, operator_index=None, denylist=None, known_fields=None,
             denylist=denylist,
             known_fields=known_fields,
             strict_fields=strict_fields,
-            field_types=field_types,
+            field_types=field_types, market_fields=market_fields,
         )
         report["expression"] = expression
         results.append(report)
