@@ -452,6 +452,40 @@ TURNOVER_FLOOR = 0.01
 MEASURED_BAND = (0.006, 0.010)
 
 
+#: `name = expression;` at the start of a statement. FASTEXPR variables are assignments
+#: separated by semicolons; the final statement is the returned expression.
+_ASSIGNMENT = re.compile(r"(?:^|;)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)")
+
+
+def unused_variable_findings(expression):
+    """Report variables that are declared and never read.
+
+    The simulator rejects those outright - "Found unused variables" - and only after a
+    submission has been accepted, so a shared preamble that declares two variants' worth of
+    helpers costs four failed simulations before the message appears.
+
+    Counting occurrences is enough here: a name that appears once in the whole expression
+    is its own declaration.
+    """
+    text = expression or ""
+    declared = []
+    for match in _ASSIGNMENT.finditer(text):
+        name = match.group(1)
+        if name not in declared:
+            declared.append(name)
+    findings = []
+    for name in declared:
+        if len(re.findall(r"\b%s\b" % re.escape(name), text)) <= 1:
+            findings.append({
+                "code": "unused_variable",
+                "severity": "error",
+                "variable": name,
+                "message": "variable %r is declared but never read; the simulator rejects "
+                           "the whole expression for that alone" % name,
+            })
+    return findings
+
+
 def turnover_findings(expression, market_fields=None):
     """Warn when the expression has no leg that moves daily.
 
@@ -742,6 +776,9 @@ def lint_expression(expression, operator_index=None, denylist=None,
             errors.append(finding)
         else:
             warnings.append(finding)
+
+    for finding in unused_variable_findings(expression):
+        errors.append(finding)
 
     for finding in turnover_findings(expression, market_fields):
         warnings.append(finding)
