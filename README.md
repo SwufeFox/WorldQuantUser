@@ -426,6 +426,36 @@ ready (a blank body is retried, because reading it as "no data" reports a correl
 as clear), and the recordset we use is `/recordsets/daily-pnl`, which is already daily, so
 the documented requirement to difference a cumulative series does not apply here.
 
+### Dimensions: do not add market cap to a balance-sheet item
+
+`cap + abs(liabilities)` is refused by the simulator: market capitalisation carries
+`Unit[CSPrice:1,CSShare:1]` — price times shares — while total liabilities is dimensionless
+in this catalogue. The error cost a submission, and the same shape was in three
+expressions of the same batch.
+
+`lint` now says so first:
+
+```
+unit_mismatch: infix arithmetic mixes cap (Unit[CSPrice:1,CSShare:1]) with
+abs(...) (dimensionless); the simulator refuses operands of different units.
+Divide by a common scale instead of adding.
+```
+
+The units are **measured, never assumed**: `tools/probe_units.py` reads them out of the
+simulator's own rejection message, and an error observed at simulation time is recorded in
+the same cache. A field with no measurement yields no finding — the same rule the type
+checker follows, because a guess that misfires trains the operator to ignore the check.
+
+Scope is deliberately narrow: additive operators and comparisons must see two operands of
+one unit, which is exactly the class that costs a round trip. Multiplication and division
+combine units so a nested expression can still be judged; a fractional exponent drops the
+unit rather than inventing a square root.
+
+Two details were learned by getting them wrong. The first version only matched the function
+form `add(a, b)` and stayed silent on `a + b`, which is the form that failed. And infix
+splitting has to treat a leading `-` as unary, or `-rank(close) - 0.5` looks like a
+mismatch.
+
 ### The turnover floor, checked mechanically
 
 **Disclosure data is not low-value.** Three of the book's entries are built entirely from

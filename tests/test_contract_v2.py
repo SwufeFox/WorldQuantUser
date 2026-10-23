@@ -30,6 +30,7 @@ import correlation
 import expression_lint
 import paper_search
 import expression_types
+import expression_units
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import probe_units  # noqa: E402
 import expression_macros  # noqa: E402
@@ -1534,3 +1535,58 @@ class TurnoverFloorTests(unittest.TestCase):
         report = expression_lint.lint_expression(self.UTB, market_fields=self.MARKET)
         self.assertEqual([w["code"] for w in report["warnings"]], ["turnover_floor_risk"])
         self.assertEqual(report["errors"], [])
+
+
+class UnitCheckTests(unittest.TestCase):
+    """Dimensional analysis from units the simulator itself reported.
+
+    The failure that prompted it: `cap + abs(liabilities)`. Market cap carries
+    Unit[CSPrice:1,CSShare:1] - price times shares - while total liabilities is
+    dimensionless here, so the addition is refused. It cost a submission, and the same
+    shape was in three expressions.
+    """
+
+    UNITS = {"cap": "Unit[CSPrice:1,CSShare:1]",
+             "fnd6_cptnewqv1300_ltq": "dimensionless"}
+
+    def codes(self, expression):
+        findings = (expression_units.infix_findings(expression, self.UNITS)
+                    + expression_units.unit_findings(expression, self.UNITS))
+        return [item["code"] for item in findings]
+
+    def test_unit_parsing_round_trips(self):
+        unit = expression_units.parse_unit("Unit[CSPrice:1,CSShare:1]")
+        self.assertEqual(unit, {"CSPrice": 1, "CSShare": 1})
+        self.assertEqual(expression_units.to_text(unit), "Unit[CSPrice:1,CSShare:1]")
+
+    def test_dimensionless_forms(self):
+        for form in ("dimensionless", "Unit[]", ""):
+            self.assertEqual(expression_units.parse_unit(form), {})
+
+    def test_the_real_failure_is_caught(self):
+        # The exact expression that was refused, in the infix form that was actually used.
+        self.assertIn("unit_mismatch",
+                      self.codes("cap + abs(ts_backfill(fnd6_cptnewqv1300_ltq, 252))"))
+
+    def test_the_function_form_is_caught_too(self):
+        self.assertIn("unit_mismatch",
+                      self.codes("add(cap, abs(ts_backfill(fnd6_cptnewqv1300_ltq, 252)))"))
+
+    def test_division_of_different_units_is_fine(self):
+        self.assertEqual(
+            self.codes("ts_backfill(fnd6_newqv1300_seqq, 252) / cap"), [])
+
+    def test_subtracting_a_scalar_from_a_rank_is_fine(self):
+        # rank() drops the unit, so this is dimensionless minus dimensionless.
+        self.assertEqual(self.codes("rank(close) - 0.5"), [])
+
+    def test_unary_minus_is_not_a_binary_operator(self):
+        self.assertEqual(self.codes("-rank(close) - 0.5"), [])
+
+    def test_unknown_units_stay_silent(self):
+        # Nothing measured for these fields, so there is nothing to compare.
+        self.assertEqual(self.codes("agg_a + agg_b"), [])
+
+    def test_unit_preserving_operators_pass_the_unit_through(self):
+        unit = expression_units.resolve("ts_mean(cap, 5)", self.UNITS)
+        self.assertEqual(unit, {"CSPrice": 1, "CSShare": 1})

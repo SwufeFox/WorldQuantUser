@@ -30,6 +30,7 @@ import os
 import re
 
 import expression_types
+import expression_units
 
 import research_paths
 import cache_store
@@ -51,7 +52,10 @@ _LITERALS = frozenset({"true", "false", "nan", "inf", "null", "none"})
 # catalog documents none of these; the entry below came from a live rejection
 # ("Variable eps is reserved and cannot be assigned"), which cost one full
 # simulation round because the offline lint had no way to know.
-_RESERVED_IDENTIFIERS = frozenset({"eps"})
+#: Names the simulator refuses as variables, learned from its own errors. The catalogue
+#: documents none of them, and each one costs a submission to discover, so they accumulate
+#: here: `eps` from a four-expression batch, `sales` from a value-lens batch.
+_RESERVED_IDENTIFIERS = frozenset({"eps", "sales"})
 
 _ASSIGNMENT_TARGET = re.compile(
     r"(?:^|;)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)"
@@ -595,7 +599,7 @@ def strip_comments(expression):
 
 def lint_expression(expression, operator_index=None, denylist=None,
                     known_fields=None, strict_fields=False, field_types=None,
-                    market_fields=None):
+                    market_fields=None, field_units=None):
     """Lint one expression. Returns ``{ok, errors, warnings, ...}``.
 
     ``operator_index`` comes from :func:`build_operator_index`; when omitted the
@@ -603,7 +607,8 @@ def lint_expression(expression, operator_index=None, denylist=None,
     unknown-identifier check.
     ``field_types`` maps field id to catalog type and enables the VECTOR check.
     ``market_fields`` is the set of fields whose category carries market data, and
-    enables the turnover-floor check.
+    enables the turnover-floor check. ``field_units`` maps field id to a unit measured by
+    the simulator, and enables the dimensional check.
     """
     expression = strip_comments(expression)
     errors = []
@@ -777,6 +782,11 @@ def lint_expression(expression, operator_index=None, denylist=None,
         else:
             warnings.append(finding)
 
+    for finding in expression_units.infix_findings(expression, field_units):
+        errors.append(finding)
+    for finding in expression_units.unit_findings(expression, field_units):
+        errors.append(finding)
+
     for finding in unused_variable_findings(expression):
         errors.append(finding)
 
@@ -805,7 +815,7 @@ def lint_expression(expression, operator_index=None, denylist=None,
 
 def lint_all(pairs, operator_index=None, denylist=None, known_fields=None,
              strict_fields=False, field_types=None,
-              market_fields=None):
+              market_fields=None, field_units=None):
     """Lint a batch of ``(expression, decay)`` pairs.
 
     Returns ``{ok, results, errors, warnings}`` where ``errors`` and
@@ -824,6 +834,7 @@ def lint_all(pairs, operator_index=None, denylist=None, known_fields=None,
             known_fields=known_fields,
             strict_fields=strict_fields,
             field_types=field_types, market_fields=market_fields,
+            field_units=field_units,
         )
         report["expression"] = expression
         results.append(report)

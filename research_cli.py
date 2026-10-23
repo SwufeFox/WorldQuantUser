@@ -43,6 +43,7 @@ import machine_lib as ml  # noqa: E402
 import research_config as config_io  # noqa: E402
 import alpha_registry  # noqa: E402
 import expression_lint  # noqa: E402
+import expression_units  # noqa: E402
 import field_contract  # noqa: E402
 import field_index  # noqa: E402
 import field_search  # noqa: E402
@@ -1855,6 +1856,7 @@ def _preflight_lint(session, pairs, args):
         strict_fields=bool(known_fields),
         field_types=field_types,
         market_fields=market_fields,
+        field_units=expression_units.load_field_units(),
     )
     report["operator_catalog_size"] = len(operator_index or {})
     report["operator_catalog"] = catalog_note
@@ -2290,6 +2292,7 @@ def cmd_lint(args, sink):
             known_fields=known_fields,
             strict_fields=getattr(args, "strict_fields", False),
             market_fields=market_fields,
+            field_units=expression_units.load_field_units(),
         )
         report["expression"] = expression
         if decay is not None:
