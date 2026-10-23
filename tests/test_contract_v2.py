@@ -27,6 +27,8 @@ sys.path.insert(0, str(ROOT))
 
 import alpha_registry  # noqa: E402
 import correlation
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
+import book_audit
 import expression_lint
 import paper_search
 import expression_types
@@ -1655,3 +1657,40 @@ class AlphaDescriptionTests(unittest.TestCase):
         alpha = schema["subcommands"]["alpha"]["subcommands"]["describe"]
         flags = [flag for option in alpha["options"] for flag in option["flags"]]
         self.assertIn("--description", flags)
+
+
+class BookAuditTests(unittest.TestCase):
+    """`candidate` in the ledger is not "in the book".
+
+    Measured 2026-10-23: 159 distinct alphas carried `candidate`, 45 were ACTIVE. The
+    verdict is written automatically when the platform's static checks pass at simulation
+    time, and nothing rewrites it after a submission is refused for self-correlation, so the
+    ledger overstated the book by 3.5x and every hit rate computed from it was wrong.
+    """
+
+    def entries(self):
+        return [
+            {"alpha_id": "A", "verdict": "candidate", "idea": "composition"},
+            {"alpha_id": "B", "verdict": "candidate", "idea": "composition"},
+            {"alpha_id": "C", "verdict": "rejected", "idea": "guidance"},
+            # same alpha recorded twice; the later record is the current word
+            {"alpha_id": "D", "verdict": "candidate", "idea": "single"},
+            {"alpha_id": "D", "verdict": "rejected", "idea": "single"},
+        ]
+
+    def test_only_book_members_count(self):
+        joined = book_audit.classify(self.entries(), {"A": {"status": "ACTIVE"}})
+        data = book_audit.report(joined)
+        self.assertEqual(data["marked_candidate"], 2)      # A and B, D was superseded
+        self.assertEqual(data["actually_in_book"], 1)      # only A
+        self.assertEqual(data["candidate_but_not_in_book"], 1)
+
+    def test_the_last_record_wins(self):
+        joined = book_audit.classify(self.entries(), {})
+        self.assertEqual(joined["D"]["verdict"], "rejected")
+
+    def test_grouping_separates_claim_from_fact(self):
+        joined = book_audit.classify(self.entries(), {"B": {"status": "ACTIVE"}})
+        data = book_audit.report(joined)
+        self.assertEqual(data["by_group"]["composition"]["candidates"], 2)
+        self.assertEqual(data["by_group"]["composition"]["in_book"], 1)
