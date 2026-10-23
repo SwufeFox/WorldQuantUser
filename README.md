@@ -357,6 +357,31 @@ The report says so explicitly when the counterpart entered after the candidate
 (`counterpart_entered_after_candidate`), instead of leaving a number that looks like a
 disagreement with the platform.
 
+### Submission is locked by default
+
+Real submissions are refused unless `.env` (or the environment) contains exactly:
+
+```
+ALLOW_AGENT_SUBMIT=true
+```
+
+Unset, empty or `false` all leave the lock closed, and so does every other spelling — `1`,
+`yes`, `TRUE`, `on`. Surrounding whitespace is forgiven, because a stray space says nothing
+about intent; anything else is ambiguous, and ambiguity resolves to "no".
+
+With the lock closed the CLI still backtests, runs the platform's checks and analyses
+self-correlation. It refuses only the one irreversible action, before it touches the network:
+
+```json
+{"ok": false, "command": "alpha", "error": {
+  "code": "SUBMIT_DISABLED",
+  "message": "submission is disabled: ALLOW_AGENT_SUBMIT is not 'true' ...",
+  "hint": "this is a policy lock, not a failure: set ALLOW_AGENT_SUBMIT=true ..."}}
+```
+
+Exit code `7`, distinct from a service error, so a caller can tell "policy says no" from
+"something broke" and stop asking instead of retrying.
+
 ### Submit (and the "test submission")
 
 There is **no separate test-submission endpoint**. The pre-submission test *is*

@@ -94,6 +94,29 @@ class SimulationError(BrainError):
     code = "SIMULATION_FAILED"
 
 
+SUBMIT_UNLOCK_ENV = "ALLOW_AGENT_SUBMIT"
+
+
+class SubmissionDisabled(BrainError):
+    """Raised when a real submission is attempted while the lock is closed."""
+
+    code = "SUBMIT_DISABLED"
+    hint = ("this is a policy lock, not a failure: set ALLOW_AGENT_SUBMIT=true in the "
+            "environment or .env to allow real submissions on this account")
+
+
+def agent_submit_allowed():
+    """Whether an agent may take the irreversible step of submitting an alpha.
+
+    Only an explicit ``ALLOW_AGENT_SUBMIT=true`` opens the lock. Surrounding whitespace is
+    forgiven - a stray space from a copy-paste says nothing about intent - but every other
+    spelling (``1``, ``yes``, ``TRUE``, ``on``) leaves it closed: there the intent is
+    ambiguous, and ambiguity resolves to "no".
+    """
+    _load_dotenv()
+    return (environ.get(SUBMIT_UNLOCK_ENV, "") or "").strip() == "true"
+
+
 class ServiceError(BrainError):
     """BRAIN answered with a non-2xx status we could not classify further."""
 
@@ -1843,6 +1866,13 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
     from a user's point of view, so ``confirm`` must be True to send it;
     otherwise a dry-run document describing the current checks is returned.
     """
+    if confirm and not agent_submit_allowed():
+        raise SubmissionDisabled(
+            "submission is disabled: %s is not 'true' in the environment or .env, so an "
+            "agent may not submit alphas on this account. Backtesting, checks and "
+            "self-correlation analysis remain available; set %s=true to allow real "
+            "submissions." % (SUBMIT_UNLOCK_ENV, SUBMIT_UNLOCK_ENV)
+        )
     current = fetch_alpha_metrics(s, alpha_id)
     status = current.get("status")
     document = {

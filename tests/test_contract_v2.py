@@ -1180,7 +1180,16 @@ class SubmissionStateTests(unittest.TestCase):
     contradicted the README's own rule that only dateSubmitted proves completion. During
     the campaign that bug produced a false report of twenty submissions; every one of them
     was still UNSUBMITTED.
+
+    These exercise the state machine, so they run with the submission lock deliberately
+    open - the lock has its own tests, and leaving it shut here would only prove that the
+    guard fires.
     """
+
+    def setUp(self):
+        patcher = mock.patch.dict(os.environ, {machine_lib.SUBMIT_UNLOCK_ENV: "true"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     class _Response:
         def __init__(self, status_code, payload=None):
