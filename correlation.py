@@ -178,13 +178,17 @@ def aggregate(series, frequency="d"):
     return out
 
 
-#: How far *above* daily Pearson the platform's SELF_CORRELATION reads, on the same book.
+#: Typical gap between daily Pearson and the platform's SELF_CORRELATION, same book, same
+#: moment: measured +0.013, +0.023 and +0.126 on three alphas.
 #:
-#: Same-moment comparisons are the only ones that measure this: LIFO local 0.6935 against
-#: platform 0.7166 (+0.023), restructuring local 0.7025 against 0.7157 (+0.013). An earlier
-#: calibration concluded the opposite from platform values recorded days before, against a
-#: smaller book - it was measuring book growth, not a measurement gap, and the wrong sign
-#: then called every borderline case optimistically.
+#: That spread is the point. The gap is not a constant, so this number orders candidates and
+#: does not gate them: an alpha at 0.62 locally was refused at 0.745, which no correction of
+#: this size would have predicted. Local correlation is a screen; the platform is the only
+#: test that counts, and a refused submission costs nothing but a call.
+#:
+#: The +0.126 case also rules out the first explanation tried here - that the platform's
+#: reference set is the ACTIVE book. It is not, or not only: that alpha's book-only local
+#: maximum was 0.6195 against an ACTIVE counterpart, and the platform still measured 0.745.
 PLATFORM_BIAS = 0.015
 
 #: How close to the limit counts as undecided rather than clear. A candidate sitting just
