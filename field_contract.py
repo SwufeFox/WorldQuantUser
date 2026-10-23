@@ -205,6 +205,18 @@ def corporate_action_risk(unit_attr):
     return {"flagged": False}
 
 
+def is_forecast(contract):
+    """Whether a contract describes a forecast rather than a reported figure.
+
+    Kept deliberately narrow - the analyst dataset and the ``anl4`` prefix - because the
+    point is to flag the forecast family, not to make every accounting field look
+    unreliable.
+    """
+    dataset = str(contract.get("dataset") or "").lower()
+    field_id = str(contract.get("field_id") or "").lower()
+    return dataset == "analyst4" or field_id.startswith("anl4")
+
+
 def audit_field(raw):
     """Turn one raw catalog record into a field contract.
 
@@ -226,6 +238,23 @@ def audit_field(raw):
         "fiscal_alignment": _unknown(
             "catalog exposes no fiscal period end or reporting lag"
         ),
+        # Two attributes deliberately kept apart from `period`. `period` answers "how
+        # often is this forecast made" - annual, quarterly. It does not answer "which
+        # fiscal year does this observation target", and the catalog never does. Without
+        # the distinction, a 63-day difference of an annual estimate reads as a revision
+        # of one forecast when it may be a comparison across two different target years.
+        "target_fiscal_period": {
+            "state": "unknown",
+            "evidence": "none",
+            "note": "the catalog names a forecast frequency, never the fiscal year a "
+                    "forecast targets",
+        },
+        "historical_target_alignment": {
+            "state": "unverified",
+            "lookback": 63,
+            "note": "differencing t against t-63 assumes both observations target the "
+                    "same fiscal period; nothing in the catalog confirms it",
+        },
     }
 
     blocking = []
@@ -308,6 +337,15 @@ def audit_operation(contracts, operation):
                 blocking.append("period")
                 findings.append("%s: reporting period unknown, cannot difference "
                                 "over time" % contract["field_id"])
+            if is_forecast(contract):
+                # Not a block: the analyst family is usable, but a time difference over it
+                # cannot be read as a revision until the target fiscal period is known.
+                warnings.append("target_fiscal_alignment_unverified")
+                findings.append(
+                    "%s: forecasts are differenced against themselves, but the target "
+                    "fiscal period is unknown, so a 63-day change may cross a fiscal-year "
+                    "rollover instead of revising one forecast"
+                    % contract["field_id"])
             if contract["corporate_action_risk"]["flagged"]:
                 blocking.append("corporate_action_adjustment")
                 findings.append(

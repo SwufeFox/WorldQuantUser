@@ -602,6 +602,27 @@ The correlation row is the one that matters. A pool whose median pairwise correl
 volatility is deliberately absent: the recordset is cumulative dollar PnL and capital is
 not exposed, so that figure cannot be computed here and is not faked.
 
+#### Forecast fields: frequency is not target period
+
+`period` answers "how often is this estimate produced". It does not answer "which fiscal
+year does this observation target", and the catalog never says. The contract therefore
+carries two more attributes, kept deliberately separate:
+
+```json
+"target_fiscal_period":         {"state": "unknown", "evidence": "none"},
+"historical_target_alignment":  {"state": "unverified", "lookback": 63}
+```
+
+The consequence is a verdict change: `ts_difference` over an analyst forecast field now
+returns `needs_review` with `target_fiscal_alignment_unverified`, where it used to return
+`ready` as soon as the frequency was known. A 63-day difference of an annual estimate is
+not necessarily the revision of one forecast — it can be a comparison across a fiscal-year
+rollover, and reading it as a revision invents a signal.
+
+The flag is narrow on purpose: the analyst dataset and the `anl4` prefix. Differencing a
+reported accounting figure is unaffected, because blocking the whole field catalogue would
+trade one mistake for a worse one.
+
 ### Remember what you found
 
 ```bash

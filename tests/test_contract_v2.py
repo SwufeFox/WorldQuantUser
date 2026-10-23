@@ -1442,3 +1442,53 @@ class LocalSelfCheckTests(unittest.TestCase):
         self.assertEqual(correlation.classify(0.71)[0], "borderline")
         self.assertEqual(correlation.classify(0.68)[0], "clear")
         self.assertEqual(correlation.classify(0.72)[0], "blocked")
+
+
+class ForecastTargetAlignmentTests(unittest.TestCase):
+    """`period` says how often a forecast is made, not which fiscal year it targets.
+
+    The contract used to stop at period = annual, which let a 63-day difference of an
+    estimate read as "the revision to one forecast". It may equally be a comparison across
+    a fiscal-year rollover. The two attributes added here keep that apart, and the operation
+    verdict stops calling such a difference ready.
+    """
+
+    def record(self, field_id, dataset):
+        return {"id": field_id, "dataset": {"id": dataset}, "description": "x",
+                "type": "MATRIX", "category": {"id": "analyst"},
+                "region": "USA", "delay": 1}
+
+    def test_target_fiscal_period_is_declared_unknown(self):
+        contract = field_contract.audit_field(
+            self.record("anl4_afv4_eps_number", "analyst4"))
+        attribute = contract["attributes"]["target_fiscal_period"]
+        self.assertEqual(attribute["state"], "unknown")
+        self.assertEqual(attribute["evidence"], "none")
+
+    def test_historical_alignment_is_unverified_with_the_lookback(self):
+        contract = field_contract.audit_field(
+            self.record("anl4_afv4_eps_number", "analyst4"))
+        attribute = contract["attributes"]["historical_target_alignment"]
+        self.assertEqual(attribute["state"], "unverified")
+        self.assertEqual(attribute["lookback"], 63)
+
+    def test_forecast_family_is_recognised_narrowly(self):
+        self.assertTrue(field_contract.is_forecast({"dataset": "analyst4", "field_id": "x"}))
+        self.assertTrue(field_contract.is_forecast({"field_id": "anl4_qfv4_eps_number"}))
+        self.assertFalse(field_contract.is_forecast(
+            {"dataset": "fundamental6", "field_id": "fnd6_newa1v1300_capx"}))
+
+    def test_differencing_a_forecast_is_not_ready(self):
+        contracts = [field_contract.audit_field(
+            self.record("anl4_afv4_eps_number", "analyst4"))]
+        operation = field_contract.audit_operation(contracts, "ts_difference")
+        self.assertEqual(operation["verdict"], "needs_review")
+        self.assertIn("target_fiscal_alignment_unverified", operation["warnings"])
+
+    def test_differencing_a_reported_figure_is_unaffected(self):
+        # The flag is for the forecast family; accounting fields must not inherit it.
+        contracts = [field_contract.audit_field(
+            self.record("fnd6_newa1v1300_capx", "fundamental6"))]
+        operation = field_contract.audit_operation(contracts, "ts_difference")
+        self.assertEqual(operation["verdict"], "ready")
+        self.assertEqual(operation["warnings"], [])
