@@ -1811,12 +1811,10 @@ def _preflight_lint(session, pairs, args):
     market_fields = None
     field_note = "unavailable"
     try:
-        # One fetch, three views. Measured on this account, a shape built only from
-        # disclosure fields turned over 0.006-0.010 against a 0.01 floor - deferred tax
-        # 0.0077, operating leases 0.0086, unrecognised tax benefits 0.009, share-based
-        # compensation 0.0083 - while the same shapes with a market-data leg cleared it
-        # easily. The list below is the basis for that check and is kept here, visible,
-        # rather than buried in the linter.
+        # One fetch, three views. The dataset split feeds the turnover check: a construct
+        # with no daily leg turned over 0.006-0.010 against a 0.01 floor, while the same
+        # disclosure fields with such a leg cleared it comfortably and entered the book.
+        # The list is kept here, visible, rather than buried in the linter.
         slow_datasets = {"fundamental2", "fundamental6", "analyst4"}
         records = field_index.fetch_all_fields(
             session,
@@ -2216,12 +2214,12 @@ def _operator_index_from_catalog(session):
 
 
 #: Datasets whose fields update on a disclosure schedule rather than with the market.
-#: Measured basis for the turnover check: a shape built only from these turned over
-#: 0.006-0.010 against the platform's 0.01 floor - deferred tax 0.0077, operating leases
-#: 0.0086, unrecognised tax benefits 0.009, share-based compensation 0.0083 - and no
-#: choice of neutralisation or decay lifted it, because the ranking only changes when a
-#: filing does. Kept as a constant, and visible, rather than inferred inside the linter.
-SLOW_DATASETS = frozenset({"fundamental2", "fundamental6", "analyst4"})
+#:
+#: "Disclosure" describes the release cadence, not the value. Three of the book's entries
+#: are built entirely from these fields; what they pair with is a leg that reprices daily.
+#: The turnover check uses this list to notice a construct with no such leg - which is a
+#: property of the expression, and fixable by adding one, not a reason to avoid the data.
+DISCLOSURE_DATASETS = frozenset({"fundamental2", "fundamental6", "analyst4"})
 
 
 def _dataset_id(record):
@@ -2245,7 +2243,7 @@ def _field_scope(session, args):
     )
     known = field_index.field_ids(records)
     market = {record.get("id") for record in records
-              if record.get("id") and _dataset_id(record) not in SLOW_DATASETS}
+              if record.get("id") and _dataset_id(record) not in DISCLOSURE_DATASETS}
     return known, market
 
 

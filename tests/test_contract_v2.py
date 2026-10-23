@@ -1513,6 +1513,10 @@ class TurnoverFloorTests(unittest.TestCase):
         findings = expression_lint.turnover_findings(self.UTB, self.MARKET)
         self.assertEqual([f["code"] for f in findings], ["turnover_floor_risk"])
         self.assertIn("0.006-0.010", findings[0]["message"])
+        # The finding must point at the missing leg, not condemn the data: three book
+        # entries are built from these very datasets.
+        self.assertIn("no leg that moves daily", findings[0]["message"])
+        self.assertIn("three book entries", findings[0]["message"])
 
     def test_a_market_field_silences_the_warning(self):
         expr = self.UTB + " - 0.5*rank(ts_sum(returns, 5))"

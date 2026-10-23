@@ -448,18 +448,23 @@ def trailing_token_findings(expression):
 #: The platform's turnover floor.
 TURNOVER_FLOOR = 0.01
 
-#: How far below the floor the measured band sits, used for the message only.
+#: The band measured for a construct with no leg that moves daily, used in the message.
 MEASURED_BAND = (0.006, 0.010)
 
 
 def turnover_findings(expression, market_fields=None):
-    """Warn when nothing in the expression reads a market field.
+    """Warn when the expression has no leg that moves daily.
 
-    A signal built only from disclosure fields barely moves: the cross-sectional order is
-    stable until the next filing. Four accounting families measured 0.006-0.010 turnover
-    against a 0.01 floor - deferred tax 0.0077, operating leases 0.0086, unrecognised tax
-    benefits 0.009, share-based compensation 0.0083 - and no choice of neutralisation or
-    decay lifted them, because the ranking itself does not change between filings.
+    The subject is the construct, not the fields. Disclosure datasets are among the most
+    productive in this account: three book entries are built entirely from them - inventory
+    stages 2.11 Sharpe, receivables-payables 1.56, raw materials 1.53 - because each pairs
+    the disclosure leg with one that reprices daily. Remove that leg and the same data
+    measures 0.006-0.010 turnover against a 0.01 floor: deferred tax 0.0077, operating
+    leases 0.0086, unrecognised tax benefits 0.009, share-based compensation 0.0083. No
+    neutralisation or decay lifted them, because the ranking only changes when a filing
+    does.
+
+    So the finding is "add the daily leg", never "this data is weak".
 
     ``market_fields`` is the set of field ids whose catalogue category carries market data,
     supplied by the caller from the catalogue. Deriving it here would mean encoding which
@@ -478,9 +483,12 @@ def turnover_findings(expression, market_fields=None):
         "code": "turnover_floor_risk",
         "severity": "warning",
         "measured_band": list(MEASURED_BAND),
-        "message": "no market-data field: shapes like this measured %.3f-%.3f turnover "
-                   "against a %.2f floor, because a ranking of disclosure fields only "
-                   "changes when a filing does; add a term that moves daily"
+        "message": "no leg that moves daily: this construct measured %.3f-%.3f turnover "
+                   "against a %.2f floor in four accounting families, because a ranking "
+                   "of disclosure fields only reorders when a filing does. The fields are "
+                   "fine - three book entries are built from them - what is missing is the "
+                   "daily leg. Add one (a reversal, position or pressure term) rather than "
+                   "discarding the idea."
                    % (MEASURED_BAND[0], MEASURED_BAND[1], TURNOVER_FLOOR),
     }]
 

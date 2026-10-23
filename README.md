@@ -428,29 +428,36 @@ the documented requirement to difference a cumulative series does not apply here
 
 ### The turnover floor, checked mechanically
 
-A shape built only from disclosure fields cannot clear the platform's 0.01 turnover floor.
-Four accounting families measured it directly: deferred tax **0.0077**, operating leases
-**0.0086**, unrecognised tax benefits **0.009**, share-based compensation **0.0083**. No
-choice of neutralisation, decay or truncation lifted any of them, because the ranking only
-changes when a filing does.
+**Disclosure data is not low-value.** Three of the book's entries are built entirely from
+`fundamental6` and `analyst4` fields — inventory stages at Sharpe 2.11, receivables-payables
+at 1.56, raw materials at 1.53 — because each pairs the disclosure leg with one that
+reprices daily.
+
+What cannot clear the 0.01 turnover floor is a construct with **no such leg**. Remove it and
+the same data measures deferred tax **0.0077**, operating leases **0.0086**, unrecognised
+tax benefits **0.009**, share-based compensation **0.0083**. No neutralisation, decay or
+truncation lifted any of them, because the ranking only reorders when a filing does.
 
 `lint` now says so before a simulation is spent:
 
 ```
-turnover_floor_risk: no market-data field: shapes like this measured 0.006-0.010 turnover
-against a 0.01 floor, because a ranking of disclosure fields only changes when a filing
-does; add a term that moves daily
+turnover_floor_risk: no leg that moves daily: this construct measured 0.006-0.010 turnover
+against a 0.01 floor in four accounting families ... The fields are fine - three book
+entries are built from them - what is missing is the daily leg. Add one (a reversal,
+position or pressure term) rather than discarding the idea.
 ```
 
 The check reads **which fields carry market data**, taking that from the catalogue's
-dataset rather than from a list of names. The first attempt keyed on "has a time-series
+dataset rather than from a list of names. Its subject is the expression, not the field: the
+finding says "add the leg", never "avoid the data". The first attempt keyed on "has a time-series
 operator" and was wrong in both directions: `ts_backfill` is a fill, not movement, so a
 static ratio passed silently; and `close/vwap` has no window at all, so a shape that turns
 over hundreds of times a year was flagged.
 
 It is a warning, not an error: a low-turnover signal is legal, it simply cannot pass. The
-slow-dataset list lives in one visible constant (`SLOW_DATASETS`) instead of being inferred
-inside the linter, so the assumption can be read and argued with.
+dataset split lives in one visible constant (`DISCLOSURE_DATASETS`, named for the release
+cadence rather than for any judgement about value) instead of being inferred inside the
+linter, so the assumption can be read and argued with.
 
 ### Types: five kinds of field, and the operators that accept them
 
