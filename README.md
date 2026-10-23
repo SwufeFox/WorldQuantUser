@@ -363,11 +363,12 @@ python research_cli.py alpha submit RRA1jdmb          # dry-run, nothing written
 python research_cli.py alpha submit RRA1jdmb --yes    # irreversible
 ```
 
-An alpha also carries metadata, and a submission is unattributable without it. Only
-three properties are writable — `name`, `category` and `tags` — and `description` does
-**not** exist: eighteen candidate spellings all return `Unexpected property`, so none is
-invented to hold one. `alpha submit` refuses an alpha with no name or category and prints
-the exact command to fix it.
+An alpha also carries metadata, and a submission is unattributable without it. `name`,
+`category` and `tags` are top-level properties; `description` is writable too but **nested
+under `regular`** — `{"regular": {"description": ...}}`. Eighteen *top-level* spellings all
+returned `Unexpected property` and the conclusion drawn was that the field did not exist;
+it was the shape that was wrong. `alpha submit` refuses an alpha with no name or category
+and prints the exact command to fix it.
 
 ```bash
 python research_cli.py alpha describe ABC12345 \
