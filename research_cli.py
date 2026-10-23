@@ -753,9 +753,9 @@ def build_parser():
                              "0 disables).")
     a_self.add_argument("--threshold", type=float, default=0.7,
                         help="The platform's limit (default 0.7).")
-    a_self.add_argument("--platform-offset", type=float, default=0.012,
-                        help="How far below daily Pearson the platform reads (default "
-                             "0.012, measured over ten alphas with known values).")
+    a_self.add_argument("--platform-bias", type=float, default=0.015,
+                        help="How far above daily Pearson the platform reads on the same "
+                             "book (default 0.015, from two same-moment comparisons).")
     a_self.add_argument("--top", type=int, default=3,
                         help="How many counterparts to list (default 3).")
     a_self.add_argument("--min-overlap", type=int, default=200,
@@ -2862,7 +2862,7 @@ def cmd_alpha_self_check(args, sink):
     # The platform reads a little lower than daily Pearson; the offset is measured, not
     # assumed, and it is what makes `borderline` a useful verdict instead of a shrug.
     verdict, estimate = correlation.classify(best["correlation"], args.threshold,
-                                              args.platform_offset)
+                                              args.platform_bias)
 
     submitted = parse(record.get("dateSubmitted")) or parse(record.get("dateCreated"))
     counterpart_when = parse(best.get("when"))
@@ -2875,7 +2875,7 @@ def cmd_alpha_self_check(args, sink):
         "peers_considered": len(daily),
         "peers_excluded_as_newer": [item["alpha_id"] for item in excluded],
         "threshold": args.threshold,
-        "platform_offset": args.platform_offset,
+        "platform_bias": args.platform_bias,
         "max_daily": best["correlation"],
         "estimated_platform": estimate,
         "counterpart": best["alpha_id"],

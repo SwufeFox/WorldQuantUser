@@ -324,11 +324,18 @@ python research_cli.py alpha self-check O0J6Aeag
 python research_cli.py alpha self-check gJWre33J --as-of 2026-10-22T09:15:30-04:00
 ```
 
-Daily Pearson is the measure that decides, because it was calibrated against ten alphas
-with a published platform value: it came within **0.006 to 0.016** and always read slightly
-lower. Weekly and monthly overstated the platform number by 0.03 to 0.08, so those are
-diagnostics rather than verdicts. `classify()` subtracts the measured offset, which is why
-0.71 is worth submitting and 0.75 is not.
+Daily Pearson is the measure that decides. Weekly and monthly overstated the platform number
+by 0.03 to 0.08, so those are diagnostics rather than verdicts.
+
+The platform reads **about 0.015 higher** than daily Pearson on the same book: LIFO measured
+0.6935 locally and was refused at 0.7166; restructuring measured 0.7025 and was refused at
+0.7157. An earlier calibration concluded the opposite — that the platform read lower by
+0.012 — from values recorded days before against a smaller book. It was measuring book
+growth, not a measurement gap, and with the sign inverted every borderline case was called
+optimistically, which spends submissions on alphas that were always going to be refused.
+
+So `classify()` **adds** the bias, and the undecided band is local 0.655–0.685. Below it,
+submit; above it, expect a refusal.
 
 Two behaviours matter more than the arithmetic, both found by disagreeing with the
 platform and then explaining why:

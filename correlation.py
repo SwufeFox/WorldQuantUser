@@ -178,23 +178,29 @@ def aggregate(series, frequency="d"):
     return out
 
 
-#: How far below daily Pearson the platform's SELF_CORRELATION reads. Measured on ten
-#: alphas with a published value: the gap ran from 0.006 to 0.016, always in this
-#: direction, because the platform's own measure is a little more conservative.
-PLATFORM_OFFSET = 0.012
+#: How far *above* daily Pearson the platform's SELF_CORRELATION reads, on the same book.
+#:
+#: Same-moment comparisons are the only ones that measure this: LIFO local 0.6935 against
+#: platform 0.7166 (+0.023), restructuring local 0.7025 against 0.7157 (+0.013). An earlier
+#: calibration concluded the opposite from platform values recorded days before, against a
+#: smaller book - it was measuring book growth, not a measurement gap, and the wrong sign
+#: then called every borderline case optimistically.
+PLATFORM_BIAS = 0.015
 
 #: How close to the limit counts as undecided rather than clear. A candidate sitting just
 #: under the line is worth submitting, but not worth trusting as a new bet.
 BORDERLINE_BAND = 0.03
 
 
-def classify(daily_correlation, threshold=0.7, platform_offset=PLATFORM_OFFSET):
+def classify(daily_correlation, threshold=0.7, platform_bias=PLATFORM_BIAS):
     """Turn a daily correlation into the verdict the platform will probably reach.
 
-    Returns ``(verdict, estimated_platform)``. The estimate subtracts the measured offset,
-    which is why an alpha at 0.705 locally is worth trying and one at 0.75 is not.
+    Returns ``(verdict, estimated_platform)``. The estimate *adds* the measured bias, which
+    is why an alpha at 0.66 locally is worth trying and one at 0.70 is not. Getting the sign
+    wrong here is expensive in one direction only: it spends submissions on alphas that were
+    always going to be refused.
     """
-    estimate = round(max(0.0, daily_correlation - platform_offset), 4)
+    estimate = round(min(1.0, daily_correlation + platform_bias), 4)
     if estimate >= threshold:
         return "blocked", estimate
     if estimate >= threshold - BORDERLINE_BAND:

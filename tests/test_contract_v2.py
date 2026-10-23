@@ -1429,23 +1429,26 @@ class LocalSelfCheckTests(unittest.TestCase):
     def test_a_series_with_no_dates_is_ignored(self):
         self.assertEqual(correlation.aggregate({"bad": 1.0}, "w"), {})
 
-    def test_verdict_uses_the_measured_offset(self):
-        # 0.705 sits just over the limit locally but under it once the offset is applied.
-        verdict, estimate = correlation.classify(0.705)
+    def test_verdict_uses_the_measured_bias(self):
+        # The platform read 0.7166 and 0.7157 on two alphas whose daily Pearson was 0.6935
+        # and 0.7025 - higher, not lower. The bias is added, so a local 0.67 lands in the
+        # undecided band rather than being called clear.
+        verdict, estimate = correlation.classify(0.67)
         self.assertEqual(verdict, "borderline")
         self.assertLess(estimate, 0.7)
+        self.assertGreater(estimate, 0.67)
 
     def test_clear_and_blocked_are_separated(self):
         self.assertEqual(correlation.classify(0.50)[0], "clear")
         self.assertEqual(correlation.classify(0.90)[0], "blocked")
 
     def test_borderline_band_is_documented_by_behaviour(self):
-        # With the measured offset of 0.012 the band is narrow: a daily correlation has to
-        # land in [0.682, 0.712) to be undecided. Below that it is clear, at or above 0.712
-        # the platform is expected to refuse.
-        self.assertEqual(correlation.classify(0.71)[0], "borderline")
-        self.assertEqual(correlation.classify(0.68)[0], "clear")
-        self.assertEqual(correlation.classify(0.72)[0], "blocked")
+        # With the measured bias of +0.015 the band is local [0.655, 0.685): below that the
+        # platform is expected to accept, at or above 0.685 it is expected to refuse. Both
+        # of today's refusals (0.6935 and 0.7025) sit above it, which is the point.
+        self.assertEqual(correlation.classify(0.67)[0], "borderline")
+        self.assertEqual(correlation.classify(0.64)[0], "clear")
+        self.assertEqual(correlation.classify(0.70)[0], "blocked")
 
 
 class ForecastTargetAlignmentTests(unittest.TestCase):
