@@ -6,6 +6,7 @@ import pickle
 import random
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from itertools import combinations, product
 from os import environ
@@ -1514,13 +1515,45 @@ def simulate_alphas(
             record["progress_url"] = progress_url
             emit("failed", index, record)
 
+    def poll_many(indices):
+        """Poll several simulations at once.
+
+        Serial polling makes the slowest arm set the pace for every arm behind it, and an
+        arm whose progress endpoint keeps answering with an empty body blocks the batch
+        outright - which is exactly what happened to a batch of three whose other two had
+        already finished on the platform.
+
+        Each poll writes only its own record, so the workers do not share state; the event
+        sink writes whole lines, which is what it is for.
+        """
+        indices = [index for index in indices if records[index].get("progress_url")
+                   or records[index].get("metrics_pending")]
+        if not indices:
+            return
+        if len(indices) == 1:
+            index = indices[0]
+            if records[index].get("progress_url"):
+                poll_record(index)
+            elif records[index].get("metrics_pending"):
+                fetch_metrics_record(index)
+            return
+        workers = min(len(indices), max(2, batch_size))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = []
+            for index in indices:
+                if records[index].get("progress_url"):
+                    futures.append(pool.submit(poll_record, index))
+                elif records[index].get("metrics_pending"):
+                    futures.append(pool.submit(fetch_metrics_record, index))
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as exc:  # noqa: BLE001 - one arm failing is not the batch
+                    note("poll worker raised %s: %s" % (type(exc).__name__, exc))
+
     # Resume accepted jobs first. An unresolved job still occupies one of the
     # platform's limited active slots, so do not submit the next batch yet.
-    for index, record in enumerate(records):
-        if record.get("progress_url"):
-            poll_record(index)
-        elif record.get("metrics_pending"):
-            fetch_metrics_record(index)
+    poll_many(range(len(records)))
     if any(
         record.get("progress_url") or record.get("metrics_pending")
         for record in records
@@ -1574,8 +1607,7 @@ def simulate_alphas(
             emit("submitted", index, record)
             submitted.append(index)
 
-        for index in submitted:
-            poll_record(index)
+        poll_many(submitted)
         if any(
             records[index].get("progress_url")
             or records[index].get("metrics_pending")

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -695,3 +696,42 @@ class RegistryLabelContractTests(unittest.TestCase):
         self.assertEqual(
             ml.alpha_labels([("rank(close)", 4)], 1), [None]
         )
+
+
+class ConcurrentPollingTests(unittest.TestCase):
+    """A slow arm must not hold the batch.
+
+    A batch of three spent six minutes on one arm while the platform had already reported
+    the other two COMPLETE. Serial polling makes the slowest arm set the pace for everything
+    behind it, and an arm whose progress endpoint keeps answering with an empty body stops
+    the batch entirely.
+    """
+
+    def test_three_pending_arms_poll_faster_than_three_round_trips(self):
+        delay = 0.25
+        checkpoint = [{
+            "expression": "rank(cap)",
+            "decay": 4,
+            "alpha_id": None,
+            "status": "PENDING",
+            "progress_url": "https://api.worldquantbrain.com/simulations/%d" % index,
+        } for index in range(3)]
+
+        def slow_poll(session, progress_url, on_event=None, deadline=None):
+            time.sleep(delay)
+            return {"status": "COMPLETE", "alpha": progress_url.rsplit("/", 1)[-1],
+                    "progress_url": progress_url}
+
+        with mock.patch.object(ml, "poll_simulation", side_effect=slow_poll), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {}}):
+            started = time.monotonic()
+            records = ml.simulate_alphas(
+                object(), [("rank(cap)", 4), ("rank(cap)", 4), ("rank(cap)", 4)],
+                max_wait_seconds=30, initial_records=checkpoint,
+            )
+            elapsed = time.monotonic() - started
+
+        self.assertEqual([r["status"] for r in records], ["COMPLETE"] * 3)
+        # Serial polling costs at least 3 x delay; concurrent polling costs about one.
+        self.assertLess(elapsed, delay * 2.2,
+                        "polling looks serial: %.3fs for three %.2fs polls" % (elapsed, delay))
