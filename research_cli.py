@@ -601,8 +601,10 @@ def build_parser():
     a_desc.add_argument("--name", default=None)
     a_desc.add_argument("--category", default=None, choices=list(ml.ALPHA_CATEGORIES))
     a_desc.add_argument("--tags", default=None,
-                        help="Comma-separated tags. The platform has no description "
-                             "property, so a description has nowhere to go.")
+                        help="Comma-separated tags.")
+    a_desc.add_argument("--description", default=None,
+                        help="Free-text note. Writable, but nested under `regular` in "
+                             "the payload rather than as a top-level property.")
     a_desc.add_argument("--save")
     _add_session_args(a_desc)
     a_desc.set_defaults(func=cmd_alpha_describe)
@@ -2736,14 +2738,15 @@ def cmd_alpha_self_corr(args, _sink):
 def cmd_alpha_describe(args, _sink):
     """Write an alpha's metadata and verify it stuck."""
     tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
-    if not any((args.name, args.category, tags)):
+    if not any((args.name, args.category, tags, args.description)):
         raise CliError("USAGE", "nothing to set",
-                       "pass --name, --category and/or --tags")
+                       "pass --name, --category, --tags and/or --description")
 
     def work(session):
         return ml.set_alpha_metadata(session, args.alpha_id, name=args.name,
                                      category=args.category,
-                                     tags=tags or None)
+                                     tags=tags or None,
+                                     description=args.description)
 
     current = with_session(args, work)
     data = {
@@ -2752,7 +2755,9 @@ def cmd_alpha_describe(args, _sink):
         "category": current.get("category"),
         "tags": current.get("tags"),
         "verified": True,
-        "note": "the platform exposes name, category and tags; there is no description",
+        "description": (current.get("regular") or {}).get("description"),
+        "note": "name, category and tags are top-level; description is nested under "
+                "`regular`",
     }
     _maybe_save(args, data)
     return data

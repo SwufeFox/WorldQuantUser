@@ -35,7 +35,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import probe_units  # noqa: E402
 import expression_macros  # noqa: E402
 import field_contract  # noqa: E402
-import machine_lib  # noqa: E402
+import machine_lib
+import research_cli  # noqa: E402
 import research_paths  # noqa: E402
 
 
@@ -1590,3 +1591,67 @@ class UnitCheckTests(unittest.TestCase):
     def test_unit_preserving_operators_pass_the_unit_through(self):
         unit = expression_units.resolve("ts_mean(cap, 5)", self.UNITS)
         self.assertEqual(unit, {"CSPrice": 1, "CSShare": 1})
+
+
+class AlphaDescriptionTests(unittest.TestCase):
+    """`description` is writable, but nested under `regular`.
+
+    Eighteen *top-level* spellings all answered "Unexpected property", and the conclusion
+    written down was "the platform has no description property". Reading another project's
+    client showed the nested shape; a PATCH returns 200 and the text reads back. The mistake
+    was about the shape of a payload, not about the field existing.
+    """
+
+    class _Session:
+        def __init__(self, response):
+            self.payloads = []
+            self._response = response
+
+        def patch(self, url, json=None, timeout=None):
+            self.payloads.append(json)
+            return self._response
+
+    class _Response:
+        status_code = 200
+
+        def __init__(self, payload):
+            self._payload = payload
+
+        def json(self):
+            return self._payload
+
+    def test_description_goes_under_regular(self):
+        session = self._Session(self._Response({}))
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics",
+                               return_value={"id": "A", "regular": {"description": "x"}}):
+            machine_lib.set_alpha_metadata(session, "A", description="x")
+        self.assertEqual(session.payloads, [{"regular": {"description": "x"}}])
+
+    def test_name_and_tags_stay_top_level(self):
+        session = self._Session(self._Response({}))
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics",
+                               return_value={"id": "A", "name": "n", "tags": ["t"]}):
+            machine_lib.set_alpha_metadata(session, "A", name="n", tags=["t"])
+        self.assertEqual(session.payloads, [{"name": "n", "tags": ["t"]}])
+
+    def test_verification_compares_only_the_description(self):
+        # `regular` comes back as a whole object; comparing objects would always fail even
+        # though the write succeeded, which is exactly what happened first.
+        response = {"id": "A", "regular": {"description": "x", "code": "...", "language": "FASTEXPR"}}
+        session = self._Session(self._Response({}))
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics", return_value=response):
+            result = machine_lib.set_alpha_metadata(session, "A", description="x")
+        self.assertEqual(result["regular"]["description"], "x")
+
+    def test_a_description_that_did_not_stick_is_reported(self):
+        response = {"id": "A", "regular": {"description": "other"}}
+        session = self._Session(self._Response({}))
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics", return_value=response):
+            with self.assertRaises(machine_lib.ServiceError):
+                machine_lib.set_alpha_metadata(session, "A", description="x")
+
+    def test_the_cli_exposes_the_flag(self):
+        schema = research_cli.describe_parser(research_cli.build_parser())
+        alpha = schema["subcommands"]["alpha"]["subcommands"]["describe"]
+        flags = [flag for option in alpha["options"] for flag in option["flags"]]
+        self.assertIn("--description", flags)

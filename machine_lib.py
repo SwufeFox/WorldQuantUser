@@ -2378,13 +2378,19 @@ def extract_split(payload):
 ALPHA_CATEGORIES = ("ANALYST", "FUNDAMENTAL", "PRICE_VOLUME", "SENTIMENT", "VOLUME")
 
 
-def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None):
+def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None,
+                       description=None):
     """Set an alpha's writable metadata and return the updated payload.
 
-    Only three properties are writable on an alpha: ``name``, ``category`` and
-    ``tags``. ``description`` does not exist - eighteen candidate spellings all
-    return "Unexpected property" - so the only free-text field the platform offers is
-    the tag list, and ``tags`` must be a list, not a string.
+    ``name``, ``category`` and ``tags`` are top-level properties; ``tags`` must be a
+    list, not a string.
+
+    ``description`` is writable too, but **nested under ``regular``** - the payload is
+    ``{"regular": {"description": ...}}``. This was missed for a long time on the
+    strength of eighteen *top-level* spellings all answering "Unexpected property", and
+    the wrong conclusion ("description does not exist") was written down here. Reading
+    another project's client showed the nested shape; a PATCH with it returns 200 and the
+    text reads back. The lesson is about the shape of a payload, not about the field.
 
     The update is verified by re-reading rather than trusting the PATCH status, for
     the same reason a submission is verified by ``dateSubmitted``: this API answers
@@ -2400,6 +2406,8 @@ def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None):
         payload["category"] = category
     if tags is not None:
         payload["tags"] = list(tags)
+    if description is not None:
+        payload["regular"] = {"description": str(description)}
     if not payload:
         raise ValueError("nothing to update")
 
@@ -2410,8 +2418,16 @@ def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None):
                            % (response.status_code, (response.text or "")[:200]))
 
     current = fetch_alpha_metrics(s, alpha_id)
-    mismatched = [key for key, value in payload.items()
-                  if current.get(key) != value]
+    mismatched = []
+    for key, value in payload.items():
+        if key == "regular":
+            # `regular` is a whole object on the way back: code, language, limits and the
+            # description among them. Comparing objects would always fail; the only part
+            # this function writes is the description.
+            if (current.get("regular") or {}).get("description") != value.get("description"):
+                mismatched.append("regular.description")
+        elif current.get(key) != value:
+            mismatched.append(key)
     if mismatched:
         raise ServiceError("metadata did not stick: %s" % ", ".join(mismatched))
     return current
