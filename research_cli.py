@@ -733,6 +733,37 @@ def build_parser():
     a_cov.add_argument("--save")
     a_cov.set_defaults(func=cmd_alpha_coverage)
 
+    a_self = alpha_sub.add_parser(
+        "self-check",
+        help="Reproduce the platform's self-correlation check locally (quota-free).",
+        description="Daily Pearson against the book, calibrated against measured platform "
+                    "values, with --as-of for reproducing a historical check and recent "
+                    "submissions included because the platform's snapshot lags.")
+    a_self.add_argument("alpha_id")
+    a_self.add_argument("--as-of", default=None,
+                        help="Only compare against peers submitted at or before this ISO "
+                             "timestamp, which is how a historical platform value is "
+                             "reproduced.")
+    a_self.add_argument("--include-unsent-hours", type=float, default=24.0,
+                        help="Also compare against UNSUBMITTED alphas created in the last "
+                             "N hours, which the platform's snapshot misses (default 24; "
+                             "0 disables).")
+    a_self.add_argument("--threshold", type=float, default=0.7,
+                        help="The platform's limit (default 0.7).")
+    a_self.add_argument("--platform-offset", type=float, default=0.012,
+                        help="How far below daily Pearson the platform reads (default "
+                             "0.012, measured over ten alphas with known values).")
+    a_self.add_argument("--top", type=int, default=3,
+                        help="How many counterparts to list (default 3).")
+    a_self.add_argument("--min-overlap", type=int, default=200,
+                        help="Minimum shared trading days (default 200).")
+    a_self.add_argument("--peer-limit", type=int, default=300,
+                        help="How many peers to scan per status (default 300).")
+    a_self.add_argument("--max-age-hours", type=float, default=168.0,
+                        help="Trust a cached PnL series younger than this (default 168).")
+    _add_session_args(a_self)
+    a_self.set_defaults(func=cmd_alpha_self_check)
+
     a_corr = alpha_sub.add_parser(
         "corr",
         help="Daily-PnL correlation between alphas (quota-free).",
@@ -2680,6 +2711,134 @@ def cmd_alpha_describe(args, _sink):
     }
     _maybe_save(args, data)
     return data
+
+
+def cmd_alpha_self_check(args, sink):
+    """Reproduce the platform's self-correlation check locally, and better.
+
+    Three measured facts shape this command.
+
+    Daily Pearson matches the platform's SELF_CORRELATION within 0.006 to 0.016 and always
+    slightly below it; weekly and monthly overstate it by 0.03 to 0.08. Daily is therefore
+    the number that decides, and the others are kept as diagnostics.
+
+    The platform compares against a periodically refreshed snapshot of the book, not a live
+    one. Two alphas submitted minutes apart were each accepted while correlating 0.975 with
+    the other. A local check that looks only at ACTIVE alphas repeats that blind spot, so
+    recent submissions - including ones not submitted yet - are included by default.
+
+    A published platform value is historical. To compare against it, the peer set has to be
+    the book as it was, which is what ``--as-of`` does. Without it, an alpha rejected last
+    night appears to correlate 0.99 with something that entered afterwards, and the apparent
+    disagreement is only a difference in what the platform could see.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    def parse(moment):
+        if not moment:
+            return None
+        try:
+            return datetime.fromisoformat(str(moment).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    cutoff = parse(args.as_of) if args.as_of else None
+    if args.as_of and cutoff is None:
+        raise CliError("INVALID_INPUT", "cannot read --as-of %r" % args.as_of,
+                       "use an ISO timestamp such as 2026-10-23T00:15:00+08:00")
+    horizon = (datetime.now(timezone.utc)
+               - timedelta(hours=max(0.0, args.include_unsent_hours)))
+
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+
+    def collect(session):
+        candidate = ml.fetch_daily_pnl(session, args.alpha_id, cache_dir=pnl_dir,
+                                       max_age_hours=args.max_age_hours)
+        if not candidate:
+            raise CliError("NOT_FOUND", "no daily PnL for %s" % args.alpha_id,
+                           "the alpha must have finished simulating")
+        record = ml.fetch_alpha_metrics(session, args.alpha_id)
+        peers, excluded = [], []
+        statuses = ["ACTIVE"]
+        if args.include_unsent_hours > 0:
+            statuses.append("UNSUBMITTED")
+        for status in statuses:
+            for entry in ml.list_alphas(session, limit=args.peer_limit, status=status,
+                                        alpha_type_not=""):
+                peer_id = entry.get("id")
+                if not peer_id or peer_id == args.alpha_id:
+                    continue
+                when = parse(entry.get("dateSubmitted")) or parse(entry.get("dateCreated"))
+                if cutoff is not None and when is not None and when > cutoff:
+                    excluded.append({"alpha_id": peer_id, "when": entry.get("dateSubmitted")
+                                     or entry.get("dateCreated")})
+                    continue
+                if status == "UNSUBMITTED" and when is not None and when < horizon:
+                    continue
+                peers.append({"alpha_id": peer_id, "when": when,
+                              "status": status})
+        series = {}
+        for peer in peers:
+            data = ml.fetch_daily_pnl(session, peer["alpha_id"], cache_dir=pnl_dir,
+                                      max_age_hours=args.max_age_hours)
+            if data:
+                series[peer["alpha_id"]] = data
+        return candidate, record, peers, series, excluded
+
+    candidate, record, peers, series, excluded = with_session(args, collect)
+
+    broadcast = {}
+    for frequency in ("d", "w", "m"):
+        target = correlation.aggregate(candidate, frequency)
+        scored = []
+        for peer in peers:
+            peer_series = series.get(peer["alpha_id"])
+            if not peer_series:
+                continue
+            left, right, _ = correlation.align(target,
+                                               correlation.aggregate(peer_series, frequency),
+                                               args.min_overlap if frequency == "d" else 12)
+            if left is None or len(left) < (args.min_overlap if frequency == "d" else 12):
+                continue
+            scored.append({"alpha_id": peer["alpha_id"],
+                           "correlation": round(correlation.pearson(left, right), 4),
+                           "when": peer["when"].isoformat() if peer["when"] else None,
+                           "status": peer["status"]})
+        scored.sort(key=lambda item: -item["correlation"])
+        broadcast[frequency] = scored
+
+    daily = broadcast["d"]
+    best = daily[0] if daily else {"alpha_id": None, "correlation": 0.0}
+    # The platform reads a little lower than daily Pearson; the offset is measured, not
+    # assumed, and it is what makes `borderline` a useful verdict instead of a shrug.
+    verdict, estimate = correlation.classify(best["correlation"], args.threshold,
+                                              args.platform_offset)
+
+    submitted = parse(record.get("dateSubmitted")) or parse(record.get("dateCreated"))
+    counterpart_when = parse(best.get("when"))
+    newer = bool(submitted and counterpart_when and counterpart_when > submitted)
+
+    return {
+        "alpha_id": args.alpha_id,
+        "candidate_submitted": record.get("dateSubmitted"),
+        "as_of": args.as_of,
+        "peers_considered": len(daily),
+        "peers_excluded_as_newer": [item["alpha_id"] for item in excluded],
+        "threshold": args.threshold,
+        "platform_offset": args.platform_offset,
+        "max_daily": best["correlation"],
+        "estimated_platform": estimate,
+        "counterpart": best["alpha_id"],
+        "counterpart_submitted": best.get("when"),
+        "counterpart_entered_after_candidate": newer,
+        "verdict": verdict,
+        "frequencies": {name: (items[0]["correlation"] if items else None)
+                        for name, items in broadcast.items()},
+        "top": daily[:args.top],
+        "note": ("the counterpart entered after this alpha, so the platform could not have "
+                 "seen it - set --as-of to reproduce the original check"
+                 if newer else None),
+    }
 
 
 def cmd_alpha_corr(args, sink):

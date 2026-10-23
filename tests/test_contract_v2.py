@@ -26,6 +26,7 @@ REPO_ROOT = str(ROOT)
 sys.path.insert(0, str(ROOT))
 
 import alpha_registry  # noqa: E402
+import correlation
 import expression_lint
 import paper_search
 import expression_types
@@ -1397,3 +1398,47 @@ class EnvExampleTests(unittest.TestCase):
         text = self.read(".env.example")
         self.assertNotRegex(text, r"until \d{4}-\d{2}-\d{2}",
                             "dated claims rot; describe the policy instead")
+
+
+class LocalSelfCheckTests(unittest.TestCase):
+    """The local check, calibrated against platform values that are on record.
+
+    Daily Pearson matched the platform within 0.006-0.016 on ten alphas and always read a
+    little lower; weekly and monthly overstated it by 0.03-0.08. That is why daily decides
+    and the slower frequencies only diagnose.
+    """
+
+    def test_daily_aggregation_is_the_identity(self):
+        series = {"2023-01-03": 1.0, "2023-01-04": 2.0}
+        self.assertEqual(correlation.aggregate(series, "d"), series)
+
+    def test_weekly_buckets_sum_within_the_month(self):
+        series = {"2023-01-02": 1.0, "2023-01-03": 2.0, "2023-01-09": 3.0}
+        self.assertEqual(correlation.aggregate(series, "w"),
+                         {"2023-01-w01": 3.0, "2023-01-w02": 3.0})
+
+    def test_monthly_buckets_sum_within_the_year(self):
+        series = {"2023-01-31": 4.0, "2023-02-01": 5.0}
+        self.assertEqual(correlation.aggregate(series, "m"),
+                         {"2023-01": 4.0, "2023-02": 5.0})
+
+    def test_a_series_with_no_dates_is_ignored(self):
+        self.assertEqual(correlation.aggregate({"bad": 1.0}, "w"), {})
+
+    def test_verdict_uses_the_measured_offset(self):
+        # 0.705 sits just over the limit locally but under it once the offset is applied.
+        verdict, estimate = correlation.classify(0.705)
+        self.assertEqual(verdict, "borderline")
+        self.assertLess(estimate, 0.7)
+
+    def test_clear_and_blocked_are_separated(self):
+        self.assertEqual(correlation.classify(0.50)[0], "clear")
+        self.assertEqual(correlation.classify(0.90)[0], "blocked")
+
+    def test_borderline_band_is_documented_by_behaviour(self):
+        # With the measured offset of 0.012 the band is narrow: a daily correlation has to
+        # land in [0.682, 0.712) to be undecided. Below that it is clear, at or above 0.712
+        # the platform is expected to refuse.
+        self.assertEqual(correlation.classify(0.71)[0], "borderline")
+        self.assertEqual(correlation.classify(0.68)[0], "clear")
+        self.assertEqual(correlation.classify(0.72)[0], "blocked")

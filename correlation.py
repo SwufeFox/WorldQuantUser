@@ -147,3 +147,56 @@ def max_against(target, refs, min_overlap=200):
         rows.append({"with": name, "r": r, "n": len(dates)})
     rows.sort(key=lambda row: abs(row["r"]), reverse=True)
     return {"max": rows[0] if rows else None, "all": rows}
+
+def aggregate(series, frequency="d"):
+    """Aggregate a daily PnL series to weekly or monthly buckets.
+
+    The platform's SELF_CORRELATION was calibrated against daily Pearson: over ten alphas
+    with a known platform value, daily came within 0.006 to 0.016 and always slightly
+    below, while weekly and monthly overstated it by 0.03 to 0.08. Daily is therefore the
+    default; the slower frequencies are diagnostic, useful for telling a shared signal
+    that drifts apart from a mechanically identical one.
+
+    Buckets are keyed by calendar period, so two series only line up when they share the
+    bucket - which is what ``align`` needs.
+    """
+    if frequency == "d":
+        return dict(series or {})
+    out = {}
+    for key, value in (series or {}).items():
+        if not isinstance(key, str) or len(key) < 10:
+            continue
+        if frequency == "m":
+            bucket = key[:7]
+        else:
+            try:
+                day = int(key[8:10])
+            except ValueError:
+                continue
+            bucket = "%s-w%02d" % (key[:7], (day - 1) // 7 + 1)
+        out[bucket] = out.get(bucket, 0.0) + float(value)
+    return out
+
+
+#: How far below daily Pearson the platform's SELF_CORRELATION reads. Measured on ten
+#: alphas with a published value: the gap ran from 0.006 to 0.016, always in this
+#: direction, because the platform's own measure is a little more conservative.
+PLATFORM_OFFSET = 0.012
+
+#: How close to the limit counts as undecided rather than clear. A candidate sitting just
+#: under the line is worth submitting, but not worth trusting as a new bet.
+BORDERLINE_BAND = 0.03
+
+
+def classify(daily_correlation, threshold=0.7, platform_offset=PLATFORM_OFFSET):
+    """Turn a daily correlation into the verdict the platform will probably reach.
+
+    Returns ``(verdict, estimated_platform)``. The estimate subtracts the measured offset,
+    which is why an alpha at 0.705 locally is worth trying and one at 0.75 is not.
+    """
+    estimate = round(max(0.0, daily_correlation - platform_offset), 4)
+    if estimate >= threshold:
+        return "blocked", estimate
+    if estimate >= threshold - BORDERLINE_BAND:
+        return "borderline", estimate
+    return "clear", estimate

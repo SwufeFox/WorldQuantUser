@@ -317,6 +317,39 @@ python research_cli.py alpha check d5K0Pod2          # compute and print live ch
 python research_cli.py alpha check d5K0Pod2 --max-wait 300
 ```
 
+### Check self-correlation locally, and correctly
+
+```bash
+python research_cli.py alpha self-check O0J6Aeag
+python research_cli.py alpha self-check gJWre33J --as-of 2026-10-22T09:15:30-04:00
+```
+
+Daily Pearson is the measure that decides, because it was calibrated against ten alphas
+with a published platform value: it came within **0.006 to 0.016** and always read slightly
+lower. Weekly and monthly overstated the platform number by 0.03 to 0.08, so those are
+diagnostics rather than verdicts. `classify()` subtracts the measured offset, which is why
+0.71 is worth submitting and 0.75 is not.
+
+Two behaviours matter more than the arithmetic, both found by disagreeing with the
+platform and then explaining why:
+
+* **The peer set must include in-flight submissions.** `O0J6Aeag` entered the book **20
+  seconds** after `gJWre33J`, and the two correlate **0.975**. Both were accepted, because
+  the platform compares against a periodically refreshed snapshot rather than a live book.
+  A local check that looks only at ACTIVE alphas repeats that blind spot, so recent
+  submissions — including ones not yet submitted — are included by default
+  (`--include-unsent-hours`, default 24).
+* **A published platform value is historical.** `0mjGjJ36` was refused at 0.7005 and now
+  measures 0.9991 against today's book, which is not a contradiction: the counterpart
+  entered afterwards. `--as-of` restricts the peers to those submitted at or before a
+  timestamp, which reproduces the original check. Timezone matters here and got it wrong
+  first: `dateSubmitted` is `-04:00`, so comparing it as a string against a Beijing
+  timestamp silently treats every alpha as older than it is.
+
+The report says so explicitly when the counterpart entered after the candidate
+(`counterpart_entered_after_candidate`), instead of leaving a number that looks like a
+disagreement with the platform.
+
 ### Submit (and the "test submission")
 
 There is **no separate test-submission endpoint**. The pre-submission test *is*
