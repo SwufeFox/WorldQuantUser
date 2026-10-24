@@ -742,9 +742,23 @@ def lint_expression(expression, operator_index=None, denylist=None,
             seen.add(name)
             if name in known:
                 continue
-            # Only flag things that actually look like datafield ids; a bare
-            # short word is more likely a keyword we do not model.
+            # A short bare name with no underscore used to be skipped outright as
+            # "probably a keyword we do not model". That is exactly how a one-letter
+            # local slipped through: ``p`` appeared in the body, was never assigned,
+            # and the simulator rejected three expressions before anyone noticed.
+            #
+            # Operators are excluded because a keyword we do not model is far more
+            # likely to be a keyword; everything else short is checked for definedness.
             if "_" not in name and len(name) < 6:
+                if operator_index and name in operator_index:
+                    continue
+                errors.append({
+                    "code": "undefined_variable",
+                    "identifier": name,
+                    "offset": identifier["offset"],
+                    "message": "%r is used but never assigned; the simulator rejects the "
+                               "whole expression for that alone" % name,
+                })
                 continue
             item = {
                 "code": "unknown_identifier",

@@ -1706,3 +1706,34 @@ class BookAuditTests(unittest.TestCase):
         data = book_audit.report(joined)
         self.assertEqual(data["by_group"]["composition"]["candidates"], 2)
         self.assertEqual(data["by_group"]["composition"]["in_book"], 1)
+
+
+class UndefinedVariableTests(unittest.TestCase):
+    """The mirror of `unused_variable`: used but never assigned.
+
+    `p` appeared in the body of three expressions and was never defined. The check skipped
+    any bare name shorter than six characters without an underscore, on the assumption it was
+    a keyword we do not model - which is exactly the shape of a one-letter local. Three
+    simulations were spent before the simulator said "Attempted to use unknown variable 'p'".
+    """
+
+    def lint(self, expression):
+        return expression_lint.lint_expression(expression, known_fields={"cap", "close"},
+                                               strict_fields=True)
+
+    def test_used_but_never_assigned_is_an_error(self):
+        result = self.lint("rank(cap) + p")
+        self.assertFalse(result["ok"])
+        self.assertIn("undefined_variable", [e["code"] for e in result["errors"]])
+
+    def test_a_defined_local_is_fine(self):
+        result = self.lint("lvl = rank(cap);\nlvl - 0.5*p_none" if False else
+                           "lvl = rank(cap);\nlvl - 0.5")
+        self.assertTrue(result["ok"])
+
+    def test_a_local_used_after_definition_is_fine(self):
+        result = self.lint("p = rank(close) - 0.5;\nrank(cap) - 0.5*p")
+        self.assertTrue(result["ok"])
+
+    def test_short_field_names_are_not_mistaken_for_locals(self):
+        self.assertTrue(self.lint("rank(cap) - 0.5")["ok"])
