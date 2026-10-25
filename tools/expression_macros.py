@@ -159,26 +159,36 @@ def expand(macros, name, args=None, _stack=()):
     return " ".join(text.split())
 
 
-def build(macros, plan, built=None):
+def build(macros, plan, built=None, universe=None):
     """Turn a plan into alphas, dropping duplicates of the ledger and of itself.
 
     ``plan`` entries are ``{macro, args, decay, candidate_id, mechanism, family}``. The
     return value is ``(alphas, skipped)`` where ``skipped`` says why an entry was dropped
     - a duplicate expression is the common case and must not be silently re-submitted.
+
+    The dedupe key includes the universe. The same expression on TOP500 and on TOP3000 is
+    two different alphas, because the universe is a global setting and the cross-section
+    is renormalised within it; keying on the expression alone silently discarded three
+    valid candidates that differed only by universe.
     """
     if built is None:
         import alpha_registry as registry
-        built = {entry.get("expression") for entry in registry.load_entries()
-                 if entry.get("expression")}
+        built = set()
+        for entry in registry.load_entries():
+            expression = entry.get("expression")
+            if not expression:
+                continue
+            settings = entry.get("settings") or {}
+            built.add((expression, entry.get("decay"), settings.get("universe")))
     alphas, skipped, seen = [], [], set(built)
     for item in plan:
         expression = expand(macros, item["macro"], item.get("args") or [])
-        key = (expression, item.get("decay"))
-        if expression in seen:
+        key = (expression, item.get("decay"), universe)
+        if key in seen:
             skipped.append({"candidate_id": item.get("candidate_id"),
                             "reason": "duplicate expression", "expression": expression})
             continue
-        seen.add(expression)
+        seen.add(key)
         alphas.append({
             "expression": expression,
             "decay": item.get("decay", 4),
@@ -277,7 +287,8 @@ def main(argv=None):
     if args.plan:
         with open(args.plan, encoding="utf-8") as handle:
             plan = json.load(handle)
-        alphas, skipped = build(macros, plan.get("plan") or [])
+        alphas, skipped = build(macros, plan.get("plan") or [],
+                                universe=(plan.get("settings") or {}).get("universe"))
         for item in skipped:
             print("skipped %s: %s" % (item["candidate_id"], item["reason"]))
         if args.lint:
