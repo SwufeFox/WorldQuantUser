@@ -159,7 +159,23 @@ def expand(macros, name, args=None, _stack=()):
     return " ".join(text.split())
 
 
-def build(macros, plan, built=None, universe=None):
+def expand_with(macros, name, args=None, backend="ast"):
+    """Expand through the chosen backend. ``text`` is the legacy path.
+
+    The default is the tree backend because textual substitution is only correct
+    while every argument is atomic; see tools/macro_parity.py for the measurement.
+    """
+    if backend in (None, "ast", "tree"):
+        import ast_macros
+
+        ast_macros.prepare(macros)
+        return ast_macros.expand(macros, name, args or [])
+    if backend == "text":
+        return expand(macros, name, args or [])
+    raise MacroError("unknown macro backend %r" % (backend,))
+
+
+def build(macros, plan, built=None, universe=None, backend="ast"):
     """Turn a plan into alphas, dropping duplicates of the ledger and of itself.
 
     ``plan`` entries are ``{macro, args, decay, candidate_id, mechanism, family}``. The
@@ -182,7 +198,8 @@ def build(macros, plan, built=None, universe=None):
             built.add((expression, entry.get("decay"), settings.get("universe")))
     alphas, skipped, seen = [], [], set(built)
     for item in plan:
-        expression = expand(macros, item["macro"], item.get("args") or [])
+        expression = expand_with(macros, item["macro"], item.get("args") or [],
+                                 backend=backend)
         key = (expression, item.get("decay"), universe)
         if key in seen:
             skipped.append({"candidate_id": item.get("candidate_id"),

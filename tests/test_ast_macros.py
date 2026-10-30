@@ -118,6 +118,32 @@ class Acceptance(unittest.TestCase):
                           "carrier%s -> %s" % (args, kind))
 
 
+class DefaultBackend(unittest.TestCase):
+    """build() now compiles through the tree; the text path stays reachable."""
+
+    def setUp(self):
+        self.macros = text_macros.parse_macros(SOURCE)
+
+    def test_prepare_upgrades_a_text_parsed_map_in_place(self):
+        self.assertNotIn("ast", self.macros["growth"])
+        ast_macros.prepare(self.macros)
+        self.assertIn("ast", self.macros["growth"])
+
+    def test_default_build_is_tree_backed(self):
+        plan = [{"macro": "scaled", "args": ["a - b"], "decay": 4, "candidate_id": "A"}]
+        alphas, _skipped = text_macros.build(self.macros, plan, built=set())
+        self.assertEqual(alphas[0]["expression"], "(a - b) * 2")
+
+    def test_text_backend_is_still_available(self):
+        plan = [{"macro": "scaled", "args": ["a - b"], "decay": 4, "candidate_id": "A"}]
+        alphas, _skipped = text_macros.build(self.macros, plan, built=set(), backend="text")
+        self.assertEqual(alphas[0]["expression"], "a - b * 2")
+
+    def test_unknown_backend_is_refused(self):
+        with self.assertRaises(text_macros.MacroError):
+            text_macros.expand_with(self.macros, "scaled", ["close"], backend="magic")
+
+
 class Structure(unittest.TestCase):
     def setUp(self):
         self.ast = ast_macros.parse_macros(SOURCE)

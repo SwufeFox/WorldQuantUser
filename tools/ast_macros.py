@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import fastexpr_ast as fa  # noqa: E402
 
-__all__ = ["parse_macros", "expand", "expand_ast_node"]
+__all__ = ["parse_macros", "prepare", "expand", "expand_ast_node"]
 
 _SENTINEL = "__ph_%s__"
 _PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -53,6 +53,25 @@ def parse_macros(text):
             spec["ast"] = fa.parse(body)
         except fa.ParseError as exc:
             raise AstMacroError("macro %r body does not parse: %s" % (name, exc)) from exc
+    return macros
+
+
+def prepare(macros):
+    """Fill in the parsed body for macros that came from the text parser.
+
+    Two entry points exist because the text expander still has to work; rather than
+    parse the file twice, this upgrades a text-parsed macro map in place, so a
+    caller can start with ``parse_macros`` and switch backends per call.
+    """
+    for spec in macros.values():
+        if "ast" in spec:
+            continue
+        body = _PLACEHOLDER.sub(lambda m: _SENTINEL % m.group(1), spec["body"])
+        try:
+            spec["ast"] = fa.parse(body)
+        except fa.ParseError as exc:
+            raise AstMacroError("macro %r body does not parse: %s"
+                                % (spec.get("name"), exc)) from exc
     return macros
 
 
