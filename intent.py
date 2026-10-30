@@ -12,11 +12,26 @@ inside a sum, and a rename turns the search into a no-op that still reports succ
 On the tree the check is structural -- "is the whole argument one bare field, and is
 that field a level" -- so it cannot half-match.
 
+Measured on the ledger (2026-10-30) before claiming any benefit: of 3023 rank-family
+calls across 1102 distinct expressions, 177 take a genuinely bare field (locals
+excluded), and **zero** of those fields is a level. They are `cap`, `volume`,
+`close/open/low/high/vwap`, `historical_volatility_*`, `adv15` -- size and market
+series, ranked bare on purpose. So this is a *preventive* check for expressions
+written from here on, not a repair pass over what exists; its measured coverage today
+is zero and should be described that way.
+
+A second measurement changed the design: most accounting amounts in this catalogue
+are stored as dimensionless (`assets`, `atq`, `revenue`, `cogs` all measure that
+way), so a unit of `Unit[TSPrice:1]` does **not** identify "amountness" -- only a
+minority of money fields carry it. Deriving levels from units therefore cannot
+replace the curated list; it can only add candidates. `derive_levels` exists for that
+purpose and is disjoint from the curated list by construction.
+
 Two guards keep it from guessing:
 
-* the field must be in the curated ``level_fields`` list (below), because a field
-  whose unit was never measured cannot be classified by name without inventing
-  knowledge; and
+* the field must be in the curated ``level_fields`` list (or passed in explicitly,
+  e.g. from :func:`derive_levels`), because neither a name nor an unmeasured unit can
+  classify a field without inventing knowledge; and
 * the rewrite is only *offered*, never applied silently. ``plan`` returns the
   variant plus a one-line reason, and the caller decides.
 
@@ -33,7 +48,7 @@ import os
 
 import fastexpr_ast as fa
 
-__all__ = ["load_rules", "level_ranks", "apply_size", "plan"]
+__all__ = ["load_rules", "derive_levels", "level_ranks", "apply_size", "plan"]
 
 _RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "intent-rules.json")
 
@@ -48,18 +63,49 @@ def load_rules(path=None):
         return {"level_fields": [], "rank_operators": {}, "size_fields": {}}
 
 
+#: Datasets whose fields are market series rather than accounting amounts. A price
+#: series and a balance-sheet total can share the same unit, so the unit alone cannot
+#: tell them apart; the catalogue's dataset id can.
+MARKET_DATASETS = frozenset({"pv1", "pv13", "option8", "option9"})
+
+
+def derive_levels(units, datasets, size_fields=()):
+    """Derive candidate level fields from measured units plus catalogue membership.
+
+    A field is a level when it is denominated in money, lives in a fundamental or
+    analyst dataset, and is not one of the size measures used as denominators. This
+    replaces the hand-written list as coverage grows: the list in intent-rules.json
+    stays as an override for fields whose unit has not been measured yet.
+
+    ``units`` maps field id to a unit string; ``datasets`` maps field id to dataset id.
+    Unmeasured fields are simply absent, so nothing is classified by name.
+    """
+    sizes = set(size_fields)
+    levels = []
+    for field_id, unit in units.items():
+        if field_id in sizes:
+            continue
+        if not str(unit).startswith("Unit[TSPrice"):
+            continue
+        if datasets.get(field_id) in MARKET_DATASETS:
+            continue
+        levels.append(field_id)
+    return sorted(levels)
+
+
 def _is_rank_call(node, rank_operators):
     return isinstance(node, fa.Call) and node.name in rank_operators
 
 
-def level_ranks(program, rules=None):
+def level_ranks(program, rules=None, level_fields=None):
     """Find ``rank(bare_level_field)`` calls, i.e. the pattern worth rewriting.
 
     Returns ``[(call, field_name), ...]`` so the caller can see exactly which call
     fired, not just that something did.
     """
     rules = rules or load_rules()
-    levels = set(rules.get("level_fields") or [])
+    levels = set(level_fields if level_fields is not None
+                 else (rules.get("level_fields") or []))
     rank_operators = rules.get("rank_operators") or {}
     found = []
     for node in program.walk():
@@ -90,10 +136,10 @@ def _replace_rank_argument(node, field_name, replacement):
     return node
 
 
-def apply_size(program, size_field, rules=None):
+def apply_size(program, size_field, rules=None, level_fields=None):
     """Rewrite every level-rank in the program to divide by ``size_field``."""
     rules = rules or load_rules()
-    found = level_ranks(program, rules)
+    found = level_ranks(program, rules, level_fields)
     if not found:
         return program
     names = {field for _call, field in found}
@@ -131,14 +177,14 @@ def _walk_and_rewrite(node, field, size_field):
     return node
 
 
-def plan(program, size_field="fnd6_cptnewqv1300_atq", rules=None):
+def plan(program, size_field="fnd6_cptnewqv1300_atq", rules=None, level_fields=None):
     """Offer the rewrite with a reason, or explain why there is nothing to do."""
     rules = rules or load_rules()
-    found = level_ranks(program, rules)
+    found = level_ranks(program, rules, level_fields)
     if not found:
         return []
     fields = sorted({field for _call, field in found})
-    rewritten = apply_size(program, size_field, rules)
+    rewritten = apply_size(program, size_field, rules, level_fields)
     return [{
         "kind": "size_normalisation",
         "fields": fields,

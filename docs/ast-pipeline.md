@@ -123,6 +123,19 @@ Three guards, each from a specific failure mode:
 
 The rewrite is *offered with a reason*, never applied silently.
 
+**Measured coverage, stated honestly: zero.** Of 3023 rank-family calls in the
+ledger's 1102 distinct expressions, 177 take a genuinely bare field (locals excluded)
+and none of those is a level — they are `cap`, `volume`, `close/open/low/high/vwap`,
+`historical_volatility_*`, `adv15`, i.e. size and market series ranked bare on
+purpose. The pattern this rewrite targets does not occur in what has already been
+written, so it is a preventive check for new expressions rather than a repair pass.
+
+A second measurement shaped the design: most accounting amounts in this catalogue are
+stored as dimensionless (`assets`, `atq`, `revenue`, `cogs` all measure that way), so
+`Unit[TSPrice:1]` does not identify "amountness". Levels cannot be derived from units
+alone; `intent.derive_levels` adds candidates and is disjoint from the curated list by
+construction, and the curated list stays the primary signal.
+
 ## The family graph
 
 `tools/family_graph.py` builds nodes from structure and three kinds of edge:

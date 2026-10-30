@@ -37,5 +37,36 @@ class Intent(unittest.TestCase):
 
 
 
+class Derivation(unittest.TestCase):
+    """Levels from units + dataset, so the curated list is an override, not the source."""
+
+    UNITS = {"assets_total": "Unit[TSPrice:1]", "close": "Unit[TSPrice:1]",
+             "atq": "Unit[TSPrice:1]", "noise": "dimensionless"}
+    DATASETS = {"assets_total": "fnd6", "close": "pv13", "atq": "fnd6",
+                "noise": "fnd6"}
+
+    def test_money_in_a_fundamental_dataset_is_a_level(self):
+        self.assertIn("assets_total",
+                      intent.derive_levels(self.UNITS, self.DATASETS, ("atq",)))
+
+    def test_price_series_is_excluded_by_dataset(self):
+        self.assertNotIn("close", intent.derive_levels(self.UNITS, self.DATASETS, ("atq",)))
+
+    def test_size_measures_are_excluded(self):
+        self.assertNotIn("atq", intent.derive_levels(self.UNITS, self.DATASETS, ("atq",)))
+
+    def test_dimensionless_field_is_not_a_level(self):
+        self.assertNotIn("noise", intent.derive_levels(self.UNITS, self.DATASETS, ()))
+
+    def test_unmeasured_field_is_absent_rather_than_guessed(self):
+        self.assertEqual(intent.derive_levels({}, {"whatever": "fnd6"}), [])
+
+    def test_explicit_level_list_overrides_the_curated_file(self):
+        program = fa.parse("group_rank(weird_field, subindustry)")
+        self.assertEqual(intent.plan(program), [])
+        plans = intent.plan(program, level_fields=["weird_field"])
+        self.assertEqual(len(plans), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
