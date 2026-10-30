@@ -64,17 +64,13 @@ def _load(path):
     return rows
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--apply", action="store_true")
-    parser.add_argument("--path", default=None)
-    args = parser.parse_args()
+def reconcile(rows, live, stamp):
+    """Update rows in place; return ``(promoted_ids, demoted_ids)``.
 
-    path = args.path or str(alpha_registry.default_registry_path())
-    rows = _load(path)
-    live = fetch_active(ml.login())
-    stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
-
+    Pure enough to test: the only inputs are the ledger rows, the platform's ACTIVE
+    map, and a timestamp. ``live`` maps alpha id to the platform's own record, which
+    is where ``dateSubmitted`` comes from.
+    """
     promoted, demoted = [], []
     for row in rows:
         alpha_id = row.get("alpha_id")
@@ -94,6 +90,21 @@ def main() -> int:
             row["reconciled_at"] = stamp
             row["not_in_book"] = True
             demoted.append(alpha_id)
+    return promoted, demoted
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--apply", action="store_true")
+    parser.add_argument("--path", default=None)
+    args = parser.parse_args()
+
+    path = args.path or str(alpha_registry.default_registry_path())
+    rows = _load(path)
+    live = fetch_active(ml.login())
+    stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+    promoted, demoted = reconcile(rows, live, stamp)
 
     print("live ACTIVE on the platform : %d" % len(live))
     print("rows promoted to ACTIVE      : %d" % len(promoted))
