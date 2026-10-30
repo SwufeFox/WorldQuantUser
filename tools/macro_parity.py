@@ -45,6 +45,46 @@ NAMES = ["x", "v"]
 SAMPLE = 300
 
 
+def non_atomic_params(program):
+    """Parameters whose placeholder does not sit in a whole-argument position.
+
+    Those are the only places where textual substitution can change meaning: the
+    argument's own operators bind against the surrounding expression instead of
+    against the placeholder. If a difference appears anywhere else, it is a real
+    regression rather than a known defect being fixed.
+    """
+    risky = set()
+
+    def walk(node, parent):
+        if (isinstance(node, fa.Field) and node.name.startswith("__ph_")
+                and not isinstance(parent, fa.Call)):
+            risky.add(node.name[5:-2])
+        if isinstance(node, fa.Call):
+            children = node.args + tuple(v for _k, v in node.kwargs)
+        elif isinstance(node, fa.BinOp):
+            children = (node.left, node.right)
+        elif isinstance(node, fa.UnaryOp):
+            children = (node.operand,)
+        elif isinstance(node, fa.Ternary):
+            children = (node.condition, node.when_true, node.when_false)
+        else:
+            children = ()
+        for child in children:
+            walk(child, node)
+
+    for _key, value in program.assignments:
+        walk(value, None)
+    if program.signal is not None:
+        walk(program.signal, None)
+    return risky
+
+
+def _is_compound(text):
+    signal = fa.parse(text).signal
+    return any(isinstance(node, (fa.BinOp, fa.UnaryOp, fa.Call))
+               for node in signal.walk())
+
+
 def classify(am, tm, name, spec, args):
     try:
         old = text_macros.expand(tm, name, list(args))
@@ -65,7 +105,13 @@ def classify(am, tm, name, spec, args):
         same = fa.parse(old).render() == new
     except Exception:
         return "new_error", None
-    return ("equal", None) if same else ("semantic_diff", (old, new))
+    if same:
+        return "equal", None
+    risky = non_atomic_params(spec["ast"])
+    bound = dict(zip([p for p, _d in spec["params"]], args))
+    if any(_is_compound(bound[p]) for p in risky if p in bound):
+        return "diff_explained", (old, new)
+    return "diff_UNEXPLAINED", (old, new)
 
 
 def main() -> int:
@@ -104,13 +150,16 @@ def main() -> int:
 
     print("\nreal findings by macro:")
     for name, counter in sorted(per_macro.items()):
-        bad = counter["old_leaks_macro"] + counter["semantic_diff"]
+        bad = (counter["old_leaks_macro"] + counter["semantic_diff"]
+               + counter["diff_UNEXPLAINED"])
         if bad:
             print("  %-14s leaks=%-5d semantic=%-5d equal=%d"
                   % (name, counter["old_leaks_macro"], counter["semantic_diff"],
                      counter["equal"]))
 
-    for kind in ("old_leaks_macro", "semantic_diff"):
+    print("\nacceptance: diff_UNEXPLAINED must be 0 before the default can flip")
+
+    for kind in ("old_leaks_macro", "semantic_diff", "diff_UNEXPLAINED"):
         for name, combo, detail in samples[kind]:
             print("\n[%s] %s%s" % (kind, name, combo))
             if kind == "old_leaks_macro":

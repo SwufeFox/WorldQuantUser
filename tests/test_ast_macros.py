@@ -99,6 +99,25 @@ class TextDefects(unittest.TestCase):
             self.assertEqual(fa.parse(out).render(), out)
 
 
+class Acceptance(unittest.TestCase):
+    """The gate for flipping build() onto the tree backend."""
+
+    def test_no_unexplained_difference_on_the_shipped_macros(self):
+        import tools.macro_parity as parity
+
+        text = ast_macros.parse_macros(SOURCE)
+        reference = text_macros.parse_macros(SOURCE)
+        risky = parity.non_atomic_params(text["carrier"]["ast"])
+        self.assertIn("fw", risky)  # {fw} sits directly against an operator
+        for args in (["fnd6_x", "position()"], ["fnd6_x", "a - b"],
+                     ["(a + b) / 2", "position()"]):
+            kind, _detail = parity.classify(text, reference, "carrier", text["carrier"], args)
+            # A leak is an old-backend defect too, so it is acceptable here; what
+            # must never appear is a difference nobody can explain.
+            self.assertIn(kind, {"equal", "diff_explained", "old_leaks_macro"},
+                          "carrier%s -> %s" % (args, kind))
+
+
 class Structure(unittest.TestCase):
     def setUp(self):
         self.ast = ast_macros.parse_macros(SOURCE)
