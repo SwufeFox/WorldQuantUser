@@ -53,7 +53,15 @@ def interpret(record):
     A unit mismatch can arrive as WARNING as well as ERROR, so the error text is
     inspected before the status: an alpha that merely carries a unit warning is not
     a failed probe.
+
+    The converse matters just as much: a probe that has not finished has no error
+    either, and treating that as "add with a scalar succeeded" would record
+    ``dimensionless`` for every field the batch ran out of time on. An unfinished
+    probe is unknown, not dimensionless.
     """
+    status = (record.get("status") or "").upper()
+    if status in {"PENDING", "QUEUED", "UNKNOWN"}:
+        return None, "probe did not finish (status %s); unit unknown" % (status or "?")
     error = str(record.get("error") or "")
     match = _UNIT_EXPECTED.search(error)
     if match:
@@ -80,6 +88,12 @@ def main(argv=None):
                         help="Write the raw probe errors even when all were resolved.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the probes without submitting them.")
+    parser.add_argument("--chunk", type=int, default=6,
+                        help="Probes per submission wave. A single batch of 36 does not "
+                             "finish inside max_wait and returns PENDING, and a PENDING "
+                             "record has no error, which used to be read as dimensionless.")
+    parser.add_argument("--max-wait", type=int, default=400,
+                        help="Seconds to wait per chunk before moving on.")
     args = parser.parse_args(argv)
 
     fields = [part.strip() for part in args.fields.split(",") if part.strip()]
@@ -102,21 +116,30 @@ def main(argv=None):
         return 0
 
     session = ml.load_session() or ml.authenticate()
-    pairs = [(probe_expression(name), 4) for name in fields]
-    records = ml.simulate_alphas(session, pairs, settings=dict(
-        ml.DEFAULT_SETTINGS, universe="TOP3000", region="USA", delay=1,
-        neutralization="SUBINDUSTRY", truncation=0.08),
-        batch_size=min(3, len(pairs)), max_wait_seconds=400)
+    settings = dict(ml.DEFAULT_SETTINGS, universe="TOP3000", region="USA", delay=1,
+                    neutralization="SUBINDUSTRY", truncation=0.08)
 
     measured, undetermined = {}, []
-    for field_id, record in zip(fields, records):
-        unit, note = interpret(record)
-        status = (record.get("status") or "").upper()
-        print("  %-46s %-22s %s" % (field_id[:46], unit or "-", note))
-        if unit:
-            measured[field_id] = unit
-        else:
-            undetermined.append({"field": field_id, "status": status, "note": note})
+    chunk_size = max(1, args.chunk)
+    for start in range(0, len(fields), chunk_size):
+        window = fields[start:start + chunk_size]
+        pairs = [(probe_expression(name), 4) for name in window]
+        records = ml.simulate_alphas(session, pairs, settings=settings,
+                                     batch_size=min(3, len(pairs)),
+                                     max_wait_seconds=args.max_wait)
+        # Match by expression rather than by position: the records carry their own
+        # expression, so a dropped or reordered record cannot silently attach one
+        # field's unit to another.
+        by_expression = {record.get("expression"): record for record in records}
+        for field_id, expression in zip(window, (pair[0] for pair in pairs)):
+            record = by_expression.get(expression) or {"status": "MISSING"}
+            unit, note = interpret(record)
+            status = (record.get("status") or "").upper()
+            print("  %-46s %-22s %s" % (field_id[:46], unit or "-", note), flush=True)
+            if unit:
+                measured[field_id] = unit
+            else:
+                undetermined.append({"field": field_id, "status": status, "note": note})
 
     known.update(measured)
     # Keep the raw text next to the verdicts: an interpretation that cannot be
