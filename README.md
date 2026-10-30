@@ -32,12 +32,23 @@ research_cli.py schema      # the whole contract, as JSON
 | `correlation.py` | Align daily PnL on shared dates, Pearson, residualise against a control. |
 | `ablation.py` | Leave-one-out and solo variants, so a leg can be shown to earn its place. |
 | `cache_store.py` | Small JSON cache with TTL, so repeat calls do not re-fetch. |
+| `fastexpr_ast.py` | FASTEXPR parser: tree, field extraction, skeletons, transforms. |
+| `alpha_sugar.py` | Sugar that compiles to FASTEXPR (`band`, `rrank`, `deadband`, ...). |
+| `operator_semantics.py` | Invariants the operator catalogue does not publish. |
+| `annotations.py` | `@annotation` vocabulary, staleness checks, ablation derivation. |
+| `intent.py` | Rewrite "rank a level" into "rank a level over size". |
 | `tools/expression_macros.py` | Named `def` templates, expanded in bulk, lint-gated. |
 | `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
 | `tools/pool_stats.py` | Report the pool as quartiles rather than as a best alpha. |
 | `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |
 | `tools/dedupe_ledger.py` | Find identical-PnL entries that are one alpha filed twice. |
 | `tools/derive_family.py` | Derive family labels from the datafield namespace. |
+| `tools/family_graph.py` | Sibling / extends / shares graph over construction, plus components. |
+| `tools/family_graph_png.py` | Draw the graph one family per cell. |
+| `tools/ast_macros.py` | Macro expansion on the tree; the default backend. |
+| `tools/macro_parity.py` | Classify every difference between the two macro backends. |
+| `tools/guarded_sim.py` | Simulate only after the catalogue check; refuses unknown names. |
+| `tools/repair_ledger.py` | Repair damaged expressions and mark abandoned rows, without deleting. |
 | `tools/turnover_repair.py` | Break-even Sharpe for a smoothing decision. |
 | `tools/backfill_registry.py` | One-off seed of the registry from the account and existing result files. |
 | `tests/` | Offline contract tests. No account required. |
@@ -56,6 +67,13 @@ all live in a results directory outside the working tree, resolved by
 `research_cli.py schema` reports the resolved path under `research_paths`. A
 `research/` directory inside the repo is git-ignored as a guard rail, so a stray
 run cannot quietly add data to the history.
+
+## The expression tree
+
+`docs/ast-pipeline.md` explains what parsing FASTEXPR into a tree bought, which
+measurements justified each step, and which two migrations were measured and then
+deliberately declined. Read it before changing anything that extracts information
+from an expression by pattern-matching the string.
 
 ## Install
 
