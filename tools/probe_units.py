@@ -9,8 +9,11 @@ where the description says "amount" and nothing says in what.
 The measurement is one cheap simulation per field. ``add(ts_backfill(field, 252), 1)``
 forces the simulator to reconcile the field's unit with a pure number:
 
-* it completes, so the field is dimensionless;
-* it fails with ``expected "Unit[...]", found "Unit[X]"``, which names the unit.
+* it completes with status COMPLETE, so the field is dimensionless;
+* it fails with ``expected "Unit[...]", found "Unit[X]"``, which names the unit;
+* it has not finished, which says *nothing* and must be retried -- a PENDING record
+  carries no error either, and reading that silence as "dimensionless" wrote 36 wrong
+  entries in one batch before this was fixed.
 
 The trick was used by hand earlier to discover that one lease ladder mixes
 dimensionless and price-denominated fields in a single table. This makes it

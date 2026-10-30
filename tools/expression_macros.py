@@ -18,8 +18,15 @@ A macro file is plain text::
         -rank(growth({f}, {w})) - {fw}*rank({fast})
 
 Macros may call other macros, so ``carrier`` expands ``growth`` itself. Expansion is
-recursive with cycle detection, and every argument is substituted as text - which is all
-FASTEXPR needs, because it has no types to check.
+recursive with cycle detection.
+
+Two backends exist. ``text`` substitutes strings, which is only correct while every
+argument is atomic: ``ts_backfill({f}, 252)`` is safe, ``{fast} * 2`` is not, and a
+nested call whose argument contains parentheses is not even matched. ``ast`` (the
+default) parses the body once and substitutes field nodes, so the renderer decides
+where parentheses go. Measured over the shipped libraries, every difference between
+the two is attributable to a compound argument in a non-atomic position, and none
+appears where the text output was already correct; see ``tools/macro_parity.py``.
 
 Two properties matter more than the substitution:
 
@@ -177,6 +184,9 @@ def expand_with(macros, name, args=None, backend="ast"):
 
 def build(macros, plan, built=None, universe=None, backend="ast"):
     """Turn a plan into alphas, dropping duplicates of the ledger and of itself.
+
+    ``backend`` selects the expander: ``ast`` (default) or ``text`` for the legacy
+    path. See :func:`expand_with`.
 
     ``plan`` entries are ``{macro, args, decay, candidate_id, mechanism, family}``. The
     return value is ``(alphas, skipped)`` where ``skipped`` says why an entry was dropped

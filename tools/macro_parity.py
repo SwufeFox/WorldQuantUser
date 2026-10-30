@@ -86,6 +86,13 @@ def _is_compound(text):
 
 
 def classify(am, tm, name, spec, args):
+    """Run one argument combination through both backends and name the outcome.
+
+    The distinction that matters is between a difference with a mechanism (the
+    placeholder sat against an operator, so the argument needed parentheses) and one
+    without. Only the second is a regression.
+    """
+
     try:
         old = text_macros.expand(tm, name, list(args))
     except Exception:

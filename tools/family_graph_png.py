@@ -7,7 +7,7 @@ margins, which hides the only two facts worth seeing -- how many families there
 are, and how lopsided their sizes are.
 
 Laying out each component separately and packing the results into a grid fixes
-that: cell area is proportional to family size, so a 18-member family and a
+that: cell area is proportional to family size, so an 18-member family and a
 singleton look like what they are.
 """
 

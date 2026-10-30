@@ -83,6 +83,8 @@ class Node:
 
 @dataclass(frozen=True)
 class Number(Node):
+    """A numeric literal, kept as written so 0.50 renders as 0.50."""
+
     text: str
 
     def render(self, parent_precedence: int = 0) -> str:
@@ -91,6 +93,8 @@ class Number(Node):
 
 @dataclass(frozen=True)
 class String(Node):
+    """A quoted literal, quotes included; never interpreted."""
+
     text: str  # includes the surrounding quotes as written
 
     def render(self, parent_precedence: int = 0) -> str:
@@ -99,6 +103,8 @@ class String(Node):
 
 @dataclass(frozen=True)
 class Field(Node):
+    """A bare identifier: a datafield, unless the program binds it."""
+
     name: str
 
     def render(self, parent_precedence: int = 0) -> str:
@@ -107,6 +113,8 @@ class Field(Node):
 
 @dataclass(frozen=True)
 class Call(Node):
+    """``name(args..., key=value)``; the only node that can be an operator."""
+
     name: str
     args: tuple = ()
     kwargs: tuple = ()  # ((key, Node), ...) so the node stays hashable
@@ -136,6 +144,8 @@ _PRECEDENCE = {
 
 @dataclass(frozen=True)
 class BinOp(Node):
+    """A binary operator; precedence lives in _PRECEDENCE, not in the tree."""
+
     op: str
     left: Node
     right: Node
@@ -157,6 +167,8 @@ class BinOp(Node):
 
 @dataclass(frozen=True)
 class UnaryOp(Node):
+    """Prefix ``-`` or ``!``, applied to one subtree."""
+
     op: str
     operand: Node
 
@@ -172,6 +184,8 @@ class UnaryOp(Node):
 
 @dataclass(frozen=True)
 class Ternary(Node):
+    """``cond ? a : b``. FASTEXPR rarely needs it; the parser accepts it anyway."""
+
     condition: Node
     when_true: Node
     when_false: Node
@@ -499,6 +513,7 @@ def macro(name, replace=None):
 
 
 def macros():
+    """A copy of the registered sugar, so a caller cannot mutate the table."""
     return dict(_MACROS)
 
 
@@ -545,6 +560,7 @@ def field_names(program: Program):
 
 
 def operator_names(program: Program):
+    """Operator names in first-use order, with sugar already expanded away."""
     ordered, seen = [], set()
     for node in program.walk():
         if isinstance(node, Call) and node.name not in _MACROS:

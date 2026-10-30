@@ -39,6 +39,8 @@ _RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "intent-rules.
 
 
 def load_rules(path=None):
+    """Read the curated level/size lists; a missing file means "rewrite nothing"."""
+
     try:
         with open(path or _RULES) as handle:
             return json.load(handle)

@@ -36,6 +36,8 @@ _SCHEMA_NAME = "annotation-schema.json"
 
 
 def load_schema(path=None):
+    """Read the annotation vocabulary; an unreadable file means "no vocabulary"."""
+
     path = path or os.path.join(os.path.dirname(os.path.abspath(__file__)), _SCHEMA_NAME)
     try:
         with open(path) as handle:

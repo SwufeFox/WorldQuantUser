@@ -15,9 +15,10 @@ free, and it says exactly *how* they are related:
 
 Components over those edges are the honest unit: two nodes in one component are
 related by construction, whatever their PnL says. That is deliberately *not* the
-same claim as independence -- measured on 2026-10-30, the 18 ACTIVE alphas have 18
-distinct skeletons and 18 distinct field sets, yet correlate at 0.85. Structure
-finds copies; only PnL finds shared bets.
+same claim as independence. Measured on 2026-10-30 against the live book: 48 alphas,
+183 edges (83 of them siblings), collapsing to 22 construction families -- and
+candidates built from those same families still correlate with the book at 0.85.
+Structure finds copies; only PnL finds shared bets.
 
 Usage:
     python3 tools/family_graph.py --book          # the submitted book
@@ -47,6 +48,12 @@ def legs(program):
 
 
 def build_nodes(entries):
+    """One node per distinct alpha id (or key), carrying its parsed structure.
+
+    Entries whose expression does not parse are skipped rather than raised: a single
+    damaged row in the ledger must not stop the graph from being built.
+    """
+
     nodes = {}
     for entry in entries:
         expression = entry.get("expression")
@@ -73,6 +80,13 @@ def build_nodes(entries):
 
 
 def build_edges(nodes):
+    """Every structural relation between two nodes, as ``(a, b, kind)``.
+
+    Siblings are checked first and short-circuit, because an identical skeleton
+    already implies a shared construction and reporting both would double-count the
+    same fact.
+    """
+
     edges = []
     ids = sorted(nodes)
     for index, left in enumerate(ids):
@@ -93,6 +107,13 @@ def build_edges(nodes):
 
 
 def components(nodes, edges):
+    """Connected components over sibling and extends edges only.
+
+    ``shares`` is deliberately excluded: "these two composites use one common leg"
+    is too weak to merge families, and including it collapses the whole book into a
+    single component.
+    """
+
     parent = {node: node for node in nodes}
 
     def find(x):
@@ -116,6 +137,8 @@ def components(nodes, edges):
 
 
 def report(nodes, edges, stream=None):
+    """Print the family summary and return it, so a caller can assert on it."""
+
     stream = stream or sys.stdout
     kinds = collections.Counter(kind for _l, _r, kind in edges)
     groups = components(nodes, edges)
@@ -140,6 +163,8 @@ def report(nodes, edges, stream=None):
 
 
 def to_dot(nodes, edges):
+    """Graphviz export; edge style encodes the relation kind."""
+
     lines = ["graph alphas {", "  node [shape=box, fontsize=9];"]
     for node, data in nodes.items():
         label = "%s\\n%s" % (node, data["skeleton"][:40].replace('"', "'"))
