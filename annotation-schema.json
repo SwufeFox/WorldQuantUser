@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "note": "Vocabulary for @annotations. Data, not code: a new annotation kind is an edit here, and an unknown name is reported by annotations.check instead of being ignored.",
+  "annotations": {
+    "mechanism": {
+      "kind": "metadata",
+      "requires": ["value"],
+      "description": "What bet the composite is supposed to express, in words. Free text, used for grouping and review."
+    },
+    "leg": {
+      "kind": "metadata",
+      "names_a_leg": "name",
+      "requires": ["name"],
+      "optional": ["role", "family"],
+      "description": "Names an assignment and its job in the composite: carrier, stabiliser, normaliser."
+    },
+    "ablate": {
+      "kind": "ablation",
+      "names_a_leg": "leg",
+      "requires": ["leg"],
+      "description": "Requests an ablation of this leg. When present, derive_ablations uses these instead of every leg."
+    },
+    "expect": {
+      "kind": "expectation",
+      "names_a_field": "field",
+      "optional": ["unit", "role"],
+      "description": "Declares what a field is meant to represent. Checked against the catalogue so a renamed or wrong field is caught before it costs a simulation."
+    },
+    "intent": {
+      "kind": "metadata",
+      "requires": ["value"],
+      "description": "The normalised form this expression is trying to reach, e.g. 'rank(fundamental / size)'. Used by the rewrite layer to decide what is already applied."
+    }
+  }
+}

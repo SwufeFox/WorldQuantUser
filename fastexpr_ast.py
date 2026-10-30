@@ -43,6 +43,7 @@ __all__ = [
     "UnaryOp",
     "Ternary",
     "Program",
+    "Annotation",
     "parse",
     "parse_program",
     "macro",
@@ -188,17 +189,49 @@ class Ternary(Node):
 
 
 @dataclass(frozen=True)
+class Annotation(Node):
+    """A pragma: ``@name(k=v, ...)``. Metadata for tooling, never for the engine.
+
+    Annotations compile away -- the simulator never sees them -- so they can carry
+    intent ("this leg is the carrier"), derivation requests ("ablate this leg") and
+    provenance without changing what is measured.
+    """
+
+    name: str
+    args: tuple = ()
+    kwargs: tuple = ()
+
+    def render(self, parent_precedence: int = 0) -> str:
+        parts = [value.render() for value in self.args]
+        parts += ["%s=%s" % (key, value.render()) for key, value in self.kwargs]
+        return "@%s(%s)" % (self.name, ", ".join(parts))
+
+    def walk(self):
+        yield self
+
+
+@dataclass(frozen=True)
 class Program(Node):
     """``assignments`` precede ``signal``; ``signal`` may be None if it is missing."""
 
     assignments: tuple = ()  # ((name, Node), ...)
     signal: object = None
+    annotations: tuple = ()  # (Annotation, ...)
 
     def render(self, parent_precedence: int = 0) -> str:
+        """The expression the simulator sees: annotations are compile-time only."""
         chunks = ["%s = %s" % (name, value.render()) for name, value in self.assignments]
         if self.signal is not None:
             chunks.append(self.signal.render())
         return ";\n".join(chunks)
+
+    def render_source(self) -> str:
+        """Everything, annotations included -- what a human wrote."""
+        chunks = [note.render() for note in self.annotations]
+        body = self.render()
+        if body:
+            chunks.append(body)
+        return "\n".join(chunks)
 
     def walk(self):
         yield self
@@ -216,7 +249,7 @@ _TOKEN = re.compile(
   | (?P<number>\d+\.\d*(?:[eE][+-]?\d+)?|\.\d+(?:[eE][+-]?\d+)?|\d+(?:[eE][+-]?\d+)?)
   | (?P<string>"[^"]*"|'[^']*')
   | (?P<ident>[A-Za-z_][A-Za-z0-9_]*)
-  | (?P<op><=|>=|==|!=|&&|\|\||[-+*/^<>!(),;=?:])
+  | (?P<op><=|>=|==|!=|&&|\|\||[-+*/^<>!(),;=?:@])
     """,
     re.VERBOSE,
 )
@@ -316,11 +349,36 @@ class _Parser:
         return self.advance()
 
     # -- grammar ----------------------------------------------------------
+    def annotation(self):
+        self.expect("@")
+        if self.token.kind != "ident":
+            raise ParseError("expected an annotation name after '@'",
+                             self.expression, self.token.start)
+        name = self.advance().text
+        args, kwargs = [], []
+        if self.accept("("):
+            if self.token.text != ")":
+                while True:
+                    if (self.token.kind == "ident"
+                            and self.tokens[self.index + 1].text == "="):
+                        key = self.advance().text
+                        self.expect("=")
+                        kwargs.append((key, self.expression_node()))
+                    else:
+                        args.append(self.expression_node())
+                    if not self.accept(","):
+                        break
+            self.expect(")")
+        return Annotation(name, tuple(args), tuple(kwargs))
+
     def program(self):
-        assignments, signal = [], None
+        assignments, signal, annotations = [], None, []
         while self.token.kind != "eof":
             if self.token.text == ";":
                 self.advance()
+                continue
+            if self.token.text == "@":
+                annotations.append(self.annotation())
                 continue
             if (self.token.kind == "ident"
                     and self.tokens[self.index + 1].text == "="):
@@ -336,9 +394,9 @@ class _Parser:
                 raise ParseError("unexpected %r after a complete statement"
                                  % self.token.text, self.expression, self.token.start)
             break
-        if not assignments and signal is None:
+        if not assignments and signal is None and not annotations:
             raise ParseError("empty expression", self.expression, 0)
-        return Program(tuple(assignments), signal)
+        return Program(tuple(assignments), signal, tuple(annotations))
 
     def expression_node(self):
         return self.ternary()
