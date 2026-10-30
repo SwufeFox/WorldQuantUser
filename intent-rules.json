@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "note": "Curated inputs for the intent rewrite. Fields are listed only when they are unambiguously a level or a size; anything absent is left alone rather than guessed at, because a wrong rewrite changes what is measured.",
+  "sources": [
+    "tools/probe_units.py unit measurements where available (field-units.json)",
+    "BRAIN field catalogue descriptions, read per field, not by name pattern"
+  ],
+  "level_fields": [
+    "assets",
+    "fnd6_cptnewqv1300_atq",
+    "fnd6_cptnewqv1300_ltq",
+    "fnd6_cptnewqv1300_rectq",
+    "fnd6_cptnewqv1300_saleq",
+    "fnd6_newa2v1300_sale",
+    "fnd6_newqv1300_ppegtq",
+    "fnd6_newqv1300_ivltq",
+    "operating_income"
+  ],
+  "size_fields": {
+    "fnd6_cptnewqv1300_atq": "total assets, quarterly -- available for every filer",
+    "cap": "market capitalisation -- market-based alternative"
+  },
+  "rank_operators": {
+    "rank": [0],
+    "group_rank": [0],
+    "zscore": [0],
+    "group_zscore": [0]
+  }
+}
