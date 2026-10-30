@@ -62,6 +62,32 @@ class Constraints(unittest.TestCase):
         self.assertEqual(semantics.rule_findings("kth_element(close, 5, k=7)", {}, RULES), [])
 
 
+class CommentProse(unittest.TestCase):
+    """The regex identifier scan cannot tell a comment from code; the tree can."""
+
+    def test_comment_words_are_not_fields(self):
+        import expression_lint
+
+        expression = ("//leverage = liabilities / assets;\r\n\r\n"
+                      "FLEV = -rank(equity / assets);\r\nFLEV")
+        report = expression_lint.lint_expression(
+            expression, known_fields=set(), strict_fields=True)
+        unknown = {item["identifier"] for item in report["errors"]
+                   if item["code"] == "unknown_identifier"}
+        self.assertNotIn("leverage", unknown)
+        self.assertIn("equity", unknown)
+
+    def test_crlf_assignment_is_a_local_not_a_field(self):
+        import expression_lint
+
+        expression = "# day1\r\nd1_mean = ts_mean(close, 20);\r\nd1_mean"
+        report = expression_lint.lint_expression(
+            expression, known_fields=set(), strict_fields=True)
+        unknown = {item["identifier"] for item in report["errors"]
+                   if item["code"] == "unknown_identifier"}
+        self.assertNotIn("d1_mean", unknown)
+
+
 class PackagedRules(unittest.TestCase):
     def test_packaged_default_exists(self):
         self.assertTrue(os.path.exists(semantics.packaged_default_path()))
