@@ -1,0 +1,38 @@
+{
+  "source": "FastPlus 0.3.5 (MIT) src/operator.rs validate_special_constraints + BRAIN operator docs",
+  "captured_at": "2026-10-30",
+  "note": "BRAIN exposes operator names, signatures and levels via GET /operators but NOT return types or cross-argument invariants. Catalogs are fetched and cached; this file is curated on purpose. Parameter names in constraints must match the catalog's definition string; a rename makes the rule skip rather than misfire.",
+  "scope_note": "returns covers only operators observed to be non-Matrix on this account (66-operator catalogue). Everything else is Matrix by omission.",
+  "returns": {
+    "bucket": "Group",
+    "densify": "Group"
+  },
+  "constraints": [
+    {
+      "operator": "kth_element",
+      "kind": "le",
+      "left": "k",
+      "right": "d",
+      "message": "kth_element requires k <= d"
+    },
+    {
+      "operator": "ts_backfill",
+      "kind": "le",
+      "left": "k",
+      "right": "lookback",
+      "message": "ts_backfill requires k <= lookback"
+    },
+    {
+      "operator": "bucket",
+      "kind": "exactly_one",
+      "keys": ["range", "buckets"],
+      "message": "bucket requires exactly one of range/buckets"
+    },
+    {
+      "operator": "bucket",
+      "kind": "increasing",
+      "key": "buckets",
+      "message": "bucket requires buckets to be strictly increasing"
+    }
+  ]
+}

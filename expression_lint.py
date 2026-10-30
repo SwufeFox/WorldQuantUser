@@ -31,6 +31,7 @@ import re
 
 import expression_types
 import expression_units
+import operator_semantics
 
 import research_paths
 import cache_store
@@ -802,6 +803,15 @@ def lint_expression(expression, operator_index=None, denylist=None,
         errors.append(finding)
 
     for finding in unused_variable_findings(expression):
+        errors.append(finding)
+
+    # Invariants the catalog does not publish: cross-argument constraints and
+    # non-Matrix signal types. Kept in a curated data file so the operator and
+    # field *catalogs* stay fetched-and-cached while this small, stable rule set
+    # stays editable and attributable.
+    for finding in operator_semantics.rule_findings(expression, operator_index):
+        errors.append(finding)
+    for finding in operator_semantics.return_type_findings(expression, operator_index):
         errors.append(finding)
 
     for finding in turnover_findings(expression, market_fields):
