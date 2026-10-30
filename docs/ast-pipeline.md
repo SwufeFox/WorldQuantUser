@@ -190,11 +190,24 @@ already correct. That zero is the acceptance test in `tests/test_ast_macros.py`.
 
 ## Ledger hygiene
 
-`tools/repair_ledger.py` fixed two defects without deleting history: nine
-expressions carried a variant index glued to their tail (repaired, annotated), and
-191 rows with no alpha id at all were marked `abandoned` rather than removed. The
-ledger is append-at-submission and nothing reconciles it, so "how many alphas do I
-have" always needs shells subtracted first — 191 of 2118 rows were shells.
+The ledger is written at submission and reconciled by nothing, so it drifts in ways
+that quietly change every count derived from it. Three tools now close those gaps:
+
+| Tool | Defect it removes |
+| --- | --- |
+| `tools/repair_ledger.py` | 9 expressions with a variant index glued to the tail (repaired, annotated); 191 rows with no alpha id at all (marked `abandoned`, not deleted) |
+| `tools/reconcile_status.py` | the `status` column lagging the platform — measured 33 ACTIVE against 48 live, i.e. 15 rows that had been submitted but still said COMPLETE or UNSUBMITTED |
+| `tools/research_template.py` | a new script having to remember the guard, the sugar, the annotation check and where results go |
+
+Consequences worth remembering: **191 of 2118 rows are shells**, so "how many alphas
+do I have" needs that subtracted first; and **rows outnumber alphas**, because one
+alpha can appear several times, so a line like "51 rows promoted" is not a claim
+about 51 alphas.
+
+Two audits that are now free: with 63 fields' units measured, the 48 ACTIVE
+expressions contain **zero** dimensional inconsistencies (expected — the simulator
+rejects those at submission — but the check costs nothing now), and the same unit
+table gates the intent rewrite.
 
 ## Known limits
 
