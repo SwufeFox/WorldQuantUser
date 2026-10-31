@@ -177,6 +177,44 @@ def _positive_form(node):
     return None
 
 
+def _strip_scale(node):
+    """Divide out a scale factor applied to the whole signal.
+
+    Measured 2026-11-01 (`akVznkO2` against `2 * akVznkO2`, ids `akKAxMl1` and its
+    parent): the platform normalises the book, so sharpe, fitness, turnover and
+    returns are identical to three decimals. A scalar multiple is the same alpha --
+    which means `2 * (a + b)` and `a + b` must land in the same unit, and without
+    this they did not, because the product turned a sum into a single term.
+
+    Only a factor applied to the *whole* signal is removed. Weights inside a sum are
+    the grid and stay where they are.
+    """
+    if isinstance(node, fa.BinOp) and node.op == "*":
+        for side in (0, 1):
+            value = _numeric(node.left if side == 0 else node.right)
+            if value is not None and value != 0:
+                return _strip_scale(node.right if side == 0 else node.left)
+    if isinstance(node, fa.BinOp) and node.op == "/":
+        value = _numeric(node.right)
+        if value is not None and value not in (0.0, 1.0):
+            return _strip_scale(node.left)
+    return node
+
+
+def _numeric(node):
+    """The value of a bare numeric factor, including one written as unary minus."""
+    if isinstance(node, fa.Number):
+        try:
+            return float(node.text)
+        except ValueError:
+            return None
+    if isinstance(node, fa.UnaryOp) and node.op == "-":
+        inner = _numeric(node.operand)
+        if inner is not None:
+            return -inner
+    return None
+
+
 def _tidy(node):
     """Rewrite spellings that differ without meaning it.
 
@@ -487,6 +525,7 @@ def split(expression, rules=None, datasets=None, settings=None):
 
     families = rules.get("datasets") or {}
     known = datasets if datasets is not None else load_field_datasets()
+    signal = _strip_scale(signal)
 
     legs, assembly, term_list = [], [], []
     for weight, body in terms(signal):

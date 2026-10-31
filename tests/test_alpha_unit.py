@@ -80,6 +80,22 @@ class Split(unittest.TestCase):
         self.assertIsNone(au.split("this is not an expression (", datasets=DATASETS))
 
 
+class Scale(unittest.TestCase):
+    """A scalar multiple is the same alpha: measured, the platform normalises."""
+
+    def test_a_global_scale_is_not_a_different_construction(self):
+        plain = au.split("rank(close) + rank(low)", datasets=DATASETS)
+        scaled = au.split("2 * (rank(close) + rank(low))", datasets=DATASETS)
+        self.assertEqual(plain.template.render(), scaled.template.render())
+        self.assertEqual(plain.assembly, scaled.assembly)
+
+    def test_a_weight_inside_the_sum_is_still_the_grid(self):
+        plain = au.split("rank(close) + rank(low)", datasets=DATASETS)
+        weighted = au.split("rank(close) + 2 * rank(low)", datasets=DATASETS)
+        self.assertNotEqual(plain.filling, weighted.filling)
+        self.assertEqual([leg.weight for leg in weighted.legs], [1.0, 2.0])
+
+
 class Templates(unittest.TestCase):
     def test_refilling_the_template_reproduces_the_expression(self):
         point = au.split(TWO_LEG, datasets=DATASETS)
