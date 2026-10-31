@@ -39,6 +39,7 @@ __all__ = [
     "VERDICTS",
     "default_registry_path",
     "expression_hash",
+    "same_expression",
     "load_entries",
     "record_entry",
     "render_markdown",
@@ -96,10 +97,37 @@ def default_registry_path():
 
 
 def expression_hash(expression):
-    """Stable short hash of a normalized expression, used as fallback key."""
-    text = " ".join((expression or "").split())
+    """Stable short hash of an expression, used as the fallback key.
+
+    Identity goes through the tree: ``rank(close)``, ``((rank(close)))`` and a copy
+    with a leading comment are one expression, and hashing their text gives three
+    keys. The canonical form (see :func:`fastexpr_ast.canonical`) collapses those.
+
+    The prefix records which rule produced the key. Rows written before 2026-10-31
+    carry ``expr:`` and are left untouched -- rewriting historical keys would silently
+    change what the append-only ledger dedupes against, and a key that changes meaning
+    is worse than a key that is merely older. New rows use ``expr2:``.
+
+    Unparseable text keeps the text hash under ``expr:``: a damaged expression still
+    needs a stable key, and pretending its tree is empty would collide every such row
+    with every other.
+    """
+    try:
+        import fastexpr_ast
+
+        fastexpr_ast.parse(expression)
+        text, prefix = fastexpr_ast.canonical(expression), "expr2:"
+    except Exception:  # noqa: BLE001 - unparseable input keeps the old rule
+        text, prefix = " ".join((expression or "").split()), "expr:"
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
-    return "expr:" + digest[:16]
+    return prefix + digest[:16]
+
+
+def same_expression(left, right):
+    """True when two expressions parse to the same tree, whatever the spelling."""
+    import fastexpr_ast
+
+    return fastexpr_ast.canonical(left) == fastexpr_ast.canonical(right)
 
 
 #: Settings that change what an expression measures. A record without an alpha id

@@ -511,7 +511,7 @@ class AlphaRegistryTests(unittest.TestCase):
         # universes, so the second record silently replaced the first.
         alpha = self._alpha(alpha_id=None)
         entry = alpha_registry.build_entry(alpha, verdict="rejected")
-        self.assertTrue(entry["key"].startswith("expr:"))
+        self.assertTrue(entry["key"].startswith(("expr:", "expr2:")))
         self.assertTrue(entry["key"].startswith(entry["expression_hash"]))
         self.assertIn("@", entry["key"])
         other = alpha_registry.build_entry(

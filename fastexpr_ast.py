@@ -34,6 +34,7 @@ from typing import Iterable, Sequence
 
 __all__ = [
     "ParseError",
+    "canonical",
     "Node",
     "Number",
     "String",
@@ -651,6 +652,58 @@ def map_fields(program: Program, mapping: dict) -> Program:
 
     return Program(tuple((key, replace(value)) for key, value in program.assignments),
                    replace(program.signal) if program.signal is not None else None)
+
+
+def _normalise_numbers(node):
+    """Rewrite every numeric literal to one spelling, so 0.50 and 0.5 agree.
+
+    Only the literal text changes; no arithmetic is folded. Folding (``2*3`` to ``6``)
+    would make two genuinely different constructions hash alike, and the number is
+    cheap to keep.
+    """
+    if isinstance(node, Number):
+        try:
+            value = float(node.text)
+        except ValueError:
+            return node
+        return Number("%.12g" % value)
+    if isinstance(node, Call):
+        return Call(node.name,
+                    tuple(_normalise_numbers(arg) for arg in node.args),
+                    tuple((key, _normalise_numbers(value)) for key, value in node.kwargs))
+    if isinstance(node, BinOp):
+        return BinOp(node.op, _normalise_numbers(node.left), _normalise_numbers(node.right))
+    if isinstance(node, UnaryOp):
+        return UnaryOp(node.op, _normalise_numbers(node.operand))
+    if isinstance(node, Ternary):
+        return Ternary(_normalise_numbers(node.condition),
+                       _normalise_numbers(node.when_true),
+                       _normalise_numbers(node.when_false))
+    if isinstance(node, Program):
+        return Program(tuple((key, _normalise_numbers(value))
+                             for key, value in node.assignments),
+                       _normalise_numbers(node.signal) if node.signal is not None else None,
+                       node.annotations)
+    return node
+
+
+def canonical(expression: str) -> str:
+    """A form that is equal for expressions that mean the same thing.
+
+    Identity by string is wrong in a way that matters for dedupe: ``rank(close)``,
+    ``((rank(close)))`` and a version with a comment in front are three strings and one
+    expression. Canonicalising goes through the tree, so redundant parentheses,
+    whitespace, comments and literal spelling all collapse.
+
+    Deliberately *not* applied: algebraic equivalence. ``a + b`` and ``b + a`` stay
+    different, because deciding equality up to arithmetic is a different problem and a
+    wrong answer there merges two real experiments.
+    """
+    try:
+        program = parse(expression)
+    except ParseError:
+        return " ".join((expression or "").split())
+    return _normalise_numbers(program).render()
 
 
 def expand(expression: str) -> str:

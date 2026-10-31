@@ -166,6 +166,13 @@ def expand(macros, name, args=None, _stack=()):
     return " ".join(text.split())
 
 
+def _canonical(expression):
+    """Tree-normalised form used for dedupe; falls back to text when unparseable."""
+    import fastexpr_ast
+
+    return fastexpr_ast.canonical(expression)
+
+
 def expand_with(macros, name, args=None, backend="ast"):
     """Expand through the chosen backend. ``text`` is the legacy path.
 
@@ -199,18 +206,22 @@ def build(macros, plan, built=None, universe=None, backend="ast"):
     """
     if built is None:
         import alpha_registry as registry
+
         built = set()
         for entry in registry.load_entries():
             expression = entry.get("expression")
             if not expression:
                 continue
             settings = entry.get("settings") or {}
-            built.add((expression, entry.get("decay"), settings.get("universe")))
+            # Canonical form, not the raw string: an expression rewrapped with
+            # redundant parentheses is the same experiment, and the ledger holds 24
+            # such pairs that string comparison would re-run and re-learn nothing from.
+            built.add((_canonical(expression), entry.get("decay"), settings.get("universe")))
     alphas, skipped, seen = [], [], set(built)
     for item in plan:
         expression = expand_with(macros, item["macro"], item.get("args") or [],
                                  backend=backend)
-        key = (expression, item.get("decay"), universe)
+        key = (_canonical(expression), item.get("decay"), universe)
         if key in seen:
             skipped.append({"candidate_id": item.get("candidate_id"),
                             "reason": "duplicate expression", "expression": expression})
