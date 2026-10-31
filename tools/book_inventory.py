@@ -219,13 +219,44 @@ def render(entries, families, pending=(), far=()):
     return "\n".join(lines) + "\n"
 
 
+def mechanism_table(entries):
+    """Per-mechanism counts and Fitness spread, as a markdown table.
+
+    Kept here rather than in the atlas document so the numbers can be regenerated:
+    a hand-maintained statistics table goes stale silently, and a stale atlas is worse
+    than none because it reads as current.
+    """
+    import statistics
+
+    groups = collections.defaultdict(list)
+    for entry in entries:
+        groups[entry.get("family") or "other"].append(entry)
+    rows = []
+    for label, members in groups.items():
+        fitness = [(m.get("metrics") or {}).get("fitness") or 0 for m in members]
+        best = max(members, key=lambda m: (m.get("metrics") or {}).get("fitness") or 0)
+        rows.append((label, len(members), statistics.median(fitness), max(fitness),
+                     best.get("alpha_id")))
+    rows.sort(key=lambda row: -row[1])
+    lines = ["| mechanism | count | median F | best F | best alpha |",
+             "| --- | --- | --- | --- | --- |"]
+    for label, count, median, best_f, best_id in rows:
+        lines.append("| %s | %d | %.2f | %.2f | `%s` |" % (label, count, median, best_f, best_id))
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mechanisms", action="store_true",
+                        help="print the per-mechanism table instead of writing the report")
     parser.add_argument("--out", default=None)
     args = parser.parse_args()
 
     session = ml.login()
     entries, families = build(session)
+    if args.mechanisms:
+        print(mechanism_table(entries))
+        return 0
     book_expressions = {e.get("expression") for e in entries}
     document = render(entries, families, backlog(session, book_expressions),
                       distant(session, entries))
