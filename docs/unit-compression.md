@@ -130,8 +130,9 @@ limits it.
 
 **Measured on the book (2026-11-01):** 43 constructions, **408 derivations never run**
 — 233 data moves, 100 `zero_leg`, 75 `drop_term`. The ablations dominate because the
-composites were never taken apart: the 13-member balance-sheet family shares one
-template and nobody removed its price-position leg.
+composites were never taken apart: the balance-sheet family — 13 alphas but only
+**8 distinct constructions**, since five of them are the same construction refiled at
+another universe — shares one template and nobody removed its price-position leg.
 
 Caveat worth keeping: many `data` moves are cosmetic — `x / atq` against
 `x / ltq` is a different grid cell and barely a different bet. The count says "open",
