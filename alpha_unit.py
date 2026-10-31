@@ -436,7 +436,14 @@ class Point:
         return fill(self.template, filling if filling is not None else self.filling)
 
     def render(self, filling=None):
-        return self.rebuild(filling).render()
+        """The expression at this grid point, with identity spellings tidied away.
+
+        Tidy on the way out, not only on the way in: a template keeps the literal
+        ``1`` of ``1 * rank(x)`` as a slot, so a refill would otherwise render a
+        weight that the canonical form of the source has already dropped, and the
+        round trip would fail on a difference that measures nothing.
+        """
+        return _tidy(self.rebuild(filling)).render()
 
 
 def _inline(program):

@@ -97,6 +97,13 @@ class Templates(unittest.TestCase):
         rendered = point.render(filling)
         self.assertEqual(rendered.count("high"), 2)
 
+    def test_a_literal_one_weight_round_trips(self):
+        # `1 * rank(x)` keeps the 1 as a slot, while the canonical form of the
+        # source drops it. Tidying only on the way in made the refill disagree with
+        # the source on 17 expressions in the ledger.
+        point = au.split("rank(close) - 1.0*rank(low)", datasets=DATASETS)
+        self.assertEqual(fa.canonical(point.render()), point.canonical)
+
     def test_filling_a_missing_slot_fails_instead_of_inventing(self):
         template, filling = au.template_of(fa.parse("rank(close)").signal)
         with self.assertRaises(KeyError):

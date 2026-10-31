@@ -128,8 +128,8 @@ interchangeable, and "both are ranked ratios over fundamentals" is a reason whil
 to the dataset id moves the yield from 70 novel to 68, so the corpus limits it, not
 the guard.
 
-**Measured on the book (2026-11-01):** 43 constructions, **408 derivations never run**
-— 233 data moves, 100 `zero_leg`, 75 `drop_term`. The ablations dominate because the
+**Measured on the book (2026-11-01):** 43 constructions, **406 derivations never run**
+— 231 data moves, 100 `zero_leg`, 75 `drop_term`. The ablations dominate because the
 composites were never taken apart: the balance-sheet family — 13 alphas but only
 **8 distinct constructions**, since five of them are the same construction refiled at
 another universe — shares one template and nobody removed its price-position leg.
