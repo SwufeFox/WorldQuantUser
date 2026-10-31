@@ -324,6 +324,19 @@ def record_entry(entry, path=None, skip_unchanged=True):
     stored record for the same key is not rewritten, which keeps bulk account
     syncs from growing the file on every run. Returns ``(entry, written)``.
     """
+    # Attach the cause here rather than at analysis time: `failing_checks` says which
+    # gate tripped, not why, and by the time a reader asks "how many of these were
+    # low amplitude" the answer is no longer recoverable from the label alone.
+    if entry.get("verdict") == "rejected" and not entry.get("reason_code"):
+        try:
+            import rejection_reasons
+
+            code, detail = rejection_reasons.classify(entry)
+            entry["reason_code"] = code
+            entry["reason_detail"] = detail
+        except Exception:  # noqa: BLE001 - recording must never fail on this
+            pass
+
     path = path or default_registry_path()
     # The dedupe check and the append have to happen under one lock: two
     # concurrent CLI calls otherwise both see "not present" and both append.
