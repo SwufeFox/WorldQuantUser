@@ -124,9 +124,9 @@ attached to a position, so "put this proven leg where that one sits" had no way 
 be stated. Measured on the corpus: **114 candidate ports, 72 never run**. The guards
 are what make the number small — a port has to be able to say *why* the two legs are
 interchangeable, and "both are ranked ratios over fundamentals" is a reason while
-"both are subexpressions" is not. Loosening the family guard to the family instead of
-the dataset raises the yield only to 70 novel, so the corpus, not the guard, is what
-limits it.
+"both are subexpressions" is not. The guard binds on the data *family*; tightening it
+to the dataset id moves the yield from 70 novel to 68, so the corpus limits it, not
+the guard.
 
 **Measured on the book (2026-11-01):** 43 constructions, **408 derivations never run**
 — 233 data moves, 100 `zero_leg`, 75 `drop_term`. The ablations dominate because the

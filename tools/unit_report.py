@@ -102,6 +102,14 @@ def report(corpus, counts, stream=sys.stdout):
     print("  one-step moves   %d  (variants reachable without inventing a value)"
           % counts["one_step"], file=stream)
 
+    book = [point for point in corpus.points
+            if any((status or "").upper() == "ACTIVE" for status in point.statuses)]
+    filers = sum(sum(1 for status in point.statuses
+                     if (status or "").upper() == "ACTIVE") for point in book)
+    print("  book             %d alphas over %d constructions, %d units, %d kinds"
+          % (filers, len(book), len({point.unit for point in book}),
+             len({point.kind for point in book})), file=stream)
+
     print("\nassemblies by coverage", file=stream)
     by_assembly = collections.Counter(point.assembly for point in corpus.points)
     for assembly, count in by_assembly.most_common(10):
