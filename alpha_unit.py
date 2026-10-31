@@ -26,9 +26,10 @@ one template plus a grid. The template is a real tree with :class:`Slot` leaves,
 unit can be re-instantiated at any grid point -- that is the "derivable" half. The
 grid is what has actually been run -- that is the "compressible" half.
 
-The measured hierarchy on 2026-10-31 (932 non-abandoned, parseable, deduplicated
-expressions) is reported by ``python3 tools/unit_report.py``; see
-``docs/unit-compression.md`` for the table and for what does *not* compress.
+The measured hierarchy (40 assemblies, 129 kinds, 550 units over 915 expressions on
+2026-11-01) is reported by ``python3 tools/unit_report.py``; see
+``docs/unit-compression.md`` for the table, for what does *not* compress, and for the
+grouping that measured better and was rejected.
 
 Design rules, each one paid for:
 
