@@ -70,6 +70,8 @@ __all__ = [
     "fill",
     "build",
     "derive",
+    "crossover",
+    "to_program",
     "expand_domain",
     "verify",
     "summary",
@@ -357,11 +359,13 @@ def role_of(node, rules=None):
 
 
 def terms(node, sign=1.0):
-    """Flatten a sum into ``[(sign, coefficient, body), ...]``.
+    """Flatten a sum into ``[(signed_weight, body), ...]``.
 
     Only ``+``/``-``/unary minus are flattened; a product of sums stays one term,
     because it is one decision rather than a list of legs. The coefficient is pulled
-    out of ``c * body`` so the weight is a grid value and not part of the shape.
+    out of ``c * body`` so the weight is a grid value and not part of the shape,
+    and the sign is folded into it because ``a - 0.5*b`` and ``a + -0.5*b`` are one
+    construction with one weight.
     """
     if isinstance(node, fa.BinOp) and node.op == "+":
         return terms(node.left, sign) + terms(node.right, sign)
@@ -372,15 +376,15 @@ def terms(node, sign=1.0):
     if isinstance(node, fa.BinOp) and node.op == "*":
         if isinstance(node.left, fa.Number):
             try:
-                return [(sign * float(node.left.text), 1.0, node.right)]
+                return [(sign * float(node.left.text), node.right)]
             except ValueError:
                 pass
         if isinstance(node.right, fa.Number):
             try:
-                return [(sign * 1.0, float(node.right.text), node.left)]
+                return [(sign * float(node.right.text), node.left)]
             except ValueError:
                 pass
-    return [(sign, 1.0, node)]
+    return [(sign, node)]
 
 
 @dataclass(frozen=True)
@@ -426,11 +430,6 @@ class Point:
     statuses: tuple = ()
     unit: str = ""
     kind: str = ""
-
-    @property
-    def fields(self):
-        return tuple(value for name, value in sorted(self.filling.items())
-                     if name.startswith("f"))
 
     def rebuild(self, filling=None):
         """Re-instantiate this point's template, optionally at another grid point."""
@@ -482,8 +481,7 @@ def split(expression, rules=None, datasets=None, settings=None):
     known = datasets if datasets is not None else load_field_datasets()
 
     legs, assembly, term_list = [], [], []
-    for sign, coefficient, body in terms(signal):
-        weight = sign * coefficient
+    for weight, body in terms(signal):
         if isinstance(body, fa.Number):
             assembly.append("L" if weight > 0 else "-L")
             term_list.append((weight, body))
@@ -660,7 +658,7 @@ def build(entries, rules=None, datasets=None):
         if kind is None:
             kind = Kind(key=kkey, assembly=kkey[0], families=kkey[1], units=[])
             kinds[kkey] = kind
-        if unit not in kind.units:
+        if not any(existing is unit for existing in kind.units):
             kind.units.append(unit)
         point.kind = kkey
         unit.kind = kkey
