@@ -91,6 +91,23 @@ class Ablations(unittest.TestCase):
         self.assertIn("1.0 * b", expression)
         self.assertNotIn("0.7 * a", expression)
 
+    def test_drop_works_on_a_subtraction(self):
+        # `_terms` used to split only `+`, so every composite written with a minus
+        # was silently undroppable -- and most composites are written that way.
+        variants = {v["label"]: v for v in
+                    annotations.derive_ablations(fa.parse("a = rank(close);\n"
+                                                          "b = rank(low);\n"
+                                                          "a - 0.5 * b"))}
+        self.assertIn("drop:b", variants)
+        self.assertNotIn("0.5 * b", variants["drop:b"]["expression"])
+
+    def test_drop_keeps_the_sign_of_a_net_short_signal(self):
+        # Dividing by the *signed* sum made a net-short composite undroppable.
+        program = fa.parse("a = rank(close);\nb = rank(low);\n-1 * a - 1 * b")
+        dropped = annotations.drop_term(program, "b")
+        self.assertIsNotNone(dropped)
+        self.assertIn("-1.0 * a", dropped.render())
+
     def test_drop_is_not_invented_for_a_single_term(self):
         variants = annotations.derive_ablations(fa.parse("a = rank(close);\na"))
         self.assertEqual([v["kind"] for v in variants], ["zero_leg"])

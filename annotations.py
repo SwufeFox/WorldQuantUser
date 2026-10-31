@@ -118,23 +118,53 @@ def zero_leg(program, name):
     return fa.Program(assignments, program.signal, program.annotations)
 
 
-def _terms(node):
+def _terms(node, sign=1.0):
+    """Signed additive decomposition: ``[(coefficient, body), ...]``.
+
+    Splits ``+``, ``-`` and unary minus, and pulls a numeric factor out of a
+    product, so the coefficient is what renormalisation needs and the body is what
+    "does this term reference the leg" needs.
+
+    This used to split only ``+``, which quietly made ``drop_term`` a no-op for
+    every composite written with subtraction -- and most composites are. A leg that
+    is never dropped is invisible in the numbers: the ablation table simply has one
+    fewer row and looks complete.
+    """
     if isinstance(node, fa.BinOp) and node.op == "+":
-        return _terms(node.left) + _terms(node.right)
-    return [node]
+        return _terms(node.left, sign) + _terms(node.right, sign)
+    if isinstance(node, fa.BinOp) and node.op == "-":
+        return _terms(node.left, sign) + _terms(node.right, -sign)
+    if isinstance(node, fa.UnaryOp) and node.op == "-":
+        return _terms(node.operand, -sign)
+    if isinstance(node, fa.BinOp) and node.op == "*":
+        for side in (0, 1):
+            value = _numeric(node.left if side == 0 else node.right)
+            if value is not None:
+                return [(sign * value, node.right if side == 0 else node.left)]
+    return [(sign, node)]
+
+
+def _numeric(node):
+    """The value of a bare numeric factor, including ``-1`` written as unary minus.
+
+    ``-1 * a`` parses as ``UnaryOp('-', 1) * a``, not as ``Number('-1') * a``, so a
+    check for ``Number`` alone misses the sign and treats the whole product as one
+    unsplittable term.
+    """
+    if isinstance(node, fa.Number):
+        try:
+            return float(node.text)
+        except ValueError:
+            return None
+    if isinstance(node, fa.UnaryOp) and node.op == "-":
+        inner = _numeric(node.operand)
+        if inner is not None:
+            return -inner
+    return None
 
 
 def _references(node, name):
     return any(isinstance(child, fa.Field) and child.name == name for child in node.walk())
-
-
-def _coefficient(term):
-    if isinstance(term, fa.BinOp) and term.op == "*" and isinstance(term.left, fa.Number):
-        try:
-            return float(term.left.text), term.right
-        except ValueError:
-            return None, term
-    return 1.0, term
 
 
 def drop_term(program, name):
@@ -143,28 +173,28 @@ def drop_term(program, name):
     Returns ``None`` when the signal is not a flat sum or when dropping would leave
     nothing -- inventing a fallback there would produce an ablation that measures a
     different construction.
+
+    The kept coefficients are divided by the **absolute** value of their sum. Using
+    the signed sum made every net-short composite undroppable: a signal that is
+    ``-l0 - l1 - 0.5*l2`` sums to a negative number and the guard rejected it,
+    although the ablation is perfectly well defined.
     """
     if program.signal is None:
         return None
     terms = _terms(program.signal)
     if len(terms) < 2:
         return None
-    kept = [term for term in terms if not _references(term, name)]
+    kept = [(coefficient, body) for coefficient, body in terms
+            if not _references(body, name)]
     if not kept or len(kept) == len(terms):
         return None
-    total = 0.0
-    weights = []
-    for term in kept:
-        coefficient, body = _coefficient(term)
-        if coefficient is None:
-            return None
-        weights.append((coefficient, body))
-        total += coefficient
-    if total <= 0:
+    total = sum(coefficient for coefficient, _body in kept)
+    if total == 0:
         return None
+    scale = abs(total)
     rebuilt = None
-    for coefficient, body in weights:
-        scaled = fa.BinOp("*", fa.Number(str(round(coefficient / total, 6))), body)
+    for coefficient, body in kept:
+        scaled = fa.BinOp("*", fa.Number(str(round(coefficient / scale, 6))), body)
         rebuilt = scaled if rebuilt is None else fa.BinOp("+", rebuilt, scaled)
     return fa.Program(program.assignments, rebuilt, program.annotations)
 

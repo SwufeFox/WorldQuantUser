@@ -119,6 +119,13 @@ the one already in `annotations.py`, including its renormalisation. `annotations
 passes on every rendered unit, which is what makes the annotation layer and the unit
 layer the same vocabulary rather than two.
 
+That decision paid for itself immediately. Wiring the two together exposed that
+`drop_term` split only `+`, so **every composite written with subtraction was
+silently undroppable** — and most composites are written that way — while every
+net-short composite (`-l0 - l1 - 0.5*l2`) failed the renormalisation guard, which
+required a positive sum. Both are fixed; the book's open ablations went from 75 to
+90. The row was simply missing, and the table looked complete.
+
 `port` is the derivation the parts catalogue could not express: a part is not
 attached to a position, so "put this proven leg where that one sits" had no way to
 be stated. Measured on the corpus: **114 candidate ports, 72 never run**. The guards
@@ -128,8 +135,8 @@ interchangeable, and "both are ranked ratios over fundamentals" is a reason whil
 to the dataset id moves the yield from 70 novel to 68, so the corpus limits it, not
 the guard.
 
-**Measured on the book (2026-11-01):** 43 constructions, **406 derivations never run**
-— 231 data moves, 100 `zero_leg`, 75 `drop_term`. The ablations dominate because the
+**Measured on the book (2026-11-01):** 43 constructions, **421 derivations never run**
+— 231 data moves, 100 `zero_leg`, 90 `drop_term`. The ablations dominate because the
 composites were never taken apart: the balance-sheet family — 13 alphas but only
 **8 distinct constructions**, since five of them are the same construction refiled at
 another universe — shares one template and nobody removed its price-position leg.
