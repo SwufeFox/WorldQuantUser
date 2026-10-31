@@ -92,5 +92,12 @@ def classify(entry):
         return "low_amplitude", detail
 
     if not checks:
-        return "unclassified", "no failing check recorded"
+        # A row with a passing Fitness and no recorded gate was rejected for something
+        # the ledger never wrote down -- usually a submission-time check. Calling that
+        # "unclassified" would blame the classifier for a recording gap.
+        if fitness is not None and fitness >= FITNESS_FLOOR:
+            return "unrecorded_check", (
+                "Fitness %.2f clears the gate but no failing check was stored; the "
+                "cause is a recording gap, not a missing rule" % fitness)
+        return "unclassified", "no failing check and no usable metrics"
     return "other_gate", "failed %s" % ", ".join(sorted(checks))
