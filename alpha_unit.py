@@ -391,6 +391,7 @@ class Leg:
     shape: str
     role: str
     fields: tuple
+    families: tuple  # data families this leg reads, used to keep a port sensible
     numbers: tuple
     weight: float
 
@@ -477,6 +478,9 @@ def split(expression, rules=None, datasets=None, settings=None):
     if signal is None:
         return None
 
+    families = rules.get("datasets") or {}
+    known = datasets if datasets is not None else load_field_datasets()
+
     legs, assembly, term_list = [], [], []
     for sign, coefficient, body in terms(signal):
         weight = sign * coefficient
@@ -486,17 +490,17 @@ def split(expression, rules=None, datasets=None, settings=None):
             continue
         assembly.append("G" if weight > 0 else "-G")
         term_list.append((weight, body))
+        leg_fields = tuple(fa.field_names(fa.Program((), body)))
         legs.append(Leg(body=body,
                         shape=fa.skeleton(fa.Program((), body)),
                         role=role_of(body, rules),
-                        fields=tuple(fa.field_names(fa.Program((), body))),
+                        fields=leg_fields,
+                        families=_datasets_of(leg_fields, known, families),
                         numbers=_numbers(body),
                         weight=weight))
 
     template, filling = template_of(signal)
     flat = _tidy(signal).render()
-    families = rules.get("datasets") or {}
-    known = datasets if datasets is not None else load_field_datasets()
     fields = tuple(sorted({leg_field for leg in legs for leg_field in leg.fields}))
     return Point(
         expression=expression,
@@ -762,19 +766,96 @@ def to_program(point, mechanism=None):
                                    (("name", fa.String('"%s"' % name)),
                                     ("role", fa.String('"%s"' % leg.role)))))
 
-    signal, leg_index = None, 0
+    terms_, leg_index = [], 0
     for weight, body in point.terms:
         if isinstance(body, fa.Number):
-            # A constant term is folded to one literal: `- 0.5` is the number -0.5,
-            # not a coefficient times 0.5. Keeping it folded is what lets
-            # annotations.drop_term see a usable coefficient when it renormalises.
-            piece = fa.Number("%.12g" % (weight * float(body.text)))
+            terms_.append((weight, body))
         else:
-            piece = fa.Field(names[leg_index]) if weight == 1.0 else \
-                fa.BinOp("*", fa.Number("%.12g" % weight), fa.Field(names[leg_index]))
+            terms_.append((weight, fa.Field(names[leg_index])))
             leg_index += 1
-        signal = piece if signal is None else fa.BinOp("+", signal, piece)
-    return fa.Program(assignments, signal, tuple(notes))
+    return fa.Program(assignments, _sum(terms_), tuple(notes))
+
+
+def _sum(terms):
+    """Join ``(weight, body)`` pairs as one sum with signed coefficients.
+
+    A constant term is folded to one literal: ``- 0.5`` is the number -0.5, not a
+    coefficient times 0.5. Keeping it folded is what lets ``annotations.drop_term``
+    see a usable coefficient when it renormalises.
+    """
+    tree = None
+    for weight, body in terms:
+        if isinstance(body, fa.Number):
+            piece = fa.Number("%.12g" % (weight * float(body.text)))
+        elif weight == 1.0:
+            piece = body
+        else:
+            piece = fa.BinOp("*", fa.Number("%.12g" % weight), body)
+        tree = piece if tree is None else fa.BinOp("+", tree, piece)
+    return tree
+
+
+def _with_body(point, index, body):
+    """Rebuild this point's sum with one leg's body replaced."""
+    positions = [position for position, (_w, node) in enumerate(point.terms)
+                 if not isinstance(node, fa.Number)]
+    if index >= len(positions):
+        return None
+    target = positions[index]
+    terms_ = [(weight, body if position == target else node)
+              for position, (weight, node) in enumerate(point.terms)]
+    return _tidy(_sum(terms_)).render()
+
+
+def crossover(unit, corpus, observed=None, tried=None):
+    """Templates nobody ran, assembled from legs that each already exist.
+
+    Within one kind every unit has the same assembly and the same data families, so
+    the legs are interchangeable *by construction*: taking the carrier leg from one
+    construction and the stabiliser from another yields something assembled entirely
+    from parts that have been simulated. That is the derivation the parts catalogue
+    could not do, because a part is not attached to a position.
+
+    Three guards, and the first one is the important one:
+
+    * the two legs must have the same **role** -- same job, different realisation. A
+      ratio leg may not be replaced by a dispersion leg;
+    * they must read the same **data families**, or the port silently changes what
+      the alpha is about;
+    * at least one other leg must be identical, otherwise the "port" is just the
+      donor construction and adds nothing.
+    """
+    observed = observed or set()
+    tried = tried or set()
+    kind = corpus.kinds.get(unit.kind)
+    if kind is None or not unit.points:
+        return []
+    reference = unit.points[0]
+    out, seen = [], set()
+    for other in kind.units:
+        if other is unit or len(other.legs) != len(unit.legs):
+            continue
+        shared = sum(1 for left, right in zip(unit.legs, other.legs)
+                     if left.shape == right.shape)
+        if shared == 0:
+            continue
+        for index, (mine, theirs) in enumerate(zip(unit.legs, other.legs)):
+            if mine.shape == theirs.shape:
+                continue
+            if mine.role != theirs.role or mine.families != theirs.families:
+                continue
+            expression = _with_body(reference, index, theirs.body)
+            if expression is None:
+                continue
+            canonical = fa.canonical(expression)
+            if canonical in seen or canonical == reference.canonical:
+                continue
+            seen.add(canonical)
+            out.append(Variant(label="port:%d" % index, rule="port",
+                               expression=expression, canonical=canonical,
+                               status=_classify(canonical, observed, tried),
+                               detail="%s <- %s" % (mine.role, other.key[:8])))
+    return out
 
 
 def derive(point, grid=None, observed=None, tried=None, domains=None, mechanism=None):

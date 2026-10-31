@@ -227,6 +227,43 @@ class DomainExpansion(unittest.TestCase):
                                                  "fundamental6"}), {})
 
 
+class Crossover(unittest.TestCase):
+    """A port takes a leg from another construction in the same kind."""
+
+    PLAIN = "rank(close/vwap) - 0.5 + rank(ts_mean(volume, 5)) - 0.5"
+    WRAPPED = ("rank(ts_backfill(close, 252)/vwap) - 0.5 "
+               "+ rank(ts_mean(volume, 5)) - 0.5")
+
+    def build(self):
+        return au.build([entry(self.PLAIN), entry(self.WRAPPED)],
+                        datasets=dict(DATASETS, vwap="pv1", volume="pv1"))
+
+    def test_a_leg_is_ported_from_the_other_construction(self):
+        corpus = self.build()
+        self.assertEqual(len(corpus.units), 2)
+        unit = [unit for unit in corpus.units.values()
+                if "ts_backfill" not in unit.points[0].flat][0]
+        variants = au.crossover(unit, corpus)
+        self.assertTrue(variants)
+        self.assertEqual({variant.rule for variant in variants}, {"port"})
+        self.assertIn("ts_backfill", variants[0].expression)
+
+    def test_a_port_that_reproduces_the_donor_is_labelled_observed(self):
+        corpus = self.build()
+        known = {point.canonical for point in corpus.points}
+        unit = [unit for unit in corpus.units.values()
+                if "ts_backfill" not in unit.points[0].flat][0]
+        variants = au.crossover(unit, corpus, observed=known)
+        self.assertEqual(variants[0].status, "observed")
+
+    def test_legs_with_different_jobs_are_not_ported(self):
+        corpus = au.build([entry("rank(close/vwap) - 0.5 + rank(ts_mean(volume, 5))"),
+                           entry("rank(close/vwap) - 0.5 + ts_std_dev(volume, 5)")],
+                          datasets=dict(DATASETS, vwap="pv1", volume="pv1"))
+        for unit in corpus.units.values():
+            self.assertEqual(au.crossover(unit, corpus), [])
+
+
 class ProgramBridge(unittest.TestCase):
     def test_a_point_renders_into_an_annotated_program(self):
         point = au.split(TWO_LEG, datasets=DATASETS)

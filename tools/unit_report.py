@@ -167,6 +167,30 @@ def gaps(corpus, known, stream=sys.stdout, top=12):
     return rows
 
 
+def crossings(corpus, known, stream=sys.stdout, top=10):
+    """Templates nobody ran, assembled from legs that each already exists.
+
+    Only a handful survive the guards (same role, same data families, one leg
+    already shared), which is the point: a port has to be able to say *why* the two
+    legs are interchangeable, and "both are ranked ratios over fundamentals" is a
+    reason while "both are subexpressions" is not.
+    """
+    total = novel = 0
+    rows = []
+    for unit in corpus.units.values():
+        variants = au.crossover(unit, corpus, observed=known)
+        for variant in variants:
+            total += 1
+            if variant.status == "novel":
+                novel += 1
+                rows.append((unit, variant))
+    print("crossovers: %d candidates, %d never run" % (total, novel), file=stream)
+    for unit, variant in rows[:top]:
+        print("  [%s] %s" % (variant.label, variant.expression.replace("\n", " ")[:120]),
+              file=stream)
+    return rows
+
+
 def _payload(corpus):
     out = []
     for unit in corpus.units.values():
@@ -198,6 +222,8 @@ def main() -> int:
     parser.add_argument("--unit", default=None, help="show one unit by key prefix")
     parser.add_argument("--derive", default=None, help="derivations for one unit prefix")
     parser.add_argument("--gaps", action="store_true", help="book derivations never run")
+    parser.add_argument("--cross", action="store_true",
+                        help="templates assembled from two existing constructions")
     parser.add_argument("--top", type=int, default=12)
     args = parser.parse_args()
 
@@ -232,6 +258,10 @@ def main() -> int:
 
     if args.gaps:
         gaps(corpus, known, top=args.top)
+        return 0
+
+    if args.cross:
+        crossings(corpus, known, top=args.top)
         return 0
 
     checked, failures = au.verify(corpus)

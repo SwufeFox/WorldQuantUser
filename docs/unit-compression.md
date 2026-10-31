@@ -111,12 +111,22 @@ ledger; nothing is simulated.
 | `zero:lN` / `drop:lN` | `annotations.derive_ablations` on the program rendered by `to_program` | none needed — asked of every leg, annotated or not |
 | `data:slot` | the unit's own grid | a slot may only move to a value the corpus already put **in that slot** |
 | `domain:slot` | `expand_domain`, opt-in | the slot must have shown variation, sit in one allowed family, and be the most-varied eligible one |
+| `port:lN` | `crossover` between two units of one kind | same role, same data families, and one other leg already shared |
 
 The ablation pair is deliberately *not* re-implemented here: `to_program` emits one
 assignment per leg with an `@leg` annotation, so the definition of "drop a leg" stays
 the one already in `annotations.py`, including its renormalisation. `annotations.check`
 passes on every rendered unit, which is what makes the annotation layer and the unit
 layer the same vocabulary rather than two.
+
+`port` is the derivation the parts catalogue could not express: a part is not
+attached to a position, so "put this proven leg where that one sits" had no way to
+be stated. Measured on the corpus: **114 candidate ports, 72 never run**. The guards
+are what make the number small — a port has to be able to say *why* the two legs are
+interchangeable, and "both are ranked ratios over fundamentals" is a reason while
+"both are subexpressions" is not. Loosening the family guard to the family instead of
+the dataset raises the yield only to 70 novel, so the corpus, not the guard, is what
+limits it.
 
 **Measured on the book (2026-11-01):** 43 constructions, **408 derivations never run**
 — 233 data moves, 100 `zero_leg`, 75 `drop_term`. The ablations dominate because the
@@ -141,6 +151,7 @@ python3 tools/unit_report.py                 # the hierarchy and the top of each
 python3 tools/unit_report.py --gaps          # book derivations never run
 python3 tools/unit_report.py --unit 3f2a     # one unit in full
 python3 tools/unit_report.py --derive 3f2a   # what that unit has not tried
+python3 tools/unit_report.py --cross         # templates assembled from two existing ones
 python3 tools/unit_report.py --json units.json
 ```
 
