@@ -147,13 +147,20 @@ construction, and the curated list stays the primary signal.
 | `shares` | one common leg, no containment | weak relation, excluded from components |
 
 Measured on the live book (2026-10-30): **48 alphas, 183 edges — 83 sibling, 36
-extends, 64 shares — collapsing to 22 construction families**, largest 18, 16
-singletons. `tools/family_graph_png.py` draws one component per cell, because a
+extends, 64 shares — collapsing to 32 construction families**, largest 13, 28
+singletons.
+
+Families are connected components over `sibling` edges only. `extends` is recorded as
+lineage and deliberately excluded from the merge: containment is transitive through a
+shared ancestor, so single linkage chains unrelated constructions together — A with one
+leg, B = A + leg1, C = A + leg2 puts B and C in one "family" although they share no
+construction. On the full ledger that inflated a single family to 467 of 951
+expressions; on the book it read as 22 families instead of 32. `tools/family_graph_png.py` draws one component per cell, because a
 single spring layout over 48 nodes is a hairball that hides the only two facts worth
 seeing: how many families there are, and how lopsided the sizes are.
 
 **Structure is not independence.** The same 48 alphas correlate at ~0.85 pairwise
-while occupying 22 families, and candidates rebuilt from those families are blocked
+while occupying 32 families, and candidates rebuilt from those families are blocked
 by self-correlation at 0.84–0.87. The graph finds copies cheaply; only daily PnL
 finds shared bets.
 

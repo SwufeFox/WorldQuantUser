@@ -16,9 +16,15 @@ free, and it says exactly *how* they are related:
 Components over those edges are the honest unit: two nodes in one component are
 related by construction, whatever their PnL says. That is deliberately *not* the
 same claim as independence. Measured on 2026-10-30 against the live book: 48 alphas,
-183 edges (83 of them siblings), collapsing to 22 construction families -- and
-candidates built from those same families still correlate with the book at 0.85.
-Structure finds copies; only PnL finds shared bets.
+183 edges (83 siblings, 36 extends, 64 shares), collapsing to **32** construction
+families -- largest 13, 28 singletons -- and candidates rebuilt from those same
+families still correlate with the book at 0.85. Structure finds copies; only PnL
+finds shared bets.
+
+The family count is 32, not 22, because components use siblings only: an earlier
+version also merged on ``extends`` and single linkage then chained unrelated
+constructions through a shared ancestor (on the full ledger that produced a
+467-member "family").
 
 Usage:
     python3 tools/family_graph.py --book          # the submitted book
@@ -107,11 +113,19 @@ def build_edges(nodes):
 
 
 def components(nodes, edges):
-    """Connected components over sibling and extends edges only.
+    """Families: connected components over **sibling** edges only.
 
-    ``shares`` is deliberately excluded: "these two composites use one common leg"
-    is too weak to merge families, and including it collapses the whole book into a
-    single component.
+    Two weaker relations are deliberately kept out, and both exclusions were forced
+    by measurement rather than taste:
+
+    * ``shares`` -- "one common leg" collapses almost everything into one component.
+    * ``extends`` -- leg-set containment is transitive through a common parent, so
+      single linkage merges siblings of a sibling: A with one leg, B = A + leg1,
+      C = A + leg2 make B and C family although they share no construction. Measured
+      on the full ledger that inflated one "family" to 467 of 951 expressions.
+
+    Containment is still useful, but as lineage (which family derives from which),
+    not as identity.
     """
 
     parent = {node: node for node in nodes}
@@ -127,8 +141,8 @@ def components(nodes, edges):
         if rx != ry:
             parent[ry] = rx
 
-    for left, right, _kind in edges:
-        if _kind in ("sibling", "extends"):
+    for left, right, kind in edges:
+        if kind == "sibling":
             union(left, right)
     groups = collections.defaultdict(list)
     for node in nodes:

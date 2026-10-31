@@ -54,6 +54,24 @@ class Edges(unittest.TestCase):
         _nodes, edges = self.build([node("A", self.BASE), node("B", "rank(volume)")])
         self.assertEqual(edges, [])
 
+    def test_extends_does_not_merge_families(self):
+        # A with one leg; B = A + leg1; C = A + leg2. B and C share no construction,
+        # so they must not land in one family just because both extend A. Single
+        # linkage over containment merged them, and on the full ledger that turned
+        # one family into 467 of 951 expressions.
+        middle = ("a = rank(close);\n"
+                  "b = rank(ts_delta(close, 5));\na + b")
+        # Deliberately a different *shape*, not a different field: swapping close for
+        # volume produces the same skeleton and therefore a sibling, which is the
+        # relation this graph is supposed to report.
+        other = ("a = rank(close);\n"
+                 "c = rank(ts_delta(volume, 5));\na * c")
+        nodes, edges = self.build([node("A", "a = rank(close);\na"),
+                                   node("B", middle), node("C", other)])
+        self.assertIn("extends", [kind for _l, _r, kind in edges])
+        groups = family_graph.components(nodes, edges)
+        self.assertEqual(len(groups), 3, "containment must not merge families")
+
     def test_components_join_siblings_but_not_weak_links(self):
         entries = [node("A", self.BASE),
                    node("B", "a = group_rank(open, subindustry) - 0.5;\na")]
