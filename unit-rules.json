@@ -1,0 +1,59 @@
+{
+  "version": 1,
+  "note": "Vocabulary for the unit layer. Data, not code: the role grammar, the dataset families and the derivation domains are all edits here. A name absent from this file is reported as `other`/`unknown` rather than guessed, because an invented classification is invisible once it is stored.",
+  "sources": [
+    "cache/metadata/datafields/*.json for field -> dataset (4417 fields, 14 datasets, 373/373 of the fields the ledger uses are covered)",
+    "operator list from cache/metadata/operators (66 operators)"
+  ],
+
+  "opaque": {
+    "note": "Cleaning operators: they decide how a value is measured, not what bet it is. Folding them keeps `ts_backfill(x, 252)` and `x` in one role.",
+    "operators": ["ts_backfill", "abs", "winsorize", "pasteurize", "ts_zscore", "ts_rank", "nan_mask", "nan_out", "signed_power", "scale", "normalize"]
+  },
+
+  "roles": {
+    "note": "Ordered: the first operator that matches the call decides. {0} is the role of argument 0.",
+    "rank": {"operators": ["rank", "group_rank", "zscore", "group_zscore", "quantile"], "form": "rank({0})"},
+    "smooth": {"operators": ["ts_mean", "ts_sum", "ts_median", "ts_decay_linear", "ts_product"], "form": "smooth({0})"},
+    "delta": {"operators": ["ts_delta"], "form": "delta({0})"},
+    "delay": {"operators": ["ts_delay"], "form": "delay({0})"},
+    "disp": {"operators": ["ts_std_dev", "ts_skewness", "ts_kurtosis", "ts_av_diff"], "form": "disp({0})"},
+    "extreme": {"operators": ["ts_max", "ts_min", "ts_arg_max", "ts_arg_min"], "form": "extreme({0})"},
+    "gate": {"operators": ["if_else"], "form": "gate({0},{1})"},
+    "stat": {"operators": ["ts_corr", "ts_covariance", "ts_regression"], "form": "stat({0},{1})"},
+    "group": {"operators": ["group_neutralize", "group_mean", "group_sum", "group_backfill"], "form": "group({0})"},
+    "trade": {"operators": ["trade_when"], "form": "trade({0},{1})"}
+  },
+
+  "binary": {
+    "note": "How a binary operator reads as a role. `mix` covers + and - because a sign is carried in the assembly, not in the leg.",
+    "/": "ratio({0},{1})",
+    "+-": "mix({0},{1})",
+    "*": "mul({0},{1})"
+  },
+
+  "datasets": {
+    "note": "Dataset id -> family. The family is what a unit is grouped by; the dataset id stays on the expression for provenance.",
+    "pv1": "price",
+    "pv13": "price",
+    "fundamental2": "fundamental",
+    "fundamental6": "fundamental",
+    "analyst4": "analyst",
+    "option8": "option",
+    "option9": "option",
+    "model16": "model",
+    "model51": "model",
+    "news12": "news",
+    "news18": "news",
+    "socialmedia8": "social",
+    "socialmedia12": "social",
+    "essential": "reference"
+  },
+
+  "domains": {
+    "note": "Which fields may fill a carrier slot when a domain is explicitly expanded. Only fields whose dataset is listed here, and only for slots whose observed fillings are all in that dataset. Expanding a domain is an offer, never something derived silently.",
+    "carrier": ["fundamental", "analyst"],
+    "market": ["price"],
+    "option": ["option"]
+  }
+}
