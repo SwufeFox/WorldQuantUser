@@ -617,6 +617,9 @@ def build_parser():
     a_sub.add_argument("--yes", action="store_true",
                        help="Actually submit. Without it nothing is written.")
     a_sub.add_argument("--max-wait", type=float, default=180.0)
+    a_sub.add_argument("--record", action="store_true",
+                       help="after a confirmed submission, read the alpha back and "
+                            "append it to the ledger (normalised, not raw)")
     _add_session_args(a_sub)
     a_sub.add_argument("--save")
     a_sub.set_defaults(func=cmd_alpha_submit)
@@ -2131,12 +2134,51 @@ def cmd_alpha_submit(args, _sink):
                 "%s has no %s" % (args.alpha_id, ", ".join(missing)),
                 "set them first: alpha describe %s --name ... --category ..."
                 % args.alpha_id)
-        return ml.submit_alpha(session, args.alpha_id, confirm=args.yes,
-                               max_wait_seconds=args.max_wait)
+        result = ml.submit_alpha(session, args.alpha_id, confirm=args.yes,
+                                 max_wait_seconds=args.max_wait)
+        if args.record and result.get("submitted"):
+            # Read the alpha back rather than trusting the submit response: the
+            # endpoint answers 201 before the checks finish, and the ledger wants what
+            # the platform ended up with.
+            result["recorded"] = _record_submitted_alpha(session, args.alpha_id)
+        return result
 
     result = with_session(args, work)
     _maybe_save(args, result)
     return result
+
+
+def _record_submitted_alpha(session, alpha_id):
+    """Append a normalised row for one alpha to the ledger and return what was written.
+
+    Two payload shapes are handled here because getting them wrong is not a cosmetic
+    mistake: `regular` is a plain string for some alphas and a `{code, description,
+    operatorCount}` object for others, and the metrics live under `is`, not `metrics`.
+    Reading either one naively recorded a row with no metrics on 2026-11-01, which the
+    ledger then treated as the newest truth.
+    """
+    current = ml.fetch_alpha_metrics(session, alpha_id)
+    code, _description, _count = ml.regular_expression(current)
+    checks = ml.fetch_alpha_checks(session, alpha_id, max_wait_seconds=60).get("checks")
+    entry = alpha_registry.build_entry(
+        {"alpha_id": alpha_id,
+         "expression": code,
+         "settings": current.get("settings") or {},
+         "metrics": current.get("is") or {},
+         "checks": checks,
+         "status": current.get("status"),
+         "out_of_sample": {"train": current.get("train") or {},
+                           "test": current.get("test") or {},
+                           "test_period": "P1Y"}},
+        verdict=_auto_verdict({"status": current.get("status"),
+                               "metrics": current.get("is") or {},
+                               "checks": checks}),
+        note="recorded by `alpha submit --record`: dateSubmitted %s"
+             % (current.get("dateSubmitted"),),
+        source="submit")
+    stored, written = alpha_registry.record_entry(entry)
+    return {"key": stored.get("key"), "status": stored.get("status"),
+            "written": written, "metrics": bool(stored.get("metrics"))}
 
 
 def cmd_alpha_list(args, _sink):

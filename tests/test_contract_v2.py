@@ -499,6 +499,35 @@ class AlphaRegistryTests(unittest.TestCase):
             self.assertFalse(second)
             self.assertEqual(len(Path(path).read_text(encoding="utf-8").splitlines()), 1)
 
+    def test_a_row_without_metrics_cannot_replace_one_with_metrics(self):
+        # The newest row wins, so recording a metrics-less row silently deletes the
+        # metrics from every view. That happened for real on 2026-11-01: a misread
+        # platform payload wrote metrics=None over a live alpha and the record still
+        # looked fine. Refusing is the cheap fix.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "reg.jsonl")
+            alpha_registry.record_entry(
+                alpha_registry.build_entry(self._alpha(), verdict="candidate"), path)
+            blind = alpha_registry.build_entry(
+                {"alpha_id": "ABC123", "expression": "rank(close)", "metrics": {}},
+                verdict="candidate")
+            with self.assertRaises(ValueError):
+                alpha_registry.record_entry(blind, path)
+            # The stored row keeps its metrics.
+            self.assertEqual(alpha_registry.load_entries(path)[0]["metrics"]["sharpe"], 1.4)
+
+    def test_losing_metrics_on_purpose_is_allowed_when_asked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "reg.jsonl")
+            alpha_registry.record_entry(
+                alpha_registry.build_entry(self._alpha(), verdict="candidate"), path)
+            blind = alpha_registry.build_entry(
+                {"alpha_id": "ABC123", "expression": "rank(close)", "metrics": {}},
+                verdict="candidate")
+            _, written = alpha_registry.record_entry(blind, path,
+                                                     allow_metrics_loss=True)
+            self.assertTrue(written)
+
     def test_failing_checks_are_extracted(self):
         checks = [{"name": "LOW_SHARPE", "result": "PASS"},
                   {"name": "CONCENTRATED_WEIGHT", "result": "FAIL"}]

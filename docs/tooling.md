@@ -68,6 +68,21 @@ python3 tools/unit_report.py                    # 不传就是人读的报告
 
 写文件失败也不再是 traceback：路径不可写 → 一行 stderr + exit 2（用法错误，因为路径是调用方给的）。共用的实现在 `tools/_output.py`，它没有 `main()`，不是工具。
 
+## 提交是唯一会写平台的动作
+
+```bash
+python3 research_cli.py alpha submit ID            # 预检：跑 live checks，什么都不发
+python3 research_cli.py alpha submit ID --yes --record   # 真提交 + 回读 + 记账
+```
+
+三条硬规矩：
+
+* **没有 `--yes` 就不发**——平台没有"试提交"，预检就是 check 流程；
+* **`name` / `category` 必须先设**，否则拒绝（`alpha describe ID --name ... --category ...`）。没有标签的 alpha 事后无法归属；
+* **`--record` 用 `regular_expression()` 和 `is` 段**取数，不直接摸平台原始 payload——`regular` 有时是字符串、有时是对象，摸错一次就记了一行没有 metrics 的账（2026-11-01 真实发生过）。
+
+台账那边现在也会拦：`record_entry` 拒绝用没有 metrics 的行覆盖有 metrics 的行，除非显式 `allow_metrics_loss=True`。
+
 ## 工具会读的封闭清单
 
 `<research>/closed-families.json` 是机制地图第二节的机器可读版：20 条已关闭的方向，带 id、类型（`blocked-by-check` / `falsified` / `structurally-impossible`）、理由、证据。

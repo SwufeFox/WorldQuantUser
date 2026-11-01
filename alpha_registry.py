@@ -345,12 +345,19 @@ def _comparable(entry):
     return comparable
 
 
-def record_entry(entry, path=None, skip_unchanged=True):
+def record_entry(entry, path=None, skip_unchanged=True, allow_metrics_loss=False):
     """Append one entry to the ledger.
 
     With ``skip_unchanged`` (the default) an entry identical to the newest
     stored record for the same key is not rewritten, which keeps bulk account
     syncs from growing the file on every run. Returns ``(entry, written)``.
+
+    ``allow_metrics_loss`` guards the one mistake this module cannot recover from:
+    appending a row for a key whose stored row carried metrics while the new one
+    carries none. Because the newest row wins, that silently deletes the metrics from
+    every view -- it happened on 2026-11-01 with a misread platform payload, and the
+    record looked fine afterwards. Refusing is cheap; the caller who genuinely means
+    it can say so.
     """
     # Attach the cause here rather than at analysis time: `failing_checks` says which
     # gate tripped, not why, and by the time a reader asks "how many of these were
@@ -371,9 +378,19 @@ def record_entry(entry, path=None, skip_unchanged=True):
     # JSONL appends stay line-atomic because each record is written in a single
     # unbuffered write, so a reader never sees half a line.
     with cache_store.file_lock(path + ".lock", timeout=30):
+        existing = {item["key"]: item for item in load_entries(path)}
+        current = existing.get(entry.get("key"))
+        if current is not None and not allow_metrics_loss:
+            had = bool(current.get("metrics"))
+            has = bool(entry.get("metrics"))
+            if had and not has:
+                raise ValueError(
+                    "refusing to record %r: the stored row has metrics and this one "
+                    "does not, and the newest row wins -- the metrics would disappear "
+                    "from every view. Fix the payload (BRAIN puts them under 'is'), or "
+                    "pass allow_metrics_loss=True if the loss is intended."
+                    % (entry.get("key"),))
         if skip_unchanged:
-            existing = {item["key"]: item for item in load_entries(path)}
-            current = existing.get(entry.get("key"))
             if current is not None and _comparable(current) == _comparable(entry):
                 return current, False
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
