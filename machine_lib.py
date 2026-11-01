@@ -824,23 +824,6 @@ def fields_to_df(fields):
     return pd.DataFrame(fields)
 
 
-def get_vec_fields(fields):
-
-    # 请在此处添加获得权限的Vector操作符
-    vec_ops = ["vec_avg", "vec_sum"]
-    vec_fields = []
- 
-    for field in fields:
-        for vec_op in vec_ops:
-            if vec_op == "vec_choose":
-                vec_fields.append("%s(%s, nth=-1)"%(vec_op, field))
-                vec_fields.append("%s(%s, nth=0)"%(vec_op, field))
-            else:
-                vec_fields.append("%s(%s)"%(vec_op, field))
- 
-    return(vec_fields)
-
-
 def process_datafields(fields):
     """Turn field metadata into directly usable FASTEXPR snippets.
 
@@ -872,52 +855,6 @@ def ts_factory(op, field):
         output.append(alpha)
     
     return output
-
-def first_order_factory(fields, ops_set):
-    alpha_set = []
-    #for field in fields:
-    for field in fields:
-        #reverse op does the work
-        alpha_set.append(field)
-        #alpha_set.append("-%s"%field)
-        for op in ops_set:
- 
-            if op == "ts_percentage":
- 
-                alpha_set += ts_comp_factory(op, field, "percentage", [0.5])
- 
- 
-            elif op == "ts_decay_exp_window":
- 
-                alpha_set += ts_comp_factory(op, field, "factor", [0.5])
- 
- 
-            elif op == "ts_moment":
- 
-                alpha_set += ts_comp_factory(op, field, "k", [2, 3, 4])
- 
-            elif op == "ts_entropy":
- 
-                alpha_set += ts_comp_factory(op, field, "buckets", [10])
- 
-            elif op.startswith("ts_") or op == "inst_tvr":
- 
-                alpha_set += ts_factory(op, field)
- 
-            elif op.startswith("vector"):
- 
-                alpha_set += vector_factory(op, field)
- 
-            elif op == "signed_power":
- 
-                alpha = "%s(%s, 2)"%(op, field)
-                alpha_set.append(alpha)
- 
-            else:
-                alpha = "%s(%s)"%(op, field)
-                alpha_set.append(alpha)
- 
-    return alpha_set
 
 def load_task_pool_single(alpha_list, limit_of_single_simulations):
 
@@ -1974,60 +1911,6 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
     return document
 
 
-def single_simulate(alpha_pool, neut="SUBINDUSTRY", region="USA", universe="TOP3000",
-                    start=0, settings=None, dry_run=False, on_event=None):
-    """Back-compat wrapper: simulate nested pools of ``(expression, decay)``.
-
-    ``alpha_pool`` is a list of batches (as produced by ``load_task_pool_single``).
-    Prefer :func:`simulate_alphas` for new code. ``start`` is accepted and
-    ignored for call compatibility.
-    """
-    merged = dict(settings or {})
-    merged.setdefault("neutralization", neut)
-    merged.setdefault("region", region)
-    merged.setdefault("universe", universe)
-    merged = resolve_settings(merged)
-
-    pairs = []
-    for batch in alpha_pool:
-        pairs.extend(normalize_alphas(batch, merged))
-
-    if dry_run:
-        session = None
-    else:
-        session = login()
-    return simulate_alphas(
-        session, pairs, settings=merged, dry_run=dry_run, on_event=on_event
-    )
-
-
-def set_alpha_properties(
-    s,
-    alpha_id,
-    name: str = None,
-    color: str = None,
-    selection_desc: str = "None",
-    combo_desc: str = "None",
-    tags: str = ["ace_tag"],
-):
-    """
-    Function changes alpha's description parameters
-    """
- 
-    params = {
-        "color": color,
-        "name": name,
-        "tags": tags,
-        "category": None,
-        "regular": {"description": None},
-        "combo": {"description": combo_desc},
-        "selection": {"description": selection_desc},
-    }
-    response = s.patch(
-        "https://api.worldquantbrain.com/alphas/" + alpha_id, json=params
-    )
-
-
 def list_alphas(s, limit=100, offset=0, order="-is.sharpe", status="UNSUBMITTED",
                 region=None, universe=None, min_sharpe=None, min_fitness=None,
                 alpha_type_not="SUPER", hidden=False, search=None):
@@ -2105,14 +1988,6 @@ def prune(alpha_records, prefix, keep_num):
     return output
 
 
-def get_group_second_order_factory(first_order, group_ops, region):
-    second_order = []
-    for fo in first_order:
-        for group_op in group_ops:
-            second_order += group_factory(group_op, fo, region)
-    return second_order
-
-
 def group_factory(op, field, region):
     output = []
     vectors = ["cap"] 
@@ -2148,107 +2023,6 @@ def group_factory(op, field, region):
         
     return output
 
-def trade_when_factory(op,field,region):
-    output = []
-    open_events = ["ts_arg_max(volume, 5) == 0", "ts_corr(close, volume, 20) < 0",
-                   "ts_corr(close, volume, 5) < 0", "ts_mean(volume,10)>ts_mean(volume,60)",
-                   "group_rank(ts_std_dev(returns,60), sector) > 0.7", "ts_zscore(returns,60) > 2",
-                   "ts_arg_min(volume, 5) > 3",
-                   "ts_std_dev(returns, 5) > ts_std_dev(returns, 20)",
-                   "ts_arg_max(close, 5) == 0", "ts_arg_max(close, 20) == 0",
-                   "ts_corr(close, volume, 5) > 0", "ts_corr(close, volume, 5) > 0.3", "ts_corr(close, volume, 5) > 0.5",
-                   "ts_corr(close, volume, 20) > 0", "ts_corr(close, volume, 20) > 0.3", "ts_corr(close, volume, 20) > 0.5",
-                   "ts_regression(returns, %s, 5, lag = 0, rettype = 2) > 0"%field,
-                   "ts_regression(returns, %s, 20, lag = 0, rettype = 2) > 0"%field,
-                   "ts_regression(returns, ts_step(20), 20, lag = 0, rettype = 2) > 0",
-                   "ts_regression(returns, ts_step(5), 5, lag = 0, rettype = 2) > 0"]
-
-    exit_events = ["abs(returns) > 0.1", "-1"]
-
-    usa_events = ["rank(rp_css_business) > 0.8", "ts_rank(rp_css_business, 22) > 0.8", "rank(vec_avg(mws82_sentiment)) > 0.8",
-                  "ts_rank(vec_avg(mws82_sentiment),22) > 0.8", "rank(vec_avg(nws48_ssc)) > 0.8",
-                  "ts_rank(vec_avg(nws48_ssc),22) > 0.8", "rank(vec_avg(mws50_ssc)) > 0.8", "ts_rank(vec_avg(mws50_ssc),22) > 0.8",
-                  "ts_rank(vec_sum(scl12_alltype_buzzvec),22) > 0.9", "pcr_oi_270 < 1", "pcr_oi_270 > 1",]
-
-    asi_events = ["rank(vec_avg(mws38_score)) > 0.8", "ts_rank(vec_avg(mws38_score),22) > 0.8"]
-
-    eur_events = ["rank(rp_css_business) > 0.8", "ts_rank(rp_css_business, 22) > 0.8",
-                  "rank(vec_avg(oth429_research_reports_fundamental_keywords_4_method_2_pos)) > 0.8",
-                  "ts_rank(vec_avg(oth429_research_reports_fundamental_keywords_4_method_2_pos),22) > 0.8",
-                  "rank(vec_avg(mws84_sentiment)) > 0.8", "ts_rank(vec_avg(mws84_sentiment),22) > 0.8",
-                  "rank(vec_avg(mws85_sentiment)) > 0.8", "ts_rank(vec_avg(mws85_sentiment),22) > 0.8",
-                  "rank(mdl110_analyst_sentiment) > 0.8", "ts_rank(mdl110_analyst_sentiment, 22) > 0.8",
-                  "rank(vec_avg(nws3_scores_posnormscr)) > 0.8",
-                  "ts_rank(vec_avg(nws3_scores_posnormscr),22) > 0.8",
-                  "rank(vec_avg(mws36_sentiment_words_positive)) > 0.8",
-                  "ts_rank(vec_avg(mws36_sentiment_words_positive),22) > 0.8"]
-
-    glb_events = ["rank(vec_avg(mdl109_news_sent_1m)) > 0.8",
-                  "ts_rank(vec_avg(mdl109_news_sent_1m),22) > 0.8",
-                  "rank(vec_avg(nws20_ssc)) > 0.8",
-                  "ts_rank(vec_avg(nws20_ssc),22) > 0.8",
-                  "vec_avg(nws20_ssc) > 0",
-                  "rank(vec_avg(nws20_bee)) > 0.8",
-                  "ts_rank(vec_avg(nws20_bee),22) > 0.8",
-                  "rank(vec_avg(nws20_qmb)) > 0.8",
-                  "ts_rank(vec_avg(nws20_qmb),22) > 0.8"]
-
-    chn_events = ["rank(vec_avg(oth111_xueqiunaturaldaybasicdivisionstat_senti_conform)) > 0.8",
-                  "ts_rank(vec_avg(oth111_xueqiunaturaldaybasicdivisionstat_senti_conform),22) > 0.8",
-                  "rank(vec_avg(oth111_gubanaturaldaydevicedivisionstat_senti_conform)) > 0.8",
-                  "ts_rank(vec_avg(oth111_gubanaturaldaydevicedivisionstat_senti_conform),22) > 0.8",
-                  "rank(vec_avg(oth111_baragedivisionstat_regi_senti_conform)) > 0.8",
-                  "ts_rank(vec_avg(oth111_baragedivisionstat_regi_senti_conform),22) > 0.8"]
-
-    kor_events = ["rank(vec_avg(mdl110_analyst_sentiment)) > 0.8",
-                  "ts_rank(vec_avg(mdl110_analyst_sentiment),22) > 0.8",
-                  "rank(vec_avg(mws38_score)) > 0.8",
-                  "ts_rank(vec_avg(mws38_score),22) > 0.8"]
-
-    twn_events = ["rank(vec_avg(mdl109_news_sent_1m)) > 0.8",
-                  "ts_rank(vec_avg(mdl109_news_sent_1m),22) > 0.8",
-                  "rank(rp_ess_business) > 0.8",
-                  "ts_rank(rp_ess_business,22) > 0.8"]
-
-    for oe in open_events:
-        for ee in exit_events:
-            alpha = "%s(%s, %s, %s)"%(op, oe, field, ee)
-            output.append(alpha)
-    return output
-
-
-def check_submission(alpha_bag, gold_bag, start):
-    depot = []
-    s = login()
-    for idx, g in enumerate(alpha_bag):
-        if idx < start:
-            continue
-        if idx % 5 == 0:
-            print(idx)
-        if idx % 200 == 0:
-            s = login()
-        #print(idx)
-        pc = get_check_submission(s, g)
-        if pc == "sleep":
-            sleep(100)
-            s = login()
-            alpha_bag.append(g)
-        elif pc != pc:
-            # pc is nan
-            print("check self-corrlation error")
-            sleep(100)
-            alpha_bag.append(g)
-        elif pc == "fail":
-            continue
-        elif pc == "error":
-            depot.append(g)
-        else:
-            print(g)
-            gold_bag.append((g, pc))
-    print(depot)
-    return gold_bag
-
-
 def get_check_submission(s, alpha_id):
     while True:
         result = s.get("https://api.worldquantbrain.com/alphas/" + alpha_id + "/check")
@@ -2272,20 +2046,6 @@ def get_check_submission(s, alpha_id):
         print("catch: %s"%(alpha_id))
         return "error"
     
-def view_alphas(gold_bag):
-    s = login()
-    sharp_list = []
-    for gold, pc in gold_bag:
-
-        triple = locate_alpha(s, gold)
-        info = [triple[0], triple[2], triple[3], triple[4], triple[5], triple[6], triple[1]]
-        info.append(pc)
-        sharp_list.append(info)
-
-    sharp_list.sort(reverse=True, key = lambda x : x[1])
-    for i in sharp_list:
-        print(i)
- 
 def locate_alpha(s, alpha_id):
     while True:
         alpha = s.get("https://api.worldquantbrain.com/alphas/" + alpha_id)
@@ -2310,23 +2070,6 @@ def locate_alpha(s, alpha_id):
             
 
 # Consultant methods
-def load_task_pool(alpha_list, limit_of_children_simulations, limit_of_multi_simulations):
-    '''
-    Input:
-        alpha_list : list of (alpha, decay) tuples
-        limit_of_multi_simulations : number of children simulation in a multi-simulation
-        limit_of_multi_simulations : number of simultaneous multi-simulations
-    Output:
-        task : [10 * (alpha, decay)] for a multi-simulation
-        pool : [10 * [10 * (alpha, decay)]] for simultaneous multi-simulations
-        pools : [[10 * [10 * (alpha, decay)]]]
-
-    '''
-    tasks = [alpha_list[i:i + limit_of_children_simulations] for i in range(0, len(alpha_list), limit_of_children_simulations)]
-    pools = [tasks[i:i + limit_of_multi_simulations] for i in range(0, len(tasks), limit_of_multi_simulations)]
-    return pools
-
-
 # some other factory for other operators
 def vector_factory(op, field):
     output = []
@@ -2356,39 +2099,6 @@ def ts_comp_factory(op, field, factor, paras):
     
     return output
  
-def twin_field_factory(op, field, fields):
-    
-    output = []
-    #days = [3, 5, 10, 20, 60, 120, 240]
-    days = [5, 22, 66, 240]
-    outset = list(set(fields) - set([field]))
-    
-    for day in days:
-        for counterpart in outset:
-            alpha = "%s(%s, %s, %d)"%(op, field, counterpart, day)
-            output.append(alpha)
-    
-    return output
- 
-def login_hk():
-    """Authenticate against the Hong Kong endpoint.
-
-    BRAIN answers the first POST with a biometrics URL instead of a session.
-    That step needs a human in a browser, so this raises with the URL rather
-    than calling ``input()`` -- an interactive prompt is a hang for any
-    automated caller.
-    """
-    session = requests.Session()
-    response = session.post("https://api.worldquantbrain.com/authentication")
-    location = response.headers.get("Location")
-    if not location:
-        return session
-    raise AuthError(
-        "Hong Kong accounts need browser authorization first: open %s, then "
-        "retry with a session created from those cookies." % location
-    )
-
-
 # ---------------------------------------------------------------------------
 # Out-of-sample split
 # ---------------------------------------------------------------------------

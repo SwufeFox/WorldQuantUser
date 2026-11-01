@@ -618,18 +618,6 @@ def leg_index(entries):
     return {body: sorted(set(keys)) for body, keys in index.items()}
 
 
-def entries_with_leg(entries, needle):
-    """Entries whose expression contains a leg body matching ``needle``."""
-    needle_lower = (needle or "").lower()
-    out = []
-    for entry in entries:
-        for body in leg_bodies(entry).values():
-            if needle_lower in body.lower():
-                out.append(entry)
-                break
-    return out
-
-
 def resolve(entries, reference):
     """Find one entry by alpha id, ledger key or expression hash."""
     if not reference:
@@ -705,17 +693,6 @@ def mark_duplicate(entry, canonical):
     updated["recorded_at"] = _now()
     updated["source"] = "dedupe"
     return updated
-
-
-def duplicate_groups(entries):
-    """``{canonical_id: [duplicate_ids]}`` from the recorded marks."""
-    groups = {}
-    for entry in entries:
-        canonical = entry.get("duplicate_of")
-        if not canonical:
-            continue
-        groups.setdefault(canonical, []).append(entry.get("alpha_id") or entry.get("key"))
-    return groups
 
 
 def unique_entries(entries):

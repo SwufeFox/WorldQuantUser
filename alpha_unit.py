@@ -438,11 +438,6 @@ class Leg:
     numbers: tuple
     weight: float
 
-    @property
-    def is_constant(self):
-        return isinstance(self.body, fa.Number)
-
-
 def _numbers(node):
     return tuple(child.text for child in node.walk() if isinstance(child, fa.Number))
 
@@ -638,13 +633,6 @@ class Corpus:
     points: list
     units: dict
     kinds: dict
-
-    def unit_of(self, point):
-        return self.units[point.unit]
-
-    def kind_of(self, point):
-        return self.kinds[point.kind]
-
 
 def _kind_key(point):
     """Assembly plus data families, in a commutative order.

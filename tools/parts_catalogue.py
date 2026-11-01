@@ -126,44 +126,6 @@ def screen(catalogue, min_fitness=1.5, max_expressions=3):
     return proven, untapped, dead
 
 
-def seeds(entries, catalogue, min_fitness=1.5):
-    """Proven parts that have met the fewest partners, plus what they never met.
-
-    A part in the book is proven; a part in the book that has only ever appeared
-    alongside two other parts has barely been tested as an ingredient. The suggestion
-    attached to each seed is the set of *other* proven parts it has never co-occurred
-    with -- assemblies nobody has run, built only from parts that already work.
-
-    This is deliberately not a ranking by Fitness: the point is coverage of
-    combinations, not another leaderboard.
-    """
-    # Co-occurrence uses *every* part, including the simple legs the display filter
-    # drops. With the filter applied here, `x = ts_backfill(f, 252)` disappeared and an
-    # expression reduced to one part, so every seed reported zero partners -- a fact
-    # about the filter, not about the book.
-    partners = collections.defaultdict(set)
-    for entry in entries:
-        expression = entry.get("expression")
-        if not expression:
-            continue
-        try:
-            shapes = {shape for shape, _f, _k in parts_of(expression, min_nodes=1)}
-        except fa.ParseError:
-            continue
-        for shape in shapes:
-            partners[shape] |= (shapes - {shape})
-    proven = [slot for slot in catalogue.values() if slot["n_book"] > 0]
-    proven_shapes = {slot["shape"] for slot in proven}
-    ranked = sorted(proven, key=lambda s: (len(partners[s["shape"]]), -(s["best_fitness"] or 0)))
-    out = []
-    for slot in ranked:
-        met = partners[slot["shape"]]
-        never = sorted(proven_shapes - met - {slot["shape"]})
-        out.append({"slot": slot, "partners": sorted(met), "never": never,
-                    "best_fitness": slot["best_fitness"]})
-    return out
-
-
 def portable_seeds(catalogue, min_fitness=1.2, max_book=1):
     """Proven parts that appear in few book alphas: ingredients never ported.
 
@@ -177,21 +139,6 @@ def portable_seeds(catalogue, min_fitness=1.2, max_book=1):
             if slot["n_book"] > 0 and slot["n_book"] <= max_book
             and (slot["best_fitness"] or 0) >= min_fitness]
     rows.sort(key=lambda s: -(s["best_fitness"] or 0))
-    return rows
-
-
-def report_seeds(entries, catalogue, top=8, stream=None):
-    stream = stream or sys.stdout
-    rows = [r for r in seeds(entries, catalogue) if (r["best_fitness"] or 0) >= 1.2]
-    print("seed parts (in the book, fewest partners):", file=stream)
-    for row in rows[:top]:
-        slot = row["slot"]
-        print("\n  %s" % slot["shape"][:96], file=stream)
-        print("    F=%.2f  used in %d expressions, %d book alphas, %d partners"
-              % (row["best_fitness"] or 0, slot["n_expressions"], slot["n_book"],
-                 len(row["partners"])), file=stream)
-        if row["never"]:
-            print("    never met: %s" % " | ".join(x[:44] for x in row["never"][:3]), file=stream)
     return rows
 
 

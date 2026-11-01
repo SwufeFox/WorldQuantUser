@@ -2252,25 +2252,6 @@ def _field_scope(session, args):
     return known, market
 
 
-def _known_field_ids(session, args):
-    """Every field id in scope, for flagging unknown identifiers.
-
-    The whole catalog, not ``--dataset``. Expressions routinely mix datasets --
-    a footnote ratio divided by total assets from fundamental6, ranked inside a
-    group defined in pv1 -- so scoping verification to one dataset reports real
-    fields as unknown and trains the caller to ignore the check. ``--dataset``
-    stays a listing filter for `catalog fields`, where narrowing is the point.
-    """
-    records = field_index.fetch_all_fields(
-        session,
-        region=getattr(args, "region", None) or "USA",
-        universe=getattr(args, "universe", None) or "TOP3000",
-        delay=getattr(args, "delay", None) if getattr(args, "delay", None) is not None else 1,
-        instrument_type=getattr(args, "instrument_type", None) or "EQUITY",
-    )
-    return field_index.field_ids(records)
-
-
 def cmd_lint(args, sink):
     settings, pairs = _collect_lint_pairs(args)
     denylist = expression_lint.load_denylist(getattr(args, "denylist", None))
