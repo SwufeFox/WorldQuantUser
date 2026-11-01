@@ -87,11 +87,21 @@ def build(entries):
                 "expressions": set(), "book": set(), "fields": set(),
                 "best_fitness": None, "best_alpha": None, "fitness_sum": 0.0,
                 "fitness_n": 0, "example": expression,
+                "book_fitness": None, "book_alpha": None,
             })
             slot["expressions"].add(expression)
             slot["fields"].update(fields)
             if in_book:
                 slot["book"].add(entry.get("alpha_id") or expression)
+                # The number that decides whether a part is worth porting has to come
+                # from an alpha that is actually in the book. `best_fitness` is a max
+                # over every expression containing the shape -- including rejected and
+                # never-submitted ones -- so 18 of 34 seeds were ranked by a score no
+                # book member ever achieved.
+                if fitness is not None and (slot["book_fitness"] is None
+                                            or fitness > slot["book_fitness"]):
+                    slot["book_fitness"] = fitness
+                    slot["book_alpha"] = entry.get("alpha_id")
             if fitness is not None:
                 slot["fitness_sum"] += fitness
                 slot["fitness_n"] += 1
@@ -140,8 +150,8 @@ def portable_seeds(catalogue, min_fitness=1.2, max_book=1):
     """
     rows = [slot for slot in catalogue.values()
             if slot["n_book"] > 0 and slot["n_book"] <= max_book
-            and (slot["best_fitness"] or 0) >= min_fitness]
-    rows.sort(key=lambda s: -(s["best_fitness"] or 0))
+            and (slot.get("book_fitness") or 0) >= min_fitness]
+    rows.sort(key=lambda s: -(s.get("book_fitness") or 0))
     return rows
 
 
