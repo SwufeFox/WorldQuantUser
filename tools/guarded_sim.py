@@ -106,3 +106,16 @@ def simulate(expressions, settings=None, labels=None, force=False, session=None,
         labels=labels,
         **kwargs,
     )
+
+
+if __name__ == "__main__":
+    # Running this file is a mistake worth naming: it is a library with no CLI, and
+    # silence looks like "the check passed" to anyone who typed it expecting output.
+    import sys as _sys
+
+    print("guarded_sim is a library, not a command:\n"
+          "  from guarded_sim import simulate, check\n"
+          "  or run tools/wire_guard.py to rewrite a research script that still "
+          "calls machine_lib.simulate_alphas directly",
+          file=_sys.stderr)
+    raise SystemExit(2)
