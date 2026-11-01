@@ -995,6 +995,19 @@ class SelfCorrelationTests(unittest.TestCase):
             {"records": [["A", None, "EQUITY", "USA", "TOP3000", 0.31, 2.0, 0.1, 0.1, 1.5, 0.001]]})
         self.assertFalse(verdict["blocked"])
 
+    def test_an_empty_payload_is_unknown_not_clear(self):
+        # No records means "not scored yet", not "uncorrelated". Reporting it as clear
+        # is how an unscored alpha gets described as submittable.
+        verdict = machine_lib.self_correlation_verdict({"records": []})
+        self.assertFalse(verdict["blocked"])
+        self.assertFalse(verdict["known"])
+
+    def test_a_scored_alpha_with_low_pairs_is_known_and_clear(self):
+        verdict = machine_lib.self_correlation_verdict(
+            {"records": [["A", None, "EQUITY", "USA", "TOP3000", 0.31, 2.0, 0.1, 0.1, 1.5, 0.001]]})
+        self.assertTrue(verdict["known"])
+        self.assertFalse(verdict["blocked"])
+
     def test_bar_uses_the_highest_counterpart_sharpe_not_the_correlated_one(self):
         # The tempting shortcut is to take the 0.90 pair's Sharpe; a second pair at
         # 0.84 with a higher Sharpe raises the bar and the shortcut would pass it.

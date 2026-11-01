@@ -2283,17 +2283,28 @@ def self_correlation_verdict(payload, limit=0.7, sharpe_margin=1.10):
     shortcut and it is wrong in the direction that matters: a second, higher-Sharpe
     counterpart raises the bar.
     """
-    correlated = [row for row in payload.get("records") or []
+    records = payload.get("records") or []
+    correlated = [row for row in records
                   if len(row) > 5 and isinstance(row[5], (int, float))
                   and abs(row[5]) > limit]
     if not correlated:
-        return {"blocked": False, "reason": "nothing above the correlation limit",
-                "counterparts": [], "sharpe_needed": None}
+        # `known` separates two things that look identical in `blocked`: a real
+        # measurement where everything sits under the limit, and a payload with no
+        # records at all because the platform has not scored this alpha yet. Reading
+        # the second as "clear" is the same mistake as reading an empty body as
+        # zero correlation, one layer up -- and it is how an unscored alpha gets
+        # reported as submittable.
+        return {"blocked": False, "known": bool(records),
+                "reason": "nothing above the correlation limit" if records
+                          else "no correlation records: not scored yet",
+                "counterparts": [], "sharpe_needed": None, "records": len(records)}
 
     sharpes = [row[6] for row in correlated if len(row) > 6 and isinstance(row[6], (int, float))]
     needed = max(sharpes) * sharpe_margin if sharpes else None
     return {
         "blocked": True,
+        "known": True,
+        "records": len(records),
         "reason": "self-correlation above the limit",
         "counterparts": [
             {"alpha_id": row[0], "name": row[1], "correlation": row[5],
