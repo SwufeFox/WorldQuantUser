@@ -624,6 +624,17 @@ def build_parser():
     a_sub.add_argument("--save")
     a_sub.set_defaults(func=cmd_alpha_submit)
 
+    a_expl = alpha_sub.add_parser(
+        "explain",
+        help="Explain one alpha: what each leg computes, and what the evidence says.")
+    a_expl.add_argument("alpha_id")
+    a_expl.add_argument("--no-corr", action="store_true",
+                        help="skip the local correlation against the book (reads "
+                             "<research>/pnl, which is a few hundred small files)")
+    _add_session_args(a_expl)
+    a_expl.add_argument("--save")
+    a_expl.set_defaults(func=cmd_alpha_explain)
+
     a_list = alpha_sub.add_parser("list", help="List the account's alphas.")
     a_list.add_argument("--limit", type=int, default=20)
     a_list.add_argument("--offset", type=int, default=0)
@@ -2674,6 +2685,143 @@ def cmd_alpha_label(args, _sink):
     }
     _maybe_save(args, data)
     return data
+
+
+def cmd_alpha_explain(args, _sink):
+    """Explain one alpha: what each leg computes, and what the evidence says.
+
+    Three layers, kept apart on purpose, because mixing them is how a description
+    starts to sound like a justification:
+
+    * **construction** -- what the expression does, leg by leg, in words. Read off the
+      tree, so it cannot drift from the formula.
+    * **evidence** -- the metrics, where the Fitness comes from arithmetically, the
+      measured ablations if any were run, and the local correlation with the book.
+    * **risk** -- whether the family is on the closed list, and what the leg weights do
+      *not* tell you (a weight is a multiplier, not a contribution).
+    """
+    import alpha_unit as au
+
+    _path, entries = _ledger(args)
+    target = alpha_registry.resolve(entries, args.alpha_id)
+    if target is None:
+        raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id,
+                       "run `alpha list` or `alpha get` to find the id")
+
+    point = au.split(target.get("expression") or "",
+                     datasets=au.load_field_datasets())
+    if point is None:
+        raise CliError("INVALID_INPUT", "%s does not parse" % args.alpha_id,
+                       "the ledger row may be damaged; `alpha get` shows the raw text")
+
+    explanation = au.explain(point)
+    metrics = target.get("metrics") or {}
+    settings = target.get("settings") or {}
+
+    # The arithmetic that decides whether the score is earned or borrowed.
+    sharpe, turnover = metrics.get("sharpe"), metrics.get("turnover")
+    returns, fitness = metrics.get("returns"), metrics.get("fitness")
+    denominator = None
+    if isinstance(turnover, (int, float)):
+        denominator = max(turnover, 0.125)
+    implied = None
+    if isinstance(sharpe, (int, float)) and isinstance(returns, (int, float)) and denominator:
+        implied = round(sharpe * (returns / denominator) ** 0.5, 3)
+
+    ablations = []
+    for entry in entries:
+        idea = entry.get("idea") or ""
+        if idea.endswith(" of %s" % args.alpha_id) or idea.endswith("of %s" % args.alpha_id):
+            m = entry.get("metrics") or {}
+            ablations.append({"label": idea.split(":")[-1].split(" of ")[0].strip(),
+                              "alpha_id": entry.get("alpha_id"),
+                              "sharpe": m.get("sharpe"), "fitness": m.get("fitness")})
+
+    gate = None if args.no_corr else _local_book_gate(args.alpha_id, entries)
+
+    document = {
+        "alpha_id": args.alpha_id,
+        "status": target.get("status"),
+        "family": target.get("family"),
+        "settings": {k: settings.get(k) for k in
+                     ("universe", "neutralization", "decay", "truncation", "delay")},
+        "construction": explanation,
+        "metrics": {k: metrics.get(k) for k in
+                    ("sharpe", "fitness", "turnover", "returns", "drawdown")},
+        "fitness_arithmetic": {
+            "formula": "sharpe * sqrt(returns / max(turnover, 0.125))",
+            "denominator_used": denominator,
+            "below_turnover_floor": bool(isinstance(turnover, (int, float))
+                                         and turnover < 0.125),
+            "implied_fitness": implied,
+        },
+        "ablations_measured": ablations,
+        "book_correlation": gate,
+        "closed_family": _closed_reason(target.get("family")),
+        "caveat": "a leg weight is a multiplier, not a contribution; which leg carries "
+                  "the alpha is only known if an ablation was run",
+    }
+    _maybe_save(args, document)
+    return document
+
+
+def _local_book_gate(alpha_id, entries):
+    """Daily-correlation of one alpha against the book, computed from cached PnL.
+
+    Measured against the platform on 2026-11-01: median difference 0.003, maximum
+    0.023. That is close enough to screen and not close enough to submit -- anything
+    above 0.67 needs the platform's own answer.
+    """
+    from pathlib import Path
+
+    import correlation
+
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+    own = pnl_dir / ("%s.json" % alpha_id)
+    if not own.exists():
+        return {"available": False, "reason": "no cached PnL for this alpha"}
+    book = {e.get("alpha_id") for e in entries
+            if (e.get("status") or "").upper() == "ACTIVE" and e.get("alpha_id")}
+    try:
+        with open(own) as handle:
+            target = json.load(handle)
+    except (OSError, ValueError):
+        return {"available": False, "reason": "cached PnL is unreadable"}
+    scores, missing = [], 0
+    for peer in sorted(book):
+        if peer == alpha_id:
+            continue
+        path = pnl_dir / ("%s.json" % peer)
+        if not path.exists():
+            missing += 1
+            continue
+        try:
+            with open(path) as handle:
+                series = json.load(handle)
+        except (OSError, ValueError):
+            missing += 1
+            continue
+        x, y, _dates = correlation.align(target, series)
+        value = correlation.pearson(x, y)
+        if value is not None:
+            scores.append((value, peer))
+    if not scores:
+        return {"available": False, "reason": "no overlapping book PnL"}
+    best = max(scores, key=lambda pair: abs(pair[0]))
+    return {"available": True, "max": round(best[0], 4), "peer": best[1],
+            "peers": len(scores), "missing_pnl": missing,
+            "verdict": ("clear" if abs(best[0]) < 0.67 else
+                        "verify on the platform (>= 0.67)"),
+            "method": "daily Pearson on cached PnL"}
+
+
+def _closed_reason(family):
+    try:
+        import closed_families
+        reason = closed_families.reason(family) if family else None
+    except Exception:  # noqa: BLE001 - an explain must work without the file
+        return None
+    return reason
 
 
 def cmd_alpha_impact(args, _sink):

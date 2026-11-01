@@ -80,6 +80,8 @@ __all__ = [
     "verify",
     "summary",
     "render_unit",
+    "describe_leg",
+    "explain",
 ]
 
 _RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unit-rules.json")
@@ -1054,6 +1056,185 @@ def summary(corpus):
 
 def _one_step(unit):
     return sum(max(0, len(values) - 1) for values in unit.grid.values())
+
+
+_RANK = {"rank", "group_rank", "zscore", "group_zscore"}
+_WINDOWED = {
+    "ts_mean": ("{w}-day average of {x}", "the average"),
+    "ts_sum": ("{w}-day sum of {x}", "the sum"),
+    "ts_median": ("{w}-day median of {x}", "the median"),
+    "ts_delta": ("{w}-day change in {x}", "the change"),
+    "ts_std_dev": ("{w}-day dispersion of {x}", "the dispersion"),
+    "ts_delay": ("{x} lagged {w} days", None),
+    "ts_backfill": ("{x}, filled back {w} days", None),
+}
+
+
+def _paren(node, text):
+    """Keep a sum readable when it is an operand of a product or a ratio."""
+    if isinstance(node, fa.BinOp) and node.op in {"+", "-"}:
+        return "(" + text + ")"
+    return text
+
+
+def _phrase(node, depth=0):
+    """A leg in words: what it computes, not how it is spelled.
+
+    Depth-capped and deliberately approximate. The point is that a reader who does not
+    know FASTEXPR can tell two legs apart and say what each is for; a faithful
+    transcription of the tree would be the tree again.
+    """
+    if depth > 6:
+        return "…"
+    if isinstance(node, fa.Number):
+        return node.text
+    if isinstance(node, fa.Field):
+        return _short(node.name)
+    if isinstance(node, fa.String):
+        return node.text.strip('"')
+    if isinstance(node, fa.Call):
+        args, name = node.args, node.name
+        if name in _RANK and args:
+            return "ranked " + _phrase(args[0], depth + 1)
+        if name in _WINDOWED and len(args) >= 2:
+            form, _fallback = _WINDOWED[name]
+            window = args[1].text if isinstance(args[1], fa.Number) else _phrase(args[1], depth + 1)
+            return form.format(w=window, x=_phrase(args[0], depth + 1))
+        if name == "abs" and args:
+            return "|" + _phrase(args[0], depth + 1) + "|"
+        if name == "vec_avg" and args:
+            return "vector average of " + _phrase(args[0], depth + 1)
+        if name == "if_else" and len(args) >= 3:
+            return "if %s then %s else %s" % tuple(_phrase(arg, depth + 1) for arg in args[:3])
+        if name == "densify" and args:
+            return _phrase(args[0], depth + 1) + ", bucketed"
+        return "%s(%s)" % (name, ", ".join(_phrase(arg, depth + 1) for arg in args))
+    if isinstance(node, fa.BinOp):
+        left, right = _phrase(node.left, depth + 1), _phrase(node.right, depth + 1)
+        if node.op == "/":
+            return "%s over %s" % (_paren(node.left, left), _paren(node.right, right))
+        if node.op == "*":
+            return "%s times %s" % (_paren(node.left, left), _paren(node.right, right)) \
+                if left != "1" else right
+        if node.op == "+":
+            return "%s plus %s" % (left, right)
+        if node.op == "-":
+            return "%s minus %s" % (left, right)
+        return "%s %s %s" % (left, node.op, right)
+    if isinstance(node, fa.UnaryOp):
+        return ("minus " if node.op == "-" else "not ") + _phrase(node.operand, depth + 1)
+    if isinstance(node, fa.Ternary):
+        return "if %s then %s else %s" % (_phrase(node.condition), _phrase(node.when_true),
+                                          _phrase(node.when_false))
+    return "?"
+
+
+def distribute(node):
+    """Push a numeric factor through a sum, so a composite reads as its legs.
+
+    ``0.25 * (a + b + c + d)`` is one term to the identity layer -- the scalar blocks
+    the additive chain -- and that is fine for grouping, because the construction is
+    the same either way. It is not fine for *reading*: an alpha whose description says
+    "one leg" when it is really a weighted sum of four teaches the reader nothing.
+    Distribution is used by :func:`explain` only; identity keeps the scalar.
+    """
+    if isinstance(node, fa.Call):
+        return fa.Call(node.name,
+                       tuple(distribute(arg) for arg in node.args),
+                       tuple((key, distribute(value)) for key, value in node.kwargs))
+    if isinstance(node, fa.BinOp):
+        left, right = distribute(node.left), distribute(node.right)
+        if node.op == "*":
+            for factor, other in ((left, right), (right, left)):
+                if isinstance(factor, fa.Number) and isinstance(other, fa.BinOp) \
+                        and other.op in {"+", "-"}:
+                    scaled = distribute(fa.BinOp("*", factor, other.left))
+                    scaled_right = distribute(fa.BinOp("*", factor, other.right))
+                    return fa.BinOp(other.op, scaled, scaled_right)
+        return fa.BinOp(node.op, left, right)
+    if isinstance(node, fa.UnaryOp):
+        return fa.UnaryOp(node.op, distribute(node.operand))
+    if isinstance(node, fa.Ternary):
+        return fa.Ternary(distribute(node.condition), distribute(node.when_true),
+                          distribute(node.when_false))
+    return node
+
+
+_PREFIXES = ("anl4_fs_detail_estimates_", "anl4_fs_guidances_", "anl4_fs_",
+             "fnd6_cptnewqv1300_", "fnd6_newqv1300_", "fnd6_newa2v1300_",
+             "fnd6_newa1v1300_", "fnd6_", "implied_volatility_", "historical_volatility_")
+
+
+def _short(field):
+    """A field name short enough to read inside a sentence."""
+    name = field
+    for prefix in _PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    return name if len(name) <= 26 else name[:24] + "…"
+
+
+def describe_leg(leg):
+    """One leg as a sentence plus the data it reads."""
+    return {"index": None, "weight": leg.weight, "role": leg.role,
+            "phrase": _phrase(leg.body), "fields": list(leg.fields),
+            "families": list(leg.families), "numbers": list(leg.numbers)}
+
+
+def _family_of(field, rules, datasets=None):
+    """The data family of one field, or ``unknown`` -- same rule as elsewhere."""
+    known = datasets if datasets is not None else _datasets_cache()
+    family = (rules.get("datasets") or {}).get(known.get(field))
+    return family or "unknown"
+
+
+_DATASETS = {}
+
+
+def _datasets_cache():
+    if not _DATASETS:
+        _DATASETS.update(load_field_datasets())
+    return _DATASETS
+
+
+def explain(point):
+    """Everything the construction itself says about the alpha.
+
+    What this deliberately does *not* do is judge: a leg's weight says how much it is
+    multiplied by, not how much it contributes. That question needs an ablation, and
+    the answer belongs next to the measurement, not next to the formula.
+    """
+    # Rebuild the signal and distribute numeric factors, so a `combo`-style composite
+    # shows its real legs instead of the sum it was written as.
+    tree = distribute(point.rebuild())
+    rules = load_rules()
+    legs = []
+    for index, (weight, body) in enumerate(terms(tree)):
+        if isinstance(body, fa.Number):
+            continue
+        fields = tuple(fa.field_names(fa.Program((), body)))
+        described = describe_leg(Leg(body=body,
+                                     shape=fa.skeleton(fa.Program((), body)),
+                                     role=role_of(body, rules),
+                                     fields=fields,
+                                     families=tuple(sorted({
+                                         _family_of(field, rules) for field in fields})),
+                                     numbers=_numbers(body),
+                                     weight=weight))
+        described["index"] = len(legs)
+        legs.append(described)
+    return {
+        "alpha_id": point.alpha_ids[:1],
+        "assembly": point.assembly,
+        "leg_count": len(legs),
+        "legs": legs,
+        "datasets": list(point.datasets),
+        "fields": list({field for leg in point.legs for field in leg.fields}),
+        "constants": [round(weight * float(body.text), 6) for weight, body in point.terms
+                      if isinstance(body, fa.Number)],
+        "weights": [leg.weight for leg in point.legs],
+    }
 
 
 def render_unit(unit, preview=0):

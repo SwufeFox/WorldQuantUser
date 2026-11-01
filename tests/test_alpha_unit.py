@@ -287,6 +287,42 @@ class Crossover(unittest.TestCase):
             self.assertEqual(au.crossover(unit, corpus), [])
 
 
+class Explanation(unittest.TestCase):
+    """A leg has to be readable, and a weighted sum has to show its real legs."""
+
+    def test_a_combo_style_sum_shows_every_leg(self):
+        # `0.25*(a+b)` inside a larger sum is one term to the identity layer, because
+        # the scalar blocks the additive chain; a reader needs both halves. A scalar
+        # applied to the *whole* signal is stripped instead (that is a different rule,
+        # measured: the platform normalises amplitude).
+        point = au.split("0.25 * (rank(close) - 0.5 + rank(low) - 0.5) + rank(high)",
+                         datasets=DATASETS)
+        self.assertEqual(len(point.legs), 2)
+        explained = au.explain(point)
+        self.assertEqual(explained["leg_count"], 3)
+        self.assertEqual([leg["weight"] for leg in explained["legs"]],
+                         [0.25, 0.25, 1.0])
+
+    def test_a_leg_reads_as_a_sentence_not_as_code(self):
+        point = au.split(TWO_LEG, datasets=DATASETS)
+        legs = au.explain(point)["legs"]
+        self.assertIn("ranked", legs[0]["phrase"])
+        self.assertIn("over", legs[0]["phrase"])
+        # Field names are shortened so the sentence stays readable.
+        self.assertNotIn("fnd6_newqv1300_", legs[0]["phrase"])
+
+    def test_a_sum_inside_a_ratio_keeps_its_parentheses(self):
+        point = au.split("rank((close - low) / (high - low))", datasets=DATASETS)
+        phrase = au.explain(point)["legs"][0]["phrase"]
+        self.assertIn("(close minus low) over (high minus low)", phrase)
+
+    def test_every_leg_carries_its_data_families(self):
+        point = au.split(TWO_LEG, datasets=DATASETS)
+        for leg in au.explain(point)["legs"]:
+            self.assertTrue(leg["families"])
+            self.assertEqual(len(leg["fields"]), len(set(leg["fields"])))
+
+
 class ProgramBridge(unittest.TestCase):
     def test_a_point_renders_into_an_annotated_program(self):
         point = au.split(TWO_LEG, datasets=DATASETS)

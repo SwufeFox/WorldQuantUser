@@ -68,6 +68,22 @@ python3 tools/unit_report.py                    # 不传就是人读的报告
 
 写文件失败也不再是 traceback：路径不可写 → 一行 stderr + exit 2（用法错误，因为路径是调用方给的）。共用的实现在 `tools/_output.py`，它没有 `main()`，不是工具。
 
+## 看一条 alpha 在算什么
+
+```bash
+python3 research_cli.py alpha explain akVznkO2
+```
+
+三层，故意分开：
+
+| 层 | 内容 |
+| --- | --- |
+| **构造** | 每条腿一句话（"ranked (close minus low) over (high minus low) minus 0.5"），带字段、数据族、权重 |
+| **证据** | 指标、Fitness 的算术复算（分母用的是真实换手还是 0.125 地板）、跑过的消融、本地对书相关 |
+| **风险** | 族是否已关闭，以及一句提醒：**权重是乘数，不是贡献** |
+
+腿是从表达式树读出来的，所以不会和公式漂移。`0.25*(a+b)` 这种会被摊开成两条腿——否则一个六腿复合体会显示成"一条腿"。
+
 ## 提交是唯一会写平台的动作
 
 ```bash
