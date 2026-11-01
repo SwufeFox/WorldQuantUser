@@ -17,7 +17,7 @@ Both were measured first, and both fail at the same place.
 
 | Attempt | Result | Why it fails |
 | --- | --- | --- |
-| Sugar forms (`sugar_rewrite`) | 951 expressions → **932** distinct sugar spellings (−2%) | Sugar works on shape. The variation is not in the shape. |
+| Sugar forms (`sugar_rewrite`, since removed) | 951 expressions → **932** distinct sugar spellings (−2%) | Sugar works on shape. The variation is not in the shape. |
 | Parts catalogue (`parts_catalogue`) | 951 → **424** parts | A vocabulary, not a compression: it says which ingredients exist, not how many dishes there are. |
 
 The variation lives one level down, in **which data** and **which constants** a fixed

@@ -193,16 +193,18 @@ argument is atomic; over 2728 sampled combinations the text backend leaked a nes
 macro 1262 times (its call regex cannot match parentheses in an argument) and changed
 meaning 101 times. Every difference is attributable to a compound argument in a
 non-atomic position, and **zero** differences appear where the text output was
-already correct. That zero is the acceptance test in `tests/test_ast_macros.py`.
+already correct. The whole macro system was later removed (2026-11-01) because
+`alpha_unit` templates do the same job and also report untried grid points.
 
 ## Ledger hygiene
 
 The ledger is written at submission and reconciled by nothing, so it drifts in ways
-that quietly change every count derived from it. Three tools now close those gaps:
+that quietly change every count derived from it. These closed those gaps (the
+one-off repair is removed now that it has run; git history keeps it):
 
 | Tool | Defect it removes |
 | --- | --- |
-| `tools/repair_ledger.py` | 9 expressions with a variant index glued to the tail (repaired, annotated); 191 rows with no alpha id at all (marked `abandoned`, not deleted) |
+| `repair_ledger` (ran once, removed) | 9 expressions with a variant index glued to the tail (repaired, annotated); 191 rows with no alpha id at all (marked `abandoned`, not deleted) |
 | `tools/reconcile_status.py` | the `status` column lagging the platform — measured 33 ACTIVE against 48 live, i.e. 15 rows that had been submitted but still said COMPLETE or UNSUBMITTED |
 | `tools/research_template.py` | a new script having to remember the guard, the sugar, the annotation check and where results go |
 

@@ -37,7 +37,6 @@ research_cli.py schema      # the whole contract, as JSON
 | `operator_semantics.py` | Invariants the operator catalogue does not publish. |
 | `annotations.py` | `@annotation` vocabulary, staleness checks, ablation derivation. |
 | `intent.py` | Rewrite "rank a level" into "rank a level over size". |
-| `tools/expression_macros.py` | Named `def` templates, expanded in bulk, lint-gated. |
 | `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
 | `tools/pool_stats.py` | Report the pool as quartiles rather than as a best alpha. |
 | `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |
@@ -45,12 +44,8 @@ research_cli.py schema      # the whole contract, as JSON
 | `tools/derive_family.py` | Derive family labels from the datafield namespace. |
 | `tools/family_graph.py` | Sibling / extends / shares graph over construction, plus components. |
 | `tools/family_graph_png.py` | Draw the graph one family per cell. |
-| `tools/ast_macros.py` | Macro expansion on the tree; the default backend. |
-| `tools/macro_parity.py` | Classify every difference between the two macro backends. |
 | `tools/guarded_sim.py` | Simulate only after the catalogue check; refuses unknown names. |
-| `tools/repair_ledger.py` | Repair damaged expressions and mark abandoned rows, without deleting. |
 | `tools/turnover_repair.py` | Break-even Sharpe for a smoothing decision. |
-| `tools/backfill_registry.py` | One-off seed of the registry from the account and existing result files. |
 | `tests/` | Offline contract tests. No account required. |
 
 **This repository versions the tool, not the research.** Simulation results,
@@ -651,48 +646,14 @@ This distinction is worth acting on: `unknown` is a prompt to measure, `absent` 
 reason to stop. An audit that records a block on a measurable unknown leaves a mechanism
 unexamined for no reason, which is how four inventory fields sat untested for days.
 
-## Write a template once, instantiate it in bulk
+## Templates: use units, not macros
 
-The same accounting-growth shape appeared in a dozen batches with only the field
-changing, and every transcription risked a typo that only lint would sometimes catch. A
-macro file makes the shape a named, parameterised thing:
-
-```
-def growth(f, w=63, b=252):
-    ts_delta(ts_backfill({f}, {b}), {w}) / (abs(ts_delay(ts_backfill({f}, {b}), {w})) + 1)
-
-def position():
-    (close - low) / (high - low) - 0.5
-
-def carrier2(f1, f2, fast, fw=0.5, w=63, b=252):
-    -rank(growth({f1}, {w}, {b})) - rank(growth({f2}, {w}, {b})) - {fw}*rank({fast})
-```
-
-```bash
-python tools/expression_macros.py --macros macros/carriers.macros --list
-python tools/expression_macros.py --macros macros/carriers.macros \
-    --expand 'carrier2(fnd6_newqv1300_invfgq,fnd6_newqv1300_invwipq,position(),0.5,63,126)'
-python tools/expression_macros.py --macros macros/carriers.macros \
-    --plan macros/plan-arap.json --lint --out rounds/batch.json
-```
-
-Expansion is textual, deterministic, and recursive: a macro may call another, cycles are
-refused, and a macro that leaves a placeholder unresolved is an error rather than a
-half-built expression. Determinism is what makes the ledger's expression dedupe
-meaningful — the same macro and arguments always produce the same string, so a repeat
-batch is caught instead of paid for.
-
-`--lint` runs the same checks the CLI runs (operator catalogue, VECTOR fields read by an
-operator that cannot take them, trailing tokens, operator budget) and **refuses to write
-a file that has problems**. A generator that can emit unchecked expressions is a way
-around every check built so far.
-
-`build` also drops duplicates of the ledger and of the plan itself before writing, and
-says which entries it dropped.
-
-The proof that the macros are faithful is a byte comparison, not a claim: expanding
-`carrier2` with the inventory fields and the `position` leg reproduces `rKd0g0bj` — the
-alpha that entered the book — character for character.
+A template with slots is `alpha_unit`'s job: every expression in the ledger already
+decomposes into a template plus a filling, and the unit also knows which grid points
+were never run. `python3 tools/unit_report.py --derive <key>` lists them. The old
+text/tree macro system that did the same thing by hand-written `def` blocks was
+removed on 2026-11-01 (git history has it); its plans in `<research>/macros/` were
+all simulated and are in the ledger.
 
 ### Report the pool as a distribution
 

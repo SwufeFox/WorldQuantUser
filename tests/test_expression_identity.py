@@ -68,19 +68,5 @@ class Hash(unittest.TestCase):
         self.assertFalse(alpha_registry.same_expression("rank(close)", "rank(open)"))
 
 
-class BuildDedupe(unittest.TestCase):
-    """The macro builder must not re-simulate a rewrapped expression."""
-
-    def test_parenthesised_variant_counts_as_already_built(self):
-        import expression_macros
-
-        macros = expression_macros.parse_macros("def pos():\n    ((close - low) / (high - low) - 0.5)\n")
-        plan = [{"macro": "pos", "args": [], "decay": 4, "candidate_id": "A"}]
-        built = {(fa.canonical("(close - low) / (high - low) - 0.5"), 4, "TOP3000")}
-        alphas, skipped = expression_macros.build(macros, plan, built=built, universe="TOP3000")
-        self.assertEqual(alphas, [])
-        self.assertIn("duplicate", skipped[0]["reason"])
-
-
 if __name__ == "__main__":
     unittest.main()
