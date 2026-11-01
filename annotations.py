@@ -167,6 +167,34 @@ def _references(node, name):
     return any(isinstance(child, fa.Field) and child.name == name for child in node.walk())
 
 
+def _prune_assignments(assignments, signal):
+    """Drop assignments nothing reads, transitively.
+
+    A dropped leg keeps its assignment under the old behaviour, so the variable stays
+    declared and unread -- and the simulator rejects the whole expression for that
+    alone. The ablation is right and the program is invalid, which is the worst of
+    both: it looks like a result until you try to run it.
+    """
+    alive = [(key, value) for key, value in assignments]
+    changed = True
+    while changed:
+        changed = False
+        used = set()
+        for node in (signal.walk() if signal is not None else []):
+            if isinstance(node, fa.Field):
+                used.add(node.name)
+        kept = []
+        for key, value in alive:
+            if key in used or any(isinstance(node, fa.Field) and node.name == key
+                                  for other_key, other_value in alive
+                                  if other_key != key for node in other_value.walk()):
+                kept.append((key, value))
+            else:
+                changed = True
+        alive = kept
+    return tuple(alive)
+
+
 def drop_term(program, name):
     """Remove the terms that reference ``name`` and renormalise the rest.
 
@@ -196,7 +224,8 @@ def drop_term(program, name):
     for coefficient, body in kept:
         scaled = fa.BinOp("*", fa.Number(str(round(coefficient / scale, 6))), body)
         rebuilt = scaled if rebuilt is None else fa.BinOp("+", rebuilt, scaled)
-    return fa.Program(program.assignments, rebuilt, program.annotations)
+    return fa.Program(_prune_assignments(program.assignments, rebuilt), rebuilt,
+                      program.annotations)
 
 
 def derive_ablations(program, schema=None):
