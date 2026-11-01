@@ -50,7 +50,15 @@ the implementation. **Do not read `research_cli.py` to learn the interface.**
    (`AUTH_CAPTCHA`). Use `--relogin` only when the cache is actually stale.
 6. **Loop on structured feedback**, not on guesses: `simulate --sort sharpe`
    returns `summary.ranking` and `summary.best`; mutate from there.
-7. **Keep credentials out of chat, commits and logs.** `.env` and
+7. **A new tool has to earn its place.** `tools/` holds 26 entry points over 24.5k
+   lines (2026-11-01), and the cost is the surface, not the logic: 26 argument
+   parsers, 26 report formats, 26 names to remember. Before adding a file, answer
+   three questions in the commit message -- which existing tool is closest, why it
+   cannot take another flag or subcommand, and what question this answers that
+   nothing else does. "Cleaner as its own file" is not an answer; put it in the
+   closest tool. `docs/tooling.md` is the map, and it is the thing to update when a
+   tool changes status, not when one is added.
+8. **Keep credentials out of chat, commits and logs.** `.env` and
    `.brain_session.json` are git-ignored; `tests/test_contract.py` guards that
    they stay that way. Never echo a credential, never write one into a file you
    intend to commit.
