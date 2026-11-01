@@ -262,10 +262,24 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mechanisms", action="store_true",
                         help="print the per-mechanism table instead of writing the report")
+    parser.add_argument("--live", action="store_true",
+                        help="read the book from the platform instead of the ledger "
+                             "(the report always does; --mechanisms does not need it)")
     parser.add_argument("--out", default=None,
                         help="write the inventory as markdown here (not JSON: "
                              "this one is a document meant to be read)")
     args = parser.parse_args()
+
+    if args.mechanisms and not args.live:
+        # The per-mechanism table is a ledger aggregation. It used to log in and read
+        # the live book first, which made the cheapest question in the toolkit the
+        # slowest one, and impossible offline.
+        entries = [e for e in alpha_registry.load_entries()
+                   if (e.get("status") or "").upper() == "ACTIVE"]
+        print("source: ledger, %d ACTIVE (pass --live to read the platform; run "
+              "tools/reconcile_status.py if the column may have drifted)" % len(entries))
+        print(mechanism_table(entries))
+        return 0
 
     session = ml.login()
     entries, families = build(session)

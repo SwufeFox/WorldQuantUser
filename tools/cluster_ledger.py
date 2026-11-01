@@ -164,6 +164,9 @@ def main(argv=None):
     parser.add_argument("--fields-index", default=None,
                         help="Path to the datafield index (fields_live.json).")
     parser.add_argument("--limit-members", type=int, default=6)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="pnl mode: fetch at most N alphas (default: all above "
+                             "--min-fitness; each one is a request)")
     args = parser.parse_args(argv)
     reserve_stdout(args)
 
@@ -187,6 +190,15 @@ def main(argv=None):
 
     ids = sorted(by_id)
     print("candidates: %d alphas with fitness >= %s" % (len(ids), args.min_fitness))
+    if args.mode == "pnl" and args.limit and len(ids) > args.limit:
+        ids = ids[:args.limit]
+        print("capped at %d by --limit" % args.limit)
+    if args.mode == "pnl":
+        # Each alpha is one request. 242 of them took over four minutes with no
+        # output beyond a counter, which reads as hung; say the size up front.
+        print("fetching %d PnL series, one request each (~%.0fs at 1/s); "
+              "use --limit N or --mode fields to avoid the network"
+              % (len(ids), len(ids) * 1.0))
     if len(ids) < 2:
         print("nothing to compare")
         return 0

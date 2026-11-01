@@ -50,6 +50,7 @@ Design rules, each one paid for:
 from __future__ import annotations
 
 import collections
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field as dc_field
@@ -574,6 +575,18 @@ class Unit:
     kind: str = ""
 
     @property
+    def short(self):
+        """A stable 8-character handle for the template.
+
+        The key is the rendered template -- 137 characters, and it changes whenever
+        the shape does. Reading a 7-character prefix out of a JSON dump was the only
+        way to name a unit, which meant the tool could not be used without first
+        exporting 1.4 MB. This is derived from the key, so it is stable for as long
+        as the template is.
+        """
+        return hashlib.sha256(self.key.encode("utf-8")).hexdigest()[:8]
+
+    @property
     def size(self):
         """How many grid points this template has actually been run at.
 
@@ -1046,7 +1059,7 @@ def _one_step(unit):
 def render_unit(unit, preview=0):
     """A human-readable template: the slots, the grid, and who is in it."""
     lines = ["unit %s  (%d point%s, %d slots)"
-             % (unit.key[:16], unit.size, "" if unit.size == 1 else "s",
+             % (unit.short, unit.size, "" if unit.size == 1 else "s",
                 len(unit.grid))]
     lines.append("  assembly : %s" % unit.assembly)
     lines.append("  families : %s" % ", ".join(unit.datasets))

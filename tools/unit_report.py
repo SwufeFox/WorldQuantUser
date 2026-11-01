@@ -163,13 +163,13 @@ def report(corpus, counts, stream=None):
                   % (kind.size, ",".join(kind.families), kind.assembly, best,
                      ",".join(hit)), file=stream)
 
-    print("\nunits by size", file=stream)
+    print("\nunits by size  (the 8-char id works with --unit / --derive)", file=stream)
     units = sorted(corpus.units.values(), key=lambda u: -u.size)
     for unit in units[:10]:
         best = max((fitness_of(point) or 0) for point in unit.points) or None
-        print("  %3d points  %-22s  slots=%2d  best F=%s  %s"
-              % (unit.size, unit.assembly, len(unit.grid),
-                 "%.2f" % best if best else "-", unit.roles[0][:44]), file=stream)
+        print("  %s  %3d points  %-22s  slots=%2d  best F=%s  %s"
+              % (unit.short, unit.size, unit.assembly, len(unit.grid),
+                 "%.2f" % best if best else "-", unit.roles[0][:40]), file=stream)
     return units
 
 
@@ -280,9 +280,12 @@ def main() -> int:
 
     if args.unit or args.derive:
         prefix = args.unit or args.derive
-        matches = [unit for key, unit in corpus.units.items() if key.startswith(prefix)]
+        matches = [unit for unit in corpus.units.values()
+                   if unit.short == prefix or unit.short.startswith(prefix)
+                   or unit.key.startswith(prefix)]
         if not matches:
-            print("no unit key starts with %r" % prefix, file=sys.stderr)
+            print("no unit matches %r (pass an 8-char id from the report, or a key "
+                  "prefix; `--json` lists every key)" % prefix, file=sys.stderr)
             return 2
         for unit in matches[:3]:
             print(au.render_unit(unit, preview=args.top))
