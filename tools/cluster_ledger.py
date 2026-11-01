@@ -40,6 +40,9 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+from _output import add_json_flag, guard, reserve_stdout, write  # noqa: E402
 
 import alpha_registry  # noqa: E402
 import correlation  # noqa: E402
@@ -153,7 +156,7 @@ def main(argv=None):
     parser.add_argument("--threshold", type=float, default=0.7)
     parser.add_argument("--min-overlap", type=int, default=200)
     parser.add_argument("--registry", default=None)
-    parser.add_argument("--out", default=None, help="Write the full result as JSON.")
+    add_json_flag(parser, help_="write the full result (default: stdout)")
     parser.add_argument("--drop-common", type=float, default=0.5,
                         help="In fields mode, ignore fields present in more than "
                              "this fraction of the pool: cap or assets appear almost "
@@ -162,6 +165,7 @@ def main(argv=None):
                         help="Path to the datafield index (fields_live.json).")
     parser.add_argument("--limit-members", type=int, default=6)
     args = parser.parse_args(argv)
+    reserve_stdout(args)
 
     path = args.registry or alpha_registry.default_registry_path()
     entries = alpha_registry.load_entries(path)
@@ -252,11 +256,9 @@ def main(argv=None):
             "groups": [{"size": len(g), "members": g} for g in groups],
             "fields": {name: sorted(value) for name, value in sets.items()},
         }
-        if args.out:
-            with open(args.out, "w", encoding="utf-8") as handle:
-                json.dump(result, handle, ensure_ascii=False, indent=1)
-            print()
-            print("wrote", args.out)
+        target = write(result, args.json)
+        if target and target != "-":
+            print("wrote", target)
         return 0
 
     session = ml.load_session() or ml.authenticate()
@@ -323,13 +325,11 @@ def main(argv=None):
         "near_duplicates": near,
         "members": {name: describe(name) for name in pnls},
     }
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as handle:
-            json.dump(result, handle, ensure_ascii=False, indent=1)
-        print()
-        print("wrote", args.out)
+    target = write(result, args.json)
+    if target and target != "-":
+        print("wrote", target)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guard(main))

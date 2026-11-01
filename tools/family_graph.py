@@ -43,6 +43,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+from _output import add_json_flag, guard, reserve_stdout, write  # noqa: E402
 
 import alpha_registry  # noqa: E402
 import fastexpr_ast as fa  # noqa: E402
@@ -198,8 +201,9 @@ def main() -> int:
     parser.add_argument("--api-book", action="store_true",
                         help="build over the live ACTIVE book instead of ledger status")
     parser.add_argument("--dot", default=None, help="write a Graphviz file here")
-    parser.add_argument("--json", default=None, help="write the summary here")
+    add_json_flag(parser, help_="write the summary (default: stdout)")
     args = parser.parse_args()
+    reserve_stdout(args)
 
     entries = alpha_registry.load_entries()
     if args.api_book:
@@ -251,12 +255,12 @@ def main() -> int:
             handle.write(to_dot(nodes, edges))
         print("\nwrote %s" % args.dot)
     if args.json:
-        with open(args.json, "w") as handle:
-            json.dump({"summary": {k: v for k, v in summary.items() if k != "groups"},
-                       "groups": summary["groups"]}, handle, ensure_ascii=False, indent=1)
-        print("wrote %s" % args.json)
+        target = write({"summary": {k: v for k, v in summary.items() if k != "groups"},
+                        "groups": summary["groups"]}, args.json)
+        if target and target != "-":
+            print("wrote %s" % target)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guard(main))

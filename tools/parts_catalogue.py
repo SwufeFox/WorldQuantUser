@@ -29,6 +29,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+from _output import add_json_flag, guard, reserve_stdout, write  # noqa: E402
 
 import alpha_registry  # noqa: E402
 import fastexpr_ast as fa  # noqa: E402
@@ -173,11 +176,12 @@ def report(catalogue, stream=None):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--json", default=None, help="write the full catalogue here")
+    add_json_flag(parser, help_="write the full catalogue (default: stdout)")
     parser.add_argument("--top", type=int, default=12)
     parser.add_argument("--seeds", action="store_true",
                         help="show proven parts confined to one book family")
     args = parser.parse_args()
+    reserve_stdout(args)
 
     entries = [e for e in alpha_registry.load_entries()
                if not e.get("abandoned") and e.get("expression")]
@@ -206,11 +210,11 @@ def main() -> int:
                 "mean_fitness": slot["mean_fitness"],
                 "fields": sorted(slot["fields"]),
             }
-        with open(args.json, "w") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=1, sort_keys=True)
-        print("\nwrote %s" % args.json)
+        target = write(payload, args.json, sort_keys=True)
+        if target and target != "-":
+            print("\nwrote %s" % target)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guard(main))

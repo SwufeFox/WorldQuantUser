@@ -33,6 +33,9 @@ from collections import Counter, defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, REPO)
+sys.path.insert(0, HERE)
+
+from _output import add_json_flag, guard, write  # noqa: E402
 
 import alpha_registry as ar          # noqa: E402
 import machine_lib as ml             # noqa: E402
@@ -110,7 +113,7 @@ def main(argv=None):
                         help="Group the hit rate by this ledger field (default idea).")
     parser.add_argument("--stale", action="store_true",
                         help="List candidates that never entered the book.")
-    parser.add_argument("--save", default=None)
+    add_json_flag(parser, help_="also write the payload here; stdout is the document")
     args = parser.parse_args(argv)
 
     session = ml.load_session() or ml.authenticate()
@@ -120,9 +123,8 @@ def main(argv=None):
     data["book_size"] = len(book)
     data["book_not_in_ledger"] = sorted(set(book) - set(joined))
 
-    if args.save:
-        with open(args.save, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, ensure_ascii=False, indent=1)
+    if args.json and args.json != "-":
+        write(data, args.json)
 
     print(json.dumps(data if args.stale else {k: v for k, v in data.items()
                                               if k != "stale_alpha_ids"},
@@ -131,4 +133,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guard(main))

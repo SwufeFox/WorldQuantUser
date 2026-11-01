@@ -49,6 +49,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+from _output import add_json_flag, guard, reserve_stdout, write  # noqa: E402
 
 import alpha_registry  # noqa: E402
 
@@ -99,8 +102,9 @@ def main(argv=None):
                         help="Minimum Sharpe headroom above break-even.")
     parser.add_argument("--limit", type=int, default=15)
     parser.add_argument("--registry", default=None)
-    parser.add_argument("--out", default=None)
+    add_json_flag(parser, help_="write the rows (default: stdout)")
     args = parser.parse_args(argv)
+    reserve_stdout(args)
 
     path = args.registry or alpha_registry.default_registry_path()
     entries = alpha_registry.load_entries(path)
@@ -130,13 +134,11 @@ def main(argv=None):
                  row["returns"], row["turnover"], row["fitness"],
                  row["break_even_sharpe"], row["sharpe_room"]))
 
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as handle:
-            json.dump(rows, handle, ensure_ascii=False, indent=1)
-        print()
-        print("wrote", args.out)
+    target = write(rows, args.json)
+    if target and target != "-":
+        print("wrote", target)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guard(main))

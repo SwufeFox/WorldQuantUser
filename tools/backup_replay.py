@@ -580,8 +580,9 @@ def select(entries, ids=None, status=None, verdict=None, limit=None, sample=None
 # ---------------------------------------------------------------------- reporting
 
 
-def report_backup(manifest, stream=sys.stdout):
+def report_backup(manifest, stream=None):
     """Print what was archived, in the terms the numbers are usually quoted in."""
+    stream = sys.stdout if stream is None else stream
     ledger = manifest.get("ledger") or {}
     print("archived %d files, %.1f MB uncompressed"
           % (manifest["totals"]["files"], manifest["totals"]["bytes"] / 1e6),
@@ -610,12 +611,13 @@ def report_backup(manifest, stream=sys.stdout):
                  (archive.get("sha256") or "")[:12]), file=stream)
 
 
-def report_replay(results, stream=sys.stdout):
+def report_replay(results, stream=None):
     """Summarise a replay by identical / drifted / failed, and name the worst drift.
 
     "Drifted" is not a verdict on the alpha -- it is a statement that the platform's
     answer changed, which is the thing worth knowing before trusting any older number.
     """
+    stream = sys.stdout if stream is None else stream
     total = len(results)
     errored = [item for item in results if item.get("error")]
     drifted = [item for item in results

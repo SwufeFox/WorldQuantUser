@@ -48,6 +48,26 @@
 | 2026-10-25 那天的台账是什么样 | `python3 tools/backup_replay.py asof --at ...` |
 | 平台数字漂了没有 | `python3 tools/backup_replay.py replay --run` |
 
+## 每个工具的输出约定
+
+`research_cli.py` 有一条契约：stdout 恰好一个 JSON 文档。工具现在跟它对齐，用同一个开关：
+
+```bash
+python3 tools/unit_report.py --json            # 文档去 stdout，人读的报告去 stderr
+python3 tools/unit_report.py --json out.json   # 同一个文档写进文件
+python3 tools/unit_report.py --json -           # 显式写 stdout
+python3 tools/unit_report.py                    # 不传就是人读的报告
+```
+
+好处只有一个但够了：`tool --json | jq` 永远成立。以前 12 个工具用三种名字（`--json` / `--out` / `--save`），而且写完文件还要自己去打开——多一步就多一次出错的机会。
+
+两条实现上的坑，都踩过：
+
+* **`--json` 一旦出现，stdout 就只属于文档。** 先打印报告再写文档会让 `json.loads(stdout)` 失败，所以报告整体改道 stderr。这不是"消失"，是搬家。
+* **`stream=sys.stdout` 不能当默认参数。** 默认值在函数定义时求值，重定向 `sys.stdout` 对它无效——先是报告照旧出现在 stdout，文档跟在后面，看起来像"契约没生效"。所有 `report(..., stream=None)` 现在在函数体里解析。
+
+写文件失败也不再是 traceback：路径不可写 → 一行 stderr + exit 2（用法错误，因为路径是调用方给的）。共用的实现在 `tools/_output.py`，它没有 `main()`，不是工具。
+
 ## 加工具之前，先回答三个问题
 
 写在 `AGENTS.md` 的规则里，这里重复一遍，因为这是唯一能阻止数量涨回去的地方。

@@ -34,6 +34,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+from _output import add_json_flag, guard, reserve_stdout, write  # noqa: E402
 
 import machine_lib as ml  # noqa: E402
 
@@ -149,13 +152,10 @@ def main(argv=None):
     # checked is how a wrong unit gets recorded as fact.
     if undetermined or args.keep_errors:
         errors_path = out_path.replace(".json", "-errors.json")
-        with open(errors_path, "w", encoding="utf-8") as handle:
-            json.dump({item["field"]: item for item in undetermined},
-                      handle, ensure_ascii=False, indent=1)
+        write({item["field"]: item for item in undetermined}, errors_path)
         print("raw errors written to", errors_path)
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as handle:
-        json.dump(known, handle, ensure_ascii=False, indent=1, sort_keys=True)
+    write(known, out_path, sort_keys=True)
     print()
     print("measured %d, undetermined %d; %d total in %s"
           % (len(measured), len(undetermined), len(known), out_path))
@@ -165,4 +165,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guard(main))

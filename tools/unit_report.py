@@ -36,6 +36,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+from _output import add_json_flag, guard, reserve_stdout, write  # noqa: E402
 
 import alpha_registry  # noqa: E402
 import alpha_unit as au  # noqa: E402
@@ -82,13 +85,14 @@ def load(entries=None):
     return corpus, known, datasets
 
 
-def report(corpus, counts, stream=sys.stdout):
+def report(corpus, counts, stream=None):
     """The hierarchy plus the top of each level, in the order the questions are asked.
 
     Every line is printed with the unit it counts: "117 rows say ACTIVE" and "48
     ACTIVE keys" are different numbers about different things, and the report has to
     say which is which or the reader supplies their own.
     """
+    stream = sys.stdout if stream is None else stream
     print("corpus", file=stream)
     print("  expressions      %d  (after inlining; variables are not content)"
           % counts["expressions"], file=stream)
@@ -142,13 +146,14 @@ def report(corpus, counts, stream=sys.stdout):
     return units
 
 
-def gaps(corpus, known, stream=sys.stdout, top=12):
+def gaps(corpus, known, stream=None, top=12):
     """Derivations of book constructions that the ledger has never run.
 
     The book is where the money is, so "which questions about it were never asked" is
     the cheapest question in the corpus. Ablations dominate: 43 of the 48 book alphas
     are composites whose legs were never individually removed.
     """
+    stream = sys.stdout if stream is None else stream
     book = [point for point in corpus.points
             if any((status or "").upper() == "ACTIVE" for status in point.statuses)]
     totals = collections.Counter()
@@ -180,7 +185,7 @@ def gaps(corpus, known, stream=sys.stdout, top=12):
     return rows
 
 
-def crossings(corpus, known, stream=sys.stdout, top=10):
+def crossings(corpus, known, stream=None, top=10):
     """Templates nobody ran, assembled from legs that each already exists.
 
     Only a handful survive the guards (same role, same data families, one leg
@@ -188,6 +193,7 @@ def crossings(corpus, known, stream=sys.stdout, top=10):
     legs are interchangeable, and "both are ranked ratios over fundamentals" is a
     reason while "both are subexpressions" is not.
     """
+    stream = sys.stdout if stream is None else stream
     total = novel = 0
     rows = []
     for unit in corpus.units.values():
@@ -231,7 +237,7 @@ def _payload(corpus):
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--json", default=None, help="write every unit here")
+    add_json_flag(parser, help_="write every unit (default: stdout)")
     parser.add_argument("--unit", default=None, help="show one unit by key prefix")
     parser.add_argument("--derive", default=None, help="derivations for one unit prefix")
     parser.add_argument("--gaps", action="store_true", help="book derivations never run")
@@ -239,6 +245,7 @@ def main() -> int:
                         help="templates assembled from two existing constructions")
     parser.add_argument("--top", type=int, default=12)
     args = parser.parse_args()
+    reserve_stdout(args)
 
     entries = alpha_registry.load_entries()
     corpus, known, _datasets = load(entries)
@@ -288,11 +295,11 @@ def main() -> int:
         return 1
 
     if args.json:
-        with open(args.json, "w") as handle:
-            json.dump(_payload(corpus), handle, ensure_ascii=False, indent=1)
-        print("\nwrote %s (%d units)" % (args.json, len(corpus.units)))
+        target = write(_payload(corpus), args.json)
+        if target and target != "-":
+            print("\nwrote %s (%d units)" % (target, len(corpus.units)))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guard(main))

@@ -30,6 +30,9 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
+sys.path.insert(0, HERE)
+
+from _output import add_json_flag, guard, reserve_stdout, write  # noqa: E402
 
 import alpha_registry  # noqa: E402
 import correlation  # noqa: E402
@@ -101,8 +104,9 @@ def main(argv=None):
     parser.add_argument("--min-fitness", type=float, default=1.25)
     parser.add_argument("--min-overlap", type=int, default=200)
     parser.add_argument("--registry", default=None)
-    parser.add_argument("--out", default=None)
+    add_json_flag(parser, help_="write the table (default: stdout)")
     args = parser.parse_args(argv)
+    reserve_stdout(args)
 
     path = args.registry or alpha_registry.default_registry_path()
     entries = [entry for entry in alpha_registry.unique_entries(
@@ -170,13 +174,11 @@ def main(argv=None):
     print("  sharpe median 2.224, turnover median 0.4752, holding 2.10 days,")
     print("  pairwise correlation median 0.1431, mean 0.1586, max 0.8733")
 
-    if args.out:
-        with open(args.out, "w", encoding="utf-8") as handle:
-            json.dump(table, handle, ensure_ascii=False, indent=1)
-        print()
-        print("wrote", args.out)
+    target = write(table, args.json)
+    if target and target != "-":
+        print("wrote", target)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(guard(main))
