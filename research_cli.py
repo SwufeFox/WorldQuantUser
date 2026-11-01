@@ -2177,8 +2177,21 @@ def _record_submitted_alpha(session, alpha_id):
              % (current.get("dateSubmitted"),),
         source="submit")
     stored, written = alpha_registry.record_entry(entry)
+    # Pull the new alpha's daily PnL into the local store as part of recording. Every
+    # local correlation scan reads <research>/pnl/, so a submission that is not cached
+    # here is invisible to the next scan -- and the scan is the cheap way to see what
+    # the submission just displaced.
+    cached = None
+    try:
+        pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+        series = ml.fetch_daily_pnl(session, alpha_id, cache_dir=pnl_dir,
+                                    max_age_hours=0)
+        cached = len(series or {})
+    except Exception as error:  # noqa: BLE001 - a cache miss must not fail the record
+        cached = "unavailable: %s" % str(error)[:60]
     return {"key": stored.get("key"), "status": stored.get("status"),
-            "written": written, "metrics": bool(stored.get("metrics"))}
+            "written": written, "metrics": bool(stored.get("metrics")),
+            "pnl_cached": cached}
 
 
 def cmd_alpha_list(args, _sink):

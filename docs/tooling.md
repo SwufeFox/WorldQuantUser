@@ -80,6 +80,7 @@ python3 research_cli.py alpha submit ID --yes --record   # 真提交 + 回读 + 
 * **没有 `--yes` 就不发**——平台没有"试提交"，预检就是 check 流程；
 * **`name` / `category` 必须先设**，否则拒绝（`alpha describe ID --name ... --category ...`）。没有标签的 alpha 事后无法归属；
 * **`--record` 用 `regular_expression()` 和 `is` 段**取数，不直接摸平台原始 payload——`regular` 有时是字符串、有时是对象，摸错一次就记了一行没有 metrics 的账（2026-11-01 真实发生过）。
+* **`--record` 顺带把这条 alpha 的日频 PnL 缓存到 `<research>/pnl/`**。本地相关扫描读的就是那个目录，不缓存的话新提交在下次扫描里是隐形的——而扫描正是看清"这次提交挤掉了什么"的便宜办法（2026-11-01：提交 `leMnKWol` 一条，同族 10 条从 0.35 跳到 0.95）。
 
 台账那边现在也会拦：`record_entry` 拒绝用没有 metrics 的行覆盖有 metrics 的行，除非显式 `allow_metrics_loss=True`。
 
