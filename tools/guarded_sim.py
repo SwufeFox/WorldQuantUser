@@ -95,6 +95,11 @@ def simulate(expressions, settings=None, labels=None, force=False, session=None,
             lines.append("  %-14s %s" % (item["code"], subject))
             if item.get("message"):
                 lines.append("      " + item["message"])
+            # `check` already knows which expression each finding came from; dropping
+            # it here left a batch of eight with one bad name and no way to tell
+            # which -- you had to rerun `check` yourself to find out.
+            if item.get("expression"):
+                lines.append("      in: " + " ".join(item["expression"].split())[:100])
         raise UnknownNameError(
             "refusing to spend a simulation: %d blocking finding(s)\n%s"
             % (len(blocking), "\n".join(lines))
