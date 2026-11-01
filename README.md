@@ -86,6 +86,21 @@ measurements justified each step, and which two migrations were measured and the
 deliberately declined. Read it before changing anything that extracts information
 from an expression by pattern-matching the string.
 
+## Documentation
+
+Four pages, each written to stop a specific mistake being repeated:
+
+| Page | Read it when |
+| --- | --- |
+| `docs/tooling.md` | you are about to add a tool, or cannot remember which one answers a question |
+| `docs/ast-pipeline.md` | you are about to inspect an expression with a regex |
+| `docs/unit-compression.md` | you want to know how many constructions there really are, and what each has not tried |
+| `docs/backup-replay.md` | you are about to trust a number, or touch the research directory |
+
+The pattern in all four is the same: measure first, record what was measured *and
+rejected*, and state the number with its unit, because the counts in prose go stale
+and the reasons do not.
+
 ## Install
 
 ```bash
