@@ -262,7 +262,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mechanisms", action="store_true",
                         help="print the per-mechanism table instead of writing the report")
-    parser.add_argument("--out", default=None)
+    parser.add_argument("--out", default=None,
+                        help="write the inventory as markdown here (not JSON: "
+                             "this one is a document meant to be read)")
     args = parser.parse_args()
 
     session = ml.login()
