@@ -34,6 +34,7 @@ sys.path.insert(0, HERE)
 from _output import add_json_flag, guard, reserve_stdout, write  # noqa: E402
 
 import alpha_registry  # noqa: E402
+import closed_families  # noqa: E402
 import fastexpr_ast as fa  # noqa: E402
 
 
@@ -87,7 +88,7 @@ def build(entries):
                 "expressions": set(), "book": set(), "fields": set(),
                 "best_fitness": None, "best_alpha": None, "fitness_sum": 0.0,
                 "fitness_n": 0, "example": expression,
-                "book_fitness": None, "book_alpha": None,
+                "book_fitness": None, "book_alpha": None, "book_families": set(),
             })
             slot["expressions"].add(expression)
             slot["fields"].update(fields)
@@ -98,6 +99,8 @@ def build(entries):
                 # over every expression containing the shape -- including rejected and
                 # never-submitted ones -- so 18 of 34 seeds were ranked by a score no
                 # book member ever achieved.
+                if entry.get("family"):
+                    slot["book_families"].add(entry["family"])
                 if fitness is not None and (slot["book_fitness"] is None
                                             or fitness > slot["book_fitness"]):
                     slot["book_fitness"] = fitness
@@ -139,7 +142,7 @@ def screen(catalogue, min_fitness=1.5, max_expressions=3):
     return proven, untapped, dead
 
 
-def portable_seeds(catalogue, min_fitness=1.2, max_book=1):
+def portable_seeds(catalogue, min_fitness=1.2, max_book=1, spec=None):
     """Proven parts that appear in few book alphas: ingredients never ported.
 
     The co-occurrence version of this question was degenerate -- most book alphas are a
@@ -151,7 +154,17 @@ def portable_seeds(catalogue, min_fitness=1.2, max_book=1):
     rows = [slot for slot in catalogue.values()
             if slot["n_book"] > 0 and slot["n_book"] <= max_book
             and (slot.get("book_fitness") or 0) >= min_fitness]
-    rows.sort(key=lambda s: -(s.get("book_fitness") or 0))
+    # A seed whose only book member sits in a closed family is a trap: the option-IV
+    # family ranks first by best-ever fitness and is closed for concentration. Sorted
+    # to the back and labelled rather than removed -- hiding a row is how the family
+    # got recommended in the first place.
+    for slot in rows:
+        slot["closed_reason"] = next(
+            (reason for reason in (closed_families.reason(f, spec)
+                                   for f in slot.get("book_families") or ())
+             if reason), None)
+    rows.sort(key=lambda s: (s["closed_reason"] is not None,
+                             -(s.get("book_fitness") or 0)))
     return rows
 
 
@@ -198,8 +211,12 @@ def main() -> int:
     catalogue = build(entries)
     if args.seeds:
         rows = portable_seeds(catalogue)
-        print("proven parts confined to a single book family (%d):" % len(rows))
+        blocked = sum(1 for slot in rows if slot.get("closed_reason"))
+        print("proven parts confined to a single book family (%d, %d of them in a "
+              "closed family and sorted last):" % (len(rows), blocked))
         for slot in rows[:args.top]:
+            if slot.get("closed_reason"):
+                print("\n  [CLOSED: %s]" % slot["closed_reason"][:88])
             print("\n  F=%.2f  n=%-3d book=%-2d  %s"
                   % (slot["best_fitness"] or 0, slot["n_expressions"], slot["n_book"],
                      slot["shape"][:92]))

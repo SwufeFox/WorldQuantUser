@@ -42,6 +42,7 @@ from _output import add_json_flag, guard, reserve_stdout, write  # noqa: E402
 
 import alpha_registry  # noqa: E402
 import alpha_unit as au  # noqa: E402
+import closed_families  # noqa: E402
 import fastexpr_ast as fa  # noqa: E402
 
 #: How an assembly token reads in prose. The vocabulary is small on purpose: there
@@ -127,14 +128,40 @@ def report(corpus, counts, stream=None):
 
     print("\nkinds by size", file=stream)
     kinds = sorted(corpus.kinds.values(), key=lambda k: (-k.size, k.assembly))
+    closed = closed_families.closed_families()
     for kind in kinds[:12]:
         best = max((fitness_of(point) or 0) for unit in kind.units
                    for point in unit.points) or None
-        print("  %4d  %-14s %-22s  units=%d  best F=%s"
+        flag = ""
+        hit = sorted(closed.intersection(kind.families))
+        if hit:
+            # The option family proves F3.38 is possible and useless: concentration
+            # kills it. A size column that does not say so reads as an opportunity.
+            flag = "  [CLOSED: %s]" % ",".join(hit)
+        print("  %4d  %-14s %-22s  units=%d  best F=%s%s"
               % (kind.size, ",".join(kind.families) or "-", kind.assembly,
-                 len(kind.units), "%.2f" % best if best else "-"), file=stream)
+                 len(kind.units), "%.2f" % best if best else "-", flag), file=stream)
         print("        e.g. %s"
               % kind.units[0].points[0].expression.replace("\n", " ")[:120], file=stream)
+
+    # A closed family that scores well is the most dangerous row in this report,
+    # and it is always small, so the size-ranked table above never shows it. Listed
+    # separately, by score, with the reason.
+    dead = []
+    for kind in corpus.kinds.values():
+        hit = sorted(closed.intersection(kind.families))
+        if not hit:
+            continue
+        best = max((fitness_of(point) or 0) for unit in kind.units
+                   for point in unit.points) or 0
+        dead.append((best, kind, hit))
+    if dead:
+        print("\nclosed families that still score well (do not read the F as an "
+              "opportunity)", file=stream)
+        for best, kind, hit in sorted(dead, key=lambda row: -row[0])[:5]:
+            print("  %4d  %-14s %-20s  best F=%.2f   [CLOSED: %s]"
+                  % (kind.size, ",".join(kind.families), kind.assembly, best,
+                     ",".join(hit)), file=stream)
 
     print("\nunits by size", file=stream)
     units = sorted(corpus.units.values(), key=lambda u: -u.size)

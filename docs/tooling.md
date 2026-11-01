@@ -68,6 +68,19 @@ python3 tools/unit_report.py                    # 不传就是人读的报告
 
 写文件失败也不再是 traceback：路径不可写 → 一行 stderr + exit 2（用法错误，因为路径是调用方给的）。共用的实现在 `tools/_output.py`，它没有 `main()`，不是工具。
 
+## 工具会读的封闭清单
+
+`<research>/closed-families.json` 是机制地图第二节的机器可读版：20 条已关闭的方向，带 id、类型（`blocked-by-check` / `falsified` / `structurally-impossible`）、理由、证据。
+
+只有带 `match` 的条目能机械匹配（今天是 `family: option`），其余是技术方向（"把腿放慢"、"跨族移植"），表达式里看不出来，留给人和 agent 读。
+
+读它的地方：
+
+* `parts_catalogue --seeds` —— 来自封闭族的种子会标 `[CLOSED: 理由]` 并排到最后，**不删**（藏起来正是它上次被推荐的原因）。
+* `unit_report` —— kind 表里标封闭族，另外单独列一节"封闭族里分数很高的"，因为那种行最容易看成机会（`fundamental,option` 那个 kind best F **3.89**）。
+
+文件缺失或损坏时两个工具都照常运行，只是什么都不标——研究文件不见了不该让工具停摆。
+
 ## 加工具之前，先回答三个问题
 
 写在 `AGENTS.md` 的规则里，这里重复一遍，因为这是唯一能阻止数量涨回去的地方。
