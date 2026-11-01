@@ -47,6 +47,12 @@ _TOKENS = {"G": "leg", "-G": "−leg", "L": "offset", "-L": "−offset"}
 
 
 def describe_assembly(assembly):
+    """``G -L -G`` -> ``leg −offset −leg``: the pattern in words, not in symbols.
+
+    The tokens are the whole vocabulary -- there are only two, a leg and a constant --
+    so the translation is three lines and removes the "what is G" step from every
+    reading of the report.
+    """
     return " ".join(_TOKENS.get(token, token) for token in assembly.split())
 
 
@@ -76,14 +82,13 @@ def load(entries=None):
     return corpus, known, datasets
 
 
-def hierarchy(corpus, entries):
-    counts = au.summary(corpus)
-    rows = [len(entries), len(corpus.points), counts["units"], counts["kinds"],
-            counts["assemblies"]]
-    return rows, counts
-
-
 def report(corpus, counts, stream=sys.stdout):
+    """The hierarchy plus the top of each level, in the order the questions are asked.
+
+    Every line is printed with the unit it counts: "117 rows say ACTIVE" and "48
+    ACTIVE keys" are different numbers about different things, and the report has to
+    say which is which or the reader supplies their own.
+    """
     print("corpus", file=stream)
     print("  expressions      %d  (after inlining; variables are not content)"
           % counts["expressions"], file=stream)

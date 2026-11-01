@@ -54,6 +54,13 @@ def live_book(session):
 
 
 def build(session):
+    """Read the live book and group it by construction, not by alpha.
+
+    The live list comes from the platform and the structure comes from the ledger, so
+    an alpha that is live but missing from the ledger is dropped rather than guessed
+    at -- it has no expression to decompose. That gap is what :func:`backlog` exists
+    to report.
+    """
     by_id = {e.get("alpha_id"): e for e in alpha_registry.load_entries() if e.get("alpha_id")}
     ids = [i for i in live_book(session) if i in by_id]
     entries = [by_id[i] for i in ids]
@@ -151,6 +158,12 @@ def distant(session, book_entries, min_fitness=1.2):
 
 
 def render(entries, families, pending=(), far=()):
+    """Render the inventory as markdown: what we hold, grouped by what it is.
+
+    `pending` and `far` are listed rather than merged: an alpha that is waiting and an
+    alpha that is structurally distant from the book are different kinds of not-yet,
+    and collapsing them into "candidates" loses the reason someone would look.
+    """
     today = datetime.date.today().isoformat()
     lines = ["# Book inventory — %s" % today, ""]
     universes = collections.Counter((e.get("settings") or {}).get("universe") for e in entries)

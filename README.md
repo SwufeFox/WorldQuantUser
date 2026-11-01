@@ -37,16 +37,32 @@ research_cli.py schema      # the whole contract, as JSON
 | `operator_semantics.py` | Invariants the operator catalogue does not publish. |
 | `annotations.py` | `@annotation` vocabulary, staleness checks, ablation derivation. |
 | `intent.py` | Rewrite "rank a level" into "rank a level over size". |
+| `alpha_unit.py` | Compress the ledger into constructions: template, grid, derivation. |
+| `expression_units.py` | Field units, harvested from the simulator's rejections. |
+| `rejection_reasons.py` | Why a rejection happened: the cause, not just the gate. |
+| `tools/guarded_sim.py` | Simulate only after the catalogue check; refuses unknown names. |
+| `tools/wire_guard.py` | Rewrite a research script so every simulation goes through the guard. |
+| `tools/research_template.py` | Runnable skeleton for a new experiment; copy it, do not start blank. |
 | `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
 | `tools/pool_stats.py` | Report the pool as quartiles rather than as a best alpha. |
 | `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |
 | `tools/dedupe_ledger.py` | Find identical-PnL entries that are one alpha filed twice. |
+| `tools/degenerate_batch.py` | Flag a batch whose different expressions produced the same result. |
+| `tools/reconcile_status.py` | Make the ledger's `status` column agree with the platform. |
 | `tools/derive_family.py` | Derive family labels from the datafield namespace. |
 | `tools/family_graph.py` | Sibling / extends / shares graph over construction, plus components. |
 | `tools/family_graph_png.py` | Draw the graph one family per cell. |
-| `tools/guarded_sim.py` | Simulate only after the catalogue check; refuses unknown names. |
+| `tools/unit_report.py` | How few constructions the ledger is, and what each has not tried. |
+| `tools/parts_catalogue.py` | Reusable parts, screened by how many book families they serve. |
+| `tools/book_inventory.py` | What the live book holds, grouped by construction. |
+| `tools/book_audit.py` | Reconcile the ledger's verdicts against the actual book. |
 | `tools/turnover_repair.py` | Break-even Sharpe for a smoothing decision. |
+| `tools/backup_replay.py` | Snapshot the research directory; replay it as of a date; diff drift. |
 | `tests/` | Offline contract tests. No account required. |
+
+`docs/tooling.md` maps these to the question each one answers. There are 18 of them
+because eight were removed on 2026-11-01 for being superseded or one-shot -- see the
+note at the top of that file before adding a nineteenth.
 
 **This repository versions the tool, not the research.** Simulation results,
 field-catalog snapshots, the alpha registry and the learned operator denylist
@@ -899,8 +915,10 @@ Errors are typed and subclass `machine_lib.BrainError`: `MissingCredentials`,
   internally.
 * **Region access is account-scoped.** Unknown region/neutralization values are
   rejected before any request is made.
-* **No interactive prompts.** `login_hk()` raises with the authorization URL
-  instead of blocking on `input()`.
+* **No interactive prompts.** Every authentication failure raises -- `MissingCredentials`,
+  `AuthError`, or `CaptchaRequired` -- instead of blocking on `input()`. A prompt is a
+  hang for an automated caller, and a hang looks like a slow request rather than a
+  failure.
 * **Field contracts are partly inferred.** No BRAIN endpoint declares a field's
   unit, currency, fiscal period or sign convention. `field_contract` labels
   every attribute `declared` / `inferred` / `unknown` and never guesses a value

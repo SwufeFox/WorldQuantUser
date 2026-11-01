@@ -143,6 +143,12 @@ def portable_seeds(catalogue, min_fitness=1.2, max_book=1):
 
 
 def report(catalogue, stream=None):
+    """Print proven / untapped / dead parts with the count that got them there.
+
+    Each row carries its own evidence -- best Fitness, how many expressions, how many
+    book alphas -- because "proven" and "untapped" are claims about counts, and a
+    reader who cannot see the counts has to trust the label instead.
+    """
     stream = stream or sys.stdout
     proven, untapped, dead = screen(catalogue)
     print("parts: %d  (proven %d, untapped %d, dead %d)"

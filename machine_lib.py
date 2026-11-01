@@ -1,3 +1,40 @@
+"""The BRAIN transport: sessions, the metadata cache, and the simulation loop.
+
+This module is the only place that talks HTTP to BRAIN. Everything above it --
+`research_cli`, `guarded_sim`, `tools/*` -- is policy, and the split is deliberate:
+a rule about *what* to simulate belongs where it can be read in ten lines, not
+buried in a 2,000-line client.
+
+What lives here, in the order a request flows through it:
+
+* **errors** -- one ``BrainError`` family, so a caller can catch the class instead
+  of matching strings. ``CaptchaRequired`` is separate because it is the one
+  failure a retry makes worse.
+* **credentials and the session cache** -- ``login`` / ``authenticate`` read the
+  configured account and cache the session so repeated invocations do not re-login;
+  BRAIN answers rapid logins with a captcha, so a cache miss is cheaper than a
+  second POST. Nothing here prompts: an interactive prompt is a hang for an
+  automated caller, so every failure raises with what the caller would need.
+* **the metadata cache** -- datasets, operators and datafields, with a TTL, because
+  the catalogue changes slowly and a field list is not worth a request per run.
+  ``cached_metadata`` is the single door; a stale entry is usable, an absent one is
+  fetched once (single-flight, so two concurrent runs do not both fetch).
+* **JSON transport** -- ``request_json`` applies the retry policy, honours
+  ``Retry-After``, and raises ``RateLimited`` only when the budget is spent. Every
+  endpoint wrapper below goes through it.
+* **the simulation loop** -- ``simulate_alphas`` submits in batches, polls, and
+  checkpoints, so an interrupted batch resumes instead of re-spending quota. This is
+  the expensive call; ``guarded_sim`` is what decides whether it may run.
+
+What is deliberately *not* here: no linting (that is ``expression_lint`` via
+``guarded_sim``), no record keeping (that is ``alpha_registry``), and no opinion
+about which alphas are worth running. A transport that also judges is a transport
+nobody can test.
+
+``pandas`` is optional: it is imported for the dataframe helpers only, so the CLI
+and the tests work on a machine without it.
+"""
+
 import hashlib
 import json
 import math

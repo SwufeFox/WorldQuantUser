@@ -135,6 +135,12 @@ def verify(path, expected_expressions):
 
 
 def ensure_import(source):
+    """Add the ``guarded_sim`` import beside the existing ``machine_lib`` one.
+
+    Next to it, not at the top: research scripts manipulate ``sys.path`` before
+    importing, so an import placed above that line fails at runtime and the failure
+    looks like a missing module rather than a rewrite that landed in the wrong place.
+    """
     if "import guarded_sim" in source:
         return source
     if SYS_PATH_LINE not in source:

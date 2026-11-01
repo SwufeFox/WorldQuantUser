@@ -61,22 +61,24 @@ sum are still the grid and are never stripped.
 
 ## The hierarchy, measured
 
+Counts are a snapshot (2026-11-01); they move with every filing, the ratios do not.
+
 | Level | Count | What question it answers |
 | --- | --- | --- |
-| Ledger rows | 1261 | what was filed |
-| Expressions (after inlining) | **920** | what was run: variables are not content |
+| Ledger rows | 2134 | what was filed (1274 distinct keys) |
+| Expressions (after inlining) | **927** | what was run: variables are not content |
 | Assemblies | **41** | how are legs mixed |
 | Kinds (assembly × data family) | **130** | what kinds of alpha exist here |
-| Units (exact template) | **554**, 434 of them singletons | the construction, plus its grid |
-| One-step moves | **479** | what can be tried next without inventing a value |
+| Units (exact template) | **558**, 437 of them singletons | the construction, plus its grid |
+| One-step moves | **483** | what can be tried next without inventing a value |
 
 So the compression is **1.66x at template level, 7.1x at kind level, 22x at assembly
 level** — and the level that compresses best is the level that says least about any
 single alpha. That is not a defect of the method, it is a fact about the corpus:
 
-> 434 of 554 templates contain exactly one expression. The exploration was
+> 437 of 558 templates contain exactly one expression. The exploration was
 > breadth-first: one expression per idea, then move on. 53% of expressions sit in a
-> shared template, and only 479 single-slot moves are available across the whole
+> shared template, and only 483 single-slot moves are available across the whole
 > corpus with values it already uses.
 
 ### The alternative that looked better and was rejected
@@ -158,7 +160,7 @@ not "promising".
 ## The round-trip gate
 
 `verify` refills every template from its own filling and demands canonical equality
-with the expression it came from: **920/920, 0 failures**. This is the property that
+with the expression it came from: **927/927, 0 failures**. This is the property that
 separates a compression from a summary. A template that cannot be re-instantiated
 makes the coverage number say 100% while nothing was checked.
 

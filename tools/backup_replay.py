@@ -205,6 +205,13 @@ def ledger_stats(path):
 
 
 def build_manifest(root, files, profile, label=None):
+    """Describe an archive: every member's size and hash, plus what the ledger says.
+
+    The ledger block is what makes a manifest readable a year later without
+    extracting anything -- rows, distinct keys, date range, verdict mix, and the book
+    counted per key. A file list alone tells you the bytes survived, not what they
+    meant.
+    """
     manifest = {
         "version": 1,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -450,6 +457,12 @@ def _parse_stamp(text):
 
 
 def summarize(rows):
+    """Count a point-in-time view the way :func:`ledger_stats` counts the live file.
+
+    ``keys`` is the number of records after deduplication and ``book`` is how many of
+    those end ACTIVE. Both are key-level on purpose: the row-level version of the
+    same number is roughly twice as large and answers a question nobody asked.
+    """
     verdicts = collections.Counter(row.get("verdict") or "-" for row in rows)
     statuses = collections.Counter((row.get("status") or "-").upper() for row in rows)
     dates = [row.get("recorded_at") for row in rows if row.get("recorded_at")]
@@ -568,6 +581,7 @@ def select(entries, ids=None, status=None, verdict=None, limit=None, sample=None
 
 
 def report_backup(manifest, stream=sys.stdout):
+    """Print what was archived, in the terms the numbers are usually quoted in."""
     ledger = manifest.get("ledger") or {}
     print("archived %d files, %.1f MB uncompressed"
           % (manifest["totals"]["files"], manifest["totals"]["bytes"] / 1e6),
@@ -597,6 +611,11 @@ def report_backup(manifest, stream=sys.stdout):
 
 
 def report_replay(results, stream=sys.stdout):
+    """Summarise a replay by identical / drifted / failed, and name the worst drift.
+
+    "Drifted" is not a verdict on the alpha -- it is a statement that the platform's
+    answer changed, which is the thing worth knowing before trusting any older number.
+    """
     total = len(results)
     errored = [item for item in results if item.get("error")]
     drifted = [item for item in results

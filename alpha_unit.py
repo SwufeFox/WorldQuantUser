@@ -26,8 +26,10 @@ one template plus a grid. The template is a real tree with :class:`Slot` leaves,
 unit can be re-instantiated at any grid point -- that is the "derivable" half. The
 grid is what has actually been run -- that is the "compressible" half.
 
-The measured hierarchy (40 assemblies, 129 kinds, 550 units over 915 expressions on
-2026-11-01) is reported by ``python3 tools/unit_report.py``; see
+The measured hierarchy is reported by ``python3 tools/unit_report.py``. What has
+stayed put across measurements is the *shape* of it -- roughly 22x fewer assemblies
+than expressions, 7x fewer kinds, 1.7x fewer templates -- while the absolute counts
+move every time an alpha is filed, so they are not repeated here. See
 ``docs/unit-compression.md`` for the table, for what does *not* compress, and for the
 grouping that measured better and was rejected.
 
@@ -573,6 +575,11 @@ class Unit:
 
     @property
     def size(self):
+        """How many grid points this template has actually been run at.
+
+        Not "how many alphas it explains": the same point can be filed at several
+        universes and still be one grid point.
+        """
         return len(self.points)
 
     @property
@@ -593,10 +600,12 @@ class Unit:
 
     @property
     def roles(self):
+        """One role per leg, in leg order -- the construction's job description."""
         return tuple(leg.role for leg in self.legs)
 
     @property
     def fields(self):
+        """Every field the template reads, deduplicated: what data it is exposed to."""
         return tuple(sorted({field for leg in self.legs for field in leg.fields}))
 
 
@@ -615,10 +624,20 @@ class Kind:
 
     @property
     def size(self):
+        """Expressions in this kind, counting every unit's points.
+
+        A kind is a bucket, so its size is the sum of what fell in -- unlike a unit,
+        whose size is distinct grid points.
+        """
         return sum(unit.size for unit in self.units)
 
     @property
     def roles(self):
+        """Every distinct role in the kind, in first-seen order.
+
+        First-seen rather than sorted: the report shows the first three, and the first
+        three of a kind are the ones its members were built around.
+        """
         seen, ordered = set(), []
         for unit in self.units:
             for role in unit.roles:
