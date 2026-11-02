@@ -203,8 +203,15 @@ def classify(daily_correlation, threshold=0.7, platform_bias=PLATFORM_BIAS):
     is why an alpha at 0.66 locally is worth trying and one at 0.70 is not. Getting the sign
     wrong here is expensive in one direction only: it spends submissions on alphas that were
     always going to be refused.
+
+    The limit is on ``|r|``. The platform blocks a candidate that mirrors an existing alpha
+    whatever the direction, so a peer at -0.95 blocks exactly as hard as one at +0.95; an
+    earlier version compared the signed value and called a perfect mirror ``clear``.
+    ``None`` means nothing was measured, which is ``unknown`` rather than ``clear``.
     """
-    estimate = round(min(1.0, daily_correlation + platform_bias), 4)
+    if daily_correlation is None:
+        return "unknown", None
+    estimate = round(min(1.0, abs(daily_correlation) + platform_bias), 4)
     if estimate >= threshold:
         return "blocked", estimate
     if estimate >= threshold - BORDERLINE_BAND:

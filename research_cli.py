@@ -1798,7 +1798,7 @@ def cmd_search(args, _sink):
     return data
 
 
-def _preflight_lint(session, pairs, args):
+def _preflight_lint(session, pairs, settings, args):
     """Lint against the operator catalog before spending simulation quota.
 
     Two catalogs are consulted, not one. The operator index catches
@@ -1836,14 +1836,14 @@ def _preflight_lint(session, pairs, args):
         slow_datasets = {"fundamental2", "fundamental6", "analyst4"}
         records = field_index.fetch_all_fields(
             session,
-            # `simulate` leaves these as None so a research file's settings win.
-            # Passing None straight through makes /data-fields answer
-            # "Invalid query", so each falls back on a falsy check rather than a
-            # plain getattr default.
-            region=getattr(args, "region", None) or "USA",
-            universe=getattr(args, "universe", None) or "TOP3000",
-            delay=getattr(args, "delay", None) if getattr(args, "delay", None) is not None else 1,
-            instrument_type=getattr(args, "instrument_type", None) or "EQUITY",
+            # Lint against the settings the simulation will actually use. Reading the
+            # raw CLI flags instead meant a research file asking for TOP500 was still
+            # linted against TOP3000: different field catalogue, so the check could
+            # reject a valid field or wave an unavailable one through.
+            region=settings.get("region") or "USA",
+            universe=settings.get("universe") or "TOP3000",
+            delay=settings.get("delay") if settings.get("delay") is not None else 1,
+            instrument_type=settings.get("instrumentType") or "EQUITY",
         )
         known_fields = field_index.field_ids(records)
         field_note = "checked (%d names)" % len(known_fields)
@@ -1974,7 +1974,7 @@ def cmd_simulate(args, sink):
     # Real submission: lint against the operator catalog first. An unknown
     # operator would otherwise burn a submission slot and a polling wait before
     # BRAIN rejected it -- exactly how `regression_neut` cost a round trip.
-    with_session(args, lambda s: _preflight_lint(s, pairs, args))
+    with_session(args, lambda s: _preflight_lint(s, pairs, settings, args))
 
     checkpoint_path, checkpoint = _prepare_simulation_run(
         settings, pairs, args.batch_size, args.checkpoint,
@@ -2948,6 +2948,31 @@ def cmd_alpha_describe(args, _sink):
     return data
 
 
+def _rank_peers(scored):
+    """Order peers by absolute correlation, largest first.
+
+    The platform's limit is on ``|r|``: a candidate that mirrors an existing alpha
+    has a large negative correlation and is blocked exactly as hard as a positive
+    one. Sorting on the signed value put such a peer last and reported the
+    runner-up as the counterpart.
+    """
+    return sorted(scored, key=lambda item: -abs(item.get("correlation") or 0.0))
+
+
+def _independence_state(flagged, skipped, measured):
+    """Three states, because "no measured pair cleared the line" is not independence.
+
+    A pair whose overlap is too short lands in ``skipped``. Treating that as a pass
+    is absence of evidence read as evidence of absence, and the unmeasurable pair is
+    the one most likely to be a duplicate.
+    """
+    if flagged:
+        return "dependent"
+    if skipped or not measured:
+        return "unknown"
+    return "independent"
+
+
 def cmd_alpha_self_check(args, sink):
     """Reproduce the platform's self-correlation check locally, and better.
 
@@ -3039,11 +3064,11 @@ def cmd_alpha_self_check(args, sink):
                            "correlation": round(correlation.pearson(left, right), 4),
                            "when": peer["when"].isoformat() if peer["when"] else None,
                            "status": peer["status"]})
-        scored.sort(key=lambda item: -item["correlation"])
+        scored[:] = _rank_peers(scored)
         broadcast[frequency] = scored
 
     daily = broadcast["d"]
-    best = daily[0] if daily else {"alpha_id": None, "correlation": 0.0}
+    best = daily[0] if daily else {"alpha_id": None, "correlation": None}
     # The platform reads a little lower than daily Pearson; the offset is measured, not
     # assumed, and it is what makes `borderline` a useful verdict instead of a shrug.
     verdict, estimate = correlation.classify(best["correlation"], args.threshold,
@@ -3130,6 +3155,14 @@ def cmd_alpha_corr(args, sink):
     dates = sorted(set.intersection(*(set(v) for v in series.values())))
     matrix = correlation.matrix(series, min_overlap=args.min_overlap)
     high = [p for p in matrix["pairs"] if abs(p["r"]) >= args.threshold]
+    # Absence of evidence is not evidence of absence. A pair whose overlap is too
+    # short lands in `skipped`, and an earlier version then reported `independent`
+    # because no measured pair cleared the threshold -- exactly backwards: the
+    # unmeasurable pair is the one most likely to be a duplicate.
+    skipped = matrix.get("skipped") or []
+    measured = len(matrix["pairs"])
+    total_pairs = measured + len(skipped)
+    independence = _independence_state(high, skipped, measured)
     data = {
         "ids": ids,
         "window": {
@@ -3140,7 +3173,15 @@ def cmd_alpha_corr(args, sink):
         "matrix": matrix,
         "flagged": high,
         "threshold": args.threshold,
-        "independent": not high,
+        "independence": independence,
+        "independent": independence == "independent",
+        "coverage": {
+            "measured_pairs": measured,
+            "skipped_pairs": len(skipped),
+            "ratio": round(measured / total_pairs, 4) if total_pairs else None,
+            "note": ("unmeasurable pairs make independence unknowable"
+                     if skipped else None),
+        },
     }
 
     if book:

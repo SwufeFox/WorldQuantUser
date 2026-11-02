@@ -171,6 +171,8 @@ def variants(expression, modes=MODES):
 
 
 def _fitness(record):
+    if not record:
+        return None
     metrics = record.get("metrics") or {}
     value = metrics.get("fitness")
     return value if isinstance(value, (int, float)) else None
@@ -195,13 +197,15 @@ def report(records):
 
     full = by_id.get("full")
     full_fitness = _fitness(full) if full else None
-    legs = []
-    for name in sorted(by_id):
-        if name.startswith("solo:"):
-            leg = name.split(":", 1)[1]
-            if any(row["leg"] == leg for row in legs):
-                continue
-            legs.append({"leg": leg, "solo": _fitness(by_id[name])})
+    # Legs come from the union of both arms. Building them from `solo:` alone meant a
+    # run of `--modes full,loo` -- which the CLI supports -- reported zero legs even
+    # though every contribution had been measured.
+    names = set()
+    for name in by_id:
+        if name.startswith("solo:") or name.startswith("loo:"):
+            names.add(name.split(":", 1)[1])
+    legs = [{"leg": leg, "solo": _fitness(by_id.get("solo:" + leg))}
+            for leg in sorted(names)]
     for row in legs:
         loo = by_id.get("loo:" + row["leg"])
         row["without"] = _fitness(loo) if loo else None

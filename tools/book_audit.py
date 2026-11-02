@@ -99,8 +99,6 @@ def report(joined, group="idea"):
         "marked_candidate": len(candidates),
         "actually_in_book": len(in_book),
         "candidate_but_not_in_book": len(stale),
-        "book_entries_missing_from_ledger": sorted(set(k for k in joined if not joined[k]["in_book"]
-                                                       and False)) or [],
         "by_group": {k: v for k, v in sorted(buckets.items(),
                                              key=lambda kv: -kv[1]["in_book"])},
         "stale_alpha_ids": sorted(stale),

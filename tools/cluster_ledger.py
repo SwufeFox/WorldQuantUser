@@ -131,8 +131,14 @@ def components_by(ids, similarity, threshold):
     return sorted(groups.values(), key=len, reverse=True)
 
 
-def independent_set(ids, pairs, threshold, priority):
-    """Greedy maximal set whose members are pairwise below the threshold."""
+def independent_set(ids, pairs, threshold, priority, unverified=()):
+    """Greedy maximal set whose members are pairwise below the threshold.
+
+    ``unverified`` names one side of a pair that could not be measured. Those nodes
+    are held out of the set: a pair with no measurement creates no conflict edge, so
+    including them would let two probable duplicates both be counted as independent.
+    """
+    blocked = set(unverified)
     conflicts = {name: set() for name in ids}
     for pair in pairs:
         if abs(pair["r"]) >= threshold:
@@ -141,6 +147,8 @@ def independent_set(ids, pairs, threshold, priority):
     order = sorted(ids, key=lambda name: priority.get(name, 0.0), reverse=True)
     chosen = []
     for name in order:
+        if name in blocked:
+            continue
         if any(other in conflicts[name] for other in chosen):
             continue
         chosen.append(name)
@@ -284,7 +292,9 @@ def main(argv=None):
                 for name in pnls}
 
     groups = components(list(pnls), pairs, args.threshold)
-    chosen = independent_set(list(pnls), pairs, args.threshold, priority)
+    unmeasured = {pair["a"] for pair in matrix["skipped"]} | {pair["b"] for pair in matrix["skipped"]}
+    chosen = independent_set(list(pnls), pairs, args.threshold, priority,
+                             unverified=unmeasured)
     near = sorted([p for p in pairs if abs(p["r"]) >= 0.9],
                   key=lambda p: -abs(p["r"]))
 
@@ -311,6 +321,10 @@ def main(argv=None):
 
     print()
     print("greedy independent set: %d alphas" % len(chosen))
+    total_pairs = len(pairs) + len(matrix["skipped"])
+    print("  measurement coverage: %d/%d pairs (%.0f%%); %d alphas held out as unverified"
+          % (len(pairs), total_pairs,
+             100.0 * len(pairs) / total_pairs if total_pairs else 0.0, len(unmeasured)))
     for name in chosen[:20]:
         row = describe(name)
         print("  %-10s fitness=%-5s family=%s"
@@ -334,6 +348,8 @@ def main(argv=None):
         "components": [{"size": len(group), "members": group} for group in groups],
         "component_count": len(groups),
         "independent_set": chosen,
+        "independent_set_unverified": sorted(unmeasured),
+        "coverage": {"measured_pairs": len(pairs), "skipped_pairs": len(matrix["skipped"])},
         "near_duplicates": near,
         "members": {name: describe(name) for name in pnls},
     }
