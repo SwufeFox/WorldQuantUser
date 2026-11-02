@@ -53,12 +53,18 @@ the implementation. **Do not read `research_cli.py` to learn the interface.**
    so expressions built on other regions will fail.
 4. **Prefer `catalog fields --expressions`** over hand-writing
    `winsorize(ts_backfill(...))` wrappers; it emits the expected idiom.
-5. **Never re-authenticate needlessly.** The session is cached in
+5. **Ask the unit layer before spending a simulation on a "new" data family.**
+   `python3 tools/unit_report.py --dataset model51` prints the shapes that family
+   has already been run in, how many points each has, and the best Fitness seen.
+   A dataset being absent from the *book* says nothing about the *ledger*: on
+   2026-11-03 six probes were simulated for model51 shapes the ledger already held,
+   one of them byte-identical, and the one command above would have said so.
+6. **Never re-authenticate needlessly.** The session is cached in
    `.brain_session.json`. BRAIN challenges rapid logins with a captcha
    (`AUTH_CAPTCHA`). Use `--relogin` only when the cache is actually stale.
-6. **Loop on structured feedback**, not on guesses: `simulate --sort sharpe`
+7. **Loop on structured feedback**, not on guesses: `simulate --sort sharpe`
    returns `summary.ranking` and `summary.best`; mutate from there.
-7. **A new tool has to earn its place.** `tools/` holds 18 entry points over 22k
+8. **A new tool has to earn its place.** `tools/` holds 18 entry points over 22k
    lines (2026-11-01), and the cost is the surface, not the logic. Before adding a
    file, answer three questions in the commit message -- which existing tool is
    closest, why it cannot take another flag or subcommand, and what question this
@@ -68,7 +74,7 @@ the implementation. **Do not read `research_cli.py` to learn the interface.**
    directory and put the conclusion in a report -- do not make a tool.
    `docs/tooling.md` is the map; update it when a tool is removed, which matters
    more than updating it when one is added.
-8. **Keep credentials out of chat, commits and logs.** `.env` and
+9. **Keep credentials out of chat, commits and logs.** `.env` and
    `.brain_session.json` are git-ignored; `tests/test_contract.py` guards that
    they stay that way. Never echo a credential, never write one into a file you
    intend to commit.

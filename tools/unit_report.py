@@ -212,6 +212,62 @@ def gaps(corpus, known, stream=None, top=12):
     return rows
 
 
+def dataset_view(corpus, dataset, stream=None, top=8):
+    """What a data family has already been asked, in shapes rather than rows.
+
+    Before spending simulations on a dataset the useful question is not "has anyone
+    used field X" but "which shapes has this family already been run in, and how did
+    they score". Each unit is one exact template and each kind is assembly x family,
+    so the answer is a short list, not a grep.
+
+    This exists because on 2026-11-03 six model51 probes were hand-written for shapes
+    the ledger already held 42 expressions of, best Fitness 0.26: the dataset looked
+    empty because the *book* had none of it, and nobody asked the unit layer. One
+    command would have said so.
+    """
+    stream = sys.stdout if stream is None else stream
+    # The unit layer groups by *family* (price / fundamental / analyst / news /
+    # option / model), not by dataset id; `unit-rules.json` holds the mapping. Take
+    # either and say which one answered, so "model51" and "model" are not a silent
+    # difference.
+    mapping = (au.load_rules() or {}).get("datasets") or {}
+    family = mapping.get(dataset, dataset)
+    if family != dataset:
+        print("\n%s → family %s (unit-rules.json)" % (dataset, family), file=stream)
+    dataset = family
+    points = [point for point in corpus.points if dataset in point.datasets]
+    units = [unit for unit in corpus.units.values() if dataset in unit.datasets]
+    in_book = [point for point in points
+               if any((status or "").upper() == "ACTIVE" for status in point.statuses)]
+    best_fitness = max((fitness_of(point) or 0) for point in points) if points else None
+    best_sharpe = max(((point.metrics or {}).get("sharpe")
+                       or -9) for point in points) if points else None
+    families = sorted({family for unit in units for family in unit.datasets})
+
+    print("\ndataset %s" % dataset, file=stream)
+    print("  expressions %d · units %d · kinds %d · in the book %d"
+          % (len(points), len(units), len({point.kind for point in points}), len(in_book)),
+          file=stream)
+    print("  families    %s" % ", ".join(families or ["?"]), file=stream)
+    print("  best        F=%s%s"
+          % ("%.2f" % best_fitness if best_fitness else "-",
+             "  S=%.2f" % best_sharpe if isinstance(best_sharpe, float) else ""),
+          file=stream)
+
+    print("\nshapes already run (by number of points)", file=stream)
+    for unit in sorted(units, key=lambda item: -len(item.points))[:top]:
+        best = max((fitness_of(point) or 0) for point in unit.points) or None
+        sample = unit.points[0].expression.replace("\n", " ")[:96]
+        print("  %-22s points=%-3d slots=%2d best F=%s"
+              % (unit.assembly, len(unit.points), len(unit.grid),
+                 "%.2f" % best if best else "-"), file=stream)
+        print("        %s" % sample, file=stream)
+    return {"dataset": dataset, "expressions": len(points), "units": len(units),
+            "in_book": len(in_book), "best_fitness": best_fitness,
+            "best_sharpe": best_sharpe,
+            "assemblies": sorted({unit.assembly for unit in units})}
+
+
 def crossings(corpus, known, stream=None, top=10):
     """Templates nobody ran, assembled from legs that each already exists.
 
@@ -270,6 +326,10 @@ def main() -> int:
     parser.add_argument("--gaps", action="store_true", help="book derivations never run")
     parser.add_argument("--cross", action="store_true",
                         help="templates assembled from two existing constructions")
+    parser.add_argument("--dataset", default=None,
+                        help="what one data family has already been asked: shapes, "
+                             "counts and the best score seen, before spending a "
+                             "simulation on it")
     parser.add_argument("--top", type=int, default=12)
     args = parser.parse_args()
     reserve_stdout(args)
@@ -308,6 +368,10 @@ def main() -> int:
 
     if args.gaps:
         gaps(corpus, known, top=args.top)
+        return 0
+
+    if args.dataset:
+        dataset_view(corpus, args.dataset, top=args.top)
         return 0
 
     if args.cross:

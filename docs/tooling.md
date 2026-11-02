@@ -26,6 +26,7 @@
 | 画出来看 | `python3 tools/family_graph_png.py` |
 | 有哪些可复用的零件，哪些只服务过一个族 | `python3 tools/parts_catalogue.py --seeds` |
 | 我们到底有几个构造、每个还差什么 | `python3 tools/unit_report.py`（`--gaps` / `--cross` / `--derive`） |
+| 这个数据族以前试过什么形状、最好多少分 | `python3 tools/unit_report.py --dataset model51`（数据集 id 自动映射到族） |
 | 书里现在拿的是什么，按构造分组 | `python3 tools/book_inventory.py --mechanisms` |
 | 台账的 verdict 和真实的书是否一致 | `python3 tools/book_audit.py` |
 
