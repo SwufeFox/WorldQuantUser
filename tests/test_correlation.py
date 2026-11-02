@@ -69,6 +69,16 @@ class MatrixTests(unittest.TestCase):
         self.assertEqual(result["measured"], 0)
         self.assertEqual(len(result["skipped"]), 1)
 
+    def test_skip_reason_separates_short_overlap_from_a_flat_series(self):
+        # Waiting fixes a short overlap; nothing fixes a flat PnL. A caller that
+        # retries the first and waits on the second wastes a run either way.
+        pnls = {"a": series([1, 2, 3, 4]), "b": series([1, 2], start=3),
+                "c": series([2, 2, 2, 2])}
+        result = correlation.matrix(pnls, min_overlap=4)
+        reasons = {(p["a"], p["b"]): p["reason"] for p in result["skipped"]}
+        self.assertEqual(reasons[("a", "b")], "short_overlap")
+        self.assertEqual(reasons[("a", "c")], "undefined")
+
 
 class MaxAgainstTests(unittest.TestCase):
     def test_highest_absolute_wins_and_order_is_stable(self):

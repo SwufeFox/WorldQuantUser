@@ -396,6 +396,12 @@ platform and then explaining why:
   timestamp, which reproduces the original check. Timezone matters here and got it wrong
   first: `dateSubmitted` is `-04:00`, so comparing it as a string against a Beijing
   timestamp silently treats every alpha as older than it is.
+* **A peer with no number is a gap, not a zero.** A flat PnL series has no Pearson
+  correlation with anything, and a peer whose PnL has not been written yet has no series
+  at all. Both are listed in `peers_unmeasured` with a reason (`undefined`, `no_pnl`,
+  `short_overlap`). `clear` is a claim about every peer, so one gap downgrades the verdict
+  to `unknown`; `blocked` and `borderline` stand, because missing evidence can only add a
+  reason to refuse.
 
 The report says so explicitly when the counterpart entered after the candidate
 (`counterpart_entered_after_candidate`), instead of leaving a number that looks like a

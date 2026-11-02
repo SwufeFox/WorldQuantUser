@@ -112,7 +112,10 @@ def matrix(pnls, min_overlap=200):
 
     Returns ``{"ids", "pairs", "measured", "skipped"}``. Pairs whose overlap is
     too short are listed in ``skipped`` rather than silently dropped, because a
-    missing pair and a zero pair mean different things.
+    missing pair and a zero pair mean different things. Each skip carries a
+    ``reason``: ``short_overlap`` is a data problem that waiting can fix, while
+    ``undefined`` means one series is flat, which is a property of the alpha and
+    will not improve.
     """
     ids = sorted(pnls)
     pairs = []
@@ -122,7 +125,8 @@ def matrix(pnls, min_overlap=200):
             x, y, dates = align(pnls[left], pnls[right], min_overlap)
             r = pearson(x, y) if x else None
             if r is None:
-                skipped.append({"a": left, "b": right, "n": len(dates)})
+                skipped.append({"a": left, "b": right, "n": len(dates),
+                                "reason": "short_overlap" if not x else "undefined"})
             else:
                 pairs.append({"a": left, "b": right, "r": r, "n": len(dates)})
     return {"ids": ids, "pairs": pairs, "measured": len(pairs),

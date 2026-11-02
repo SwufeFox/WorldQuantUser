@@ -131,28 +131,47 @@ def components_by(ids, similarity, threshold):
     return sorted(groups.values(), key=len, reverse=True)
 
 
-def independent_set(ids, pairs, threshold, priority, unverified=()):
-    """Greedy maximal set whose members are pairwise below the threshold.
+def independent_set(ids, pairs, threshold, priority):
+    """Greedy maximal set whose members are pairwise measured and below the threshold.
 
-    ``unverified`` names one side of a pair that could not be measured. Those nodes
-    are held out of the set: a pair with no measurement creates no conflict edge, so
-    including them would let two probable duplicates both be counted as independent.
+    The requirement is local, and that is the point. What the set asserts is that
+    *its own members* are pairwise distinct, so only pairs inside the set have to be
+    known. An alpha that could not be compared with some other candidate it never
+    sits next to is still usable — excluding it buys no evidence and shrinks the
+    answer for free. An earlier version held out both sides of every unmeasured
+    pair, so one gap removed two alphas and the "how many separate bets" number came
+    out low for no measured reason.
+
+    A pair missing from ``pairs`` was never measured. A candidate whose pair with an
+    already-chosen member is missing is refused rather than taken: including it would
+    assert a distinction nobody verified.
+
+    ``priority`` orders the greedy pass, so it decides which of two near-duplicates
+    survives. Returns ``(chosen, refused)``, and each refusal names the reason and the
+    member it ran into, which is what makes the lower bound explainable.
     """
-    blocked = set(unverified)
-    conflicts = {name: set() for name in ids}
+    measured = {}
     for pair in pairs:
-        if abs(pair["r"]) >= threshold:
-            conflicts[pair["a"]].add(pair["b"])
-            conflicts[pair["b"]].add(pair["a"])
+        measured[frozenset((pair["a"], pair["b"]))] = pair["r"]
     order = sorted(ids, key=lambda name: priority.get(name, 0.0), reverse=True)
-    chosen = []
+    chosen, refused = [], []
     for name in order:
-        if name in blocked:
-            continue
-        if any(other in conflicts[name] for other in chosen):
+        reason, other = None, None
+        for ally in chosen:
+            value = measured.get(frozenset((name, ally)))
+            if value is None:
+                reason, other = "unmeasured", ally
+                break
+            if abs(value) >= threshold:
+                reason, other = "dependent", ally
+                break
+        if reason:
+            refused.append({"alpha_id": name, "reason": reason, "with": other,
+                            "r": None if reason == "unmeasured"
+                            else measured[frozenset((name, other))]})
             continue
         chosen.append(name)
-    return chosen
+    return chosen, refused
 
 
 def main(argv=None):
@@ -288,13 +307,15 @@ def main(argv=None):
 
     matrix = correlation.matrix(pnls, min_overlap=args.min_overlap)
     pairs = matrix["pairs"]
+    short = sum(1 for pair in matrix["skipped"] if pair.get("reason") == "short_overlap")
+    undefined = len(matrix["skipped"]) - short
     priority = {name: (by_id[name].get("metrics") or {}).get("fitness", 0.0)
                 for name in pnls}
 
     groups = components(list(pnls), pairs, args.threshold)
-    unmeasured = {pair["a"] for pair in matrix["skipped"]} | {pair["b"] for pair in matrix["skipped"]}
-    chosen = independent_set(list(pnls), pairs, args.threshold, priority,
-                             unverified=unmeasured)
+    chosen, refused = independent_set(list(pnls), pairs, args.threshold, priority)
+    unverified = [row["alpha_id"] for row in refused if row["reason"] == "unmeasured"]
+    dependent = [row["alpha_id"] for row in refused if row["reason"] == "dependent"]
     near = sorted([p for p in pairs if abs(p["r"]) >= 0.9],
                   key=lambda p: -abs(p["r"]))
 
@@ -308,8 +329,8 @@ def main(argv=None):
         }
 
     print()
-    print("pairs measured: %d (skipped for short overlap: %d)"
-          % (matrix["measured"], len(matrix["skipped"])))
+    print("pairs measured: %d (unmeasured: %d; short overlap %d, undefined %d)"
+          % (matrix["measured"], len(matrix["skipped"]), short, undefined))
     print("connected components at |r| >= %.2f: %d" % (args.threshold, len(groups)))
     for group in groups[: args.limit_members + 1]:
         head = describe(group[0])
@@ -322,9 +343,11 @@ def main(argv=None):
     print()
     print("greedy independent set: %d alphas" % len(chosen))
     total_pairs = len(pairs) + len(matrix["skipped"])
-    print("  measurement coverage: %d/%d pairs (%.0f%%); %d alphas held out as unverified"
+    print("  measurement coverage: %d/%d pairs (%.0f%%)"
           % (len(pairs), total_pairs,
-             100.0 * len(pairs) / total_pairs if total_pairs else 0.0, len(unmeasured)))
+             100.0 * len(pairs) / total_pairs if total_pairs else 0.0))
+    print("  held out: %d (dependent %d, unverified against a member %d)"
+          % (len(refused), len(dependent), len(unverified)))
     for name in chosen[:20]:
         row = describe(name)
         print("  %-10s fitness=%-5s family=%s"
@@ -348,8 +371,10 @@ def main(argv=None):
         "components": [{"size": len(group), "members": group} for group in groups],
         "component_count": len(groups),
         "independent_set": chosen,
-        "independent_set_unverified": sorted(unmeasured),
-        "coverage": {"measured_pairs": len(pairs), "skipped_pairs": len(matrix["skipped"])},
+        "independent_set_refused": refused,
+        "independent_set_unverified": unverified,
+        "coverage": {"measured_pairs": len(pairs), "skipped_pairs": len(matrix["skipped"]),
+                     "skipped_short_overlap": short, "skipped_undefined": undefined},
         "near_duplicates": near,
         "members": {name: describe(name) for name in pnls},
     }

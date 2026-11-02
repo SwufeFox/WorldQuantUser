@@ -170,5 +170,110 @@ class AblationReportTests(unittest.TestCase):
         self.assertIsNone(legs["alpha"]["solo"])
 
 
+class VerdictGapTests(unittest.TestCase):
+    """`clear` is a claim about every peer, so a gap has to weaken it."""
+
+    def test_no_gaps_leaves_the_verdict_alone(self):
+        self.assertEqual(cli._verdict_with_gaps("clear", []), ("clear", None))
+
+    def test_a_gap_turns_clear_into_unknown_and_says_why(self):
+        gaps = [{"alpha_id": "X", "reason": "undefined", "n": 400},
+                {"alpha_id": "Y", "reason": "no_pnl", "n": 0}]
+        verdict, note = cli._verdict_with_gaps("clear", gaps)
+        self.assertEqual(verdict, "unknown")
+        self.assertIn("2 peer(s)", note)
+        self.assertIn("no_pnl 1", note)
+        self.assertIn("undefined 1", note)
+
+    def test_a_gap_cannot_rescue_a_block(self):
+        # Missing evidence can only add a reason to refuse, never remove one.
+        gaps = [{"alpha_id": "X", "reason": "undefined", "n": 400}]
+        self.assertEqual(cli._verdict_with_gaps("blocked", gaps)[0], "blocked")
+        self.assertEqual(cli._verdict_with_gaps("borderline", gaps)[0], "borderline")
+
+
+class SelfCheckGapTests(unittest.TestCase):
+    """Drive `alpha self-check` through its real body with a patched session.
+
+    These cover the two ways a peer with no usable number used to vanish: a flat
+    PnL series crashed `round(None, 4)`, and a peer that returned no PnL was
+    skipped silently so the reported maximum was taken over survivors only.
+    """
+
+    DAYS = 400
+
+    def _run(self, series, peers, extra=None):
+        import math
+        candidate = {"d%05d" % i: math.sin(i * 0.3) + 0.01 * (i % 7)
+                     for i in range(self.DAYS)}
+        entries = [{"id": alpha_id, "status": "ACTIVE",
+                    "dateCreated": "2026-10-01T00:00:00Z",
+                    "dateSubmitted": "2026-10-01T00:00:00Z"} for alpha_id in peers]
+        args = argparse.Namespace(alpha_id="CAND", as_of=None, include_unsent_hours=24.0,
+                                  threshold=0.7, platform_bias=0.015, top=3,
+                                  min_overlap=200, peer_limit=300,
+                                  max_age_hours=168.0, json=None)
+        for key, value in (extra or {}).items():
+            setattr(args, key, value)
+
+        def fake_list(session, limit=None, status=None, alpha_type_not=None):
+            return entries if status == "ACTIVE" else []
+
+        def fake_pnl(session, alpha_id, cache_dir=None, max_age_hours=None):
+            return candidate if alpha_id == "CAND" else series.get(alpha_id)
+
+        with mock.patch.object(cli, "with_session", lambda a, fn: fn(None)), \
+                mock.patch.object(cli.ml, "list_alphas", fake_list), \
+                mock.patch.object(cli.ml, "fetch_daily_pnl", fake_pnl), \
+                mock.patch.object(cli.ml, "fetch_alpha_metrics",
+                                  lambda s, i: {"dateCreated": "2026-10-01T00:00:00Z",
+                                                "dateSubmitted": None}), \
+                mock.patch.object(cli.research_paths, "ensure_dir", lambda: "/tmp"):
+            return cli.cmd_alpha_self_check(args, mock.MagicMock())
+
+    def test_flat_peer_is_unmeasured_not_a_crash_and_not_a_zero(self):
+        flat = {"d%05d" % i: 0.25 for i in range(self.DAYS)}
+        data = self._run({"FLAT": flat}, ["FLAT"])
+        self.assertEqual(data["verdict"], "unknown")
+        self.assertIsNone(data["max_daily"])
+        self.assertEqual([gap["reason"] for gap in data["peers_unmeasured"]], ["undefined"])
+        self.assertIn("could not be measured", data["verdict_note"])
+
+    def test_peer_without_pnl_is_reported_rather_than_dropped(self):
+        data = self._run({}, ["NOPNL"])
+        self.assertEqual(data["verdict"], "unknown")
+        self.assertEqual(data["peers_considered"], 1)
+        self.assertEqual(data["peers_measured"], 0)
+        self.assertEqual([gap["reason"] for gap in data["peers_unmeasured"]], ["no_pnl"])
+
+    def test_short_overlap_is_unmeasured(self):
+        import math
+        short = {"d%05d" % i: math.cos(i * 0.9) for i in range(100)}
+        data = self._run({"SHORT": short}, ["SHORT"])
+        self.assertEqual(data["verdict"], "unknown")
+        self.assertEqual([gap["reason"] for gap in data["peers_unmeasured"]],
+                         ["short_overlap"])
+
+    def test_a_measured_weak_peer_still_clears(self):
+        import math
+        weak = {"d%05d" % i: math.cos(i * 1.7) + 0.5 * math.sin(i * 0.11)
+                for i in range(self.DAYS)}
+        data = self._run({"WEAK": weak}, ["WEAK"])
+        self.assertEqual(data["verdict"], "clear")
+        self.assertEqual(data["peers_measured"], 1)
+        self.assertEqual(data["peers_unmeasured"], [])
+        self.assertIsNone(data["verdict_note"])
+
+    def test_a_gap_does_not_hide_a_measured_block(self):
+        import math
+        flat = {"d%05d" % i: 0.25 for i in range(self.DAYS)}
+        mirror = {"d%05d" % i: -(math.sin(i * 0.3) + 0.01 * (i % 7))
+                  for i in range(self.DAYS)}
+        data = self._run({"FLAT": flat, "MIRROR": mirror}, ["FLAT", "MIRROR"])
+        self.assertEqual(data["verdict"], "blocked")
+        self.assertEqual(data["counterpart"], "MIRROR")
+        self.assertEqual(len(data["peers_unmeasured"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

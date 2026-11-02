@@ -2973,6 +2973,35 @@ def _independence_state(flagged, skipped, measured):
     return "independent"
 
 
+def _verdict_with_gaps(verdict, gaps):
+    """A gap can only hide a block, never a clear.
+
+    ``clear`` means every peer was measured and none came close. When a peer's
+    PnL is missing, too short, or flat, that statement is not supported: the
+    pair nobody could measure is the likeliest duplicate, so ``clear`` degrades
+    to ``unknown`` instead of surviving on the pairs that did work.
+
+    ``blocked`` and ``borderline`` already mean do not submit, and a missing
+    measurement can only add a reason, never remove one, so they stand.
+
+    Returns ``(verdict, note)``; the note names the gaps whenever there are any,
+    including when the verdict was already ``unknown`` because nothing at all
+    could be measured - that case is a gap too, and the least informative one.
+    """
+    if not gaps:
+        return verdict, None
+    counts = {}
+    for gap in gaps:
+        counts[gap["reason"]] = counts.get(gap["reason"], 0) + 1
+    note = ("%d peer(s) could not be measured (%s)"
+            % (len(gaps), ", ".join("%s %d" % (reason, count)
+                                    for reason, count in sorted(counts.items()))))
+    if verdict == "clear":
+        return "unknown", (note + "; an unmeasured pair is the one most likely to be a "
+                                   "duplicate, so `clear` is not claimed")
+    return verdict, note
+
+
 def cmd_alpha_self_check(args, sink):
     """Reproduce the platform's self-correlation check locally, and better.
 
@@ -2991,6 +3020,12 @@ def cmd_alpha_self_check(args, sink):
     the book as it was, which is what ``--as-of`` does. Without it, an alpha rejected last
     night appears to correlate 0.99 with something that entered afterwards, and the apparent
     disagreement is only a difference in what the platform could see.
+
+    Every peer that yields no number is named with a reason - no PnL, too little overlap,
+    or an undefined Pearson because one series is flat. A flat series is the sharp case:
+    ``round(None, 4)`` used to be a TypeError, and the tempting fix, dropping the pair,
+    would read as a measured zero. ``_verdict_with_gaps`` says why a gap downgrades
+    ``clear`` to ``unknown`` and leaves ``blocked`` alone.
     """
     from datetime import datetime, timedelta, timezone
 
@@ -3019,6 +3054,7 @@ def cmd_alpha_self_check(args, sink):
                            "the alpha must have finished simulating")
         record = ml.fetch_alpha_metrics(session, args.alpha_id)
         peers, excluded = [], []
+        seen = set()
         statuses = ["ACTIVE"]
         if args.include_unsent_hours > 0:
             statuses.append("UNSUBMITTED")
@@ -3035,6 +3071,12 @@ def cmd_alpha_self_check(args, sink):
                     continue
                 if status == "UNSUBMITTED" and when is not None and when < horizon:
                     continue
+                if peer_id in seen:
+                    # An alpha submitted minutes ago is ACTIVE and was also created
+                    # inside the unsubmitted window, so it arrives twice and would be
+                    # counted, correlated and gap-reported twice.
+                    continue
+                seen.add(peer_id)
                 peers.append({"alpha_id": peer_id, "when": when,
                               "status": status})
         series = {}
@@ -3047,21 +3089,40 @@ def cmd_alpha_self_check(args, sink):
 
     candidate, record, peers, series, excluded = with_session(args, collect)
 
+    # Every peer that produced no number is named with a reason. The crash this
+    # replaces was `round(None, 4)` on a flat PnL series; the quieter defect was
+    # that a peer with no PnL at all was skipped without a word, so the maximum
+    # was a maximum over whatever happened to be measurable.
+    gaps = []
+    usable = []
+    for peer in peers:
+        if series.get(peer["alpha_id"]):
+            usable.append(peer)
+        else:
+            gaps.append({"alpha_id": peer["alpha_id"], "reason": "no_pnl", "n": 0})
+
     broadcast = {}
     for frequency in ("d", "w", "m"):
         target = correlation.aggregate(candidate, frequency)
+        minimum = args.min_overlap if frequency == "d" else 12
         scored = []
-        for peer in peers:
-            peer_series = series.get(peer["alpha_id"])
-            if not peer_series:
+        for peer in usable:
+            left, right, _ = correlation.align(
+                target, correlation.aggregate(series[peer["alpha_id"]], frequency),
+                minimum)
+            if len(left) < minimum:
+                if frequency == "d":
+                    gaps.append({"alpha_id": peer["alpha_id"],
+                                 "reason": "short_overlap", "n": len(left)})
                 continue
-            left, right, _ = correlation.align(target,
-                                               correlation.aggregate(peer_series, frequency),
-                                               args.min_overlap if frequency == "d" else 12)
-            if left is None or len(left) < (args.min_overlap if frequency == "d" else 12):
+            value = correlation.pearson(left, right)
+            if value is None:
+                if frequency == "d":
+                    gaps.append({"alpha_id": peer["alpha_id"],
+                                 "reason": "undefined", "n": len(left)})
                 continue
             scored.append({"alpha_id": peer["alpha_id"],
-                           "correlation": round(correlation.pearson(left, right), 4),
+                           "correlation": round(value, 4),
                            "when": peer["when"].isoformat() if peer["when"] else None,
                            "status": peer["status"]})
         scored[:] = _rank_peers(scored)
@@ -3073,6 +3134,7 @@ def cmd_alpha_self_check(args, sink):
     # assumed, and it is what makes `borderline` a useful verdict instead of a shrug.
     verdict, estimate = correlation.classify(best["correlation"], args.threshold,
                                               args.platform_bias)
+    verdict, verdict_note = _verdict_with_gaps(verdict, gaps)
 
     submitted = parse(record.get("dateSubmitted")) or parse(record.get("dateCreated"))
     counterpart_when = parse(best.get("when"))
@@ -3082,7 +3144,9 @@ def cmd_alpha_self_check(args, sink):
         "alpha_id": args.alpha_id,
         "candidate_submitted": record.get("dateSubmitted"),
         "as_of": args.as_of,
-        "peers_considered": len(daily),
+        "peers_considered": len(peers),
+        "peers_measured": len(daily),
+        "peers_unmeasured": gaps,
         "peers_excluded_as_newer": [item["alpha_id"] for item in excluded],
         "threshold": args.threshold,
         "platform_bias": args.platform_bias,
@@ -3092,6 +3156,7 @@ def cmd_alpha_self_check(args, sink):
         "counterpart_submitted": best.get("when"),
         "counterpart_entered_after_candidate": newer,
         "verdict": verdict,
+        "verdict_note": verdict_note,
         "frequencies": {name: (items[0]["correlation"] if items else None)
                         for name, items in broadcast.items()},
         "top": daily[:args.top],
