@@ -85,6 +85,16 @@ class ExpandTests(unittest.TestCase):
             research_template.expand("x = rank(close)", {"liab_total_2": ["a"]})
 
 
+class HandwrittenTests(unittest.TestCase):
+    def test_a_tuple_carries_its_label_into_the_batch(self):
+        # The label becomes the ledger entry's mechanism; a truncated first line of
+        # the expression is not a mechanism, and that is what the old code used.
+        pairs = research_template.handwritten([("beta_low", "rank(close)"),
+                                               "rank(volume)"])
+        self.assertEqual([label for label, _ in pairs], ["beta_low", "expr2"])
+        self.assertEqual(pairs[1][1], "rank(volume)")
+
+
 class ParentExperimentTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()

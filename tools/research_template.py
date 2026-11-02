@@ -68,6 +68,9 @@ SETTINGS_KEYS = ("region", "universe", "delay", "decay", "neutralization", "trun
                  "instrumentType", "language")
 
 #: Sugar and annotations are allowed here; both compile away before submission.
+#: An entry may be a plain string or ``(label, string)``. Use a label when the batch
+#: is meant to be read later: the label travels into the ledger as the entry's
+#: mechanism, and a truncated first line of an expression is not a mechanism.
 EXPRESSIONS = [
     # '@mechanism("...")  a = rrank(...); b = ...; 0.7 * a + 0.3 * b',
 ]
@@ -90,6 +93,19 @@ def prepare(source):
     """Return ``(compiled_expression, annotation_findings)`` for one source string."""
     program = fastexpr_ast.parse(alpha_sugar.fs(source))
     return program.render(), annotations.check(program)
+
+
+def handwritten(expressions):
+    """``(label, expression)`` pairs for the ``EXPRESSIONS`` shape."""
+    pairs = []
+    for index, item in enumerate(expressions, 1):
+        label, source = item if isinstance(item, tuple) else ("expr%d" % index, item)
+        expression, findings = prepare(source)
+        for finding in findings:
+            print("annotation: %s -- %s" % (finding["code"], finding["message"]))
+        print("\n%s\n  -> %s" % (source.replace("\n", "\n     "), expression))
+        pairs.append((label, expression))
+    return pairs
 
 
 def expand(expression, substitutions):
@@ -153,13 +169,7 @@ def main() -> int:
             print("EXPRESSIONS and PARENT are both empty: add one, or read the docstring.")
             return 0
         settings = SETTINGS
-        pairs = []
-        for source in EXPRESSIONS:
-            expression, findings = prepare(source)
-            for finding in findings:
-                print("annotation: %s -- %s" % (finding["code"], finding["message"]))
-            pairs.append((source.splitlines()[0][:40], expression))
-            print("\n%s\n  -> %s" % (source.replace("\n", "\n     "), expression))
+        pairs = handwritten(EXPRESSIONS)
 
     compiled = [expression for _label, expression in pairs]
     labels = [label for label, _expression in pairs]
