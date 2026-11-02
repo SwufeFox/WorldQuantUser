@@ -13,6 +13,7 @@ carrying a code, because callers branch on the code and never on the message.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -53,6 +54,51 @@ class NegativeMaxWaitTests(unittest.TestCase):
         with self.assertRaises(cli.CliError) as caught:
             cli.cmd_alpha_submit(args, mock.MagicMock())
         self.assertEqual(caught.exception.code, "USAGE")
+
+
+def result_record(alpha_id="A1", sharpe=2.0, test_sharpe=1.4):
+    return {"alpha_id": alpha_id, "expression": "rank(close)",
+            "metrics": {"sharpe": sharpe, "fitness": 1.5, "turnover": 0.15},
+            "checks": {"LOW_SHARPE": {"result": "PASS"}},
+            "out_of_sample": {"train": {"sharpe": sharpe + 0.1},
+                              "test": {"sharpe": test_sharpe}}}
+
+
+class CompareShapeTests(unittest.TestCase):
+    """`compare` has to read what this repository actually writes."""
+
+    def _run(self, *payloads):
+        paths = []
+        for payload in payloads:
+            path = os.path.join(tempfile.mkdtemp(), "batch.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle)
+            paths.append(path)
+        args = argparse.Namespace(files=paths, min_fitness=None, sort="sharpe",
+                                  contributions=False, save=None)
+        return cli.cmd_compare(args, mock.MagicMock())
+
+    def test_a_bare_list_is_accepted(self):
+        # Wrong behaviour this prevents: the research template writes a bare list of
+        # records, and `compare` refused its own repository's output.
+        data = self._run([result_record()])
+        self.assertEqual(data["count"], 1)
+        self.assertAlmostEqual(data["rows"][0]["test_sharpe"], 1.4)
+
+    def test_the_envelope_shape_is_still_accepted(self):
+        data = self._run({"data": {"results": [result_record("A1"),
+                                              result_record("A2", sharpe=1.1)]}})
+        self.assertEqual([row["alpha_id"] for row in data["rows"]], ["A1", "A2"])
+
+    def test_an_already_tabulated_file_is_refused_with_a_reason(self):
+        # `compare`'s own rows carry `sharpe` at the top level. Reading them as
+        # records would print a table of nulls instead of saying what is wrong.
+        rows = {"files": ["x.json"], "count": 1,
+                "rows": [{"alpha_id": "A1", "sharpe": 2.0, "fitness": 1.5}]}
+        with self.assertRaises(cli.CliError) as caught:
+            self._run(rows)
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+        self.assertIn("not a simulate result document", str(caught.exception))
 
 
 if __name__ == "__main__":

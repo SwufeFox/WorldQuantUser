@@ -1643,6 +1643,27 @@ def cmd_compare(args, _sink):
     Variants used to live in separate batch files and were aligned by eye, which
     is how a five-leg version scoring below its four-leg parent went unnoticed.
     """
+    def records_from(path, payload):
+        """Records from the two shapes this repository writes.
+
+        `simulate` writes ``{"data": {"results": [...]}}`` and the research template
+        writes a bare list, so a batch produced by the template could not be compared
+        at all - the file was there, the command refused it, and the reason had
+        nothing to do with the batch. Rows already flattened by `compare` are not
+        accepted on purpose: they carry ``sharpe`` at the top level, and re-reading
+        them as records would fill the table with nulls instead of saying so.
+        """
+        if isinstance(payload, dict) and "data" in payload:
+            return records_from(path, payload.get("data"))
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        if isinstance(payload, dict) and isinstance(payload.get("results"), list):
+            return [item for item in payload["results"] if isinstance(item, dict)]
+        raise CliError("INVALID_INPUT",
+                       "%s is not a simulate result document" % path,
+                       "expected {\"results\": [...]} or a bare list of records; "
+                       "`alpha registry --format json` rows are not records")
+
     records = []
     for path in args.files:
         try:
@@ -1650,11 +1671,7 @@ def cmd_compare(args, _sink):
         except (OSError, ValueError) as exc:
             raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc),
                            "point at a file written by `simulate`") from exc
-        body = (payload.get("data")
-                if isinstance(payload, dict) and "data" in payload else payload)
-        for record in (body or {}).get("results") or []:
-            if isinstance(record, dict):
-                records.append(record)
+        records.extend(records_from(path, payload))
 
     if not records:
         raise CliError("NOT_FOUND", "no result records in the given files",
@@ -2705,6 +2722,13 @@ def cmd_alpha_explain(args, _sink):
             "below_turnover_floor": bool(isinstance(turnover, (int, float))
                                          and turnover < 0.125),
             "implied_fitness": implied,
+            # The gap is the integrity check this block exists for: a row whose
+            # stored Fitness cannot be rebuilt from its own Sharpe/returns/turnover
+            # is stale or damaged, and every ranking built on it inherits that.
+            "reported_fitness": fitness,
+            "gap": (round(fitness - implied, 3)
+                    if isinstance(fitness, (int, float)) and implied is not None
+                    else None),
         },
         "ablations_measured": ablations,
         "book_correlation": gate,
