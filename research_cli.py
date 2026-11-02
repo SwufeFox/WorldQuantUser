@@ -1926,7 +1926,10 @@ def cmd_paper(args, _sink):
         raise CliError("SERVICE_ERROR", "OpenAlex request failed: %s" % exc,
                        "the API is public and needs no key; retry shortly") from exc
     if args.save:
-        _write_json(args.save, data)
+        # `_write_json` never existed; `--save` was a NameError waiting for the first
+        # caller. `_maybe_save` is the helper every other command uses, and it also
+        # reports the path on stderr so stdout stays one JSON document.
+        _maybe_save(args, data)
         data["saved_to"] = args.save
     return data
 
@@ -2106,7 +2109,8 @@ def cmd_alpha_check(args, _sink):
     then returns the computed correlation.
     """
     if args.max_wait is not None and args.max_wait < 0:
-        raise UsageError("--max-wait must be non-negative")
+        raise CliError("USAGE", "--max-wait must be non-negative",
+                       "pass a number of seconds, or omit the flag for the default")
     result = with_session(args, lambda s: ml.fetch_alpha_checks(
         s, args.alpha_id, max_wait_seconds=args.max_wait))
     if not result.get("complete"):
@@ -2131,7 +2135,8 @@ def cmd_alpha_submit(args, _sink):
     platform's "test submission", which is simply the check flow.
     """
     if args.max_wait is not None and args.max_wait < 0:
-        raise UsageError("--max-wait must be non-negative")
+        raise CliError("USAGE", "--max-wait must be non-negative",
+                       "pass a number of seconds, or omit the flag for the default")
 
     def work(session):
         # A submission carries metadata with it: the platform accepts a name, a
@@ -2181,9 +2186,9 @@ def _record_submitted_alpha(session, alpha_id):
          "out_of_sample": {"train": current.get("train") or {},
                            "test": current.get("test") or {},
                            "test_period": "P1Y"}},
-        verdict=_auto_verdict({"status": current.get("status"),
-                               "metrics": current.get("is") or {},
-                               "checks": checks}),
+        verdict=alpha_registry.auto_verdict({"status": current.get("status"),
+                                             "metrics": current.get("is") or {},
+                                             "checks": checks}),
         note="recorded by `alpha submit --record`: dateSubmitted %s"
              % (current.get("dateSubmitted"),),
         source="submit")
@@ -2478,75 +2483,21 @@ def cmd_catalog_field_audit(args, sink):
 # alpha record / alpha registry -- the durable ledger
 # ---------------------------------------------------------------------------
 
-def _auto_verdict(record):
-    """Classify a simulation record without pretending to be a researcher.
-
-    Only the default for ``simulate --record``: it keeps the ledger useful when
-    nobody has written a judgement yet. Anything that cleared the usual bar is a
-    ``candidate``; anything that failed a platform check is ``rejected``; the
-    rest stays ``watch`` until someone decides.
-    """
-    if record.get("status") != "COMPLETE":
-        return "rejected"
-    checks = record.get("checks") or {}
-    if isinstance(checks, dict):
-        results = [str((value or {}).get("result") or "").upper()
-                   if isinstance(value, dict) else str(value).upper()
-                   for value in checks.values()]
-    else:
-        results = [str((value or {}).get("result") or "").upper()
-                   for value in checks if isinstance(value, dict)]
-    if any(result in {"FAIL", "ERROR"} for result in results):
-        return "rejected"
-    metrics = record.get("metrics") or {}
-    sharpe = metrics.get("sharpe")
-    fitness = metrics.get("fitness")
-    if isinstance(sharpe, (int, float)) and isinstance(fitness, (int, float)):
-        if sharpe >= 1.25 and fitness >= 1.0:
-            return "candidate"
-    return "watch"
-
-
 def _record_simulation(records, settings, args):
-    """Append finished simulation records to the registry."""
-    registry_path = (getattr(args, "registry", None)
-                     or alpha_registry.default_registry_path())
-    entries = []
-    written = 0
-    for record in records:
-        entry = alpha_registry.build_entry(
-            {
-                "alpha_id": record.get("alpha_id"),
-                "expression": record.get("expression"),
-                "decay": record.get("decay"),
-                "settings": settings,
-                "metrics": record.get("metrics"),
-                "checks": record.get("checks"),
-                "out_of_sample": record.get("out_of_sample"),
-                "status": record.get("status"),
-                "error": record.get("error"),
-            },
-            idea=getattr(args, "idea", None),
-            # A per-expression label beats the run-wide default so a batch that
-            # spans several mechanisms still lands labelled per entry.
-            mechanism=record.get("mechanism") or getattr(args, "mechanism", None),
-            family=record.get("family") or getattr(args, "family", None),
-            verdict=_auto_verdict(record),
-            note=getattr(args, "note", None),
-            source="simulate",
-        )
-        _, did_write = alpha_registry.record_entry(entry, registry_path)
-        written += 1 if did_write else 0
-        entries.append(entry)
-    return {
-        "registry": registry_path,
-        "recorded": len(entries),
-        "appended": written,
-        "by_verdict": {
-            verdict: sum(1 for entry in entries if entry["verdict"] == verdict)
-            for verdict in alpha_registry.VERDICTS
-        },
-    }
+    """Append finished simulation records to the registry.
+
+    The mapping lives in :func:`alpha_registry.record_simulation`, because the
+    research template records the same records and had been copying this body by
+    hand - or, more often, skipping it.
+    """
+    return alpha_registry.record_simulation(
+        records, settings,
+        idea=getattr(args, "idea", None),
+        mechanism=getattr(args, "mechanism", None),
+        family=getattr(args, "family", None),
+        note=getattr(args, "note", None),
+        registry_path=getattr(args, "registry", None),
+        source="simulate")
 
 
 def cmd_alpha_record(args, sink):

@@ -402,6 +402,90 @@ def record_entry(entry, path=None, skip_unchanged=True, allow_metrics_loss=False
         return entry, True
 
 
+def auto_verdict(record):
+    """Classify a simulation record without pretending to be a researcher.
+
+    Only a default, for the two paths that persist results before anyone has written
+    a judgement: ``simulate --record`` and the research template. Anything that
+    cleared the usual bar is a ``candidate``; anything that failed a platform check
+    is ``rejected``; the rest stays ``watch`` until someone decides.
+
+    It lives here rather than in the CLI because the ledger is what it classifies,
+    and because the same mapping had been written twice - once for the CLI and once
+    by hand in each research script that recorded its own results.
+    """
+    if record.get("status") != "COMPLETE":
+        return "rejected"
+    checks = record.get("checks") or {}
+    if isinstance(checks, dict):
+        results = [str((value or {}).get("result") or "").upper()
+                   if isinstance(value, dict) else str(value).upper()
+                   for value in checks.values()]
+    else:
+        results = [str((value or {}).get("result") or "").upper()
+                   for value in checks if isinstance(value, dict)]
+    if any(result in {"FAIL", "ERROR"} for result in results):
+        return "rejected"
+    metrics = record.get("metrics") or {}
+    sharpe = metrics.get("sharpe")
+    fitness = metrics.get("fitness")
+    if isinstance(sharpe, (int, float)) and isinstance(fitness, (int, float)):
+        if sharpe >= 1.25 and fitness >= 1.0:
+            return "candidate"
+    return "watch"
+
+
+def record_simulation(records, settings, idea=None, mechanism=None, family=None,
+                      note=None, verdict=None, registry_path=None, source="simulate"):
+    """Append one ledger entry per finished simulation record; return a summary.
+
+    ``record["mechanism"]`` and ``record["family"]`` win over the run-wide default,
+    so a batch spanning several mechanisms still lands labelled per entry. ``verdict``
+    pins the verdict for every entry; without it each record is classified by
+    :func:`auto_verdict`, which is a default and not a judgement.
+
+    The research template calls this too. Before it existed the template recorded
+    nothing, so an experiment copied from it left no trace in the ledger - the file
+    every experiment is copied from was the one path that could silently skip the
+    durable record.
+    """
+    path = registry_path or default_registry_path()
+    entries = []
+    written = 0
+    for record in records:
+        entry = build_entry(
+            {
+                "alpha_id": record.get("alpha_id"),
+                "expression": record.get("expression"),
+                "decay": record.get("decay"),
+                "settings": record.get("settings") or settings,
+                "metrics": record.get("metrics"),
+                "checks": record.get("checks"),
+                "out_of_sample": record.get("out_of_sample"),
+                "status": record.get("status"),
+                "error": record.get("error"),
+            },
+            idea=idea,
+            mechanism=record.get("mechanism") or mechanism,
+            family=record.get("family") or family,
+            verdict=verdict or auto_verdict(record),
+            note=note,
+            source=source,
+        )
+        _, did_write = record_entry(entry, path)
+        written += 1 if did_write else 0
+        entries.append(entry)
+    return {
+        "registry": path,
+        "recorded": len(entries),
+        "appended": written,
+        "by_verdict": {
+            name: sum(1 for entry in entries if entry["verdict"] == name)
+            for name in VERDICTS
+        },
+    }
+
+
 def find_entries(entries, field=None, mechanism=None, idea=None,
                  expression=None, verdicts=None, min_fitness=None,
                  family=None):

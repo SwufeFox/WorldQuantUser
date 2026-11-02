@@ -42,7 +42,7 @@ research_cli.py schema      # the whole contract, as JSON
 | `rejection_reasons.py` | Why a rejection happened: the cause, not just the gate. |
 | `tools/guarded_sim.py` | Simulate only after the catalogue check; refuses unknown names. |
 | `tools/wire_guard.py` | Rewrite a research script so every simulation goes through the guard. |
-| `tools/research_template.py` | Runnable skeleton for a new experiment; copy it, do not start blank. |
+| `tools/research_template.py` | Runnable skeleton for a new experiment; copy it, do not start blank. Two shapes: a hand-written `EXPRESSIONS` list, or `PARENT` + `SUBSTITUTIONS` for the swap-one-token batch. Records to the ledger either way. |
 | `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
 | `tools/pool_stats.py` | Report the pool as quartiles rather than as a best alpha. |
 | `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |

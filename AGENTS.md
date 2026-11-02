@@ -133,6 +133,33 @@ Diagnose a single alpha:
 python research_cli.py alpha get P0Mq0wEM      # metrics + per-check PASS/FAIL/limit/value
 ```
 
+Ask whether a submission would be refused, and by whom - the platform names the
+counterparts, so the "Sharpe above every correlated alpha" route becomes arithmetic
+instead of a guess:
+
+```bash
+python research_cli.py alpha self-corr ID      # platform list + the Sharpe bar
+python research_cli.py alpha self-check ID     # local daily-Pearson reproduction
+```
+
+Read BRAIN's own out-of-sample split before believing an in-sample number. It is
+already in the payload, so this costs one call and no simulation:
+
+```bash
+python research_cli.py alpha get ID            # see data.out_of_sample.{train,test}
+```
+
+Run an experiment without re-writing the plumbing. The template handles both shapes
+in use here - a hand-written expression list, or a proven parent with one token
+swapped N times - and records every result to the ledger:
+
+```bash
+cp tools/research_template.py /path/to/experiment.py   # fill PARENT + SUBSTITUTIONS
+python /path/to/experiment.py --dry-run                # lint, submit nothing
+python /path/to/experiment.py                          # simulate and record
+python research_cli.py compare results.json --sort sharpe   # train/test columns included
+```
+
 ## 4. Where things live
 
 | Path | Contents |
