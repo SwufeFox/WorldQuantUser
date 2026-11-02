@@ -180,6 +180,28 @@ class RecordSimulationTests(unittest.TestCase):
                                         verdict="watch", registry_path=path)
         self.assertEqual(alpha_registry.load_entries(path)[0]["verdict"], "watch")
 
+    def test_a_rerun_cannot_demote_a_book_alpha(self):
+        # BRAIN returns the existing id when an identical expression is simulated
+        # again, so a re-run of a book member arrives looking like a new record. On
+        # 2026-11-02 that rewrote an ACTIVE entry to COMPLETE/rejected and silently
+        # shrank the book by one.
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "registry.jsonl")
+        alpha_registry.record_entry(
+            alpha_registry.build_entry(
+                {"alpha_id": "BOOK1", "expression": "rank(close)",
+                 "settings": {"region": "USA"}, "metrics": {"sharpe": 1.9, "fitness": 1.2},
+                 "status": "ACTIVE"}, verdict="candidate"),
+            path)
+        rerun = record(alpha_id="BOOK1", sharpe=1.89, fitness=1.15)
+        rerun["status"] = "COMPLETE"
+        alpha_registry.record_simulation([rerun], {}, registry_path=path)
+        newest = alpha_registry.load_entries(path)[0]
+        self.assertEqual(newest["status"], "ACTIVE")
+        self.assertEqual(newest["verdict"], "candidate")
+        # The metrics still update: the run is recorded, it just cannot move the book.
+        self.assertAlmostEqual(newest["metrics"]["sharpe"], 1.89)
+
 
 if __name__ == "__main__":
     unittest.main()

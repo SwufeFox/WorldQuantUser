@@ -6,8 +6,16 @@ should save you from reading the source.
 ## 0. Start here
 
 ```bash
+python research_cli.py brief     # one bounded document: book, last runs, open questions
 python research_cli.py schema
 ```
+
+`brief` is the cheapest way to learn where the work stands. Read it before the
+ledger, before the result directory, and before any note written last week: it is
+built to be smaller than the archive it summarises. Its open-question list comes from
+`open-threads.md` in the research directory - keep that file honest, one
+`- [open] …` or `- [closed] …` line per question, because it is what survives a
+context reset.
 
 That prints the complete contract as JSON: every command, every argument with
 its type and choices, the research-file format, the error codes and the exit

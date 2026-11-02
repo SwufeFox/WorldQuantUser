@@ -450,25 +450,40 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
     durable record.
     """
     path = registry_path or default_registry_path()
+    stored = {entry.get("key"): entry for entry in load_entries(path)}
     entries = []
     written = 0
     for record in records:
+        key = record.get("alpha_id")
+        previous = stored.get(key) if key else None
+        status = record.get("status")
+        chosen_verdict = verdict or auto_verdict(record)
+        if previous and (previous.get("status") or "").upper() == "ACTIVE":
+            # A simulation cannot un-submit a book alpha. BRAIN hands back the
+            # existing id when an identical expression is re-run, so a re-run of a
+            # book member arrives here looking like an ordinary new record - and on
+            # 2026-11-02 a 20-field batch demoted `E5VzE550` from ACTIVE to COMPLETE
+            # and relabelled it `rejected`, which quietly shrank the book by one.
+            if (status or "").upper() != "ACTIVE":
+                status = previous.get("status")
+            if not verdict:
+                chosen_verdict = previous.get("verdict") or chosen_verdict
         entry = build_entry(
             {
-                "alpha_id": record.get("alpha_id"),
+                "alpha_id": key,
                 "expression": record.get("expression"),
                 "decay": record.get("decay"),
                 "settings": record.get("settings") or settings,
                 "metrics": record.get("metrics"),
                 "checks": record.get("checks"),
                 "out_of_sample": record.get("out_of_sample"),
-                "status": record.get("status"),
+                "status": status,
                 "error": record.get("error"),
             },
             idea=idea,
             mechanism=record.get("mechanism") or mechanism,
             family=record.get("family") or family,
-            verdict=verdict or auto_verdict(record),
+            verdict=chosen_verdict,
             note=note,
             source=source,
         )

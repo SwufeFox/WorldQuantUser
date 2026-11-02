@@ -182,6 +182,20 @@ python research_cli.py schema            # commands, arguments, formats, codes
 python research_cli.py schema simulate   # one command in detail
 ```
 
+### Start a session with one bounded document
+
+```bash
+python research_cli.py brief             # book, last 7 days, new write-ups, open questions
+python research_cli.py brief --days 30 --top 10
+```
+
+It answers "where does the research stand" from the ledger, the result directory and
+`open-threads.md`, and stays small on purpose: reading the ledger, every write-up and
+last week's note is the expensive part of resuming work, and it grows every week while
+the answer does not. The open-question list is a hand-maintained file (`- [open] …` /
+`- [closed] …`, one line each) because what is still undecided is a judgement, not a
+derived number.
+
 ### Check the account
 
 ```bash
