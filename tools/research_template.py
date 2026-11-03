@@ -40,6 +40,7 @@ import argparse
 import itertools
 import json
 import os
+import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -120,15 +121,21 @@ def expand(expression, substitutions):
     like a batch of variants that all failed.
     """
     targets = list(substitutions)
+    patterns = {}
     for target in targets:
-        if target not in expression:
+        # Whole identifiers only. `str.replace("sales", "revenue")` also rewrites
+        # `sales_growth` and `sales_number`, so a "single-factor" swap silently
+        # changed several inputs - and both fields exist, so the lint passed.
+        pattern = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(target))
+        if not pattern.search(expression):
             raise SystemExit("%r is not in the parent expression; nothing to swap"
                              % target)
+        patterns[target] = pattern
     pairs = []
     for combination in itertools.product(*(substitutions[t] for t in targets)):
         text = expression
         for target, value in zip(targets, combination):
-            text = text.replace(target, value)
+            text = patterns[target].sub(value, text)
         pairs.append((",".join("%s=%s" % (t, v) for t, v in zip(targets, combination)),
                       text))
     return pairs

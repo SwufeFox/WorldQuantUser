@@ -37,7 +37,6 @@ import json
 import random
 import re
 import sys
-from collections import Counter
 
 sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
@@ -252,20 +251,35 @@ def apply_review(pooled, review):
     merges = review.get("merges") or []
     excluded = review.get("exclusions") or {}
     members = {field: root for root, group in pooled["clusters"].items() for field in group}
+
+    # Merge *clusters*, not the fields named in the review. Naming one member of a
+    # three-field cluster is how a reviewer says "these two clusters are one economic
+    # concept"; reassigning only the listed names left the rest of each cluster under
+    # its old root, so sampling could still draw two fields from what was supposed to
+    # be a single concept.
+    parent = {root: root for root in pooled["clusters"]}
+
+    def find(name):
+        while parent.get(name, name) != name:
+            parent[name] = parent.get(parent[name], parent[name])
+            name = parent[name]
+        return name
+
+    def union(left, right):
+        a, b = find(left), find(right)
+        if a != b:
+            parent[a] = b
+
     for group in merges:
-        roots = {members.get(name) for name in group if name in members}
-        roots.discard(None)
-        if not roots:
-            continue
-        anchor = sorted(roots)[0]
-        for name in group:
-            if name in members:
-                members[name] = anchor
+        roots = sorted({members[name] for name in group if name in members})
+        for other in roots[1:]:
+            union(roots[0], other)
+
     clusters = {}
     for field, root in members.items():
         if field in excluded:
             continue
-        clusters.setdefault(root, []).append(field)
+        clusters.setdefault(find(root), []).append(field)
     merged = dict(pooled)
     merged["clusters"] = {root: sorted(v) for root, v in sorted(clusters.items())}
     merged["review"] = {"merges": merges, "exclusions": excluded,

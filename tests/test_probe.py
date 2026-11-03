@@ -86,6 +86,9 @@ class ProbeTests(unittest.TestCase):
         # test year, which is the only out-of-sample evidence the API exposes.
         data = self._run()
         self.assertTrue(all("train_sharpe" in row for row in data["rows"]))
+        self.assertTrue(all("train_fitness" in row for row in data["rows"]))
+        # The full-window numbers contain the test year, so they are protected too.
+        self.assertTrue(all("sharpe" not in row for row in data["rows"]))
         self.assertTrue(all("test_sharpe" not in row for row in data["rows"]))
         data = self._run(force=True, show_test=True)
         self.assertTrue(all("test_sharpe" in row for row in data["rows"]))

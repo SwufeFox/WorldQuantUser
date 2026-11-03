@@ -75,7 +75,7 @@ class CompareShapeTests(unittest.TestCase):
                 json.dump(payload, handle)
             paths.append(path)
         args = argparse.Namespace(files=paths, min_fitness=None, sort="sharpe",
-                                  contributions=False, save=None)
+                                  contributions=False, save=None, frozen=True)
         return cli.cmd_compare(args, mock.MagicMock())
 
     def test_a_bare_list_is_accepted(self):

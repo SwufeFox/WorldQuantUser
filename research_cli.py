@@ -554,6 +554,10 @@ def build_parser():
     cmp_.add_argument("--min-fitness", type=float, default=None)
     cmp_.add_argument("--sort", default="fitness",
                       choices=["fitness", "sharpe", "turnover", "returns", "id"])
+    cmp_.add_argument("--frozen", action="store_true",
+                      help="Show full-window and test-period columns. Only for a "
+                           "design that is already frozen: the full window contains "
+                           "the test year.")
     cmp_.add_argument("--contributions", action="store_true",
                       help="Also compute per-leg contributions from ablate labels.")
     cmp_.add_argument("--save")
@@ -965,10 +969,21 @@ def merge_settings(file_settings, args):
 # ---------------------------------------------------------------------------
 # Result shaping
 # ---------------------------------------------------------------------------
+def _finished(record):
+    """A run that produced final numbers.
+
+    ``WARNING`` is a finished run: BRAIN marks a simulation WARNING when a check
+    warns without failing (UNITS is the usual one) and every metric is final.
+    Counting only COMPLETE made a batch of WARNING records look like zero
+    completions, so `simulate` reported SIMULATION_FAILED and skipped recording.
+    """
+    return (record.get("status") or "").upper() in alpha_registry.FINISHED_STATUSES
+
+
 def summarize(records):
     """Count outcomes and rank the scored alphas so a caller can pick winners."""
-    completed = [r for r in records if r.get("status") == "COMPLETE"]
-    failed = [r for r in records if r.get("status") == "FAILED"]
+    completed = [r for r in records if _finished(r)]
+    failed = [r for r in records if (r.get("status") or "").upper() == "FAILED"]
     scored = [r for r in completed if isinstance(r.get("metrics"), dict)]
     ranking = sorted(
         (
@@ -987,10 +1002,10 @@ def summarize(records):
         "completed": len(completed),
         "failed": len(failed),
         "pending": sum(
-            r.get("status") == "PENDING" or bool(r.get("progress_url"))
+            (r.get("status") or "").upper() == "PENDING" or bool(r.get("progress_url"))
             for r in records
         ),
-        "queued": sum(r.get("status") == "QUEUED" for r in records),
+        "queued": sum((r.get("status") or "").upper() == "QUEUED" for r in records),
         "other": len(records) - len(completed) - len(failed),
         "ranking": ranking,
         "best": ranking[0] if ranking else None,
@@ -1570,22 +1585,29 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
         Path(checkpoint_path).unlink(missing_ok=True)
         checkpoint_path = None
 
-    records = _sort_simulation_results(records, args)
-    summary = summarize(records)
+    # The display view honours --sort/--top; the batch, the summary and the ledger
+    # must not. Truncating before recording lost every arm outside the top N - and
+    # with the checkpoint deleted at the end, those alphas had been paid for and
+    # left no trace, which is both wasted quota and a selection bias in the archive.
+    every = list(records)
+    display = _sort_simulation_results(records, args)
+    summary = summarize(every)
     if summary["completed"] == 0 and summary["total"] and not (
         summary["pending"] or summary["queued"]
     ):
         first_error = next(
-            (r.get("error") for r in records if r.get("error")), "unknown error"
+            (r.get("error") for r in every if r.get("error")), "unknown error"
         )
         raise CliError(
             "SIMULATION_FAILED",
             "all %d simulations failed" % summary["total"],
             str(first_error),
         )
-    result = _simulation_result(records, settings, checkpoint_path)
+    result = _simulation_result(every, settings, checkpoint_path)
+    result["results"] = display
+    result["results_total"] = len(every)
     if getattr(args, "record", False):
-        result["registry"] = _record_simulation(records, settings, args)
+        result["registry"] = _record_simulation(every, settings, args)
     return result
 
 
@@ -1682,7 +1704,12 @@ def cmd_compare(args, _sink):
 
     Variants used to live in separate batch files and were aligned by eye, which
     is how a five-leg version scoring below its four-leg parent went unnoticed.
+
+    Two views, because the default one must not leak the test year. ``train`` ranks
+    on the train period and does not print the full-window numbers; ``frozen`` shows
+    them for a design that is already fixed.
     """
+    frozen = bool(getattr(args, "frozen", False))
     def records_from(path, payload):
         """Records from the two shapes this repository writes.
 
@@ -1725,30 +1752,40 @@ def cmd_compare(args, _sink):
                         if isinstance(value, dict)
                         and value.get("result") in ("FAIL", "ERROR"))
         oos = record.get("out_of_sample") or {}
-        rows.append({
+        train = oos.get("train") or {}
+        row = {
             "candidate_id": record.get("candidate_id"),
             "alpha_id": record.get("alpha_id"),
             "decay": record.get("decay"),
-            "sharpe": metrics.get("sharpe"),
-            "fitness": metrics.get("fitness"),
-            "turnover": metrics.get("turnover"),
-            "returns": metrics.get("returns"),
-            "train_sharpe": (oos.get("train") or {}).get("sharpe"),
-            "test_sharpe": (oos.get("test") or {}).get("sharpe"),
+            # The exploration columns. `sharpe`/`fitness` below are the full window,
+            # which contains the test year, so they are only filled in the frozen view.
+            "train_sharpe": train.get("sharpe"),
+            "train_fitness": train.get("fitness"),
+            "train_turnover": train.get("turnover"),
             "failed_checks": failed,
-        })
+        }
+        if frozen:
+            row.update({"sharpe": metrics.get("sharpe"), "fitness": metrics.get("fitness"),
+                        "turnover": metrics.get("turnover"),
+                        "returns": metrics.get("returns"),
+                        "test_sharpe": (oos.get("test") or {}).get("sharpe")})
+        rows.append(row)
 
+    fitness_key = "fitness" if frozen else "train_fitness"
     if args.min_fitness is not None:
         rows = [row for row in rows
-                if isinstance(row["fitness"], (int, float))
-                and row["fitness"] >= args.min_fitness]
+                if isinstance(row.get(fitness_key), (int, float))
+                and row[fitness_key] >= args.min_fitness]
 
     key = "alpha_id" if args.sort == "id" else args.sort
+    if not frozen and key in {"sharpe", "fitness", "turnover", "returns"}:
+        key = "train_" + key
     rows.sort(key=lambda row: (row[key] is None, -(row[key] or 0)
                                if isinstance(row[key], (int, float))
                                else str(row[key])))
 
-    data = {"files": args.files, "count": len(rows), "rows": rows}
+    data = {"files": args.files, "count": len(rows), "view": "frozen" if frozen else "train",
+            "rows": rows}
     if args.contributions:
         data["contributions"] = ablation.report(records)
     _maybe_save(args, data)
@@ -1837,29 +1874,37 @@ def cmd_probe(args, _sink):
 
     rows = []
     note("")
-    note("%-28s %6s %6s %7s %7s%s" % ("label", "S", "F", "T", "train",
-                                       " %7s" % "test" if args.show_test else ""))
+    header = "%-28s %7s %6s %7s" % ("label", "trS", "trF", "trT")
+    if args.show_test:
+        header += " %7s %6s %7s %7s" % ("S", "F", "T", "testS")
+    note(header)
     for record, arm in zip(records, [a for group in groups.values() for a in group]):
         metrics = record.get("metrics") or {}
         split = record.get("out_of_sample") or {}
+        train = split.get("train") or {}
         failed = sorted(name for name, body in (record.get("checks") or {}).items()
                         if isinstance(body, dict) and body.get("result") == "FAIL")
+        # Exploration view: train period only. The platform's headline metrics use
+        # the full window, which *contains* the test year, so ranking on them is
+        # ranking on test - hiding one column would not have fixed that.
         row = {"label": arm["label"], "alpha_id": record.get("alpha_id"),
                "expression": arm["expression"],
                "settings": {**settings, **(arm.get("settings") or {})},
                "status": record.get("status"), "error": record.get("error"),
-               "sharpe": metrics.get("sharpe"), "fitness": metrics.get("fitness"),
-               "turnover": metrics.get("turnover"), "returns": metrics.get("returns"),
-               "train_sharpe": (split.get("train") or {}).get("sharpe"),
-               "train_fitness": (split.get("train") or {}).get("fitness"),
+               "train_sharpe": train.get("sharpe"),
+               "train_fitness": train.get("fitness"),
+               "train_turnover": train.get("turnover"),
+               "train_returns": train.get("returns"),
                "failed_checks": failed}
+        line = "%-28s %7s %6s %7s" % (arm["label"], row["train_sharpe"],
+                                      row["train_fitness"], row["train_turnover"])
         if args.show_test:
-            row["test_sharpe"] = (split.get("test") or {}).get("sharpe")
+            row.update({"sharpe": metrics.get("sharpe"), "fitness": metrics.get("fitness"),
+                        "turnover": metrics.get("turnover"),
+                        "test_sharpe": (split.get("test") or {}).get("sharpe")})
+            line += " %7s %6s %7s %7s" % (row["sharpe"], row["fitness"],
+                                          row["turnover"], row["test_sharpe"])
         rows.append(row)
-        line = "%-28s %6s %6s %7s %7s" % (arm["label"], row["sharpe"], row["fitness"],
-                                          row["turnover"], row["train_sharpe"])
-        if args.show_test:
-            line += " %7s" % row["test_sharpe"]
         note(line + ("  fail=" + ",".join(failed) if failed else ""))
 
     target = Path(research_paths.ensure_dir()) / ("%s-%s.json" % (

@@ -344,9 +344,11 @@ class SummaryTests(unittest.TestCase):
         ]
         summary = cli.summarize(records)
         self.assertEqual(summary["total"], 4)
-        self.assertEqual(summary["completed"], 2)
+        # WARNING is a finished run: the platform writes every metric and only a check
+        # warned, so it counts as completed and stays out of `other`.
+        self.assertEqual(summary["completed"], 3)
         self.assertEqual(summary["failed"], 1)
-        self.assertEqual(summary["other"], 1)
+        self.assertEqual(summary["other"], 0)
         self.assertEqual(summary["best"]["alpha_id"], "B")
 
     def test_records_without_metrics_are_not_ranked(self):

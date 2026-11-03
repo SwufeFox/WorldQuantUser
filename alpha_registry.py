@@ -56,6 +56,13 @@ __all__ = [
 # ``no_go``     - abandoned before a fair test (data blocked, unusable fields).
 VERDICTS = ("candidate", "watch", "rejected", "falsified", "no_go")
 
+#: Statuses that mean the platform finished the run and every number is final.
+#: ``WARNING`` belongs here: BRAIN uses it when a check warns without failing
+#: (``UNITS`` is the usual one), and the metrics are as final as ``COMPLETE``.
+#: Treating it as unfinished made a Sharpe 2.37 / Fitness 1.68 alpha look like a
+#: failed simulation in every summary and in the ledger.
+FINISHED_STATUSES = frozenset({"COMPLETE", "WARNING"})
+
 # Second-level grouping: which return source an alpha draws on. ``mechanism``
 # is deliberately specific (one label per construction), so counting labels
 # overstates diversity -- thirteen book alphas carry eleven labels but only
@@ -420,7 +427,7 @@ def auto_verdict(record):
     # Sharpe 2.37, Fitness 1.68, only a UNITS warning - was filed as `rejected` with
     # reason `unrecorded_check`, which reads as "this alpha failed" to every later
     # search over the ledger.
-    if record.get("status") not in {"COMPLETE", "WARNING"}:
+    if (record.get("status") or "").upper() not in FINISHED_STATUSES:
         return "rejected"
     checks = record.get("checks") or {}
     if isinstance(checks, dict):
@@ -441,8 +448,32 @@ def auto_verdict(record):
     return "watch"
 
 
+def _inherit_judgement(entry, previous, pinned_verdict=False):
+    """Keep human labels when a simulation is re-recorded without them.
+
+    Metrics and checks are measurements and are always replaced. Family,
+    mechanism, idea, note and lineage are judgement - ``alpha label`` exists
+    precisely so a person can set them - and a re-run that carries no opinion must
+    not erase them. Before this, re-simulating an id blanked ``family`` and
+    ``mechanism`` and dropped ``parent``/``op``, so the ledger's lineage view lost
+    the record while the newest-row-wins rule kept the blank one.
+    """
+    for field in ("family", "mechanism", "idea", "note", "parent", "op", "legs"):
+        if not entry.get(field) and previous.get(field) is not None:
+            entry[field] = previous[field]
+    # An automatic verdict may not overwrite a verdict a human set; ``relabel``
+    # marks those with ``verdict_manual``.
+    if (previous.get("verdict_manual") and not pinned_verdict
+            and previous.get("verdict")):
+        entry["verdict"] = previous["verdict"]
+        entry["verdict_manual"] = True
+    elif previous.get("verdict_manual"):
+        entry["verdict_manual"] = True
+    return entry
+
+
 def record_simulation(records, settings, idea=None, mechanism=None, family=None,
-                      note=None, verdict=None, registry_path=None, source="simulate"):
+                       note=None, verdict=None, registry_path=None, source="simulate"):
     """Append one ledger entry per finished simulation record; return a summary.
 
     ``record["mechanism"]`` and ``record["family"]`` win over the run-wide default,
@@ -493,6 +524,8 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
             note=note,
             source=source,
         )
+        if previous:
+            entry = _inherit_judgement(entry, previous, pinned_verdict=verdict is not None)
         _, did_write = record_entry(entry, path)
         written += 1 if did_write else 0
         entries.append(entry)
@@ -651,6 +684,8 @@ def relabel(entry, family=None, verdict=None, mechanism=None, idea=None,
             raise ValueError("verdict must be one of %s, got %r"
                              % (", ".join(VERDICTS), verdict))
         updated["verdict"] = verdict
+        # A human decision, so a later automatic record must not overwrite it.
+        updated["verdict_manual"] = True
     if mechanism is not None:
         updated["mechanism"] = mechanism
     if idea is not None:
