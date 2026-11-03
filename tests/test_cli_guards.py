@@ -119,6 +119,41 @@ class AlphaGetMetadataTests(unittest.TestCase):
         self.assertEqual(data["tags"], ["dispersion"])
 
 
+class CompareSortAndContributionTests(unittest.TestCase):
+    def _run(self, payload, **overrides):
+        path = os.path.join(tempfile.mkdtemp(), "batch.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        args = argparse.Namespace(files=[path], min_fitness=None, sort="sharpe",
+                                  contributions=False, save=None, frozen=False)
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        return cli.cmd_compare(args, mock.MagicMock())
+
+    def test_every_allowed_sort_key_exists_in_the_train_view(self):
+        # `--sort returns` raised KeyError: the row had train_sharpe/fitness/turnover
+        # but no train_returns, and the sort key had already been rewritten.
+        for key in ("sharpe", "fitness", "turnover", "returns", "id"):
+            data = self._run([result_record()], sort=key)
+            self.assertEqual(data["count"], 1, key)
+
+    def test_contributions_use_train_fitness_in_the_train_view(self):
+        # The table hid the test year; `--contributions` read full-window fitness anyway,
+        # so the "drop this leg" verdict was computed on data the view had just hidden.
+        records = [
+            {"candidate_id": "full", "alpha_id": "F",
+             "metrics": {"fitness": 2.0}, "out_of_sample": {"train": {"fitness": 1.0}}},
+            {"candidate_id": "loo:a", "alpha_id": "A",
+             "metrics": {"fitness": 1.9}, "out_of_sample": {"train": {"fitness": 1.4}}},
+        ]
+        train = self._run(records, contributions=True)
+        self.assertEqual(train["contributions"]["view"], "train")
+        self.assertEqual(train["contributions"]["legs"][0]["verdict"], "hurts")
+        frozen = self._run(records, contributions=True, frozen=True)
+        self.assertEqual(frozen["contributions"]["view"], "frozen")
+        self.assertEqual(frozen["contributions"]["legs"][0]["verdict"], "adds")
+
+
 class CompareMinFitnessTests(unittest.TestCase):
     def test_min_fitness_applies_to_the_view_it_reports_on(self):
         # The train view filters on train_fitness; --frozen filters on the full-window

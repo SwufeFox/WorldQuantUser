@@ -93,6 +93,16 @@ class ProbeTests(unittest.TestCase):
         data = self._run(force=True, show_test=True)
         self.assertTrue(all("test_sharpe" in row for row in data["rows"]))
 
+    def test_a_name_collision_is_detected_before_anything_is_spent(self):
+        # Wrong behaviour this prevents: the same-day re-run paid for the whole batch
+        # and only then refused to save it, because the collision was checked after
+        # `guarded_sim.simulate` had already been called.
+        self._run()
+        self.fake.calls.clear()
+        with self.assertRaises(cli.CliError):
+            self._run()
+        self.assertEqual(self.fake.calls, [])
+
     def test_an_existing_batch_file_is_not_silently_overwritten(self):
         # Wrong behaviour this prevents: a second run reusing the same NAME wrote over
         # the previous batch's JSON, which is how a 6-arm result disappeared.
@@ -134,6 +144,44 @@ class ProbeTests(unittest.TestCase):
         data = self._run(dry_run=True)
         self.assertTrue(data["dry_run"])
         self.assertEqual(self.fake.calls, [])
+
+    def test_dry_run_lints_each_settings_group_separately(self):
+        # A per-arm universe change moves the datafield catalogue; linting everything
+        # against the spec-level settings can pass a name that does not exist there.
+        seen = []
+
+        def fake_check(expressions, settings=None, session=None):
+            seen.append(dict(settings or {}))
+            return {"errors": [], "warnings": []}
+
+        self.fake.check = fake_check
+        self.spec["arms"] = [
+            {"label": "sub", "expression": "rank(close)"},
+            {"label": "top500", "expression": "rank(close)",
+             "settings": {"universe": "TOP500"}},
+        ]
+        self._write(self.spec)
+        self._run(dry_run=True)
+        self.assertEqual([item.get("universe") for item in seen], ["TOP3000", "TOP500"])
+
+    def test_each_record_carries_the_settings_it_ran_under(self):
+        # The ledger used to receive the spec-level settings for every arm, so an
+        # INDUSTRY arm was archived as SUBINDUSTRY and the comparison could not be
+        # reproduced.
+        self.spec["arms"] = [{"label": "ind", "expression": "rank(close)",
+                              "settings": {"neutralization": "INDUSTRY"}}]
+        self._write(self.spec)
+        data = self._run(force=True)
+        written = json.load(open(data["path"], encoding="utf-8"))
+        self.assertEqual(written["records"][0]["settings"]["neutralization"], "INDUSTRY")
+
+    def test_the_batch_file_can_be_read_by_compare(self):
+        data = self._run(force=True)
+        args = argparse.Namespace(files=[data["path"]], min_fitness=None,
+                                  sort="sharpe", contributions=False, save=None,
+                                  frozen=False)
+        compared = cli.cmd_compare(args, mock.MagicMock())
+        self.assertEqual(compared["count"], 2)
 
     def test_rows_carry_the_failed_checks(self):
         self.fake.records = [record("A1", 1.2, 0.7, fails=("LOW_SHARPE",)),

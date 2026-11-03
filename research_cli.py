@@ -969,6 +969,16 @@ def merge_settings(file_settings, args):
 # ---------------------------------------------------------------------------
 # Result shaping
 # ---------------------------------------------------------------------------
+def _train_metrics(record):
+    """The metrics a selection decision is allowed to see: the train period only.
+
+    The platform's headline numbers use the full window, which contains the test
+    year, so every path that ranks, filters or ablates must come through here unless
+    the caller has explicitly frozen the design (``--frozen`` / ``--show-test``).
+    """
+    return (record.get("out_of_sample") or {}).get("train") or {}
+
+
 def _finished(record):
     """A run that produced final numbers.
 
@@ -1726,6 +1736,10 @@ def cmd_compare(args, _sink):
             return [item for item in payload if isinstance(item, dict)]
         if isinstance(payload, dict) and isinstance(payload.get("results"), list):
             return [item for item in payload["results"] if isinstance(item, dict)]
+        if isinstance(payload, dict) and isinstance(payload.get("records"), list):
+            # `probe` writes the raw simulation records next to its display rows, so a
+            # batch can be re-read under --frozen without re-running anything.
+            return [item for item in payload["records"] if isinstance(item, dict)]
         raise CliError("INVALID_INPUT",
                        "%s is not a simulate result document" % path,
                        "expected {\"results\": [...]} or a bare list of records; "
@@ -1762,6 +1776,7 @@ def cmd_compare(args, _sink):
             "train_sharpe": train.get("sharpe"),
             "train_fitness": train.get("fitness"),
             "train_turnover": train.get("turnover"),
+            "train_returns": train.get("returns"),
             "failed_checks": failed,
         }
         if frozen:
@@ -1787,7 +1802,13 @@ def cmd_compare(args, _sink):
     data = {"files": args.files, "count": len(rows), "view": "frozen" if frozen else "train",
             "rows": rows}
     if args.contributions:
-        data["contributions"] = ablation.report(records)
+        # The contribution is a selection decision ("does this leg earn its place"),
+        # so in the exploration view it has to be computed from train-period fitness.
+        # It used to read the full-window block regardless, which put the test year
+        # back into the answer the table had just hidden.
+        data["contributions"] = ablation.report(
+            records, metrics_of=None if frozen else _train_metrics)
+        data["contributions"]["view"] = "frozen" if frozen else "train"
     _maybe_save(args, data)
     return data
 
@@ -1854,19 +1875,33 @@ def cmd_probe(args, _sink):
         key = json.dumps({**settings, **(arm.get("settings") or {})}, sort_keys=True)
         groups.setdefault(key, []).append(arm)
 
+    # The output path and its collision rule are decided before anything is spent:
+    # an existing batch file used to raise only after the simulations had run, so a
+    # same-day re-run paid full quota and then refused to save the result.
+    target = Path(research_paths.batch_path(name))
+    if target.exists() and not args.force:
+        raise CliError("INVALID_INPUT", "%s already exists" % target.name,
+                       "pass --name to label this batch, or --force to overwrite it")
+
     if args.dry_run:
-        report = guarded_sim.check([arm["expression"] for arm in arms], settings)
-        blocking = [item for item in report["errors"]
-                    if item["code"] in {"unknown_operator", "unknown_identifier",
-                                        "unused_variable", "operator_arg_constraint",
-                                        "signal_type", "undefined_variable"}]
-        for item in blocking:
-            note("lint %-16s %s" % (item["code"],
-                                    item.get("identifier") or item.get("operator")))
+        blocking = []
+        for key, group in groups.items():
+            # Lint each group against its own settings: a per-arm universe or region
+            # change moves the datafield catalogue, so one shared lint can pass a name
+            # that does not exist in the scope the arm actually runs in.
+            arm_settings = json.loads(key)
+            report = guarded_sim.check([arm["expression"] for arm in group], arm_settings)
+            for item in report["errors"]:
+                if item["code"] in {"unknown_operator", "unknown_identifier",
+                                    "unused_variable", "operator_arg_constraint",
+                                    "signal_type", "undefined_variable"}:
+                    blocking.append(item)
+                    note("lint %-16s %s" % (item["code"],
+                                            item.get("identifier") or item.get("operator")))
         note("dry run: %d arm(s) in %d settings group(s), %d blocking finding(s)"
              % (len(arms), len(groups), len(blocking)))
         return {"dry_run": True, "arms": len(arms), "groups": len(groups),
-                "blocking": blocking, "errors": report["errors"]}
+                "blocking": blocking}
 
     records = []
     for key, group in groups.items():
@@ -1874,10 +1909,16 @@ def cmd_probe(args, _sink):
         note("simulating %d arm(s) under %s/%s/%s"
              % (len(group), arm_settings.get("region"), arm_settings.get("universe"),
                 arm_settings.get("neutralization")))
-        records.extend(guarded_sim.simulate(
+        produced = guarded_sim.simulate(
             [arm["expression"] for arm in group], arm_settings,
             labels=[arm["label"] for arm in group],
-            on_event=lambda kind, payload: note("  %s" % kind)))
+            on_event=lambda kind, payload: note("  %s" % kind))
+        for record in produced:
+            # Carry the settings this arm actually ran under. The ledger used to be
+            # written with the spec's global settings, so an INDUSTRY arm was filed as
+            # SUBINDUSTRY and the comparison could not be reproduced later.
+            record["settings"] = dict(arm_settings)
+        records.extend(produced)
 
     rows = []
     note("")
@@ -1914,14 +1955,9 @@ def cmd_probe(args, _sink):
         rows.append(row)
         note(line + ("  fail=" + ",".join(failed) if failed else ""))
 
-    target = Path(research_paths.ensure_dir()) / ("%s-%s.json" % (
-        name, __import__("datetime").date.today().isoformat()))
-    if target.exists() and not args.force:
-        raise CliError("INVALID_INPUT",
-                       "%s already exists" % target.name,
-                       "pass --name to label this batch, or --force to overwrite it")
     Path(target).write_text(
-        json.dumps({"spec": str(args.spec), "name": name, "rows": rows},
+        json.dumps({"spec": str(args.spec), "name": name, "rows": rows,
+                    "records": records},
                    ensure_ascii=False, indent=1), encoding="utf-8")
     note("wrote %s" % target)
 

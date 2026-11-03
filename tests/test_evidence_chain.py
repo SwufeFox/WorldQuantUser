@@ -137,6 +137,23 @@ class PlaceboClusterMergeTests(unittest.TestCase):
         self.assertEqual(list(merged["clusters"].values()), [["a1", "b1"]])
 
 
+class AblationViewTests(unittest.TestCase):
+    def test_contributions_can_be_computed_from_a_chosen_metric_block(self):
+        # `compare --contributions` used to read the full window even in the train
+        # view, so a "drop this leg" verdict could rest on the test year.
+        records = [
+            {"candidate_id": "full", "metrics": {"fitness": 2.0},
+             "out_of_sample": {"train": {"fitness": 1.0}}},
+            {"candidate_id": "loo:a", "metrics": {"fitness": 1.9},
+             "out_of_sample": {"train": {"fitness": 1.4}}},
+        ]
+        frozen = cli.ablation.report(records)
+        train = cli.ablation.report(
+            records, metrics_of=lambda r: (r.get("out_of_sample") or {}).get("train", {}))
+        self.assertEqual(frozen["legs"][0]["verdict"], "adds")
+        self.assertEqual(train["legs"][0]["verdict"], "hurts")
+
+
 class IdentifierSubstitutionTests(unittest.TestCase):
     def test_a_token_that_is_a_prefix_of_another_field_is_not_rewritten(self):
         # Wrong behaviour this prevents: swapping `sales` also rewrote `sales_growth`,

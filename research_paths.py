@@ -132,3 +132,19 @@ def lock_path(name):
     """Path of a named lock file under the cache directory."""
     safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in name)
     return os.path.join(cache_root(), "locks", safe + ".lock")
+
+
+def batch_path(name, directory=None, day=None):
+    """Where one experiment batch writes its JSON: ``<dir>/<name>-<YYYY-MM-DD>.json``.
+
+    The name is derived here rather than in each caller because two of them had
+    already drifted: `probe` refused to overwrite but only after spending the run,
+    and the research template opened the path with mode ``w`` and overwrote the
+    previous batch of the same name without a word. One function means a batch file
+    has one name and one collision rule.
+    """
+    import datetime
+
+    directory = directory or ensure_dir()
+    day = day or datetime.date.today().isoformat()
+    return os.path.join(directory, "%s-%s.json" % (name, day))

@@ -170,15 +170,15 @@ def variants(expression, modes=MODES):
     return out
 
 
-def _fitness(record):
+def _fitness(record, metrics_of=None):
     if not record:
         return None
-    metrics = record.get("metrics") or {}
-    value = metrics.get("fitness")
+    metrics = metrics_of(record) if metrics_of else (record.get("metrics") or {})
+    value = (metrics or {}).get("fitness")
     return value if isinstance(value, (int, float)) else None
 
 
-def report(records):
+def report(records, metrics_of=None):
     """Turn simulation records into per-leg contributions.
 
     ``contribution`` is ``fitness(full) - fitness(full without this leg)``, so a
@@ -187,6 +187,9 @@ def report(records):
     separates a driver from a carrier: a carrier can add to a composite while
     scoring weakly on its own.
     """
+    def fitness(record):
+        return _fitness(record, metrics_of)
+
     by_id = {}
     for record in records or []:
         if not isinstance(record, dict):
@@ -196,7 +199,7 @@ def report(records):
             by_id[name] = record
 
     full = by_id.get("full")
-    full_fitness = _fitness(full) if full else None
+    full_fitness = fitness(full) if full else None
     # Legs come from the union of both arms. Building them from `solo:` alone meant a
     # run of `--modes full,loo` -- which the CLI supports -- reported zero legs even
     # though every contribution had been measured.
@@ -204,11 +207,11 @@ def report(records):
     for name in by_id:
         if name.startswith("solo:") or name.startswith("loo:"):
             names.add(name.split(":", 1)[1])
-    legs = [{"leg": leg, "solo": _fitness(by_id.get("solo:" + leg))}
+    legs = [{"leg": leg, "solo": fitness(by_id.get("solo:" + leg))}
             for leg in sorted(names)]
     for row in legs:
         loo = by_id.get("loo:" + row["leg"])
-        row["without"] = _fitness(loo) if loo else None
+        row["without"] = fitness(loo) if loo else None
         if full_fitness is not None and row["without"] is not None:
             row["contribution"] = round(full_fitness - row["without"], 4)
         else:

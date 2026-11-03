@@ -13,10 +13,12 @@ and the recording are the template's job, and they are tested without a network.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -126,6 +128,32 @@ class ParentExperimentTests(unittest.TestCase):
     def test_empty_substitutions_is_refused(self):
         with self.assertRaises(SystemExit):
             research_template.parent_experiment("PARENT1", self.registry)
+
+
+class BatchFileCollisionTests(unittest.TestCase):
+    def test_an_existing_batch_file_stops_the_run_before_simulating(self):
+        # The template opened its output with mode "w" after a finished simulation, so
+        # a same-day re-run both spent quota and silently replaced the earlier file.
+        tmp = tempfile.mkdtemp()
+        target = os.path.join(tmp, "template-2026-11-04.json")
+        with open(target, "w", encoding="utf-8") as handle:
+            json.dump([{"alpha_id": "OLD"}], handle)
+        called = []
+
+        def fake_simulate(*args, **kwargs):
+            called.append(args)
+            return []
+
+        with mock.patch.object(research_template, "EXPRESSIONS", ["rank(close)"]), \
+                mock.patch.object(research_template, "PARENT", ""), \
+                mock.patch.object(research_template, "NAME", "template"), \
+                mock.patch.object(research_template.research_paths, "batch_path",
+                                  lambda name: target), \
+                mock.patch.object(research_template.guarded_sim, "simulate", fake_simulate), \
+                mock.patch("sys.argv", ["research_template.py"]):
+            with self.assertRaises(SystemExit):
+                research_template.main()
+        self.assertEqual(called, [])
 
 
 class AutoVerdictTests(unittest.TestCase):

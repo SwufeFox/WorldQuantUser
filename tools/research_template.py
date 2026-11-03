@@ -165,7 +165,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="parse and lint only; never submits")
     parser.add_argument("--force", action="store_true",
-                        help="simulate even if the catalogue check complains")
+                        help="simulate even if the catalogue check complains, and "
+                             "overwrite an existing batch file of the same name")
     parser.add_argument("--no-record", action="store_true",
                         help="do not append the results to the ledger")
     parser.add_argument("--show-test", action="store_true",
@@ -197,29 +198,38 @@ def main() -> int:
               % (len(compiled), len(report["errors"])))
         return 0
 
+    # The output name and its collision rule are shared with `probe`, and checked
+    # before the run: opening the path with mode "w" after a finished simulation
+    # silently overwrote the earlier batch of the same name.
+    out = research_paths.batch_path(NAME)
+    if os.path.exists(out) and not args.force:
+        raise SystemExit("%s already exists; pass --force to overwrite it" % out)
+
     records = guarded_sim.simulate(compiled, settings, labels=labels, force=args.force)
 
-    out = os.path.join(research_paths.ensure_dir(), "%s-%s.json" % (
-        NAME, __import__("datetime").date.today().isoformat()))
     with open(out, "w") as handle:
         json.dump(records, handle, ensure_ascii=False, indent=1)
 
     print()
-    header = "%-28s %6s %6s %7s %7s" % ("label", "S", "F", "T", "train")
+    header = "%-28s %7s %6s %7s" % ("label", "trS", "trF", "trT")
     if args.show_test:
-        header += " %7s" % "test"
+        header += " %7s %6s %7s %7s" % ("S", "F", "T", "testS")
     print(header)
     for record in records:
         metrics = record.get("metrics") or {}
         split = record.get("out_of_sample") or {}
+        train = split.get("train") or {}
         failed = [name for name, body in (record.get("checks") or {}).items()
                   if isinstance(body, dict) and body.get("result") == "FAIL"]
-        line = ("%-28s %6s %6s %7s %7s"
+        # Train period only. The full window contains the test year, so printing it
+        # while choosing between arms is selection on out-of-sample data.
+        line = ("%-28s %7s %6s %7s"
                 % (str(record.get("mechanism") or record.get("alpha_id"))[:28],
-                   metrics.get("sharpe"), metrics.get("fitness"), metrics.get("turnover"),
-                   (split.get("train") or {}).get("sharpe")))
+                   train.get("sharpe"), train.get("fitness"), train.get("turnover")))
         if args.show_test:
-            line += " %7s" % (split.get("test") or {}).get("sharpe")
+            line += " %7s %6s %7s %7s" % (metrics.get("sharpe"), metrics.get("fitness"),
+                                          metrics.get("turnover"),
+                                          (split.get("test") or {}).get("sharpe"))
         print(line + ("  fail=" + ",".join(failed) if failed else ""))
 
     if not args.no_record:
