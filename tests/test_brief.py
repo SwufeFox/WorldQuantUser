@@ -86,6 +86,23 @@ class BriefTests(unittest.TestCase):
         self.assertEqual(data["recent"]["runs"], 0)
         self.assertEqual(data["documents"], [])
 
+    def test_ledger_health_counts_label_debt_and_recording_gaps(self):
+        # Both numbers were invisible until counted by hand: an ACTIVE row with no
+        # family/mechanism breaks every "how many mechanisms" question, and a row with
+        # metrics but no checks cannot be re-audited for why it failed.
+        alpha_registry.record_entry(entry("BOOK3", "ACTIVE", 1.2, family="event"),
+                                    self.registry)
+        rows = [json.loads(line) for line in open(self.registry, encoding="utf-8")]
+        rows[-1]["family"] = None
+        rows[-1]["mechanism"] = None
+        rows[-1]["checks"] = {}
+        with open(self.registry, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+        data = self._run()
+        self.assertEqual(data["ledger"]["book_rows_missing_labels"], 1)
+        self.assertGreaterEqual(data["ledger"]["rows_with_metrics_but_no_checks"], 1)
+
     def test_the_document_stays_small(self):
         # The bound is the point: a digest is useful only while it is cheaper to read
         # than the archive it replaces.

@@ -101,5 +101,40 @@ class CompareShapeTests(unittest.TestCase):
         self.assertIn("not a simulate result document", str(caught.exception))
 
 
+class AlphaGetMetadataTests(unittest.TestCase):
+    def test_name_category_and_tags_are_visible(self):
+        # Wrong behaviour this prevents: `alpha submit` refuses an alpha that has no
+        # name or category, and `alpha get` used to show neither - the only way to see
+        # why the submission stopped was to fetch the raw payload by hand.
+        payload = {"id": "A1", "name": "qf dispersion change", "category": "ANALYST",
+                   "tags": ["dispersion"], "regular": {"code": "rank(close)",
+                                                       "description": "", "operatorCount": 1},
+                   "settings": {"region": "USA"}, "status": "UNSUBMITTED",
+                   "is": {"sharpe": 2.0}, "checks": []}
+        args = argparse.Namespace(alpha_id="A1", save=None)
+        with mock.patch.object(cli, "with_session", lambda a, fn: payload):
+            data = cli.cmd_alpha_get(args, mock.MagicMock())
+        self.assertEqual(data["name"], "qf dispersion change")
+        self.assertEqual(data["category"], "ANALYST")
+        self.assertEqual(data["tags"], ["dispersion"])
+
+
+class CompareMinFitnessTests(unittest.TestCase):
+    def test_min_fitness_applies_to_the_view_it_reports_on(self):
+        # The train view filters on train_fitness; --frozen filters on the full-window
+        # number. Mixing them would let a row pass a bar it never cleared.
+        path = os.path.join(tempfile.mkdtemp(), "batch.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump([{"alpha_id": "A1", "metrics": {"sharpe": 2.0, "fitness": 1.6},
+                        "checks": {},
+                        "out_of_sample": {"train": {"sharpe": 1.0, "fitness": 0.6},
+                                          "test": {"sharpe": 0.8}}}], handle)
+        args = argparse.Namespace(files=[path], min_fitness=1.0, sort="fitness",
+                                  contributions=False, save=None, frozen=False)
+        self.assertEqual(cli.cmd_compare(args, mock.MagicMock())["count"], 0)
+        args.frozen = True
+        self.assertEqual(cli.cmd_compare(args, mock.MagicMock())["count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

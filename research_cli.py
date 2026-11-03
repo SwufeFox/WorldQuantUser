@@ -1808,6 +1808,13 @@ def _load_probe_spec(path):
     if not isinstance(arms, list) or not arms:
         raise CliError("INVALID_INPUT", "spec has no arms",
                        "each arm needs at least {\"expression\": ...}")
+    known = {"name", "idea", "mechanism", "note", "settings", "arms"}
+    unknown = sorted(set(spec) - known)
+    if unknown:
+        # A typo here is silent otherwise: `"setting"` instead of `"settings"` would
+        # run the whole batch on the defaults and look like a failed hypothesis.
+        note("spec: ignoring unknown key(s) %s (known: %s)"
+             % (", ".join(unknown), ", ".join(sorted(known))))
     for index, arm in enumerate(arms, 1):
         if not isinstance(arm, dict) or not isinstance(arm.get("expression"), str) \
                 or not arm["expression"].strip():
@@ -2041,10 +2048,18 @@ def cmd_brief(args, _sink):
                     if body:
                         threads[key].append(body)
 
+    # Label debt and recording gaps: both were invisible until someone counted by
+    # hand, and both make the ledger look complete while it is not.
+    unlabeled = sum(1 for entry in book.values()
+                    if not entry.get("family") or not entry.get("mechanism"))
+    no_checks = sum(1 for entry in entries
+                    if (entry.get("metrics") or {}) and not (entry.get("checks") or {}))
     data = {
         "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "window_days": days,
-        "ledger": {"rows": len(entries), "path": registry_path},
+        "ledger": {"rows": len(entries), "path": registry_path,
+                   "book_rows_missing_labels": unlabeled,
+                   "rows_with_metrics_but_no_checks": no_checks},
         "book": {
             "count": len(book),
             "sharpe_median": (round(sorted(sharpes)[len(sharpes) // 2], 3)
@@ -2445,6 +2460,13 @@ def cmd_alpha_get(args, _sink):
     code, description, operator_count = ml.regular_expression(payload)
     document = {
         "alpha_id": payload.get("id", args.alpha_id),
+        # Name, category and tags are what a submission carries and what makes an
+        # alpha attributable later. They live at the top of the payload, not under
+        # `is`, so they were invisible here - the submit path even refuses an alpha
+        # without them, and the only way to see why was to read the raw payload.
+        "name": payload.get("name"),
+        "category": payload.get("category"),
+        "tags": payload.get("tags") or [],
         "expression": code,
         "expression_description": description,
         "operator_count": operator_count,

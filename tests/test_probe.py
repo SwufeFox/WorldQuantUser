@@ -121,6 +121,15 @@ class ProbeTests(unittest.TestCase):
             self._run()
         self.assertEqual(caught.exception.code, "INVALID_INPUT")
 
+    def test_a_typo_in_a_top_level_key_is_reported(self):
+        # `"setting"` instead of `"settings"` would otherwise run the batch on the
+        # defaults and read as a failed hypothesis rather than a typo.
+        self.spec["setting"] = {"universe": "TOP500"}
+        self._write(self.spec)
+        with mock.patch.object(cli, "note") as spy:
+            self._run()
+        self.assertTrue(any("unknown key" in call.args[0] for call in spy.call_args_list))
+
     def test_dry_run_spends_nothing(self):
         data = self._run(dry_run=True)
         self.assertTrue(data["dry_run"])
