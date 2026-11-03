@@ -1633,6 +1633,14 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
     result = _simulation_result(every, settings, checkpoint_path)
     result["results"] = display
     result["results_total"] = len(every)
+    pending_ids = [record.get("alpha_id") or record.get("candidate_id")
+                   for record in every
+                   if (record.get("status") or "").upper() in {"PENDING", "QUEUED"}]
+    if pending_ids:
+        result["pending"] = pending_ids
+        result["next"] = ("some arms are still running; the checkpoint was kept - "
+                          "run `resume %s` before judging them"
+                          % (checkpoint_path or "<checkpoint>"))
     if getattr(args, "record", False):
         result["registry"] = _record_simulation(every, settings, args)
     return result

@@ -212,12 +212,16 @@ def report(records, metrics_of=None):
     for row in legs:
         loo = by_id.get("loo:" + row["leg"])
         row["without"] = fitness(loo) if loo else None
+        row["status"] = (loo or {}).get("status") or ("missing" if not loo else None)
         if full_fitness is not None and row["without"] is not None:
             row["contribution"] = round(full_fitness - row["without"], 4)
         else:
             row["contribution"] = None
         if row["contribution"] is None:
-            row["verdict"] = "unmeasured"
+            # A PENDING run is not a missing measurement: the number exists, it has
+            # just not arrived. Calling both "unmeasured" hid a resume that had to
+            # happen before the leg could be judged at all.
+            row["verdict"] = "pending" if row["status"] in {"PENDING", "QUEUED"} else "unmeasured"
         elif row["contribution"] > 0.02:
             row["verdict"] = "adds"
         elif row["contribution"] < -0.02:
@@ -226,10 +230,12 @@ def report(records, metrics_of=None):
             row["verdict"] = "neutral"
 
     hurts = [row["leg"] for row in legs if row["verdict"] == "hurts"]
+    pending = [row["leg"] for row in legs if row["verdict"] == "pending"]
     return {
         "full_fitness": full_fitness,
         "full_alpha_id": (full or {}).get("alpha_id"),
         "legs": legs,
         "hurts": hurts,
+        "pending": pending,
         "measured": sum(1 for row in legs if row["contribution"] is not None),
     }

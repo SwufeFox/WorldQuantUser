@@ -177,6 +177,24 @@ class AblationViewTests(unittest.TestCase):
         self.assertEqual(train["legs"][0]["verdict"], "hurts")
 
 
+class AblationPendingTests(unittest.TestCase):
+    def test_a_pending_loo_is_not_called_unmeasured(self):
+        # A PENDING arm is a number that has not arrived, not a number that cannot
+        # exist; collapsing both into "unmeasured" hid a `resume` that had to run
+        # before the leg could be judged.
+        records = [
+            {"candidate_id": "full", "status": "COMPLETE", "metrics": {"fitness": 2.0}},
+            {"candidate_id": "loo:a", "status": "PENDING", "metrics": None},
+            {"candidate_id": "loo:b", "status": "COMPLETE", "metrics": {"fitness": 1.9}},
+        ]
+        report = cli.ablation.report(records)
+        legs = {row["leg"]: row for row in report["legs"]}
+        self.assertEqual(legs["a"]["verdict"], "pending")
+        self.assertEqual(legs["a"]["status"], "PENDING")
+        self.assertEqual(legs["b"]["verdict"], "adds")
+        self.assertEqual(report["pending"], ["a"])
+
+
 class IdentifierSubstitutionTests(unittest.TestCase):
     def test_a_token_that_is_a_prefix_of_another_field_is_not_rewritten(self):
         # Wrong behaviour this prevents: swapping `sales` also rewrote `sales_growth`,
