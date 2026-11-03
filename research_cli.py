@@ -3026,6 +3026,11 @@ def cmd_alpha_label(args, _sink):
 
     Appends rather than edits: the ledger is append-only and the newest record for
     a key wins, so a relabel keeps the earlier judgement visible.
+
+    The response mirrors `alpha record`: ``registry``, ``written`` and the stored
+    ``entry``, plus the summary fields. It used to return only the summary, so a
+    caller that wanted the whole row had to reload the ledger - and the first
+    attempt to read ``data["entry"]`` silently produced ``None``.
     """
     path, entries = _ledger(args)
     target = alpha_registry.resolve(entries, args.alpha_id)
@@ -3043,16 +3048,19 @@ def cmd_alpha_label(args, _sink):
             mechanism=args.mechanism, idea=args.idea, note=args.note)
     except ValueError as exc:
         raise CliError("INVALID_INPUT", str(exc)) from exc
-    _, written = alpha_registry.record_entry(updated, path)
+    stored, written = alpha_registry.record_entry(updated, path)
     data = {
-        "key": updated.get("key"),
-        "alpha_id": updated.get("alpha_id"),
+        "registry": path,
         "written": written,
-        "family": updated.get("family"),
-        "verdict": updated.get("verdict"),
-        "mechanism": updated.get("mechanism"),
+        "entry": stored,
+        "key": stored.get("key"),
+        "alpha_id": stored.get("alpha_id"),
+        "family": stored.get("family"),
+        "verdict": stored.get("verdict"),
+        "mechanism": stored.get("mechanism"),
         "before": {"family": target.get("family"),
-                   "verdict": target.get("verdict")},
+                   "verdict": target.get("verdict"),
+                   "mechanism": target.get("mechanism")},
     }
     _maybe_save(args, data)
     return data
