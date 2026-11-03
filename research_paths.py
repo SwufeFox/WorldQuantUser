@@ -148,3 +148,31 @@ def batch_path(name, directory=None, day=None):
     directory = directory or ensure_dir()
     day = day or datetime.date.today().isoformat()
     return os.path.join(directory, "%s-%s.json" % (name, day))
+
+def views_log_path():
+    """Append-only log of every time out-of-sample numbers were looked at.
+
+    Hiding a column is not the same as not looking: a researcher who sees the test
+    period in round three and adjusts in round four has contaminated it just the
+    same. The only defence that survives across sessions is a record of *when* the
+    test period was read, by which tool, for which alphas - so a later reader can
+    tell a frozen validation from an iterative peek.
+    """
+    return os.path.join(ensure_dir(), "views.jsonl")
+
+
+def log_view(tool, view, alpha_ids=(), note=None):
+    """Append one entry to the views log. Never raises: logging must not block work."""
+    import datetime
+    import json
+
+    entry = {"ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+             "tool": tool, "view": view,
+             "alpha_ids": [value for value in alpha_ids if value],
+             "note": note}
+    try:
+        with open(views_log_path(), "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        return None
+    return entry

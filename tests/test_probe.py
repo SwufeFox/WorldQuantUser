@@ -183,6 +183,19 @@ class ProbeTests(unittest.TestCase):
         compared = cli.cmd_compare(args, mock.MagicMock())
         self.assertEqual(compared["count"], 2)
 
+    def test_showing_the_test_period_is_written_to_the_views_log(self):
+        # Hiding a column does not stop the leak; the log is what tells a frozen
+        # validation apart from an iterative peek three rounds later.
+        log = os.path.join(self.output_dir, "views.jsonl")
+        with mock.patch.object(cli.research_paths, "views_log_path", lambda: log):
+            self._run(force=True, show_test=True)
+            self._run(force=True)
+        entries = [json.loads(line) for line in open(log, encoding="utf-8")]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["tool"], "probe")
+        self.assertEqual(entries[0]["view"], "test")
+        self.assertEqual(sorted(entries[0]["alpha_ids"]), ["A1", "B1"])
+
     def test_rows_carry_the_failed_checks(self):
         self.fake.records = [record("A1", 1.2, 0.7, fails=("LOW_SHARPE",)),
                              record("B1", 2.0, 1.5)]

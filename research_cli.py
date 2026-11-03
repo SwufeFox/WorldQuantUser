@@ -526,6 +526,12 @@ def build_parser():
                      help="Research file (JSON) holding the composite. Omit with --expr.")
     abl.add_argument("--expr", default=None,
                      help="Composite expression: 'a = ...; b = ...; a + b'.")
+    abl.add_argument("--ids", default=None,
+                     help="Comma-separated ledger ids: write one ablation file per "
+                          "alpha instead of one for --expr/--file. Expressions that "
+                          "are not a sum of named legs are reported, not guessed at.")
+    abl.add_argument("--out-dir", default=None,
+                     help="With --ids, write <id>.json here (default: the research dir).")
     abl.add_argument("--modes", default="full,loo,solo",
                      help="Comma list from full, loo, solo (default all three).")
     abl.add_argument("--decay", type=int, default=None,
@@ -602,6 +608,17 @@ def build_parser():
     probe.add_argument("--registry", default=None)
     probe.add_argument("--save")
     probe.set_defaults(func=cmd_probe)
+
+    views = sub.add_parser(
+        "views",
+        help="Who looked at test-period numbers, when, and for which alphas.",
+        description="Reads the append-only views log that `probe --show-test` and "
+                    "`compare --frozen` write. Hiding a column does not stop the leak; "
+                    "recording when it was opened does.")
+    views.add_argument("--alpha", default=None, help="Only entries naming this alpha id.")
+    views.add_argument("--limit", type=int, default=50)
+    views.add_argument("--save")
+    views.set_defaults(func=cmd_views)
 
     alpha = sub.add_parser("alpha", help="Inspect the account's alphas (quota-free).")
     alpha_sub = alpha.add_subparsers(dest="subcommand", metavar="<action>",
@@ -1666,9 +1683,49 @@ def cmd_ablate(args, _sink):
     resolved = dict(ml.DEFAULT_SETTINGS)
     resolved.update(settings)
 
+    if args.ids:
+        # Batch form. One file per alpha, because `compare --contributions` groups by
+        # candidate_id and reads `full` / `loo:<leg>` / `solo:<leg>`; merging six
+        # alphas into one file would collide on those names and silently attribute
+        # one alpha's leg contributions to another.
+        path, entries = _ledger(args)
+        out_dir = Path(args.out_dir or research_paths.ensure_dir())
+        out_dir.mkdir(parents=True, exist_ok=True)
+        modes = [part.strip() for part in str(args.modes).split(",") if part.strip()]
+        done, skipped = [], []
+        for raw in str(args.ids).replace(",", " ").split():
+            entry = alpha_registry.resolve(entries, raw)
+            if entry is None:
+                skipped.append({"alpha_id": raw, "reason": "not in the ledger"})
+                continue
+            source = entry.get("expression") or ""
+            try:
+                plan = ablation.variants(source, modes)
+            except ablation.AblationError as exc:
+                skipped.append({"alpha_id": raw, "reason": str(exc)})
+                continue
+            alpha_settings = dict(ml.DEFAULT_SETTINGS)
+            alpha_settings.update(entry.get("settings") or {})
+            alphas = []
+            for item in plan:
+                item_entry = {"expression": item["expression"],
+                              "candidate_id": item["candidate_id"],
+                              "mechanism": entry.get("mechanism") or raw}
+                if entry.get("settings", {}).get("decay") is not None:
+                    item_entry["decay"] = entry["settings"]["decay"]
+                alphas.append(item_entry)
+            target = out_dir / ("%s-ablation.json" % raw)
+            target.write_text(json.dumps({"settings": alpha_settings, "alphas": alphas},
+                                         ensure_ascii=False, indent=2))
+            done.append({"alpha_id": raw, "file": str(target), "variants": len(plan)})
+            note("wrote %s (%d variants)" % (target, len(plan)))
+        return {"mode": "ids", "written": done, "skipped": skipped,
+                "count": sum(item["variants"] for item in done),
+                "next": "simulate each file, then `compare <results> --contributions`"}
+
     if not expression:
         raise CliError("USAGE", "nothing to ablate",
-                       "pass a research file or --expr")
+                       "pass a research file, --expr, or --ids")
 
     modes = [part.strip() for part in str(args.modes).split(",") if part.strip()]
     try:
@@ -1801,6 +1858,9 @@ def cmd_compare(args, _sink):
 
     data = {"files": args.files, "count": len(rows), "view": "frozen" if frozen else "train",
             "rows": rows}
+    if frozen:
+        research_paths.log_view("compare", "frozen", [row.get("alpha_id") for row in rows],
+                                note=", ".join(str(path) for path in args.files))
     if args.contributions:
         # The contribution is a selection decision ("does this leg earn its place"),
         # so in the exploration view it has to be computed from train-period fitness.
@@ -1959,6 +2019,9 @@ def cmd_probe(args, _sink):
         json.dumps({"spec": str(args.spec), "name": name, "rows": rows,
                     "records": records},
                    ensure_ascii=False, indent=1), encoding="utf-8")
+    if args.show_test:
+        research_paths.log_view("probe", "test", [row.get("alpha_id") for row in rows],
+                                note=name)
     note("wrote %s" % target)
 
     summary = {"name": name, "path": str(target), "rows": rows,
@@ -1969,6 +2032,30 @@ def cmd_probe(args, _sink):
             note=spec.get("note"), registry_path=args.registry, source="simulate")
     _maybe_save(args, summary)
     return summary
+
+
+def cmd_views(args, _sink):
+    """Read the log of every time out-of-sample numbers were looked at.
+
+    The point is auditability, not prevention: a frozen validation and an iterative
+    peek look identical in a results table, and only the log tells them apart.
+    """
+    path = research_paths.views_log_path()
+    entries = []
+    if Path(path).exists():
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if args.alpha and args.alpha not in (entry.get("alpha_ids") or []):
+                continue
+            entries.append(entry)
+    entries = entries[-args.limit:]
+    return {"path": path, "count": len(entries),
+            "by_tool": {tool: sum(1 for entry in entries if entry.get("tool") == tool)
+                        for tool in sorted({entry.get("tool") for entry in entries if entry.get("tool")})},
+            "entries": entries}
 
 
 def _first_heading(path):

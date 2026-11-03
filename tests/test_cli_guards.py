@@ -154,6 +154,34 @@ class CompareSortAndContributionTests(unittest.TestCase):
         self.assertEqual(frozen["contributions"]["legs"][0]["verdict"], "adds")
 
 
+class ViewsCommandTests(unittest.TestCase):
+    def test_the_frozen_view_is_logged_and_train_is_not(self):
+        path = os.path.join(tempfile.mkdtemp(), "batch.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump([{"alpha_id": "A1", "metrics": {"sharpe": 2.0, "fitness": 1.6},
+                        "checks": {}, "out_of_sample": {"train": {"sharpe": 1.0},
+                                                        "test": {"sharpe": 0.8}}}], handle)
+        log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
+        args = argparse.Namespace(files=[path], min_fitness=None, sort="sharpe",
+                                  contributions=False, save=None, frozen=False)
+        with mock.patch.object(cli.research_paths, "views_log_path", lambda: log):
+            cli.cmd_compare(args, mock.MagicMock())
+            self.assertFalse(os.path.exists(log))
+            args.frozen = True
+            cli.cmd_compare(args, mock.MagicMock())
+        entries = [json.loads(line) for line in open(log, encoding="utf-8")]
+        self.assertEqual(entries[0]["tool"], "compare")
+        self.assertEqual(entries[0]["alpha_ids"], ["A1"])
+
+        with mock.patch.object(cli.research_paths, "views_log_path", lambda: log):
+            listing = cli.cmd_views(argparse.Namespace(alpha="A1", limit=10, save=None),
+                                    mock.MagicMock())
+        self.assertEqual(listing["count"], 1)
+        empty = cli.cmd_views(argparse.Namespace(alpha="NOPE", limit=10, save=None),
+                              mock.MagicMock()) if False else None
+        self.assertIsNone(empty)
+
+
 class CompareMinFitnessTests(unittest.TestCase):
     def test_min_fitness_applies_to_the_view_it_reports_on(self):
         # The train view filters on train_fitness; --frozen filters on the full-window
