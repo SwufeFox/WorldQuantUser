@@ -10,8 +10,11 @@ and it already does the five things every experiment here needs:
 2. the catalogue check runs before the simulation, not after a rejection;
 3. results land in the research tree with a date-stamped name, never in the repo;
 4. results also land in the ledger, which is the only durable index of what was tried;
-5. the summary prints train/test alongside the score, because an in-sample number
-   picked by a search is a rank and not a forecast.
+5. the summary prints the **train** period next to the score and hides the test
+   period unless you ask for it. `testPeriod` is the only out-of-sample evidence the
+   API exposes - BRAIN's full window already contains it, so selecting on the
+   full-window number trains on the test year. Print it once, after the design is
+   frozen, with ``--show-test``.
 
 Two shapes of experiment, because that is what the last week actually was:
 
@@ -158,6 +161,11 @@ def main() -> int:
                         help="simulate even if the catalogue check complains")
     parser.add_argument("--no-record", action="store_true",
                         help="do not append the results to the ledger")
+    parser.add_argument("--show-test", action="store_true",
+                        help="print the platform's test-period numbers. Do not pass this "
+                             "while choosing between arms: the test year is the only "
+                             "out-of-sample evidence there is, and reading it during "
+                             "selection turns it into training data.")
     parser.add_argument("--registry", default=None)
     args = parser.parse_args()
 
@@ -190,18 +198,22 @@ def main() -> int:
         json.dump(records, handle, ensure_ascii=False, indent=1)
 
     print()
-    print("%-28s %6s %6s %7s %7s %7s" % ("label", "S", "F", "T", "train", "test"))
+    header = "%-28s %6s %6s %7s %7s" % ("label", "S", "F", "T", "train")
+    if args.show_test:
+        header += " %7s" % "test"
+    print(header)
     for record in records:
         metrics = record.get("metrics") or {}
         split = record.get("out_of_sample") or {}
         failed = [name for name, body in (record.get("checks") or {}).items()
                   if isinstance(body, dict) and body.get("result") == "FAIL"]
-        print("%-28s %6s %6s %7s %7s %7s%s"
-              % (str(record.get("mechanism") or record.get("alpha_id"))[:28],
-                 metrics.get("sharpe"), metrics.get("fitness"), metrics.get("turnover"),
-                 (split.get("train") or {}).get("sharpe"),
-                 (split.get("test") or {}).get("sharpe"),
-                 "  fail=" + ",".join(failed) if failed else ""))
+        line = ("%-28s %6s %6s %7s %7s"
+                % (str(record.get("mechanism") or record.get("alpha_id"))[:28],
+                   metrics.get("sharpe"), metrics.get("fitness"), metrics.get("turnover"),
+                   (split.get("train") or {}).get("sharpe")))
+        if args.show_test:
+            line += " %7s" % (split.get("test") or {}).get("sharpe")
+        print(line + ("  fail=" + ",".join(failed) if failed else ""))
 
     if not args.no_record:
         summary = alpha_registry.record_simulation(
