@@ -65,7 +65,7 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(
             set(commands), {"schema", "auth", "catalog", "simulate", "resume",
                             "alpha", "lint", "cache", "search", "paper", "ablate",
-                            "compare", "brief"},
+                            "compare", "brief", "probe"},
         )
         simulate = commands["simulate"]
         flags = {flag for option in simulate["options"] for flag in option["flags"]}

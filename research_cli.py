@@ -574,6 +574,31 @@ def build_parser():
     brief.add_argument("--save")
     brief.set_defaults(func=cmd_brief)
 
+    probe = sub.add_parser(
+        "probe",
+        help="Run a batch of arms from a spec file (lint, simulate, table, record).",
+        description="One command for the experiment shape used every day here: a list "
+                    "of labelled expressions, one lint pass, one simulation run, a "
+                    "train-only table on stderr, a JSON document on stdout, and a "
+                    "ledger entry per arm. The table hides the test period unless "
+                    "--show-test is passed, because selecting on it destroys the only "
+                    "out-of-sample evidence there is.")
+    probe.add_argument("spec", help="JSON spec: {name, settings, arms:[{label, expression, settings?}]}.")
+    probe.add_argument("--name", default=None,
+                       help="Batch name for the output file (default: the spec's name).")
+    probe.add_argument("--dry-run", action="store_true",
+                       help="Lint only; never submits and spends nothing.")
+    probe.add_argument("--show-test", action="store_true",
+                       help="Also print the test period. Do not pass this while "
+                            "choosing between arms.")
+    probe.add_argument("--force", action="store_true",
+                       help="Overwrite an existing batch file of the same name.")
+    probe.add_argument("--no-record", action="store_true",
+                       help="Do not append the arms to the ledger.")
+    probe.add_argument("--registry", default=None)
+    probe.add_argument("--save")
+    probe.set_defaults(func=cmd_probe)
+
     alpha = sub.add_parser("alpha", help="Inspect the account's alphas (quota-free).")
     alpha_sub = alpha.add_subparsers(dest="subcommand", metavar="<action>",
                                      parser_class=JsonArgumentParser)
@@ -1728,6 +1753,134 @@ def cmd_compare(args, _sink):
         data["contributions"] = ablation.report(records)
     _maybe_save(args, data)
     return data
+
+
+def _load_probe_spec(path):
+    """Read and validate a probe spec: settings plus a list of labelled arms."""
+    try:
+        spec = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CliError("INVALID_INPUT", "cannot read spec %s: %s" % (path, exc),
+                       "pass a JSON file shaped like "
+                       "{\"name\": ..., \"settings\": {...}, \"arms\": [{\"label\", "
+                       "\"expression\"}]}") from exc
+    if not isinstance(spec, dict):
+        raise CliError("INVALID_INPUT", "spec must be a JSON object",
+                       "see `research_cli.py schema probe`")
+    arms = spec.get("arms")
+    if not isinstance(arms, list) or not arms:
+        raise CliError("INVALID_INPUT", "spec has no arms",
+                       "each arm needs at least {\"expression\": ...}")
+    for index, arm in enumerate(arms, 1):
+        if not isinstance(arm, dict) or not isinstance(arm.get("expression"), str) \
+                or not arm["expression"].strip():
+            raise CliError("INVALID_INPUT", "arm %d has no expression" % index,
+                           "an arm is {\"label\": ..., \"expression\": ..., "
+                           "\"settings\": {...} (optional)}")
+        arm.setdefault("label", "arm%d" % index)
+    return spec
+
+
+def cmd_probe(args, _sink):
+    """Run a batch of arms from one spec file: lint, simulate, table, record.
+
+    Every experiment in this campaign is those four steps, and each was being
+    re-written as a throwaway script. The copies drifted in ways that cost real time:
+    one printed its table to stdout and broke the one-JSON-document contract, one
+    reused its own output filename and silently overwrote the previous batch, one had
+    a quoting bug that only surfaced at import, and none logged progress, so a
+    four-minute wait looked like a hang.
+
+    A spec file plus this verb removes all four: expressions are JSON strings so
+    quoting cannot break, the output name carries the spec name *and* refuses to
+    overwrite, progress goes to stderr, and the table shows **train only** unless
+    ``--show-test`` is passed - selecting on the test year turns the only
+    out-of-sample evidence into training data.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+    import guarded_sim  # noqa: E402 - lives in tools/, imported lazily
+
+    spec = _load_probe_spec(args.spec)
+    settings = dict(spec.get("settings") or {})
+    arms = spec["arms"]
+    name = args.name or spec.get("name") or Path(args.spec).stem
+
+    groups = {}
+    for arm in arms:
+        key = json.dumps({**settings, **(arm.get("settings") or {})}, sort_keys=True)
+        groups.setdefault(key, []).append(arm)
+
+    if args.dry_run:
+        report = guarded_sim.check([arm["expression"] for arm in arms], settings)
+        blocking = [item for item in report["errors"]
+                    if item["code"] in {"unknown_operator", "unknown_identifier",
+                                        "unused_variable", "operator_arg_constraint",
+                                        "signal_type", "undefined_variable"}]
+        for item in blocking:
+            note("lint %-16s %s" % (item["code"],
+                                    item.get("identifier") or item.get("operator")))
+        note("dry run: %d arm(s) in %d settings group(s), %d blocking finding(s)"
+             % (len(arms), len(groups), len(blocking)))
+        return {"dry_run": True, "arms": len(arms), "groups": len(groups),
+                "blocking": blocking, "errors": report["errors"]}
+
+    records = []
+    for key, group in groups.items():
+        arm_settings = json.loads(key)
+        note("simulating %d arm(s) under %s/%s/%s"
+             % (len(group), arm_settings.get("region"), arm_settings.get("universe"),
+                arm_settings.get("neutralization")))
+        records.extend(guarded_sim.simulate(
+            [arm["expression"] for arm in group], arm_settings,
+            labels=[arm["label"] for arm in group],
+            on_event=lambda kind, payload: note("  %s" % kind)))
+
+    rows = []
+    note("")
+    note("%-28s %6s %6s %7s %7s%s" % ("label", "S", "F", "T", "train",
+                                       " %7s" % "test" if args.show_test else ""))
+    for record, arm in zip(records, [a for group in groups.values() for a in group]):
+        metrics = record.get("metrics") or {}
+        split = record.get("out_of_sample") or {}
+        failed = sorted(name for name, body in (record.get("checks") or {}).items()
+                        if isinstance(body, dict) and body.get("result") == "FAIL")
+        row = {"label": arm["label"], "alpha_id": record.get("alpha_id"),
+               "expression": arm["expression"],
+               "settings": {**settings, **(arm.get("settings") or {})},
+               "status": record.get("status"), "error": record.get("error"),
+               "sharpe": metrics.get("sharpe"), "fitness": metrics.get("fitness"),
+               "turnover": metrics.get("turnover"), "returns": metrics.get("returns"),
+               "train_sharpe": (split.get("train") or {}).get("sharpe"),
+               "train_fitness": (split.get("train") or {}).get("fitness"),
+               "failed_checks": failed}
+        if args.show_test:
+            row["test_sharpe"] = (split.get("test") or {}).get("sharpe")
+        rows.append(row)
+        line = "%-28s %6s %6s %7s %7s" % (arm["label"], row["sharpe"], row["fitness"],
+                                          row["turnover"], row["train_sharpe"])
+        if args.show_test:
+            line += " %7s" % row["test_sharpe"]
+        note(line + ("  fail=" + ",".join(failed) if failed else ""))
+
+    target = Path(research_paths.ensure_dir()) / ("%s-%s.json" % (
+        name, __import__("datetime").date.today().isoformat()))
+    if target.exists() and not args.force:
+        raise CliError("INVALID_INPUT",
+                       "%s already exists" % target.name,
+                       "pass --name to label this batch, or --force to overwrite it")
+    Path(target).write_text(
+        json.dumps({"spec": str(args.spec), "name": name, "rows": rows},
+                   ensure_ascii=False, indent=1), encoding="utf-8")
+    note("wrote %s" % target)
+
+    summary = {"name": name, "path": str(target), "rows": rows,
+               "simulated": len(rows), "show_test": bool(args.show_test)}
+    if not args.no_record:
+        summary["registry"] = alpha_registry.record_simulation(
+            records, settings, idea=spec.get("idea"), mechanism=spec.get("mechanism"),
+            note=spec.get("note"), registry_path=args.registry, source="simulate")
+    _maybe_save(args, summary)
+    return summary
 
 
 def _first_heading(path):

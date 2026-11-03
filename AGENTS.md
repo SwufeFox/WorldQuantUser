@@ -163,16 +163,29 @@ already in the payload, so this costs one call and no simulation:
 python research_cli.py alpha get ID            # see data.out_of_sample.{train,test}
 ```
 
-Run an experiment without re-writing the plumbing. The template handles both shapes
-in use here - a hand-written expression list, or a proven parent with one token
-swapped N times - and records every result to the ledger:
+Run an experiment as **one command**, not a copied script. A spec file holds the
+arms, the settings and the labels; `probe` lints, simulates, prints a train-only table
+on stderr, writes one JSON document on stdout and records every arm to the ledger:
 
 ```bash
-cp tools/research_template.py /path/to/experiment.py   # fill PARENT + SUBSTITUTIONS
-python /path/to/experiment.py --dry-run                # lint, submit nothing
-python /path/to/experiment.py                          # simulate and record
-python research_cli.py compare results.json --sort sharpe   # train/test columns included
+python research_cli.py probe batch.spec.json --dry-run     # lint, spend nothing
+python research_cli.py probe batch.spec.json               # simulate + record
+python research_cli.py probe batch.spec.json --show-test   # only after the design is frozen
 ```
+
+```json
+{"name": "vrp-20261104", "idea": "...", "mechanism": "...",
+ "settings": {"region": "USA", "universe": "TOP3000", "neutralization": "SUBINDUSTRY"},
+ "arms": [{"label": "vrp_diff", "expression": "rank(close)"},
+          {"label": "vrp_ind", "expression": "rank(close)", "settings": {"neutralization": "INDUSTRY"}}]}
+```
+
+Per-arm `settings` become separate simulation groups, so a neutralisation sweep is one
+spec. The output file is `<name>-<date>.json` and refuses to overwrite an existing
+batch - that is how a six-arm result disappeared once.
+
+`tools/research_template.py` still exists for the other shape: a single exploratory run,
+or a proven parent with one token swapped N times (`PARENT` + `SUBSTITUTIONS`).
 
 ## 4. Where things live
 

@@ -34,7 +34,8 @@
 
 | 问题 | 命令 |
 | --- | --- |
-| 我要开一个新实验 | 复制 `tools/research_template.py`（两种形状：手写 `EXPRESSIONS`，或 `PARENT` + `SUBSTITUTIONS` 换一个 token 跑 N 个变体） |
+| 我要跑一批臂（常态） | 写一个 spec.json，然后 `python3 research_cli.py probe spec.json`——lint、模拟、train-only 表格、JSON、台账一次做完 |
+| 我要开一个单次实验 | 复制 `tools/research_template.py`（`EXPRESSIONS`，或 `PARENT` + `SUBSTITUTIONS` 换一个 token 跑 N 个变体） |
 | 换字段 / 换窗口 / 换权重的批量实验 | 同上，把要换的 token 写进 `SUBSTITUTIONS`；parent 的表达式和设置从台账读，结果自动写回台账 |
 | 我想跑一批，但怕名字写错 | `tools/guarded_sim.py`（库，不是 CLI） |
 | 把脚本里的 `ml.simulate_alphas` 改成走护栏 | `python3 tools/wire_guard.py` |
