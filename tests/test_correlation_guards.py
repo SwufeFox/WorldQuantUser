@@ -80,7 +80,6 @@ class IndependenceStateTests(unittest.TestCase):
 
 def _series(days, seed, shape):
     """Deterministic synthetic daily PnL."""
-    import math
     return {("2020-01-%02d" % (i % 28 + 1)) if False else ("d%05d" % i):
             shape(seed, i) for i in range(days)}
 
