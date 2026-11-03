@@ -414,7 +414,13 @@ def auto_verdict(record):
     and because the same mapping had been written twice - once for the CLI and once
     by hand in each research script that recorded its own results.
     """
-    if record.get("status") != "COMPLETE":
+    # WARNING is a finished run: the platform marks a simulation WARNING when a check
+    # warns without failing (UNITS is the common one), and every metric is final. It
+    # used to fall into the "not finished" branch, so `RREmgObg` - all checks PASS,
+    # Sharpe 2.37, Fitness 1.68, only a UNITS warning - was filed as `rejected` with
+    # reason `unrecorded_check`, which reads as "this alpha failed" to every later
+    # search over the ledger.
+    if record.get("status") not in {"COMPLETE", "WARNING"}:
         return "rejected"
     checks = record.get("checks") or {}
     if isinstance(checks, dict):

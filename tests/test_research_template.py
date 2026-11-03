@@ -141,6 +141,14 @@ class AutoVerdictTests(unittest.TestCase):
     def test_unfinished_is_rejected(self):
         self.assertEqual(alpha_registry.auto_verdict(record(status="PENDING")), "rejected")
 
+    def test_a_warning_run_is_classified_by_its_checks(self):
+        # WARNING means "finished, one check warned without failing" (UNITS is the
+        # usual one). Treating it as unfinished filed a Sharpe 2.37 / Fitness 1.68
+        # alpha as `rejected` with reason `unrecorded_check`.
+        self.assertEqual(alpha_registry.auto_verdict(record(status="WARNING")), "candidate")
+        body = record(status="WARNING", checks={"UNITS": {"result": "WARNING"}})
+        self.assertEqual(alpha_registry.auto_verdict(body), "candidate")
+
     def test_weak_but_clean_stays_watch(self):
         self.assertEqual(alpha_registry.auto_verdict(record(sharpe=1.1, fitness=0.8)),
                          "watch")
