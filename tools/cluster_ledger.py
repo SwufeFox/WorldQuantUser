@@ -174,6 +174,51 @@ def independent_set(ids, pairs, threshold, priority):
     return chosen, refused
 
 
+
+def spectral_summary(ids, pairs):
+    """How many *independent* bets a set of alphas really is.
+
+    Two numbers, both from the correlation matrix and both pure arithmetic:
+    ``effective_bets`` is ``(sum lambda)^2 / sum lambda^2`` and ``pc1_share`` is the
+    largest eigenvalue over the trace. They answer a different question from the
+    cluster count: 25 alphas can sit in 24 clusters at |r| >= 0.7 and still behave
+    like seven bets, because the correlation is diffuse rather than blocked. Counting
+    clusters alone made the quality family look un-saturated.
+
+    ``sum lambda^2`` is the squared Frobenius norm, so only ``lambda_1`` needs
+    iteration - computed here by power iteration to keep this module free of numpy.
+    """
+    n = len(ids)
+    if n < 2:
+        return {"effective_bets": None, "pc1_share": None, "median_abs_r": None,
+                "pairs_measured": 0}
+    index = {name: position for position, name in enumerate(ids)}
+    matrix = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    off = []
+    for pair in pairs:
+        i, j = index[pair["a"]], index[pair["b"]]
+        value = pair["r"]
+        matrix[i][j] = matrix[j][i] = value
+        off.append(abs(value))
+    frobenius = sum(cell * cell for row in matrix for cell in row)
+    effective = (n * n / frobenius) if frobenius else None
+    vector = [1.0] * n
+    for _ in range(80):
+        product = [sum(matrix[i][j] * vector[j] for j in range(n)) for i in range(n)]
+        scale = max(abs(value) for value in product) or 1.0
+        vector = [value / scale for value in product]
+    numerator = sum(sum(matrix[i][j] * vector[j] for j in range(n)) * vector[i]
+                    for i in range(n))
+    denominator = sum(value * value for value in vector)
+    lam1 = numerator / denominator if denominator else 0.0
+    ordered = sorted(off)
+    median = ordered[len(ordered) // 2] if ordered else None
+    return {"effective_bets": round(effective, 2) if effective else None,
+            "pc1_share": round(lam1 / n, 3),
+            "median_abs_r": round(median, 3) if median is not None else None,
+            "pairs_measured": len(off)}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--min-fitness", type=float, default=1.25)
@@ -194,18 +239,44 @@ def main(argv=None):
     parser.add_argument("--limit", type=int, default=None,
                         help="pnl mode: fetch at most N alphas (default: all above "
                              "--min-fitness; each one is a request)")
+    parser.add_argument("--family", action="append", default=None,
+                        help="pnl mode: only these families (repeatable).")
+    parser.add_argument("--mechanism", action="append", default=None,
+                        help="pnl mode: only entries whose mechanism contains this text.")
+    parser.add_argument("--idea", action="append", default=None,
+                        help="pnl mode: only entries whose idea contains this text.")
+    parser.add_argument("--status", action="append", default=None,
+                        help="pnl mode: only these platform statuses (e.g. ACTIVE).")
+    parser.add_argument("--ids", default=None,
+                        help="pnl mode: comma-separated alpha ids, bypassing the fitness floor.")
     args = parser.parse_args(argv)
     reserve_stdout(args)
 
     path = args.registry or alpha_registry.default_registry_path()
     entries = alpha_registry.load_entries(path)
+    wanted = None
+    if args.ids:
+        wanted = {part.strip() for part in args.ids.replace(",", " ").split() if part.strip()}
     by_id = {}
     for entry in entries:
         alpha_id = entry.get("alpha_id")
         fitness = (entry.get("metrics") or {}).get("fitness")
         if not alpha_id or not isinstance(fitness, (int, float)):
             continue
-        if fitness < args.min_fitness:
+        if wanted is not None and alpha_id not in wanted:
+            continue
+        if wanted is None and fitness < args.min_fitness:
+            continue
+        if args.status and (entry.get("status") or "").upper() not in {
+                item.upper() for item in args.status}:
+            continue
+        if args.family and (entry.get("family") or "") not in set(args.family):
+            continue
+        if args.mechanism and not any(needle.lower() in (entry.get("mechanism") or "").lower()
+                                      for needle in args.mechanism):
+            continue
+        if args.idea and not any(needle.lower() in (entry.get("idea") or "").lower()
+                                 for needle in args.idea):
             continue
         if entry.get("duplicate_of"):
             # An id whose PnL equals another id's is one strategy, not two; leaving
@@ -313,6 +384,7 @@ def main(argv=None):
                 for name in pnls}
 
     groups = components(list(pnls), pairs, args.threshold)
+    spectral = spectral_summary(sorted(pnls), pairs)
     chosen, refused = independent_set(list(pnls), pairs, args.threshold, priority)
     unverified = [row["alpha_id"] for row in refused if row["reason"] == "unmeasured"]
     dependent = [row["alpha_id"] for row in refused if row["reason"] == "dependent"]
@@ -332,6 +404,10 @@ def main(argv=None):
     print("pairs measured: %d (unmeasured: %d; short overlap %d, undefined %d)"
           % (matrix["measured"], len(matrix["skipped"]), short, undefined))
     print("connected components at |r| >= %.2f: %d" % (args.threshold, len(groups)))
+    if spectral["effective_bets"] is not None:
+        print("independent bets: effective=%.2f  pc1=%.0f%%  median|r|=%.2f  (%d pairs measured)"
+              % (spectral["effective_bets"], 100 * spectral["pc1_share"],
+                 spectral["median_abs_r"] or 0.0, spectral["pairs_measured"]))
     for group in groups[: args.limit_members + 1]:
         head = describe(group[0])
         print("  size %-3d  %s  %s"
@@ -370,6 +446,7 @@ def main(argv=None):
         "pairs_measured": matrix["measured"],
         "components": [{"size": len(group), "members": group} for group in groups],
         "component_count": len(groups),
+        "spectral": spectral,
         "independent_set": chosen,
         "independent_set_refused": refused,
         "independent_set_unverified": unverified,

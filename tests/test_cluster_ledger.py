@@ -95,5 +95,31 @@ class IndependentSetTests(unittest.TestCase):
         self.assertEqual(refused, [])
 
 
+class SpectralSummaryTests(unittest.TestCase):
+    def test_an_equicorrelated_pool_is_fewer_bets_than_names(self):
+        # Wrong behaviour this prevents: counting clusters at |r|>=0.7 and concluding
+        # "25 alphas = 24 bets" while the pool behaves like a handful, because the
+        # correlation is diffuse rather than blocked. The quality family measured
+        # exactly that: 24 clusters, 7.1 effective bets.
+        ids = ["A", "B", "C", "D"]
+        pairs = [pair(a, b, 0.3) for a, b in
+                 ("AB", "AC", "AD", "BC", "BD", "CD")]
+        summary = cl.cluster_ledger_spectral(ids, pairs) if hasattr(cl, "cluster_ledger_spectral") \
+            else cl.spectral_summary(ids, pairs)
+        self.assertLess(summary["effective_bets"], len(ids))
+        self.assertGreater(summary["pc1_share"], 1.0 / len(ids))
+
+    def test_perfectly_independent_names_are_their_own_bets(self):
+        ids = ["A", "B", "C"]
+        summary = cl.spectral_summary(ids, [pair("A", "B", 0.0), pair("A", "C", 0.0),
+                                            pair("B", "C", 0.0)])
+        self.assertAlmostEqual(summary["effective_bets"], 3.0, places=1)
+        self.assertAlmostEqual(summary["pc1_share"], 1.0 / 3, places=2)
+
+    def test_a_single_name_has_no_spread(self):
+        summary = cl.spectral_summary(["A"], [])
+        self.assertIsNone(summary["effective_bets"])
+
+
 if __name__ == "__main__":
     unittest.main()
