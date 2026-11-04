@@ -64,7 +64,7 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(
             set(commands), {"schema", "auth", "catalog", "simulate", "resume",
                             "alpha", "lint", "cache", "search", "paper", "ablate",
-                            "compare", "brief", "probe", "views"},
+                            "compare", "brief", "ask", "probe", "views"},
         )
         simulate = commands["simulate"]
         flags = {flag for option in simulate["options"] for flag in option["flags"]}
@@ -120,6 +120,20 @@ class ErrorEnvelopeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ml.resolve_settings({"region": "MARS"})
 
+    def test_well_formed_unknown_neutralization_is_sent(self):
+        # The platform owns this enum. Refusing a value locally made "we never
+        # tried STATISTICAL" indistinguishable from "the tool cannot say it"
+        # (2026-11-04). A well-formed unknown token now goes out and the
+        # platform's own answer is the record.
+        for value in ("STATISTICAL", "FAST", "SOME_FUTURE_SCHEME"):
+            resolved = ml.resolve_settings({"neutralization": value})
+            self.assertEqual(resolved["neutralization"], value)
+
+    def test_malformed_neutralization_is_still_a_local_typo(self):
+        for value in ("", "sub industry", "Statistical", "SUB-IND"):
+            with self.assertRaises(ValueError):
+                ml.resolve_settings({"neutralization": value})
+
     def test_every_error_code_has_an_exit_code(self):
         for code in cli.ERROR_CODES:
             self.assertIn(code, cli.EXIT_CODES, code)
@@ -144,6 +158,15 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(payload["regular"], "rank(cap)")
         self.assertEqual(payload["settings"]["decay"], 4)
         self.assertEqual(payload["settings"]["region"], "USA")
+
+    def test_dry_run_accepts_a_neutralization_outside_the_local_list(self):
+        # The CLI must not be a second gate: one validation point, in
+        # machine_lib.resolve_settings.
+        proc = run_cli("simulate", "--expr", "rank(cap)",
+                       "--neutralization", "STATISTICAL", "--dry-run")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(parse(proc)["data"]["settings"]["neutralization"],
+                         "STATISTICAL")
 
     def test_cli_flags_override_research_file_settings(self):
         with tempfile.TemporaryDirectory() as tmp:

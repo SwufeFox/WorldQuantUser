@@ -154,6 +154,36 @@ class CompareSortAndContributionTests(unittest.TestCase):
         self.assertEqual(frozen["contributions"]["legs"][0]["verdict"], "adds")
 
 
+class ComparePerFileTests(unittest.TestCase):
+    def test_per_file_keeps_each_alphas_legs_apart(self):
+        # Ablation files all name their arms `full` / `loo:l0`, so a merged
+        # contribution report mixes one alpha's legs into another's. --per-file
+        # reports once per input and carries the leg legend through.
+        def write(name, full_f, loo):
+            payload = [{"candidate_id": "full", "status": "COMPLETE",
+                        "metrics": {"fitness": full_f},
+                        "out_of_sample": {"train": {"fitness": full_f}}},
+                       {"candidate_id": "loo:l0", "status": "COMPLETE",
+                        "metrics": {"fitness": loo},
+                        "out_of_sample": {"train": {"fitness": loo}}}]
+            path = os.path.join(tempfile.mkdtemp(), name)
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"alphas": payload, "records": payload,
+                           "legs": {"l0": {"fields": ["atq"]}}}, handle)
+            return path
+
+        args = argparse.Namespace(files=[write("A-results.json", 2.0, 1.0),
+                                         write("B-results.json", 1.5, 1.4)],
+                                  min_fitness=None, sort="sharpe", contributions=False,
+                                  save=None, frozen=False, per_file=True)
+        data = cli.cmd_compare(args, mock.MagicMock())
+        self.assertEqual(len(data["per_file"]), 2)
+        first, second = data["per_file"]
+        self.assertAlmostEqual(first["top_leg"]["contribution"], 1.0, places=3)
+        self.assertAlmostEqual(second["top_leg"]["contribution"], 0.1, places=3)
+        self.assertEqual(first["top_leg"]["fields"], ["atq"])
+
+
 class ViewsCommandTests(unittest.TestCase):
     def test_the_frozen_view_is_logged_and_train_is_not(self):
         path = os.path.join(tempfile.mkdtemp(), "batch.json")

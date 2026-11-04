@@ -188,7 +188,17 @@ REGIONS = [
     "AMR", "EMEA", "APAC",
 ]
 
-NEUTRALIZATIONS = ["NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY"]
+#: Neutralizations seen accepted by the API. **A record, not a gate.** The platform
+#: owns this enum and answers for it; until 2026-11-04 a value missing here was
+#: refused before a request was ever sent, which turned "we never tried STATISTICAL"
+#: into "the tool cannot say the word". Well-formed values that are not on this list
+#: are now *sent*, and the platform's 400 is the authority. Malformed values still
+#: fail locally, because that is a typo and not a discovery.
+NEUTRALIZATIONS = ["NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY",
+                   "STATISTICAL", "FAST"]
+
+#: Shape of a settings enum token: upper case, digits, underscores.
+_SETTING_TOKEN = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 #: Non-exhaustive list of common universes, used for input validation hints.
 UNIVERSES = [
@@ -1163,8 +1173,11 @@ def fetch_alpha_metrics(s, alpha_id, on_event=None, deadline=None):
 def resolve_settings(overrides=None):
     """Merge ``overrides`` onto :data:`DEFAULT_SETTINGS` and validate the result.
 
-    Returns a fresh dict. Raises ``ValueError`` on an unknown region,
-    neutralization or delay so callers fail before spending quota.
+    Returns a fresh dict. Raises ``ValueError`` on an unknown region, a malformed
+    neutralization or a bad delay so callers fail before spending quota. A
+    well-formed neutralization that is merely missing from :data:`NEUTRALIZATIONS`
+    is passed through: the platform owns that enum, and refusing a value here makes
+    "not yet tried" indistinguishable from "cannot be expressed".
     """
     settings = dict(DEFAULT_SETTINGS)
     for key, value in (overrides or {}).items():
@@ -1174,7 +1187,8 @@ def resolve_settings(overrides=None):
         raise ValueError(
             "unknown region %r (known: %s)" % (settings["region"], ", ".join(REGIONS))
         )
-    if settings["neutralization"] not in NEUTRALIZATIONS:
+    neutralization = str(settings["neutralization"])
+    if neutralization not in NEUTRALIZATIONS and not _SETTING_TOKEN.match(neutralization):
         raise ValueError(
             "unknown neutralization %r (known: %s)"
             % (settings["neutralization"], ", ".join(NEUTRALIZATIONS))

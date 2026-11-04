@@ -2,7 +2,7 @@
 
 这里不解释怎么用，只回答一个问题：**我想问的那句话，对应哪个命令。**
 
-18 个入口。这个数字是砍出来的：2026-11-01 之前是 26 个，删掉了 8 个——宏子系统（`expression_macros` / `ast_macros` / `macro_parity`，被 `alpha_unit` 的模板+槽位取代）、`sugar_rewrite`（量过一次，结论已在文档里）、`family_tree`（被 `family_graph` 取代）、以及三个跑完的台账迁移（`repair_ledger` / `backfill_registry` / `backfill_reason_codes`，东西已经改了，工具留着只会让人以为还要跑）。
+19 个入口。这个数字是砍出来的：2026-11-01 之前是 26 个，删掉了 8 个——宏子系统（`expression_macros` / `ast_macros` / `macro_parity`，被 `alpha_unit` 的模板+槽位取代）、`sugar_rewrite`（量过一次，结论已在文档里）、`family_tree`（被 `family_graph` 取代）、以及三个跑完的台账迁移（`repair_ledger` / `backfill_registry` / `backfill_reason_codes`，东西已经改了，工具留着只会让人以为还要跑）。2026-11-04 加了 `ask`：一个只读查询入口，替掉每次都要重写一遍的内联脚本。
 
 删除标准只有一条：**被取代，或者跑完就没下次。** 不是"文件不够干净"。
 
@@ -13,6 +13,10 @@
 | 问题 | 命令 |
 | --- | --- |
 | 台账的 status 和平台对不对得上 | `python3 tools/reconcile_status.py` |
+| 按轴分组看一眼：`n` / 中位数 / 地板税占比 | `python3 research_cli.py ask --by neutralization --stat n,median:sharpe,floor_share` |
+| 某个旋钮在面板内的斜率（不是语料趋势） | `python3 research_cli.py ask --by decay --panel turnover,fitness` |
+| 同一构造换设置之后还相关多少 | `python3 research_cli.py ask --matrix corr --matrix-within expr` |
+| 哪些行「零 FAIL」但检查其实没算 | `python3 research_cli.py ask --where check=SELF_CORRELATION:PENDING --list` |
 | 有没有两个 alpha 的 PnL 其实是一个 | `python3 tools/dedupe_ledger.py` |
 | 哪些行缺 `family` 标签 | `python3 tools/derive_family.py` |
 | 同一批里有没有「不同表达式同一个结果」 | `python3 tools/degenerate_batch.py` |
@@ -127,6 +131,22 @@ python3 research_cli.py alpha submit ID --yes --record   # 真提交 + 回读 + 
 三个都过了再写；过不了就把功能塞进最接近的那个。
 
 **更常发生的其实是第四种情况：这个问题只问一次。** 那就别做工具——写个一次性脚本放在研究目录，把结论写进报告和 `mechanism-atlas`。工具是给会跑第二次的东西用的。
+
+## 实验设计：一个批次要么有对照，要么声明自己在扫描
+
+`probe` 的 spec 里每个臂都必须带 `design`，取值只有五个：
+
+| design | 是什么 | 约束 |
+| --- | --- | --- |
+| `control` | 空白对照：父表达式原样、设置不变 | 每批**恰好一个** |
+| `add` | 加法：加一条腿或一个字段 | settings 必须与对照完全相同 |
+| `drop` | 减法：拿掉一条腿 | 同上 |
+| `parallel` | 相互对照：只动一个旋钮做梯度 | 与对照的 settings 差**恰好一个键** |
+| `rescue` | 互补：换一个*不同实现*把效果补回来 | 必须写 `proxy_of` |
+
+不带对照的批次必须把 `"design": "explore"` 写在 spec 顶层。这不是逃生门，是**记录**：扫描和实验在台账里长得一样，唯一区别是扫描自己承认了。
+
+理由不是洁癖。2026-11-03 那批四个臂，参照是一个本来就不过门的 base（S 1.23 / F 0.68）；两个臂"更差"，但差在哪里无法归因——**没有合格的对照，减法实验就没有解释力**。
 
 ## 边界
 

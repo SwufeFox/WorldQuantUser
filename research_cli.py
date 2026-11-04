@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import machine_lib as ml  # noqa: E402
 import research_config as config_io  # noqa: E402
 import alpha_registry  # noqa: E402
+import alpha_unit  # noqa: E402
 import expression_lint  # noqa: E402
 import expression_units  # noqa: E402
 import field_contract  # noqa: E402
@@ -204,8 +205,10 @@ def _add_settings_args(parser):
     parser.add_argument("--region", choices=ml.REGIONS,
                         help="BRAIN region.")
     parser.add_argument("--universe", help="Universe, e.g. TOP3000.")
-    parser.add_argument("--neutralization", choices=ml.NEUTRALIZATIONS,
-                        help="Neutralization scheme.")
+    parser.add_argument("--neutralization",
+                        help="Neutralization scheme; validation lives in "
+                             "machine_lib.resolve_settings, which sends a well-formed "
+                             "value the platform may still accept.")
     parser.add_argument("--decay", type=int,
                         help="Default decay for alphas that do not set their own.")
     parser.add_argument("--delay", type=int, choices=[0, 1],
@@ -539,8 +542,8 @@ def build_parser():
     abl.add_argument("--universe", default=None,
                      help="Override the universe for the ablation file.")
     abl.add_argument("--neutralization", default=None,
-                     choices=ml.NEUTRALIZATIONS,
-                     help="Override neutralisation for the ablation file.")
+                     help="Override neutralisation for the ablation file "
+                          "(not gated by a local list).")
     abl.add_argument("--region", default=None, choices=ml.REGIONS)
     abl.add_argument("--delay", type=int, default=None, choices=[0, 1])
     abl.add_argument("--test-period", default=None,
@@ -566,6 +569,10 @@ def build_parser():
                            "the test year.")
     cmp_.add_argument("--contributions", action="store_true",
                       help="Also compute per-leg contributions from ablate labels.")
+    cmp_.add_argument("--per-file", action="store_true",
+                      help="Report contributions once per input file instead of "
+                           "merging them: ablation arms share the names full/loo:<leg> "
+                           "across files, so a merged report would mix them up.")
     cmp_.add_argument("--save")
     cmp_.set_defaults(func=cmd_compare)
 
@@ -583,6 +590,45 @@ def build_parser():
     brief.add_argument("--registry", default=None)
     brief.add_argument("--save")
     brief.set_defaults(func=cmd_brief)
+
+    ask = sub.add_parser(
+        "ask",
+        help="One query over the ledger: filter, group, summarise, correlate.",
+        description="The read-only shape every ad-hoc analysis kept re-improving: "
+                    "a filter (--where), a grouping axis (--by), a list of "
+                    "statistics (--stat), a within-panel slope (--panel) and a "
+                    "pairwise correlation matrix over cached PnL (--matrix). Built "
+                    "as one verb instead of seven because the seventh variant is "
+                    "always another script.")
+    ask.add_argument("--where", default="",
+                     help="Comma list of field=value / field!=value; fields: " +
+                          ", ".join(_ASK_FIELDS) +
+                          " plus check=NAME:RESULT and has=metrics|pnl|checks.")
+    ask.add_argument("--by", default=None,
+                     help="Grouping axis; one of " + ", ".join(_ASK_FIELDS) + ".")
+    ask.add_argument("--stat", default="n",
+                     help="Comma list: n, floor_share, median:METRIC, mean:METRIC, "
+                          "p25:METRIC, p75:METRIC, min:METRIC, max:METRIC.")
+    ask.add_argument("--panel", default="",
+                     help="Comma list of metrics whose within-panel slope against "
+                          "the numeric --by axis is reported. A panel is one "
+                          "construction under one set of settings, so the slope is "
+                          "the knob's own effect rather than a corpus trend.")
+    ask.add_argument("--matrix", default=None, choices=["corr"],
+                     help="Pairwise correlation over cached PnL of the matched rows.")
+    ask.add_argument("--matrix-within", default="expr",
+                     choices=["none", "expr", "family", "neutralization"],
+                     help="Restrict matrix pairs to rows sharing this key "
+                          "(default expr: same construction, another setting).")
+    ask.add_argument("--min-overlap", type=int, default=200,
+                     help="Shared trading days a pair needs (default 200).")
+    ask.add_argument("--list", action="store_true",
+                     help="Include one line per matched row.")
+    ask.add_argument("--limit", type=int, default=20,
+                     help="How many rows or pairs to list (default 20).")
+    ask.add_argument("--registry", default=None)
+    ask.add_argument("--save")
+    ask.set_defaults(func=cmd_ask)
 
     probe = sub.add_parser(
         "probe",
@@ -1707,11 +1753,39 @@ def cmd_ablate(args, _sink):
                 skipped.append({"alpha_id": raw, "reason": "not in the ledger"})
                 continue
             source = entry.get("expression") or ""
+            legs_legend = None
             try:
                 plan = ablation.variants(source, modes)
             except ablation.AblationError as exc:
-                skipped.append({"alpha_id": raw, "reason": str(exc)})
-                continue
+                # Most of the book is not `a = ...; b = ...; a + b`: akVznkO2 is a
+                # single expression whose last line mixes a term with a price leg, so
+                # the named-leg rule refuses it. The unit layer already derives
+                # zero/drop ablations from the parsed structure, so fall back to it
+                # rather than telling the caller "test by hand" 25 times.
+                point = alpha_unit.split(source)
+                if point is None:
+                    skipped.append({"alpha_id": raw,
+                                    "reason": "%s; and it does not parse" % exc})
+                    continue
+                legs_legend = {}
+                for index, leg in enumerate(getattr(point, "legs", ()) or ()):
+                    legs_legend["l%d" % index] = {"fields": list(leg.fields),
+                                                  "role": leg.role,
+                                                  "weight": leg.weight}
+                derived = alpha_unit.derive(point)
+                plan = []
+                if "full" in modes:
+                    plan.append({"candidate_id": "full", "expression": source})
+                for variant in derived:
+                    if variant.rule != "drop_term":
+                        continue
+                    name = variant.detail or "t%d" % len(plan)
+                    plan.append({"candidate_id": "loo:%s" % name,
+                                 "expression": variant.expression})
+                if not plan:
+                    skipped.append({"alpha_id": raw,
+                                    "reason": "unit layer derived no ablations"})
+                    continue
             alpha_settings = dict(ml.DEFAULT_SETTINGS)
             alpha_settings.update(entry.get("settings") or {})
             alphas = []
@@ -1723,9 +1797,12 @@ def cmd_ablate(args, _sink):
                     item_entry["decay"] = entry["settings"]["decay"]
                 alphas.append(item_entry)
             target = out_dir / ("%s-ablation.json" % raw)
-            target.write_text(json.dumps({"settings": alpha_settings, "alphas": alphas},
-                                         ensure_ascii=False, indent=2))
-            done.append({"alpha_id": raw, "file": str(target), "variants": len(plan)})
+            document = {"settings": alpha_settings, "alphas": alphas}
+            if legs_legend:
+                document["legs"] = legs_legend
+            target.write_text(json.dumps(document, ensure_ascii=False, indent=2))
+            done.append({"alpha_id": raw, "file": str(target), "variants": len(plan),
+                         "source": "unit" if legs_legend else "named-legs"})
             note("wrote %s (%d variants)" % (target, len(plan)))
         return {"mode": "ids", "written": done, "skipped": skipped,
                 "count": sum(item["variants"] for item in done),
@@ -1869,7 +1946,36 @@ def cmd_compare(args, _sink):
     if frozen:
         research_paths.log_view("compare", "frozen", [row.get("alpha_id") for row in rows],
                                 note=", ".join(str(path) for path in args.files))
-    if args.contributions:
+    if getattr(args, "per_file", False):
+        # One report per input file. A merged report cannot work here: every ablation
+        # file names its arms `full` / `loo:l0`, so merging twenty-five of them mixes
+        # one alpha's legs into another's contribution.
+        per_file = []
+        for path in args.files:
+            try:
+                payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            file_records = records_from(path, payload)
+            legend = payload.get("legs") if isinstance(payload, dict) else None
+            report = ablation.report(
+                file_records, metrics_of=None if frozen else _train_metrics)
+            for row in report["legs"]:
+                if legend and row["leg"] in legend:
+                    row["fields"] = legend[row["leg"]].get("fields")
+                    row["role"] = legend[row["leg"]].get("role")
+            scored = [row for row in report["legs"]
+                      if isinstance(row.get("contribution"), (int, float))]
+            per_file.append({
+                "file": path,
+                "alpha_id": Path(path).stem.split("-")[0],
+                "full_fitness": report["full_fitness"],
+                "top_leg": max(scored, key=lambda row: row["contribution"]) if scored else None,
+                "contributions": report,
+            })
+        data["per_file"] = per_file
+        data["per_file_view"] = "frozen" if frozen else "train"
+    elif args.contributions:
         # The contribution is a selection decision ("does this leg earn its place"),
         # so in the exploration view it has to be computed from train-period fitness.
         # It used to read the full-window block regardless, which put the test year
@@ -1897,7 +2003,7 @@ def _load_probe_spec(path):
     if not isinstance(arms, list) or not arms:
         raise CliError("INVALID_INPUT", "spec has no arms",
                        "each arm needs at least {\"expression\": ...}")
-    known = {"name", "idea", "mechanism", "note", "settings", "arms"}
+    known = {"name", "idea", "mechanism", "note", "settings", "arms", "design"}
     unknown = sorted(set(spec) - known)
     if unknown:
         # A typo here is silent otherwise: `"setting"` instead of `"settings"` would
@@ -1912,6 +2018,96 @@ def _load_probe_spec(path):
                            "\"settings\": {...} (optional)}")
         arm.setdefault("label", "arm%d" % index)
     return spec
+
+
+#: The five experiment designs a batch can be built from, borrowed from the way a
+#: biology experiment is laid out: a blank control, a gain-of-function arm, a
+#: loss-of-function arm, a series of arms that control each other, and a rescue.
+#: ``explore`` is the recorded opt-out: a scan is not an experiment, and saying so
+#: is more honest than pretending two arbitrary formulas are a comparison.
+_DESIGNS = ("control", "add", "drop", "parallel", "rescue")
+
+
+def _probe_design(spec, settings):
+    """Refuse a batch that cannot answer the question it claims to ask.
+
+    On 2026-11-03 four arms were run against a 5-day reversal base that was itself
+    below the gate (S 1.23 / F 0.68). Two of them scored worse, and no conclusion was
+    available: without a control that can pass, "worse" is not attributable. That is
+    the failure this refuses in advance -- a batch with no blank control is a lottery,
+    not an experiment.
+
+    The rules are the ones a wet-lab notebook enforces without discussion:
+
+    * exactly one arm is the blank control (the parent expression, unchanged);
+    * ``add``/``drop``/``rescue`` move the expression and nothing else, so their
+      settings must be identical to the control's -- otherwise two things changed;
+    * ``parallel`` arms differ from the control in exactly one setting, which is what
+      makes them a dose series rather than a confounding;
+    * ``rescue`` names ``proxy_of``: the different implementation of the same
+      economic quantity that is expected to restore the effect.
+    """
+    mode = spec.get("design")
+    if mode is not None and mode not in _DESIGNS + ("explore",):
+        raise CliError("INVALID_INPUT", "spec design %r is not a design" % (mode,),
+                       "use one of " + ", ".join(_DESIGNS + ("explore",)))
+    if mode == "explore":
+        return {"mode": "explore", "control": None,
+                "note": "scan, not an experiment: no arm pair is being compared"}
+
+    arms = spec["arms"]
+    unlabelled = [arm["label"] for arm in arms if not arm.get("design")]
+    if unlabelled:
+        raise CliError(
+            "INVALID_INPUT",
+            "arm(s) %s carry no design" % ", ".join(unlabelled),
+            "label every arm control/add/drop/parallel/rescue, or set "
+            "\"design\": \"explore\" on the spec to record that this is a scan")
+
+    controls = [arm for arm in arms if arm.get("design") == "control"]
+    if not controls:
+        raise CliError(
+            "INVALID_INPUT", "no control arm",
+            "run the parent expression unchanged as {\"label\": ..., \"design\": "
+            "\"control\", \"expression\": ...}; without it a drop or an add cannot "
+            "be attributed to anything")
+    if len(controls) > 1:
+        raise CliError("INVALID_INPUT",
+                       "%d control arms; a batch has exactly one" % len(controls),
+                       "the other arms compare against it")
+    control = controls[0]
+    base = {**settings, **(control.get("settings") or {})}
+    for arm in arms:
+        design = arm.get("design")
+        if design == "control":
+            continue
+        if design not in _DESIGNS:
+            raise CliError("INVALID_INPUT",
+                           "arm %r has design %r" % (arm["label"], design),
+                           "use " + ", ".join(_DESIGNS))
+        if design == "rescue" and not arm.get("proxy_of"):
+            raise CliError(
+                "INVALID_INPUT", "rescue arm %r has no proxy_of" % (arm["label"],),
+                "name the different implementation of the same economic quantity, "
+                "e.g. \"proxy_of\": \"gross_profit/assets\"")
+        effective = {**settings, **(arm.get("settings") or {})}
+        moved = sorted(key for key in set(base) | set(effective)
+                       if base.get(key) != effective.get(key))
+        if design == "parallel":
+            if len(moved) != 1:
+                raise CliError(
+                    "INVALID_INPUT",
+                    "parallel arm %r moves %d settings (%s)"
+                    % (arm["label"], len(moved), ", ".join(moved) or "none"),
+                    "a dose series moves exactly one knob; split the batch instead")
+        elif moved:
+            raise CliError(
+                "INVALID_INPUT",
+                "%s arm %r also moves %s" % (design, arm["label"], ", ".join(moved)),
+                "only a parallel arm may change a setting; an add/drop/rescue arm "
+                "changes the expression and nothing else")
+    return {"mode": "controlled", "control": control["label"],
+            "designs": {arm["label"]: arm["design"] for arm in arms}}
 
 
 def cmd_probe(args, _sink):
@@ -1937,6 +2133,13 @@ def cmd_probe(args, _sink):
     settings = dict(spec.get("settings") or {})
     arms = spec["arms"]
     name = args.name or spec.get("name") or Path(args.spec).stem
+
+    # Before anything is spent: can this batch answer the question it claims to ask?
+    # A scan may say so explicitly and is recorded as such; a comparison may not skip
+    # the control arm, because then "worse" has nothing to be worse than.
+    design = _probe_design(spec, settings)
+    if design["mode"] == "explore":
+        note("design: explore -- no control arm, so no arm is being attributed")
 
     groups = {}
     for arm in arms:
@@ -1969,7 +2172,7 @@ def cmd_probe(args, _sink):
         note("dry run: %d arm(s) in %d settings group(s), %d blocking finding(s)"
              % (len(arms), len(groups), len(blocking)))
         return {"dry_run": True, "arms": len(arms), "groups": len(groups),
-                "blocking": blocking}
+                "blocking": blocking, "design": design}
 
     records = []
     for key, group in groups.items():
@@ -2004,6 +2207,7 @@ def cmd_probe(args, _sink):
         # the full window, which *contains* the test year, so ranking on them is
         # ranking on test - hiding one column would not have fixed that.
         row = {"label": arm["label"], "alpha_id": record.get("alpha_id"),
+               "design": arm.get("design"),
                "expression": arm["expression"],
                "settings": {**settings, **(arm.get("settings") or {})},
                "status": record.get("status"), "error": record.get("error"),
@@ -2025,7 +2229,7 @@ def cmd_probe(args, _sink):
 
     Path(target).write_text(
         json.dumps({"spec": str(args.spec), "name": name, "rows": rows,
-                    "records": records},
+                    "design": design, "records": records},
                    ensure_ascii=False, indent=1), encoding="utf-8")
     if args.show_test:
         research_paths.log_view("probe", "test", [row.get("alpha_id") for row in rows],
@@ -2033,7 +2237,8 @@ def cmd_probe(args, _sink):
     note("wrote %s" % target)
 
     summary = {"name": name, "path": str(target), "rows": rows,
-               "simulated": len(rows), "show_test": bool(args.show_test)}
+               "simulated": len(rows), "show_test": bool(args.show_test),
+               "design": design}
     if not args.no_record:
         summary["registry"] = alpha_registry.record_simulation(
             records, settings, idea=spec.get("idea"), mechanism=spec.get("mechanism"),
@@ -3352,6 +3557,266 @@ def cmd_alpha_lineage(args, _sink):
     }
     _maybe_save(args, data)
     return data
+
+
+# ---------------------------------------------------------------------------
+# ask -- one query over the ledger
+# ---------------------------------------------------------------------------
+
+#: Columns the ledger can be filtered and grouped by. Everything here is read from
+#: an entry, so a new axis is one line rather than a new command.
+_ASK_FIELDS = ("status", "verdict", "family", "region", "universe", "neutralization",
+               "delay", "decay", "month")
+
+#: Aggregations --stat understands. ``floor_share`` is separate from the metric
+#: aggregations because it answers a question about the sample rather than about a
+#: column: how much of it is paying the ``max(turnover, 0.125)`` tax.
+_ASK_STATS = ("n", "floor_share", "median", "mean", "p25", "p75", "min", "max")
+
+_ASK_TURNOVER_FLOOR = 0.125
+
+
+def _ask_field(entry, field):
+    """Read one grouping/filter field off a ledger entry."""
+    if field in ("status", "verdict", "family"):
+        return entry.get(field)
+    if field == "month":
+        return (entry.get("recorded_at") or "")[:7] or None
+    return (entry.get("settings") or {}).get(field)
+
+
+def _ask_has(entry, what):
+    if what == "metrics":
+        return bool(entry.get("metrics"))
+    if what == "checks":
+        return bool(entry.get("checks"))
+    if what == "pnl":
+        alpha = entry.get("alpha_id")
+        return bool(alpha) and (Path(research_paths.ensure_dir()) / "pnl" /
+                                ("%s.json" % alpha)).exists()
+    raise CliError("USAGE", "has=%r is not a thing" % what,
+                   "use has=metrics, has=checks or has=pnl")
+
+
+def _ask_filters(text):
+    """Parse ``--where`` into ``[(field, op, value)]``.
+
+    Two names carry a colon rather than a value: ``check=SELF_CORRELATION:PENDING``
+    and ``has=pnl``. Both exist because the questions that started this command were
+    "which rows never had their checks computed" and "which rows have a PnL".
+    """
+    filters = []
+    for item in [piece.strip() for piece in (text or "").split(",") if piece.strip()]:
+        op = "!=" if "!=" in item else "="
+        field, _, value = item.partition(op)
+        field, value = field.strip(), value.strip()
+        if field not in _ASK_FIELDS + ("check", "has"):
+            raise CliError("USAGE", "unknown --where field %r" % field,
+                           "supported: " + ", ".join(_ASK_FIELDS + ("check", "has")))
+        filters.append((field, op, value))
+    return filters
+
+
+def _ask_passes(entry, filters):
+    for field, op, value in filters:
+        if field == "check":
+            name, _, expected = value.partition(":")
+            actual = ((entry.get("checks") or {}).get(name) or {}).get("result")
+            hit = str(actual or "") == expected
+        elif field == "has":
+            hit = _ask_has(entry, value)
+        else:
+            actual = _ask_field(entry, field)
+            hit = str(actual) == value if actual is not None else False
+        if hit != (op == "="):
+            return False
+    return True
+
+
+def _ask_quantile(values, q):
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    position = q * (len(ordered) - 1)
+    low = int(math.floor(position))
+    high = min(low + 1, len(ordered) - 1)
+    return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+
+def _ask_stat(entries, spec):
+    """Compute one ``--stat`` term over a group."""
+    if spec == "n":
+        return len(entries)
+    if spec == "floor_share":
+        turnovers = [(entry.get("metrics") or {}).get("turnover") for entry in entries]
+        turnovers = [value for value in turnovers if isinstance(value, (int, float))]
+        if not turnovers:
+            return None
+        return round(sum(1 for value in turnovers if value < _ASK_TURNOVER_FLOOR)
+                     / float(len(turnovers)), 4)
+    name, _, metric = spec.partition(":")
+    if name not in _ASK_STATS or not metric:
+        raise CliError("USAGE", "unknown --stat %r" % spec,
+                       "use n, floor_share or <agg>:<metric>; " + ", ".join(_ASK_STATS))
+    values = [(entry.get("metrics") or {}).get(metric) for entry in entries]
+    values = [value for value in values if isinstance(value, (int, float))]
+    if not values:
+        return None
+    if name == "median":
+        return round(_ask_quantile(values, 0.5), 4)
+    if name == "mean":
+        return round(sum(values) / float(len(values)), 4)
+    if name == "p25":
+        return round(_ask_quantile(values, 0.25), 4)
+    if name == "p75":
+        return round(_ask_quantile(values, 0.75), 4)
+    if name == "min":
+        return min(values)
+    return max(values)
+
+
+def _ask_panel(entries, axis, metrics):
+    """Within-panel slope of ``axis`` against each metric.
+
+    A panel is one construction under one set of settings, so the only thing varying
+    inside it is the knob itself. Pooling the corpus instead measures how big alphas
+    differ from small ones, which is a different question and a misleading answer.
+    """
+    panels = {}
+    for entry in entries:
+        settings = entry.get("settings") or {}
+        key = (entry.get("expression_hash"), settings.get("region"),
+               settings.get("universe"), settings.get("neutralization"),
+               settings.get("truncation"), settings.get("delay"))
+        panels.setdefault(key, []).append(entry)
+    report = {}
+    for metric in [piece.strip() for piece in metrics.split(",") if piece.strip()]:
+        slopes = []
+        detail = []
+        for key, rows in panels.items():
+            if len(rows) < 3:
+                continue
+            xs = [row.get("settings", {}).get(axis) for row in rows]
+            ys = [(row.get("metrics") or {}).get(metric) for row in rows]
+            if any(not isinstance(x, (int, float)) for x in xs):
+                continue
+            if any(not isinstance(y, (int, float)) for y in ys):
+                continue
+            r = correlation.pearson(xs, ys)
+            if r is None:
+                continue
+            slopes.append(r)
+            detail.append({"panel": key[0], "n": len(rows), "r": round(r, 4)})
+        report[metric] = {
+            "panels": len(slopes),
+            "median_r": round(_ask_quantile(slopes, 0.5), 4) if slopes else None,
+            "detail": sorted(detail, key=lambda item: abs(item["r"]), reverse=True),
+        }
+    return report
+
+
+def _ask_matrix(entries, within, min_overlap):
+    """Pairwise correlation of the matched rows' cached PnL."""
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+    groups = {}
+    missing = []
+    for entry in entries:
+        alpha = entry.get("alpha_id")
+        path = pnl_dir / ("%s.json" % alpha) if alpha else None
+        if not path or not path.exists():
+            if alpha:
+                missing.append(alpha)
+            continue
+        try:
+            series = json.loads(path.read_text())
+        except (OSError, ValueError):
+            missing.append(alpha)
+            continue
+        if within == "none":
+            key = None
+        elif within == "expr":
+            key = entry.get("expression_hash")
+        elif within == "family":
+            key = entry.get("family")
+        else:
+            key = (entry.get("settings") or {}).get("neutralization")
+        groups.setdefault(key, {}).setdefault(alpha, series)
+
+    pairs, skipped = [], []
+    for key, pnls in groups.items():
+        if len(pnls) < 2:
+            continue
+        block = correlation.matrix(pnls, min_overlap=min_overlap)
+        for pair in block["pairs"]:
+            pairs.append({**pair, "within": key})
+        for pair in block["skipped"]:
+            skipped.append({**pair, "within": key})
+    ordered = sorted(pairs, key=lambda item: abs(item["r"]), reverse=True)
+    absolute = [abs(pair["r"]) for pair in pairs]
+    return {
+        "pairs_measured": len(pairs),
+        "pairs_skipped": len(skipped),
+        "median_abs_r": round(_ask_quantile(absolute, 0.5), 4) if absolute else None,
+        "largest": ordered[0] if ordered else None,
+        "pairs": ordered,
+        "skipped": skipped[:20],
+        "missing_pnl": missing[:20],
+    }
+
+
+def cmd_ask(args, _sink):
+    """Answer one read-only question about the ledger, in the shape it is asked.
+
+    Every analysis in the 2026-11 campaign was the same four moves -- filter, group,
+    aggregate, compare -- retyped as an inline script, which meant each one was
+    written outside the test suite and re-derived the next time it was needed. This
+    verb is that shape once: the filter is ``--where``, the group is ``--by``, the
+    aggregate is ``--stat``, and the comparison is ``--panel``/``--matrix``.
+    """
+    _path, entries = _ledger(args)
+    matched = [entry for entry in entries if _ask_passes(entry, _ask_filters(args.where))]
+    stats = [piece.strip() for piece in (args.stat or "n").split(",") if piece.strip()]
+    document = {
+        "query": {"where": args.where, "by": args.by, "stat": args.stat,
+                  "matrix_within": args.matrix_within if args.matrix else None},
+        "rows_matched": len(matched),
+    }
+    if args.by:
+        if args.by not in _ASK_FIELDS:
+            raise CliError("USAGE", "unknown --by axis %r" % args.by,
+                           "supported: " + ", ".join(_ASK_FIELDS))
+        buckets = {}
+        for entry in matched:
+            buckets.setdefault(_ask_field(entry, args.by), []).append(entry)
+        document["groups"] = [
+            {"value": value, "n": len(rows),
+             **{name: _ask_stat(rows, name) for name in stats if name != "n"}}
+            for value, rows in sorted(buckets.items(),
+                                      key=lambda item: -len(item[1]))
+        ]
+    else:
+        document["summary"] = {name: _ask_stat(matched, name) for name in stats}
+    if args.panel:
+        if not args.by:
+            raise CliError("USAGE", "--panel needs --by",
+                           "a panel is the grouping axis whose slope you want")
+        document["panel"] = _ask_panel(matched, args.by, args.panel)
+    if args.matrix:
+        document["matrix"] = _ask_matrix(matched, args.matrix_within, args.min_overlap)
+    if args.list:
+        document["rows"] = [
+            {"alpha_id": entry.get("alpha_id"), "status": entry.get("status"),
+             "verdict": entry.get("verdict"), "family": entry.get("family"),
+             "neutralization": (entry.get("settings") or {}).get("neutralization"),
+             "decay": (entry.get("settings") or {}).get("decay"),
+             "sharpe": (entry.get("metrics") or {}).get("sharpe"),
+             "fitness": (entry.get("metrics") or {}).get("fitness")}
+            for entry in matched[: args.limit]
+        ]
+    _maybe_save(args, document)
+    return document
 
 
 def cmd_alpha_coverage(args, _sink):
