@@ -111,13 +111,13 @@ characters, rejected locally.
 Relate alphas to each other (offline):
 
 ```bash
-python research_cli.py alpha coverage              # label debt: family column
-python research_cli.py alpha label ID --family quality --verdict candidate
-python research_cli.py alpha impact ID             # shared leg bodies
-python research_cli.py alpha lineage ID            # parent chain
+python research_cli.py ledger coverage              # label debt: family column
+python research_cli.py ledger label ID --family quality --verdict candidate
+python research_cli.py ledger impact ID             # shared leg bodies
+python research_cli.py ledger lineage ID            # parent chain
 ```
 
-`alpha impact` compares leg bodies, not names: a shared `a` means nothing.
+`ledger impact` compares leg bodies, not names: a shared `a` means nothing.
 
 Ask whether a composite leg earns its place, without hand-writing variants:
 

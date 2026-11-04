@@ -722,7 +722,7 @@ class CheckReconciliationTests(unittest.TestCase):
 
 
 class RegistryQueryTests(unittest.TestCase):
-    """`alpha find` exists so a field is not re-tested by accident."""
+    """`ledger list` exists so a field is not re-tested by accident."""
 
     ENTRIES = [
         {"alpha_id": "A1", "verdict": "candidate", "idea": "Idea 70",

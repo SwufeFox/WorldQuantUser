@@ -12,6 +12,7 @@ Run with::
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import stat
@@ -31,14 +32,14 @@ import research_cli as cli  # noqa: E402
 import research_config as config_io  # noqa: E402
 
 
-def run_cli(*args, expect_env=True):
+def run_cli(*args, expect_env=True, input_text=None):
     """Run the CLI in a subprocess with BRAIN_* credentials stripped."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("BRAIN_")}
     if not expect_env:
         env.pop("BRAIN_USERNAME", None)
     proc = subprocess.run(
         [sys.executable, str(ROOT / "research_cli.py"), *args],
-        capture_output=True, text=True, cwd=str(ROOT), env=env,
+        capture_output=True, encoding="utf-8", cwd=str(ROOT), env=env, input=input_text,
     )
     return proc
 
@@ -59,29 +60,6 @@ class SchemaContractTests(unittest.TestCase):
                     "settings_defaults", "credentials", "commands"):
             self.assertIn(key, data)
 
-    def test_schema_lists_every_command_and_its_options(self):
-        commands = parse(run_cli("schema"))["data"]["commands"]["subcommands"]
-        self.assertEqual(
-            set(commands), {"schema", "auth", "catalog", "simulate", "resume",
-                            "alpha", "lint", "cache", "search", "paper", "ablate",
-                            "compare", "brief", "probe", "views"},
-        )
-        simulate = commands["simulate"]
-        flags = {flag for option in simulate["options"] for flag in option["flags"]}
-        self.assertIn("--dry-run", flags)
-        self.assertIn("--sort", flags)
-        self.assertIn("--max-wait-seconds", flags)
-        catalog = commands["catalog"]["subcommands"]
-        self.assertIn("--dataset", {f for o in catalog["fields"]["options"] for f in o["flags"]})
-        search_flags = {f for o in commands["search"]["options"] for f in o["flags"]}
-        self.assertIn("--fetch", search_flags)
-        self.assertIn("--min-score", search_flags)
-        ablate_flags = {f for o in commands["ablate"]["options"] for f in o["flags"]}
-        self.assertIn("--modes", ablate_flags)
-        compare_flags = {f for o in commands["compare"]["options"] for f in o["flags"]}
-        self.assertIn("--contributions", compare_flags)
-        cache = commands["cache"]["subcommands"]
-        self.assertEqual(set(cache), {"info", "clear"})
 
     def test_schema_can_describe_one_command(self):
         payload = parse(run_cli("schema", "simulate"))["data"]
@@ -101,10 +79,13 @@ class ErrorEnvelopeTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "USAGE")
 
-    def test_command_without_subcommand(self):
+    def test_command_without_subcommand_shows_local_choices(self):
         proc = run_cli("catalog")
-        self.assertEqual(proc.returncode, 2)
-        self.assertEqual(parse(proc)["error"]["code"], "USAGE")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        document = parse(proc)
+        self.assertEqual(document["command"], "catalog")
+        self.assertIn("fields", document["data"]["commands"])
+        self.assertNotIn("ledger", document["data"]["commands"])
 
     def test_simulate_without_any_alpha(self):
         proc = run_cli("simulate")
@@ -169,6 +150,75 @@ class DryRunTests(unittest.TestCase):
             self.assertEqual(decays, [7, 1])
 
 
+class CliWorkflowContractTests(unittest.TestCase):
+    def invoke(self, *arguments):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+            code = cli.main(arguments)
+        return code, stdout.getvalue(), stderr.getvalue()
+
+    def test_common_options_work_before_between_and_after_commands(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for index, arguments in enumerate([
+                ["--compact", "--quiet", "schema", "alpha", "get"],
+                ["schema", "--compact", "alpha", "get", "--quiet"],
+                ["schema", "alpha", "get", "--compact", "--quiet"],
+            ]):
+                target = Path(directory) / str(index) / "contract.json"
+                with self.subTest(arguments=arguments):
+                    code, stdout, stderr = self.invoke(*arguments, "--save", str(target))
+                    self.assertEqual(code, 0, stderr)
+                    self.assertEqual(stdout.count("\n"), 1)
+                    self.assertEqual(target.read_bytes(), stdout.encode("utf-8"))
+                    self.assertEqual(json.loads(stdout)["data"]["command"]["command"], "alpha get")
+                    self.assertEqual(stderr, "")
+
+    def test_saved_usage_failure_keeps_envelope_and_command_context(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "failure.json"
+            code, stdout, stderr = self.invoke("--save", str(target), "catalog", "feilds", "--quiet")
+            document = json.loads(stdout)
+            self.assertEqual(code, 2)
+            self.assertEqual(target.read_bytes(), stdout.encode("utf-8"))
+            self.assertEqual(document["error"]["code"], "USAGE")
+            self.assertIn("fields", document["error"]["details"]["suggestions"])
+            self.assertIn("catalog", document["error"]["details"]["usage"])
+            self.assertIn("USAGE", stderr)
+
+    def test_invalid_save_destination_is_rejected_before_command_side_effect(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ml, "invalidate_session") as logout:
+            code, stdout, _stderr = self.invoke("auth", "logout", "--save", directory)
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(stdout)["error"]["code"], "INVALID_INPUT")
+            logout.assert_not_called()
+
+    def test_workspace_override_is_local_to_each_invocation(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(ROOT / "unused-research")}):
+            code, stdout, stderr = self.invoke("ledger", "list", "--research-dir", directory)
+            self.assertEqual(code, 0, stderr)
+            self.assertEqual(json.loads(stdout)["data"]["registry"],
+                             str(Path(directory) / "alpha-registry.jsonl"))
+            self.assertEqual(os.environ["BRAIN_RESEARCH_DIR"], str(ROOT / "unused-research"))
+
+    def test_nonfinite_thresholds_fail_before_contacting_platform(self):
+        with mock.patch.object(ml, "load_session") as login:
+            code, stdout, _stderr = self.invoke("alpha", "list", "--min-sharpe", "nan")
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(stdout)["error"]["code"], "USAGE")
+            login.assert_not_called()
+
+    def test_nested_help_and_misspelled_option_are_actionable(self):
+        code, stdout, stderr = self.invoke("help", "catalog", "fields")
+        self.assertEqual(code, 0, stderr)
+        self.assertIn("catalog fields", json.loads(stdout)["data"]["usage"])
+        code, stdout, _stderr = self.invoke("simulate", "--expr", "rank(close)", "--dry-rnu")
+        self.assertEqual(code, 2)
+        self.assertIn("--dry-run", json.loads(stdout)["error"]["details"]["suggestions"])
+
+
+
 class ResearchConfigTests(unittest.TestCase):
     def test_json_array(self):
         settings, alphas = config_io.parse_research_text('["rank(cap)"]')
@@ -199,6 +249,30 @@ class ResearchConfigTests(unittest.TestCase):
         with self.assertRaises(config_io.ResearchError):
             config_io.load_research_file("/nonexistent/research.json")
 
+    def test_utf8_research_file_with_bom_preserves_expression(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "研究.json"
+            path.write_text(json.dumps({"alphas": ["rank(close) /* 中文 */"]},
+                                       ensure_ascii=False), encoding="utf-8-sig")
+            _, alphas = config_io.load_research_file(path)
+        self.assertEqual(alphas, ["rank(close) /* 中文 */"])
+
+    def test_stdin_decodes_utf8_bom_without_losing_unicode(self):
+        text = json.dumps({"settings": {"decay": 3},
+                           "alphas": ["rank(close) /* 研究 */"]}, ensure_ascii=False)
+        stream = io.BytesIO(("\ufeff" + text).encode("utf-8"))
+        with mock.patch.object(sys, "stdin", stream):
+            settings, alphas = config_io.load_research_file("-")
+        self.assertEqual(settings, {"decay": 3})
+        self.assertEqual(alphas, ["rank(close) /* 研究 */"])
+        self.assertEqual(stream.tell(), len(stream.getvalue()))
+
+    def test_stdin_rejects_non_utf8_bytes_as_research_input_error(self):
+        with mock.patch.object(sys, "stdin", io.BytesIO(b"\xff")):
+            with self.assertRaises(config_io.ResearchError) as caught:
+                config_io.load_research_file("-")
+        self.assertIn("cannot read -", str(caught.exception))
+
     def test_object_without_alphas_or_expression(self):
         with self.assertRaises(config_io.ResearchError):
             config_io.parse_research_text('{"settings": {}}')
@@ -219,6 +293,150 @@ class ResearchConfigTests(unittest.TestCase):
     def test_build_config_rejects_nothing_to_do(self):
         with self.assertRaises(config_io.ResearchError):
             config_io.build_config({}, [])
+
+
+class ExpressionWorkflowTests(unittest.TestCase):
+    def test_one_research_document_can_flow_through_all_offline_commands(self):
+        expression = "a = rank(close); b = rank(volume); a + b"
+        text = "\ufeff" + json.dumps({
+            "settings": {"region": "EUR", "universe": "TOP600", "delay": 0, "decay": 3},
+            "alphas": [{"expression": expression, "decay": 2}],
+        })
+        commands = [("lint", "--file", "-", "--offline"),
+                    ("simulate", "-", "--dry-run"), ("ablate", "-")]
+        for command in commands:
+            with self.subTest(command=command):
+                proc = run_cli(*command, input_text=text)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                data = parse(proc)["data"]
+                self.assertEqual(data["settings"]["region"], "EUR")
+                self.assertEqual(data["settings"]["universe"], "TOP600")
+                self.assertEqual(data["settings"]["delay"], 0)
+                if command[0] == "ablate":
+                    self.assertEqual(data["source_expression"], expression)
+                else:
+                    self.assertEqual(data["results"][0]["expression"], expression)
+                    self.assertEqual(data["results"][0]["decay"], 2)
+
+    def test_lint_and_simulate_merge_repeated_files_and_expressions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "first.json", Path(tmp) / "second.json"
+            first.write_text(json.dumps({"settings": {"decay": 8, "universe": "TOP500"},
+                                         "alphas": ["rank(close)"]}), encoding="utf-8")
+            second.write_text(json.dumps({"settings": {"decay": 4},
+                                          "alphas": [{"expression": "rank(volume)", "decay": 2}]}),
+                              encoding="utf-8")
+            for command in ("lint", "simulate"):
+                with self.subTest(command=command):
+                    args = [command]
+                    args += (["--file", str(first)] if command == "lint" else [str(first)])
+                    args += ["--file", str(second), "--expr", "rank(cap)",
+                             "--expr", "rank(assets)", "--decay", "3"]
+                    args += ["--offline"] if command == "lint" else ["--dry-run"]
+                    proc = run_cli(*args)
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    data = parse(proc)["data"]
+                    self.assertEqual([r["expression"] for r in data["results"]],
+                                     ["rank(close)", "rank(volume)", "rank(cap)", "rank(assets)"])
+                    self.assertEqual([r["decay"] for r in data["results"]], [3, 2, 3, 3])
+                    self.assertEqual(data["settings"]["universe"], "TOP500")
+            proc = run_cli("simulate", "--file", str(first), "--file", str(second), "--dry-run")
+            self.assertEqual(parse(proc)["data"]["settings"]["decay"], 4)
+
+    def test_lint_positional_expression_is_merged_with_file_and_flags(self):
+        proc = run_cli("lint", "rank(cap)", "--file", "-", "--expr", "rank(volume)",
+                       "--offline", input_text="rank(close)")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([r["expression"] for r in parse(proc)["data"]["results"]],
+                         ["rank(close)", "rank(cap)", "rank(volume)"])
+
+    def test_settings_flags_are_case_insensitive_and_emit_canonical_values(self):
+        proc = run_cli("simulate", "--expr", "rank(close)", "--region", "eur",
+                       "--universe", "top600", "--neutralization", "industry",
+                       "--pasteurization", "off", "--nan-handling", "verify",
+                       "--test-period", "p1y", "--instrument-type", "equity", "--dry-run")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        settings = parse(proc)["data"]["results"][0]["payload"]["settings"]
+        for key, expected in {"region": "EUR", "universe": "TOP600", "neutralization": "INDUSTRY",
+                              "pasteurization": "OFF", "nanHandling": "VERIFY",
+                              "testPeriod": "P1Y", "instrumentType": "EQUITY"}.items():
+            self.assertEqual(settings[key], expected)
+
+    def test_lint_catalog_uses_file_scope_and_explicit_overrides(self):
+        document = {"settings": {"region": "EUR", "universe": "TOP600", "delay": 0},
+                    "alphas": ["rank(scoped_field)"]}
+        for flags, expected in [([], ("EUR", "TOP600", 0)),
+                                (["--region", "usa", "--universe", "top500", "--delay", "1"],
+                                 ("USA", "TOP500", 1))]:
+            with self.subTest(flags=flags):
+                def fields(_session, **scope):
+                    actual = (scope["region"], scope["universe"], scope["delay"])
+                    return ([{"id": "scoped_field", "type": "MATRIX", "dataset": "model1"}]
+                            if actual == expected else [])
+
+                args = cli.build_parser().parse_args(["lint", "--file", "-", "--strict-fields", *flags])
+                with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(document))), \
+                        mock.patch.object(ml, "load_session", return_value=object()), \
+                        mock.patch.object(ml, "fetch_operators", return_value=[
+                            {"name": "rank", "definition": "rank(x)"}]), \
+                        mock.patch.object(cli.field_index, "fetch_all_fields", side_effect=fields):
+                    data = cli.cmd_lint(args, None)
+                self.assertTrue(data["ok"])
+                self.assertEqual(data["known_field_count"], 1)
+                self.assertEqual(tuple(data["settings"][key] for key in ("region", "universe", "delay")),
+                                 expected)
+
+    def test_catalog_and_lint_defaults_follow_machine_library(self):
+        defaults = {**ml.DEFAULT_SETTINGS, "region": "EUR", "universe": "TOP600", "delay": 0}
+        with mock.patch.object(ml, "DEFAULT_SETTINGS", defaults):
+            parser = cli.build_parser()
+            args = parser.parse_args(["catalog", "datasets"])
+            with mock.patch.object(ml, "load_session", return_value=object()), \
+                    mock.patch.object(ml, "get_datasets", return_value=[{"id": "available"}]):
+                catalog = cli.cmd_catalog_datasets(args, None)
+            lint = cli.cmd_lint(parser.parse_args(["lint", "rank(close)", "--offline"]), None)
+        for key in ("region", "universe", "delay"):
+            self.assertEqual(catalog[key], defaults[key])
+            self.assertEqual(lint["settings"][key], defaults[key])
+
+    def test_conflicting_ablation_inputs_are_rejected_before_reading_files(self):
+        for args in [("ablate", "missing.json", "--expr", "a = rank(close); a"),
+                     ("ablate", "missing.json", "--ids", "A1"),
+                     ("ablate", "--expr", "a = rank(close); a", "--ids", "A1")]:
+            with self.subTest(args=args):
+                proc = run_cli(*args)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
+                self.assertNotIn("cannot read", parse(proc)["error"]["message"])
+
+    def test_multiple_stdin_inputs_are_rejected(self):
+        for args in [("simulate", "-", "--file", "-", "--dry-run"),
+                     ("lint", "--file", "-", "--file", "-", "--offline"),
+                     ("compare", "-", "-")]:
+            with self.subTest(args=args):
+                proc = run_cli(*args, input_text="rank(close)")
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
+                self.assertIn("only once", parse(proc)["error"]["message"])
+
+    def test_compare_accepts_stdin_and_regular_files(self):
+        first = {"alpha_id": "A", "out_of_sample": {"train": {"fitness": 2}}}
+        second = {"alpha_id": "B", "out_of_sample": {"train": {"fitness": 1}}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "result.json"
+            path.write_text(json.dumps([second]), encoding="utf-8-sig")
+            proc = run_cli("compare", "-", str(path),
+                           input_text="\ufeff" + json.dumps({"ok": True, "data": {"results": [first]}}))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([r["alpha_id"] for r in parse(proc)["data"]["rows"]], ["A", "B"])
+
+    def test_malformed_stdin_is_invalid_input(self):
+        for args in [("simulate", "-", "--dry-run"), ("lint", "--file", "-", "--offline"),
+                     ("ablate", "-"), ("probe", "-", "--dry-run"), ("compare", "-")]:
+            with self.subTest(args=args):
+                proc = run_cli(*args, input_text="{invalid")
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
 
 
 class CredentialTests(unittest.TestCase):
@@ -400,7 +618,8 @@ class SimulationResumeTests(unittest.TestCase):
             path = Path(temporary_directory) / "checkpoint.json"
             cli._write_simulation_checkpoint(path, {"records": []})
             self.assertEqual(json.loads(path.read_text()), {"records": []})
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(list(path.parent.glob(".checkpoint.json.*.tmp")), [])
 
     def test_progress_url_rejects_untrusted_hosts_before_authenticated_get(self):

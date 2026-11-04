@@ -17,7 +17,7 @@ research_cli.py schema      # the whole contract, as JSON
 | File | Job |
 | --- | --- |
 | `research_cli.py` | The machine-readable CLI. stdout is always one JSON document. |
-| `research_config.py` | Research-file format: parsing and validation, shared by CLI and GUI. |
+| `research_config.py` | Research-file format: parsing and validation, shared by CLI and research scripts. |
 | `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
 | `expression_types.py` | Five field types, operator signatures, and the mismatches they imply. |
@@ -28,7 +28,6 @@ research_cli.py schema      # the whole contract, as JSON
 | `field_contract.py` | Field contracts: declared vs inferred period/unit/sign, verdicts. |
 | `research_paths.py` | Resolves where results go -- always outside this working tree. |
 | `alpha_registry.py` | Append-only ledger of alphas worth remembering. |
-| `research_gui.py` | Small tkinter wrapper for interactive use. |
 | `correlation.py` | Align daily PnL on shared dates, Pearson, residualise against a control. |
 | `ablation.py` | Leave-one-out and solo variants, so a leg can be shown to earn its place. |
 | `cache_store.py` | Small JSON cache with TTL, so repeat calls do not re-fetch. |
@@ -178,9 +177,29 @@ message text.
 ### Discover the surface
 
 ```bash
-python research_cli.py schema            # commands, arguments, formats, codes
-python research_cli.py schema simulate   # one command in detail
+python research_cli.py                         # concise guide
+python research_cli.py help catalog fields     # examples and options for one task
+python research_cli.py catalog                 # commands available in this group
+python research_cli.py catalog fields --help   # terminal help, including defaults
+python research_cli.py schema                  # full machine-readable contract
+python research_cli.py schema alpha get        # just one command's contract
 ```
+
+Common options work before or after any command: `--save PATH` creates missing parent
+directories and atomically writes **the same complete JSON envelope as stdout**, including
+failures; `--save -` uses stdout only. The destination is checked before execution.
+`--compact` emits one line, `--quiet` suppresses progress while keeping errors, and
+`--research-dir PATH` overrides the research directory for this invocation.
+
+```bash
+python research_cli.py --research-dir ./research ledger list --family quality
+python research_cli.py simulate batch.json --dry-run --compact --save preview.json
+```
+
+In CLI 3.0, local records live under `ledger`: `ledger list` combines the former
+`alpha registry` and `alpha find` filters. `record`, `label`, `impact`, `lineage` and
+`coverage` also moved from `alpha` to `ledger`. `alpha` reads or updates the platform;
+`ledger` works locally except for `ledger record`, which fetches the selected alpha.
 
 ### Start a session with one bounded document
 
@@ -292,6 +311,43 @@ simulations. `--max-wait-seconds` adjusts the budget for either command.
 A failed expression is reported in its own record instead of aborting the run;
 the command only fails outright when *every* expression failed.
 
+### Probe a labelled experiment
+
+Use one spec for a batch of arms and their settings:
+
+```json
+{"name": "neutralization-sweep", "settings": {"decay": 4},
+ "arms": [{"label": "subindustry", "expression": "rank(close)"},
+          {"label": "industry-fast", "expression": "rank(close)", "decay": 2,
+           "settings": {"neutralization": "INDUSTRY"}}]}
+```
+
+```bash
+python research_cli.py probe batch.spec.json --dry-run
+python research_cli.py probe batch.spec.json
+```
+
+`probe --dry-run` is a fully offline preview: it loads no session or credentials,
+contacts no catalog, and spends no simulation quota. It validates every settings
+group, resolves defaults and per-arm decay, and returns the complete settings and
+exact `POST /simulations` payload for each labelled arm in `results`. Structural
+lint and the learned denylist run locally; `blocking` lists their errors. The
+`lint` report explicitly marks the live operator and field catalogs as unchecked.
+Use `lint` when you need authoritative catalog checks.
+
+A real probe validates every group locally before loading a session or submitting
+anything, then runs the existing catalog guard for each simulation group. Arms
+with equivalent resolved settings and decay share a group. Results and ledger
+entries retain each arm's actual settings and decay. The table and `rows` show
+train-period metrics by default; `--show-test` also reveals the full-window and
+test metrics and records that view. Existing batch files are protected before
+simulation; choose another `--name` or pass `--force` to overwrite deliberately.
+
+`probe` accepts the same settings and session flags as `simulate`. Explicit settings
+override the spec and each arm's settings; an arm's top-level `decay` remains its
+per-expression override. One real batch shares a session across all groups.
+Use `probe - --dry-run` to read a spec from stdin.
+
 ### Inspect results
 
 ```bash
@@ -319,11 +375,11 @@ python research_cli.py alpha book --check P0M7171K
 ### Check the ledger before spending a simulation
 
 The most expensive mistake in this workflow is re-testing a field that was
-already falsified. `alpha find` answers that offline, with no network call:
+already falsified. `ledger list` answers that offline, with no network call:
 
 ```bash
-python research_cli.py alpha find --field anl4_cfo_number
-python research_cli.py alpha find --mechanism revision --verdict rejected
+python research_cli.py ledger list --field anl4_cfo_number
+python research_cli.py ledger list --mechanism revision --verdict rejected
 ```
 
 `already_tested: true` in the output means a prior entry mentions that field;
@@ -357,7 +413,7 @@ never inferred: a keyword guess would label an analyst forward-EPS alpha as
 
 ```bash
 python research_cli.py alpha book           # book_size / mechanism_count / family_count
-python research_cli.py alpha find --family quality
+python research_cli.py ledger list --family quality
 ```
 
 Quote `family_count` when the question is "how many independent bets do I
@@ -754,9 +810,9 @@ trade one mistake for a worse one.
 ```bash
 python research_cli.py simulate batch.json --record --idea "Idea 50" \
     --mechanism "external financing gap"
-python research_cli.py alpha record P0Mq0wEM --idea "leverage, size-bucketed" \
+python research_cli.py ledger record P0Mq0wEM --idea "leverage, size-bucketed" \
     --verdict candidate --note "why it mattered"
-python research_cli.py alpha registry --format markdown --min-sharpe 1.25
+python research_cli.py ledger list --format markdown --min-sharpe 1.25
 ```
 
 `<research_dir>/alpha-registry.jsonl` is an append-only ledger, one alpha per
@@ -767,7 +823,7 @@ the expression, the full settings, the in-sample metrics, the platform checks,
 the idea it belongs to, a verdict (`candidate` / `watch` / `rejected` / `no_go`)
 and a note. Re-recording the same alpha replaces it on read without rewriting
 history. `simulate --record` classifies automatically (clears the bar →
-`candidate`, fails a check → `rejected`, otherwise `watch`); `alpha record` takes
+`candidate`, fails a check → `rejected`, otherwise `watch`); `ledger record` takes
 an explicit verdict when you have actually decided something.
 
 ## Track how alphas relate
@@ -776,19 +832,19 @@ The ledger records what each alpha is and how it scored. These commands cover th
 other half — how they relate — and all of them work offline.
 
 ```bash
-python research_cli.py alpha coverage                 # how much lacks a family label
-python research_cli.py alpha label ABC12345 --family quality --verdict candidate
-python research_cli.py alpha impact ABC12345          # who else stands on these legs
-python research_cli.py alpha lineage ABC12345         # where a variant came from
+python research_cli.py ledger coverage                 # how much lacks a family label
+python research_cli.py ledger label ABC12345 --family quality --verdict candidate
+python research_cli.py ledger impact ABC12345          # who else stands on these legs
+python research_cli.py ledger lineage ABC12345         # where a variant came from
 ```
 
-`alpha impact` matches on the **leg body**, not the leg name: leg names are
+`ledger impact` matches on the **leg body**, not the leg name: leg names are
 positional, so `a` means whatever the author put there and a shared letter carries
 no information. Two alphas sharing a body are the same exposure even when their
 PnL is uncorrelated, and that is the question correlation cannot answer.
 
-`alpha label` appends a new record under the same key rather than rewriting, so a
-superseded judgement stays visible. `alpha coverage` exists because independence is
+`ledger label` appends a new record under the same key rather than rewriting, so a
+superseded judgement stays visible. `ledger coverage` exists because independence is
 counted on the `family` column, and that column being partly empty is itself a
 finding rather than something to paper over.
 
@@ -916,9 +972,20 @@ rejected locally, because the server's error does not say what to shorten.
 }
 ```
 
-Command-line flags override the file, which overrides the defaults. A file that
-does not start with `{` or `[` is read as plain text: one expression per line,
-blank lines and `#` comments skipped.
+`lint` and `simulate` accept repeated `--file` and `--expr` arguments. Files merge
+in order; later files override earlier settings, then command-line flags override
+the merged settings. Each expression's own `decay` remains authoritative. A file
+that does not start with `{` or `[` is plain text: one expression per line,
+blank lines and `#` comments skipped. Inputs are UTF-8, with or without a BOM.
+
+```bash
+python research_cli.py lint --file base.json --file additions.json --expr "rank(close)" --offline
+python research_cli.py simulate base.json --file additions.json --expr "rank(close)" --dry-run
+```
+
+Use `-` for stdin in `lint --file -`, `simulate -`, `ablate -`, `probe -` or
+`compare -`. Stdin can be consumed only once per invocation. `ablate` accepts one
+of a file, `--expr`, or `--ids`; conflicting sources are rejected explicitly.
 
 ## Using `machine_lib` directly
 

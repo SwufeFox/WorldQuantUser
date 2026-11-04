@@ -110,7 +110,7 @@ def collect(root, profile="state", extra_exclude=()):
         for name in filenames:
             if name.endswith(EXCLUDED_SUFFIXES) or name in SECRET_FILES:
                 continue
-            relative = os.path.normpath(os.path.join(relative_dir, name))
+            relative = os.path.normpath(os.path.join(relative_dir, name)).replace(os.sep, "/")
             if relative.startswith(".."):
                 continue
             if wanted is not None and relative not in wanted:
@@ -127,7 +127,7 @@ def secret_files(root):
         for name in filenames:
             if name in SECRET_FILES:
                 found.append(os.path.normpath(
-                    os.path.join(os.path.relpath(directory, root), name)))
+                    os.path.join(os.path.relpath(directory, root), name)).replace(os.sep, "/"))
     return sorted(found)
 
 

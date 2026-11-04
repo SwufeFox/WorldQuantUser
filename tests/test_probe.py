@@ -9,6 +9,7 @@ no progress output. Each of those is pinned here.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -42,10 +43,15 @@ class FakeGuard(types.ModuleType):
     def check(self, expressions, settings=None, session=None):
         return {"errors": [], "warnings": []}
 
-    def simulate(self, expressions, settings=None, labels=None, **kwargs):
+    def simulate(self, expressions, settings=None, labels=None, session=None, **kwargs):
+        preview = cli.ml.simulate_alphas(
+            None, expressions, settings=settings, labels=labels, dry_run=True)
         self.calls.append({"expressions": expressions, "labels": labels,
-                           "settings": dict(settings or {})})
-        return self.records[:len(expressions)]
+                           "settings": dict(settings or {}), "session": session,
+                           "payloads": [item["payload"] for item in preview]})
+        return [{**fixture, "expression": item["expression"], "decay": item["decay"],
+                 "mechanism": item["mechanism"]}
+                for fixture, item in zip(self.records, preview)]
 
 
 class ProbeTests(unittest.TestCase):
@@ -65,6 +71,10 @@ class ProbeTests(unittest.TestCase):
         self._patched = mock.patch.dict(sys.modules, {"guarded_sim": self.fake})
         self._patched.start()
         self.addCleanup(self._patched.stop)
+        self.session = object()
+        session_patch = mock.patch.object(cli.ml, "load_session", return_value=self.session)
+        self.load_session = session_patch.start()
+        self.addCleanup(session_patch.stop)
 
     def _write(self, payload):
         with open(self.spec_path, "w", encoding="utf-8") as handle:
@@ -125,6 +135,54 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(self.fake.calls[1]["settings"]["neutralization"], "INDUSTRY")
         self.assertEqual(self.fake.calls[0]["labels"], ["sub"])
 
+    def test_cli_overrides_all_arm_settings_but_preserves_explicit_arm_decay(self):
+        self.spec["settings"].update(region="EUR", universe="TOP600", delay=0)
+        self.spec["arms"] = [
+            {"label": "default", "expression": "rank(close)"},
+            {"label": "explicit", "expression": "rank(volume)", "decay": 2,
+             "settings": {"region": "GLB", "universe": "TOP1000", "decay": 3}},
+            {"label": "settings", "expression": "rank(cap)", "settings": {"decay": 1}},
+        ]
+        self._write(self.spec)
+        args = cli.build_parser().parse_args([
+            "probe", self.spec_path, "--dry-run", "--region", "usa", "--universe", "top500",
+            "--neutralization", "industry", "--delay", "1", "--decay", "7",
+            "--pasteurization", "off", "--nan-handling", "verify", "--test-period", "p1y",
+        ])
+        data = self._run(**vars(args))
+        self.assertEqual(data["groups"], 2)
+        by_label = {record["label"]: record for record in data["results"]}
+        self.assertEqual({label: record["decay"] for label, record in by_label.items()},
+                         {"default": 7, "explicit": 2, "settings": 7})
+        for label, item in by_label.items():
+            expected = {**cli.ml.DEFAULT_SETTINGS, "universe": "TOP500", "neutralization": "INDUSTRY",
+                        "pasteurization": "OFF", "nanHandling": "VERIFY", "testPeriod": "P1Y",
+                        "decay": 2 if label == "explicit" else 7}
+            self.assertEqual(item["payload"]["settings"], expected)
+        self.load_session.assert_not_called()
+
+    def test_stdin_spec_supports_utf8_bom_and_real_preview_payloads(self):
+        self.spec["arms"][0]["label"] = "研究"
+        stream = io.TextIOWrapper(io.BytesIO(
+            ("\ufeff" + json.dumps(self.spec, ensure_ascii=False)).encode("utf-8")), encoding="utf-8")
+        with stream, mock.patch.object(sys, "stdin", stream):
+            data = self._run(spec="-", dry_run=True)
+        self.assertEqual(data["arms"], 2)
+        self.assertEqual(data["results"][0]["label"], "研究")
+        self.assertEqual(data["results"][0]["payload"]["regular"], "rank(close)")
+        self.load_session.assert_not_called()
+
+    def test_multiple_groups_share_the_requested_session_policy(self):
+        self.spec["arms"][1]["settings"] = {"neutralization": "INDUSTRY"}
+        self._write(self.spec)
+        args = cli.build_parser().parse_args([
+            "probe", self.spec_path, "--no-cache", "--relogin", "--no-record"])
+        data = self._run(**vars(args))
+        self.assertEqual(data["simulated"], 2)
+        self.assertEqual(len(self.fake.calls), 2)
+        self.assertTrue(all(call["session"] is self.session for call in self.fake.calls))
+        self.load_session.assert_called_once_with(use_cache=False, refresh=True)
+
     def test_a_spec_without_arms_is_refused_with_a_code(self):
         self._write({"name": "x", "arms": []})
         with self.assertRaises(cli.CliError) as caught:
@@ -140,29 +198,140 @@ class ProbeTests(unittest.TestCase):
             self._run()
         self.assertTrue(any("unknown key" in call.args[0] for call in spy.call_args_list))
 
-    def test_dry_run_spends_nothing(self):
-        data = self._run(dry_run=True)
+    def test_dry_run_is_offline_and_does_not_load_a_session(self):
+        with mock.patch.object(cli.ml, "login", side_effect=AssertionError("login")), \
+                mock.patch.object(cli.ml, "get_credentials", side_effect=AssertionError("credentials")), \
+                mock.patch.object(cli.ml, "fetch_operators", side_effect=AssertionError("catalog")), \
+                mock.patch.object(self.fake, "check", side_effect=AssertionError("live lint")), \
+                mock.patch.object(cli.ml.requests.sessions.Session, "request",
+                                  side_effect=AssertionError("network")):
+            data = self._run(dry_run=True)
+        self.load_session.assert_not_called()
         self.assertTrue(data["dry_run"])
+        self.assertEqual(data["arms"], 2)
+        self.assertEqual(data["groups"], 1)
         self.assertEqual(self.fake.calls, [])
+        self.assertFalse(data["lint"]["operator_catalog_checked"])
+        self.assertFalse(data["lint"]["field_catalog_checked"])
+        self.assertIn("not checked", data["lint"]["hint"])
+        self.assertEqual(os.listdir(self.output_dir), [])
 
-    def test_dry_run_lints_each_settings_group_separately(self):
-        # A per-arm universe change moves the datafield catalogue; linting everything
-        # against the spec-level settings can pass a name that does not exist there.
-        seen = []
-
-        def fake_check(expressions, settings=None, session=None):
-            seen.append(dict(settings or {}))
-            return {"errors": [], "warnings": []}
-
-        self.fake.check = fake_check
+    def test_dry_run_contains_exact_payloads_and_resolved_settings(self):
         self.spec["arms"] = [
-            {"label": "sub", "expression": "rank(close)"},
-            {"label": "top500", "expression": "rank(close)",
-             "settings": {"universe": "TOP500"}},
+            {"label": "spaced", "expression": "  rank(close)  "},
+            {"label": "fast", "expression": "rank(volume)", "decay": 2,
+             "settings": {"neutralization": "INDUSTRY", "universe": "TOP500"}},
         ]
         self._write(self.spec)
-        self._run(dry_run=True)
-        self.assertEqual([item.get("universe") for item in seen], ["TOP3000", "TOP500"])
+        data = self._run(dry_run=True)
+        default = {**cli.ml.DEFAULT_SETTINGS, "decay": 4}
+        fast = {**default, "decay": 2, "neutralization": "INDUSTRY", "universe": "TOP500"}
+        self.assertEqual(data["settings"], [default, fast])
+        self.assertEqual(data["groups"], 2)
+        self.assertEqual([item["label"] for item in data["results"]], ["spaced", "fast"])
+        self.assertEqual([item["mechanism"] for item in data["results"]], ["spaced", "fast"])
+        self.assertEqual([item["decay"] for item in data["results"]], [4, 2])
+        self.assertEqual([item["payload"] for item in data["results"]], [
+            {"type": "REGULAR", "regular": "rank(close)", "settings": default},
+            {"type": "REGULAR", "regular": "rank(volume)", "settings": fast},
+        ])
+        self.assertEqual([item["settings"] for item in data["results"]], [default, fast])
+
+    def test_dry_run_reuses_structural_lint_and_learned_denylist(self):
+        self.spec["arms"] = [
+            {"label": "denied", "expression": "rank(close)"},
+            {"label": "unbalanced", "expression": "rank(close"},
+        ]
+        self._write(self.spec)
+        with mock.patch.object(cli.expression_lint, "load_denylist", return_value={
+                "rank": {"severity": "block", "message": "observed rejection"}}):
+            data = self._run(dry_run=True)
+        self.assertFalse(data["lint"]["ok"])
+        self.assertTrue(any(item["code"] == "operator_rejected" for item in data["blocking"]))
+        self.assertTrue(any(item["code"] == "unbalanced_parens" for item in data["blocking"]))
+        self.assertEqual(data["blocking"], data["lint"]["errors"])
+        self.assertEqual(len(data["results"]), 2)
+        self.assertEqual(self.fake.calls, [])
+
+    def test_equivalent_defaults_share_one_group_and_session(self):
+        self.spec["arms"] = [
+            {"label": "implicit", "expression": "rank(close)"},
+            {"label": "explicit", "expression": "rank(volume)",
+             "settings": {"neutralization": "SUBINDUSTRY", "delay": 1, "decay": 4}},
+        ]
+        self._write(self.spec)
+        preview = self._run(dry_run=True)
+        self.assertEqual(preview["groups"], 1)
+        self._run()
+        self.load_session.assert_called_once_with(use_cache=True, refresh=False)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertIs(self.fake.calls[0]["session"], self.session)
+        self.assertEqual(self.fake.calls[0]["labels"], ["implicit", "explicit"])
+        self.assertEqual(self.fake.calls[0]["payloads"],
+                         [item["payload"] for item in preview["results"]])
+
+    def test_invalid_later_group_never_authenticates_or_spends_quota(self):
+        invalid_arms = [
+            {"expression": "rank(volume)", "settings": {"region": "INVALID"}},
+            {"expression": "rank(volume)", "settings": {"neutralization": "INVALID"}},
+            {"expression": "rank(volume)", "settings": {"delay": 2}},
+            {"expression": "rank(volume)", "settings": {"decay": -1}},
+            {"expression": "rank(volume)", "decay": True},
+            {"expression": "rank(volume)", "decay": 1.5},
+        ]
+        for dry_run in (False, True):
+            for invalid in invalid_arms:
+                with self.subTest(dry_run=dry_run, arm=invalid):
+                    self.spec["arms"] = [{"label": "valid", "expression": "rank(close)"},
+                                         {"label": "invalid", **invalid}]
+                    self._write(self.spec)
+                    with self.assertRaises(cli.CliError) as caught:
+                        self._run(dry_run=dry_run)
+                    self.assertEqual(caught.exception.code, "INVALID_INPUT")
+                    self.load_session.assert_not_called()
+                    self.assertEqual(self.fake.calls, [])
+                    self.assertEqual(os.listdir(self.output_dir), [])
+
+    def test_settings_must_be_objects(self):
+        for owner in (self.spec, self.spec["arms"][1]):
+            for invalid in ([], "USA", None):
+                with self.subTest(scope="spec" if owner is self.spec else "arm", value=invalid):
+                    original = owner.get("settings", {})
+                    owner["settings"] = invalid
+                    self._write(self.spec)
+                    with self.assertRaises(cli.CliError) as caught:
+                        self._run(dry_run=True)
+                    self.assertEqual(caught.exception.code, "INVALID_INPUT")
+                    self.load_session.assert_not_called()
+                    owner["settings"] = original
+
+    def test_arm_decay_and_labels_match_preview_results_and_ledger(self):
+        self.spec["arms"] = [
+            {"label": "slow", "expression": "  rank(close)  "},
+            {"label": "fast", "expression": "rank(volume)", "decay": 2},
+            {"label": "same-fast", "expression": "rank(cap)", "settings": {"decay": 2}},
+        ]
+        self._write(self.spec)
+        preview = self._run(dry_run=True)
+        with mock.patch.object(cli.alpha_registry, "record_simulation", return_value={}) as ledger:
+            data = self._run(no_record=False)
+        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual([call["settings"]["decay"] for call in self.fake.calls], [4, 2])
+        self.assertEqual([call["labels"] for call in self.fake.calls], [["slow"], ["fast", "same-fast"]])
+        self.assertEqual([payload for call in self.fake.calls for payload in call["payloads"]],
+                         [item["payload"] for item in preview["results"]])
+        self.assertEqual([row["label"] for row in data["rows"]], ["slow", "fast", "same-fast"])
+        self.assertEqual([row["expression"] for row in data["rows"]],
+                         [item["expression"] for item in preview["results"]])
+        self.assertEqual([row["decay"] for row in data["rows"]], [4, 2, 2])
+        records = ledger.call_args.args[0]
+        self.assertEqual([item["mechanism"] for item in records], ["slow", "fast", "same-fast"])
+        self.assertEqual([item["settings"] for item in records],
+                         [item["payload"]["settings"] for item in preview["results"]])
+        self.assertEqual([row["settings"] for row in data["rows"]],
+                         [item["settings"] for item in records])
+        self.load_session.assert_called_once_with(use_cache=True, refresh=False)
+        self.assertTrue(all(call["session"] is self.session for call in self.fake.calls))
 
     def test_each_record_carries_the_settings_it_ran_under(self):
         # The ledger used to receive the spec-level settings for every arm, so an

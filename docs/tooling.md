@@ -6,6 +6,28 @@
 
 删除标准只有一条：**被取代，或者跑完就没下次。** 不是"文件不够干净"。
 
+## 先从统一 CLI 进入
+
+```bash
+python3 research_cli.py                       # 简短入口指南
+python3 research_cli.py help catalog fields   # 具体任务的参数和例子
+python3 research_cli.py schema alpha get      # 单个命令的机器契约
+```
+
+常用路径是 `catalog` 找数据、`lint` 检查表达式、`simulate` / `probe`
+先 `--dry-run` 再运行、`compare` 看结果。平台 alpha 读写在 `alpha`；本地台账
+统一在 `ledger`：`list`、`record`、`label`、`coverage`、`impact`、`lineage`。
+`ledger list` 同时支持标签、字段、机制和指标筛选。
+
+所有 CLI 命令共用 `--save PATH`、`--compact`、`--quiet`、`--research-dir PATH`，
+参数放在哪一级都有效。`--save` 原子保存与 stdout 完全相同的 JSON envelope，
+也保存结构化错误；写入路径在执行命令前检查。下表的辅助工具继续使用自己的
+`--json` 报告接口。
+
+`lint` / `simulate` 共用可重复的 `--file`、`--expr`；后文件覆盖前文件设置，
+CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的命令用 `-`
+读取 stdin，每次调用只能读一次。`probe` 同样接受模拟设置和会话参数。
+
 ## 我要回答……
 
 ### 台账里有什么、对不对
@@ -35,6 +57,7 @@
 | 问题 | 命令 |
 | --- | --- |
 | 我要跑一批臂（常态） | 写一个 spec.json，然后 `python3 research_cli.py probe spec.json`——lint、模拟、train-only 表格、JSON、台账一次做完 |
+| 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe spec.json --dry-run`；逐组验证配置并输出完整 payload，实时目录检查在正式模拟前执行 |
 | 我要开一个单次实验 | 复制 `tools/research_template.py`（`EXPRESSIONS`，或 `PARENT` + `SUBSTITUTIONS` 换一个 token 跑 N 个变体） |
 | 换字段 / 换窗口 / 换权重的批量实验 | 同上，把要换的 token 写进 `SUBSTITUTIONS`；parent 的表达式和设置从台账读，结果自动写回台账 |
 | 我想跑一批，但怕名字写错 | `tools/guarded_sim.py`（库，不是 CLI） |
@@ -42,6 +65,8 @@
 | 换手把 Fitness 压住了怎么办 | `python3 tools/turnover_repair.py` |
 | 这个池子够不够厚 | `python3 tools/pool_stats.py` |
 | 这个字段到底什么量纲 | `python3 tools/probe_units.py` |
+
+日常实验只维护 spec 文件：先离线预览，再正式运行。所有配置组在登录和模拟前完成本地校验；等效设置合并，同一批复用缓存会话。`simulate` 的研究文件和 `probe` 的 spec 文件都按 UTF-8 读取，兼容 BOM。
 
 ### 备份与重放
 

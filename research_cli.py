@@ -29,6 +29,7 @@ Typical use::
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import math
 import os
@@ -54,7 +55,7 @@ import paper_search  # noqa: E402
 import correlation  # noqa: E402
 import ablation  # noqa: E402
 
-VERSION = "2.4.0"
+VERSION = "3.0.0"
 
 #: Stable process exit codes. Callers branch on these, so the mapping from an
 #: error code to an exit code is part of the contract.
@@ -83,6 +84,7 @@ ERROR_CODES = {
     "RATE_LIMITED": "BRAIN rate limited us and the backoff budget ran out.",
     "SERVICE_ERROR": "Network or HTTP failure while talking to BRAIN.",
     "SIMULATION_FAILED": "Every submitted simulation failed.",
+    "SUBMIT_DISABLED": "Real submission is disabled by the submission policy.",
     "INTERRUPTED": "Cancelled by signal.",
 }
 
@@ -91,15 +93,58 @@ METRIC_KEYS = ("sharpe", "fitness", "turnover", "returns", "drawdown", "margin",
                "longCount", "shortCount", "pnl")
 
 
-class JsonArgumentParser(argparse.ArgumentParser):
-    """argparse that keeps the stdout contract: usage errors are JSON too."""
+class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
+    """Readable examples together with command-specific defaults."""
 
-    def error(self, message):
-        emit({"ok": False, "command": _command_of(None),
-              "error": {"code": "USAGE", "message": message,
-                        "hint": "run `research_cli.py schema` for the full contract"}})
-        note("USAGE: %s" % message)
-        raise SystemExit(EXIT_CODES["USAGE"])
+    def _get_help_string(self, action):
+        if action.default is None or action.default is False or action.default in ("", argparse.SUPPRESS, []):
+            return action.help or ""
+        return super()._get_help_string(action)
+
+
+class JsonArgumentParser(argparse.ArgumentParser):
+    """The same common options and contextual errors at every command level."""
+
+    def __init__(self, *args, common=True, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        kwargs.setdefault("formatter_class", HelpFormatter)
+        super().__init__(*args, **kwargs)
+        self.set_defaults(_parser=self)
+        if common:
+            _add_common_args(self)
+
+    def add_argument(self, *args, **kwargs):
+        action = super().add_argument(*args, **kwargs)
+        if action.help is None:
+            action.help = action.dest.replace("_", " ").capitalize() + "."
+        return action
+
+    def parse_args(self, args=None, namespace=None):
+        parsed, remaining = self.parse_known_args(args, namespace)
+        if remaining:
+            parsed._parser.error("unrecognized arguments: %s" % " ".join(remaining))
+        return parsed
+
+    def _check_value(self, action, value):
+        if isinstance(action, argparse._SubParsersAction) and value not in action.choices:
+            suggestions = difflib.get_close_matches(value, action.choices, n=3, cutoff=0.6)
+            self.error("unknown command %r" % value, suggestions=suggestions)
+        super()._check_value(action, value)
+
+    def error(self, message, suggestions=None):
+        if suggestions is None and message.startswith("unrecognized arguments:"):
+            token = message.partition(":")[2].strip().split()[0]
+            suggestions = difflib.get_close_matches(token, self._option_string_actions,
+                                                   n=3, cutoff=0.6)
+        path = self.prog.split()[1:]
+        hint = "run `%s --help`" % self.prog
+        if suggestions:
+            hint = "did you mean %s? %s" % (", ".join(suggestions), hint)
+        error = CliError("USAGE", message, hint,
+                         {"command_path": path, "usage": self.format_usage().strip(),
+                          "suggestions": suggestions or []})
+        error.command = path[0] if path else "help"
+        raise error
 
 
 class CliError(Exception):
@@ -131,17 +176,27 @@ def _error_body(exc):
     return body
 
 
-def emit(payload):
-    """Write the single JSON document that is this process's stdout."""
-    json.dump(payload, sys.stdout, ensure_ascii=False, indent=2, default=str)
-    sys.stdout.write("\n")
+def emit(payload, compact=False, prepared=None):
+    """Serialize once, then save atomically and write exactly the same document."""
+    text = json.dumps(payload, ensure_ascii=False, indent=None if compact else 2,
+                      separators=(",", ":") if compact else None, default=str) + "\n"
+    if prepared:
+        target, temporary = prepared
+        temporary.write_text(text, encoding="utf-8", newline="")
+        os.replace(temporary, target)
+    sys.stdout.write(text)
     sys.stdout.flush()
+    return text
 
 
-def note(message):
-    """Human-facing diagnostics. Always stderr, never stdout."""
-    sys.stderr.write(str(message) + "\n")
-    sys.stderr.flush()
+_QUIET = False
+
+
+def note(message, *, force=False):
+    """Human-facing diagnostics. Quiet mode suppresses progress, never errors."""
+    if not _QUIET or force:
+        sys.stderr.write(str(message) + "\n")
+        sys.stderr.flush()
 
 
 def make_event_sink(stream, verbose):
@@ -162,6 +217,18 @@ def make_event_sink(stream, verbose):
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
+def _add_common_args(parser):
+    group = parser.add_argument_group("Output and workspace (accepted at every level)")
+    group.add_argument("--save", metavar="PATH", default=argparse.SUPPRESS,
+                       help="Atomically save the same JSON document as stdout; '-' means stdout only.")
+    group.add_argument("--compact", action="store_true", default=argparse.SUPPRESS,
+                       help="Write JSON on one line.")
+    group.add_argument("--quiet", action="store_true", default=argparse.SUPPRESS,
+                       help="Suppress progress on stderr; errors are still reported.")
+    group.add_argument("--research-dir", metavar="PATH", default=argparse.SUPPRESS,
+                       help="Use this research directory for this invocation, overriding BRAIN_RESEARCH_DIR.")
+
+
 def _add_session_args(parser):
     parser.add_argument("--no-cache", action="store_true",
                         help="Ignore the cached session and re-authenticate.")
@@ -201,10 +268,12 @@ def _positive_seconds(value):
 
 
 def _add_settings_args(parser):
-    parser.add_argument("--region", choices=ml.REGIONS,
+    parser.add_argument("--region", type=str.upper, choices=ml.REGIONS,
                         help="BRAIN region.")
-    parser.add_argument("--universe", help="Universe, e.g. TOP3000.")
-    parser.add_argument("--neutralization", choices=ml.NEUTRALIZATIONS,
+    parser.add_argument("--universe", type=str.upper, help="Universe, e.g. TOP3000.")
+    parser.add_argument("--instrument-type", type=str.upper,
+                        help="BRAIN instrument type.")
+    parser.add_argument("--neutralization", type=str.upper, choices=ml.NEUTRALIZATIONS,
                         help="Neutralization scheme.")
     parser.add_argument("--decay", type=int,
                         help="Default decay for alphas that do not set their own.")
@@ -212,16 +281,16 @@ def _add_settings_args(parser):
                         help="Data delay (0 or 1).")
     parser.add_argument("--truncation", type=float,
                         help="Truncation, e.g. 0.08.")
-    parser.add_argument("--pasteurization", choices=["ON", "OFF"])
-    parser.add_argument("--nan-handling", choices=["ON", "OFF", "VERIFY"])
-    parser.add_argument("--test-period", help="e.g. P0Y, P1Y, P2Y.")
+    parser.add_argument("--pasteurization", type=str.upper, choices=["ON", "OFF"])
+    parser.add_argument("--nan-handling", type=str.upper, choices=["ON", "OFF", "VERIFY"])
+    parser.add_argument("--test-period", type=str.upper, help="e.g. P0Y, P1Y, P2Y.")
 
 
 def build_parser():
     parser = JsonArgumentParser(
         prog="research_cli.py",
-        description="Machine-readable WorldQuant BRAIN research CLI. "
-                    "stdout is always one JSON document; stderr is for humans.",
+        description="WorldQuant research: discover data, check expressions, run experiments, "
+                    "and keep the evidence. Results are JSON; progress goes to stderr.",
     )
     parser.add_argument("--version", action="version", version=VERSION)
     sub = parser.add_subparsers(dest="command", metavar="<command>",
@@ -230,8 +299,14 @@ def build_parser():
     schema = sub.add_parser(
         "schema", help="Print the full call contract as JSON (commands, "
                        "arguments, research-file format, error codes).")
-    schema.add_argument("name", nargs="?", help="Restrict to one command.")
+    schema.add_argument("name", nargs="*", metavar="COMMAND",
+                        help="Restrict to a command path, e.g. catalog fields or alpha get.")
     schema.set_defaults(func=cmd_schema)
+
+    help_command = sub.add_parser("help", help="Show a concise guide or help for a command path.")
+    help_command.add_argument("path", nargs="*", metavar="COMMAND",
+                              help="Command path, e.g. help catalog fields.")
+    help_command.set_defaults(func=cmd_help)
 
     auth = sub.add_parser("auth", help="Credential and session checks.")
     auth_sub = auth.add_subparsers(dest="subcommand", metavar="<check>",
@@ -275,27 +350,27 @@ def build_parser():
     cat_op.add_argument("--group", default="", help="Exact category, e.g. 'Time Series'.")
     cat_op.add_argument("--docs", nargs="*", metavar="NAME",
                         help="Also fetch full documentation for these operators.")
-    cat_op.add_argument("--save", help="Also write the JSON result to this file.")
+
     _add_session_args(cat_op)
     cat_op.set_defaults(func=cmd_catalog_operators)
 
     cat_ds = cat.add_parser("datasets", help="Datasets for a region/universe/delay.")
-    cat_ds.add_argument("--instrument-type", default="EQUITY")
-    cat_ds.add_argument("--region", default="USA")
-    cat_ds.add_argument("--universe", default="TOP3000")
-    cat_ds.add_argument("--delay", type=int, default=1, choices=[0, 1])
+    cat_ds.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
+    cat_ds.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_ds.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
+    cat_ds.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
     cat_ds.add_argument("--limit", type=int, default=None)
-    cat_ds.add_argument("--save")
+
     _add_session_args(cat_ds)
     cat_ds.set_defaults(func=cmd_catalog_datasets)
 
     cat_f = cat.add_parser("fields", help="Datafields of one dataset.")
     cat_f.add_argument("--dataset", required=True, help="Dataset id, e.g. fundamental6.")
-    cat_f.add_argument("--region", default="USA")
-    cat_f.add_argument("--universe", default="TOP3000")
-    cat_f.add_argument("--delay", type=int, default=1, choices=[0, 1])
-    cat_f.add_argument("--instrument-type", default="EQUITY")
-    cat_f.add_argument("--type", dest="field_type", choices=["MATRIX", "VECTOR", "GROUP"],
+    cat_f.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_f.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
+    cat_f.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_f.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
+    cat_f.add_argument("--type", dest="field_type", type=str.upper, choices=["MATRIX", "VECTOR", "GROUP"],
                        help="Keep only this BRAIN field type.")
     cat_f.add_argument("--search", default="",
                        help="Ranked local search. Multi-word queries are AND; "
@@ -307,7 +382,7 @@ def build_parser():
     cat_f.add_argument("--limit", type=int, default=None)
     cat_f.add_argument("--expressions", action="store_true",
                        help="Also emit ready-to-use FASTEXPR snippets.")
-    cat_f.add_argument("--save")
+
     _add_session_args(cat_f)
     cat_f.set_defaults(func=cmd_catalog_fields)
 
@@ -316,11 +391,11 @@ def build_parser():
         help="Group fields by concept and show variants side by side.")
     cat_cc.add_argument("--dataset", default=None,
                         help="Limit to one dataset id, e.g. analyst4.")
-    cat_cc.add_argument("--region", default="USA")
-    cat_cc.add_argument("--universe", default="TOP3000")
-    cat_cc.add_argument("--delay", type=int, default=1, choices=[0, 1])
-    cat_cc.add_argument("--instrument-type", default="EQUITY")
-    cat_cc.add_argument("--type", dest="field_type",
+    cat_cc.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_cc.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
+    cat_cc.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_cc.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
+    cat_cc.add_argument("--type", dest="field_type", type=str.upper,
                         choices=["MATRIX", "VECTOR", "GROUP"],
                         help="Keep only this BRAIN field type.")
     cat_cc.add_argument("--tail-tokens", type=int, default=2,
@@ -343,7 +418,7 @@ def build_parser():
     cat_cc.add_argument("--min-spread", type=float, default=0.0,
                         help="Only concepts whose coverage spread is at least this.")
     cat_cc.add_argument("--limit", type=int, default=40)
-    cat_cc.add_argument("--save")
+
     _add_session_args(cat_cc)
     cat_cc.set_defaults(func=cmd_catalog_concepts)
 
@@ -352,21 +427,21 @@ def build_parser():
         help="Check field ids against the live catalog (catches typed-from-memory names).")
     cat_vf.add_argument("--fields", nargs="+", default=[],
                         help="Field ids, comma or space separated.")
-    cat_vf.add_argument("--region", default="USA")
-    cat_vf.add_argument("--universe", default="TOP3000")
-    cat_vf.add_argument("--delay", type=int, default=1, choices=[0, 1])
-    cat_vf.add_argument("--instrument-type", default="EQUITY")
+    cat_vf.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_vf.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
+    cat_vf.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_vf.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
     cat_vf.add_argument("--strict", action="store_true",
                         help="Exit with INVALID_INPUT when any name is unknown.")
-    cat_vf.add_argument("--save")
+
     _add_session_args(cat_vf)
     cat_vf.set_defaults(func=cmd_catalog_verify)
 
     cat_c = cat.add_parser("categories", help="Data categories with crowding stats.")
-    cat_c.add_argument("--region", default="USA")
-    cat_c.add_argument("--universe", default="TOP3000")
-    cat_c.add_argument("--delay", type=int, default=1, choices=[0, 1])
-    cat_c.add_argument("--save")
+    cat_c.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_c.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
+    cat_c.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+
     _add_session_args(cat_c)
     cat_c.set_defaults(func=cmd_catalog_categories)
 
@@ -384,11 +459,11 @@ def build_parser():
                                 "verdict.")
     cat_audit.add_argument("--search", default="")
     cat_audit.add_argument("--limit", type=int, default=None)
-    cat_audit.add_argument("--region", default="USA")
-    cat_audit.add_argument("--universe", default="TOP3000")
-    cat_audit.add_argument("--delay", type=int, default=1, choices=[0, 1])
-    cat_audit.add_argument("--instrument-type", default="EQUITY")
-    cat_audit.add_argument("--save")
+    cat_audit.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_audit.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
+    cat_audit.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_audit.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
+
     _add_session_args(cat_audit)
     cat_audit.set_defaults(func=cmd_catalog_field_audit)
 
@@ -397,8 +472,11 @@ def build_parser():
         help="Pre-flight expressions against the operator catalog (quota-free).")
     lint.add_argument("expression", nargs="?",
                       help="Expression to lint, e.g. 'rank(ts_delta(close, 5))'.")
-    lint.add_argument("--file", default=None,
-                      help="Research file (JSON or one expression per line).")
+    lint.add_argument("--file", dest="files", action="append", default=[],
+                      help="Research file or - for stdin; repeat to merge expressions. "
+                           "Later file settings override earlier files.")
+    lint.add_argument("--expr", action="append", default=[], metavar="EXPRESSION",
+                      help="Inline expression; repeat and combine with files or the positional expression.")
     lint.add_argument("--offline", action="store_true",
                       help="Skip the operator catalog; check structure and the "
                            "learned denylist only.")
@@ -407,13 +485,10 @@ def build_parser():
                            "identifiers are flagged.")
     lint.add_argument("--strict-fields", action="store_true",
                       help="Treat unknown identifiers as errors, not warnings.")
-    lint.add_argument("--region", default="USA")
-    lint.add_argument("--universe", default="TOP3000")
-    lint.add_argument("--delay", type=int, default=1, choices=[0, 1])
-    lint.add_argument("--instrument-type", default="EQUITY")
+    _add_settings_args(lint)
     lint.add_argument("--denylist", default=None,
                       help="Override the learned denylist path.")
-    lint.add_argument("--save")
+
     _add_session_args(lint)
     lint.set_defaults(func=cmd_lint)
 
@@ -437,7 +512,7 @@ def build_parser():
                      help="Reuse a cached answer younger than this (default 168).")
     lit.add_argument("--no-cache", action="store_true",
                      help="Ignore and do not write the cache.")
-    lit.add_argument("--save")
+
     lit.set_defaults(func=cmd_search)
 
     papers = sub.add_parser(
@@ -450,7 +525,7 @@ def build_parser():
                         help="Only papers published in or after this year.")
     papers.add_argument("--min-citations", type=int, default=None,
                         help="Drop papers with fewer citations than this.")
-    papers.add_argument("--save")
+
     papers.set_defaults(func=cmd_paper)
 
     sim = sub.add_parser(
@@ -460,6 +535,9 @@ def build_parser():
                           "Omit when using --expr.")
     sim.add_argument("--expr", action="append", default=[], metavar="EXPRESSION",
                      help="Inline expression; repeat for several.")
+    sim.add_argument("--file", dest="files", action="append", default=[],
+                     help="Additional research file or - for stdin; repeat to merge expressions. "
+                          "Later file settings override earlier files.")
     _add_settings_args(sim)
     sim.add_argument("--batch-size", type=int, default=3,
                      help="Concurrent submissions per batch (BRAIN allows 3).")
@@ -534,20 +612,10 @@ def build_parser():
                      help="With --ids, write <id>.json here (default: the research dir).")
     abl.add_argument("--modes", default="full,loo,solo",
                      help="Comma list from full, loo, solo (default all three).")
-    abl.add_argument("--decay", type=int, default=None,
-                     help="Override decay for every variant.")
-    abl.add_argument("--universe", default=None,
-                     help="Override the universe for the ablation file.")
-    abl.add_argument("--neutralization", default=None,
-                     choices=ml.NEUTRALIZATIONS,
-                     help="Override neutralisation for the ablation file.")
-    abl.add_argument("--region", default=None, choices=ml.REGIONS)
-    abl.add_argument("--delay", type=int, default=None, choices=[0, 1])
-    abl.add_argument("--test-period", default=None,
-                     help="P0Y / P1Y / P2Y / P3Y; the only split the platform honours.")
+    _add_settings_args(abl)
     abl.add_argument("--out", default=None,
                      help="Write the research file here instead of only reporting it.")
-    abl.add_argument("--save")
+
     abl.set_defaults(func=cmd_ablate)
 
     cmp_ = sub.add_parser(
@@ -566,7 +634,7 @@ def build_parser():
                            "the test year.")
     cmp_.add_argument("--contributions", action="store_true",
                       help="Also compute per-leg contributions from ablate labels.")
-    cmp_.add_argument("--save")
+
     cmp_.set_defaults(func=cmd_compare)
 
     brief = sub.add_parser(
@@ -581,7 +649,7 @@ def build_parser():
     brief.add_argument("--top", type=int, default=5,
                        help="How many best runs and write-ups to list (default 5).")
     brief.add_argument("--registry", default=None)
-    brief.add_argument("--save")
+
     brief.set_defaults(func=cmd_brief)
 
     probe = sub.add_parser(
@@ -594,10 +662,12 @@ def build_parser():
                     "--show-test is passed, because selecting on it destroys the only "
                     "out-of-sample evidence there is.")
     probe.add_argument("spec", help="JSON spec: {name, settings, arms:[{label, expression, settings?}]}.")
+    _add_settings_args(probe)
+    _add_session_args(probe)
     probe.add_argument("--name", default=None,
                        help="Batch name for the output file (default: the spec's name).")
     probe.add_argument("--dry-run", action="store_true",
-                       help="Lint only; never submits and spends nothing.")
+                       help="Offline validation and exact request preview; no login or quota spent.")
     probe.add_argument("--show-test", action="store_true",
                        help="Also print the test period. Do not pass this while "
                             "choosing between arms.")
@@ -606,7 +676,7 @@ def build_parser():
     probe.add_argument("--no-record", action="store_true",
                        help="Do not append the arms to the ledger.")
     probe.add_argument("--registry", default=None)
-    probe.add_argument("--save")
+
     probe.set_defaults(func=cmd_probe)
 
     views = sub.add_parser(
@@ -617,7 +687,7 @@ def build_parser():
                     "recording when it was opened does.")
     views.add_argument("--alpha", default=None, help="Only entries naming this alpha id.")
     views.add_argument("--limit", type=int, default=50)
-    views.add_argument("--save")
+
     views.set_defaults(func=cmd_views)
 
     alpha = sub.add_parser("alpha", help="Inspect the account's alphas (quota-free).")
@@ -627,7 +697,7 @@ def build_parser():
     a_get = alpha_sub.add_parser("get", help="Fetch one alpha's metrics and checks.")
     a_get.add_argument("alpha_id")
     _add_session_args(a_get)
-    a_get.add_argument("--save")
+
     a_get.set_defaults(func=cmd_alpha_get)
 
     a_chk = alpha_sub.add_parser(
@@ -637,7 +707,7 @@ def build_parser():
     a_chk.add_argument("--max-wait", type=float, default=180.0,
                        help="Seconds to wait for the async check job (default 180).")
     _add_session_args(a_chk)
-    a_chk.add_argument("--save")
+
     a_chk.set_defaults(func=cmd_alpha_check)
 
     a_sc = alpha_sub.add_parser(
@@ -649,7 +719,7 @@ def build_parser():
     a_sc.add_argument("alpha_id")
     a_sc.add_argument("--limit", type=float, default=0.7)
     a_sc.add_argument("--sharpe-margin", type=float, default=1.10)
-    a_sc.add_argument("--save")
+
     _add_session_args(a_sc)
     a_sc.set_defaults(func=cmd_alpha_self_corr)
 
@@ -667,7 +737,7 @@ def build_parser():
     a_desc.add_argument("--description", default=None,
                         help="Free-text note. Writable, but nested under `regular` in "
                              "the payload rather than as a top-level property.")
-    a_desc.add_argument("--save")
+
     _add_session_args(a_desc)
     a_desc.set_defaults(func=cmd_alpha_describe)
 
@@ -682,7 +752,7 @@ def build_parser():
                        help="after a confirmed submission, read the alpha back and "
                             "append it to the ledger (normalised, not raw)")
     _add_session_args(a_sub)
-    a_sub.add_argument("--save")
+
     a_sub.set_defaults(func=cmd_alpha_submit)
 
     a_expl = alpha_sub.add_parser(
@@ -693,7 +763,7 @@ def build_parser():
                         help="skip the local correlation against the book (reads "
                              "<research>/pnl, which is a few hundred small files)")
     _add_session_args(a_expl)
-    a_expl.add_argument("--save")
+
     a_expl.set_defaults(func=cmd_alpha_explain)
 
     a_list = alpha_sub.add_parser("list", help="List the account's alphas.")
@@ -711,106 +781,106 @@ def build_parser():
     a_list.add_argument("--all", action="store_true",
                         help="Include hidden and SUPER alphas.")
     _add_session_args(a_list)
-    a_list.add_argument("--save")
+
     a_list.set_defaults(func=cmd_alpha_list)
 
-    a_rec = alpha_sub.add_parser(
-        "record", help="Persist one alpha into the append-only registry.")
-    a_rec.add_argument("alpha_id")
-    a_rec.add_argument("--idea", default=None, help="e.g. 'Idea 47'.")
-    a_rec.add_argument("--mechanism", default=None)
-    a_rec.add_argument("--verdict", choices=list(alpha_registry.VERDICTS),
+    ledger = sub.add_parser(
+        "ledger", help="Record and explore the durable local research ledger.",
+        description="List, label and relate recorded research offline. Only record "
+                    "contacts BRAIN: it logs in and fetches an alpha's current metrics "
+                    "before appending them; it never runs a simulation.")
+    ledger_sub = ledger.add_subparsers(dest="subcommand", metavar="<action>",
+                                        parser_class=JsonArgumentParser)
+
+    l_rec = ledger_sub.add_parser(
+        "record", help="Fetch one alpha from BRAIN and append it to the ledger (online).",
+        description="Requires a BRAIN session and an existing alpha id. Fetches "
+                    "current metrics without spending simulation quota. To change "
+                    "judgement labels on a stored entry offline, use ledger label.")
+    l_rec.add_argument("alpha_id")
+    l_rec.add_argument("--idea", default=None, help="e.g. 'Idea 47'.")
+    l_rec.add_argument("--mechanism", default=None)
+    l_rec.add_argument("--verdict", choices=list(alpha_registry.VERDICTS),
                        default="watch")
-    a_rec.add_argument("--note", default=None)
-    a_rec.add_argument("--family", default=None, choices=list(alpha_registry.FAMILIES),
+    l_rec.add_argument("--note", default=None)
+    l_rec.add_argument("--family", default=None, choices=list(alpha_registry.FAMILIES),
                        help="Return-source grouping; declared, never inferred.")
-    a_rec.add_argument("--registry", default=None)
-    _add_session_args(a_rec)
-    a_rec.set_defaults(func=cmd_alpha_record)
+    l_rec.add_argument("--registry", default=None)
+    _add_session_args(l_rec)
+    l_rec.set_defaults(func=cmd_ledger_record)
 
-    a_reg = alpha_sub.add_parser(
-        "registry", help="Read the durable alpha ledger (no network needed).")
-    a_reg.add_argument("--verdict", action="append", default=[],
-                       choices=list(alpha_registry.VERDICTS),
-                       help="Keep only these verdicts; repeatable.")
-    a_reg.add_argument("--idea", default=None)
-    a_reg.add_argument("--min-sharpe", type=float, default=None)
-    a_reg.add_argument("--format", choices=["json", "markdown"], default="json")
-    a_reg.add_argument("--registry", default=None)
-    a_reg.add_argument("--save")
-    a_reg.set_defaults(func=cmd_alpha_registry)
-
-    a_find = alpha_sub.add_parser(
-        "find",
-        help="Search the ledger before spending a simulation (offline).",
-        description="Answer 'have I already tested this field / mechanism?' "
-                    "from the durable ledger. No network, no quota.")
-    a_find.add_argument("--field", default=None,
-                        help="Datafield id to look for inside recorded expressions.")
-    a_find.add_argument("--mechanism", default=None,
-                        help="Substring of the recorded mechanism label.")
-    a_find.add_argument("--idea", default=None)
-    a_find.add_argument("--expression", default=None,
-                        help="Substring of a recorded expression.")
-    a_find.add_argument("--verdict", action="append", default=[],
+    l_list = ledger_sub.add_parser(
+        "list", help="List or search the durable ledger (offline).",
+        description="Without filters, list every current ledger entry. Combine "
+                    "filters to check prior field or mechanism research before "
+                    "spending a simulation. Reads the latest record per key, "
+                    "including submitted book alphas. No login or network.")
+    l_list.add_argument("--verdict", action="append", default=[],
                         choices=list(alpha_registry.VERDICTS),
-                        help="Keep only these verdicts; repeatable.")
-    a_find.add_argument("--family", default=None,
+                        help="Keep any of these verdicts; repeatable.")
+    l_list.add_argument("--idea", default=None,
+                        help="Case-insensitive substring of the idea label.")
+    l_list.add_argument("--min-sharpe", type=float, default=None)
+    l_list.add_argument("--min-fitness", type=float, default=None)
+    l_list.add_argument("--family", default=None,
                         choices=list(alpha_registry.FAMILIES),
                         help="Return-source grouping declared at record time.")
-    a_find.add_argument("--min-fitness", type=float, default=None)
-    a_find.add_argument("--registry", default=None)
-    a_find.add_argument("--limit", type=int, default=50)
-    a_find.add_argument("--save")
-    a_find.set_defaults(func=cmd_alpha_find)
+    l_list.add_argument("--field", default=None,
+                        help="Datafield id substring inside recorded expressions.")
+    l_list.add_argument("--mechanism", default=None,
+                        help="Case-insensitive substring of the mechanism label.")
+    l_list.add_argument("--expression", default=None,
+                        help="Case-insensitive substring of a recorded expression.")
+    l_list.add_argument("--limit", type=int, default=0,
+                        help="Maximum entries to show, ranked by fitness; 0 shows all (default).")
+    l_list.add_argument("--format", choices=["json", "markdown"], default="json",
+                        help="Markdown adds a table inside the JSON envelope.")
+    l_list.add_argument("--registry", default=None)
+    l_list.set_defaults(func=cmd_ledger_list)
 
-    a_lbl = alpha_sub.add_parser(
+    l_lbl = ledger_sub.add_parser(
         "label",
         help="Set family / verdict / mechanism on an existing ledger entry (offline).",
         description="Fill in the judgement columns without editing JSONL by hand. "
                     "A new record is appended under the same key, so history is kept.")
-    a_lbl.add_argument("alpha_id")
-    a_lbl.add_argument("--family", default=None, choices=list(alpha_registry.FAMILIES))
-    a_lbl.add_argument("--verdict", default=None, choices=list(alpha_registry.VERDICTS))
-    a_lbl.add_argument("--mechanism", default=None)
-    a_lbl.add_argument("--idea", default=None)
-    a_lbl.add_argument("--note", default=None)
-    a_lbl.add_argument("--registry", default=None)
-    a_lbl.add_argument("--save")
-    a_lbl.set_defaults(func=cmd_alpha_label)
+    l_lbl.add_argument("alpha_id")
+    l_lbl.add_argument("--family", default=None, choices=list(alpha_registry.FAMILIES))
+    l_lbl.add_argument("--verdict", default=None, choices=list(alpha_registry.VERDICTS))
+    l_lbl.add_argument("--mechanism", default=None)
+    l_lbl.add_argument("--idea", default=None)
+    l_lbl.add_argument("--note", default=None)
+    l_lbl.add_argument("--registry", default=None)
+    l_lbl.set_defaults(func=cmd_ledger_label)
 
-    a_imp = alpha_sub.add_parser(
+    l_imp = ledger_sub.add_parser(
         "impact",
         help="Which other alphas stand on the same legs (offline).",
         description="Leg names are positional, so exposure is matched on the leg "
                     "body: the same sub-expression, not the same letter.")
-    a_imp.add_argument("alpha_id")
-    a_imp.add_argument("--min-shared", type=int, default=1)
-    a_imp.add_argument("--limit", type=int, default=25)
-    a_imp.add_argument("--registry", default=None)
-    a_imp.add_argument("--save")
-    a_imp.set_defaults(func=cmd_alpha_impact)
+    l_imp.add_argument("alpha_id")
+    l_imp.add_argument("--min-shared", type=int, default=1)
+    l_imp.add_argument("--limit", type=int, default=25)
+    l_imp.add_argument("--registry", default=None)
+    l_imp.set_defaults(func=cmd_ledger_impact)
 
-    a_lin = alpha_sub.add_parser(
+    l_lin = ledger_sub.add_parser(
         "lineage",
         help="Walk the parent edges of an alpha (offline).",
         description="Shows where a variant came from and by which operation.")
-    a_lin.add_argument("alpha_id")
-    a_lin.add_argument("--registry", default=None)
-    a_lin.add_argument("--save")
-    a_lin.set_defaults(func=cmd_alpha_lineage)
+    l_lin.add_argument("alpha_id")
+    l_lin.add_argument("--registry", default=None)
+    l_lin.set_defaults(func=cmd_ledger_lineage)
 
-    a_cov = alpha_sub.add_parser(
+    l_cov = ledger_sub.add_parser(
         "coverage",
         help="How much of the ledger still lacks labels (offline).",
         description="Independence is counted on the family column; this reports "
                     "how far that column is from being usable.")
-    a_cov.add_argument("--registry", default=None)
-    a_cov.add_argument("--list-missing", action="store_true",
+    l_cov.add_argument("--registry", default=None)
+    l_cov.add_argument("--list-missing", action="store_true",
                        help="Also list keys missing a family, most recent first.")
-    a_cov.add_argument("--limit", type=int, default=40)
-    a_cov.add_argument("--save")
-    a_cov.set_defaults(func=cmd_alpha_coverage)
+    l_cov.add_argument("--limit", type=int, default=40)
+    l_cov.set_defaults(func=cmd_ledger_coverage)
 
     a_self = alpha_sub.add_parser(
         "self-check",
@@ -863,7 +933,7 @@ def build_parser():
                         help="Flag pairs at or above this absolute value (default 0.7).")
     a_corr.add_argument("--max-age-hours", type=float, default=24.0,
                         help="Reuse cached PnL younger than this (default 24).")
-    a_corr.add_argument("--save")
+
     _add_session_args(a_corr)
     a_corr.set_defaults(func=cmd_alpha_corr)
 
@@ -879,52 +949,157 @@ def build_parser():
                              "against the whole book.")
     a_book.add_argument("--registry", default=None)
     _add_session_args(a_book)
-    a_book.add_argument("--save")
+
     a_book.set_defaults(func=cmd_alpha_book)
 
+    _attach_examples(parser)
+    return parser
+
+
+_COMMAND_EXAMPLES = {
+    "": ["brief", "catalog fields --dataset fundamental6 --expressions --limit 10",
+         'simulate --expr "rank(close)" --dry-run', "ledger list --family quality"],
+    "help": ["help catalog fields"],
+    "schema": ["schema alpha get"],
+    "auth": ["auth check"],
+    "auth check": ["auth check"],
+    "auth logout": ["auth logout"],
+    "cache": ["cache info"],
+    "cache info": ["cache info"],
+    "cache clear": ["cache clear --kind metadata"],
+    "catalog": ["catalog datasets --limit 10", "catalog fields --dataset fundamental6 --limit 10"],
+    "catalog operators": ["catalog operators --search rank --limit 10"],
+    "catalog datasets": ["catalog datasets --region USA --limit 10"],
+    "catalog fields": ["catalog fields --dataset fundamental6 --search liability --expressions --limit 10"],
+    "catalog concepts": ["catalog concepts --dataset fundamental6 --limit 10"],
+    "catalog verify": ["catalog verify --fields close volume --strict"],
+    "catalog categories": ["catalog categories"],
+    "catalog field-audit": ["catalog field-audit --fields close,volume"],
+    "lint": ['lint --expr "rank(close)" --offline', "lint --file research.json"],
+    "search": ['search "post earnings announcement drift" --min-authority 3'],
+    "paper": ['paper "accruals stock returns" --limit 3'],
+    "simulate": ['simulate --expr "rank(close)" --dry-run',
+                 "simulate research.json --sort fitness --save results.json"],
+    "resume": ["resume CHECKPOINT.json --save results.json"],
+    "ablate": ['ablate --expr "a = rank(close); b = rank(volume); a + b" --out variants.json'],
+    "compare": ["compare results.json --sort fitness"],
+    "brief": ["brief", "brief --days 7 --top 5"],
+    "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json"],
+    "views": ["views --limit 10"],
+    "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],
+    "alpha get": ["alpha get ALPHA_ID"],
+    "alpha check": ["alpha check ALPHA_ID"],
+    "alpha self-corr": ["alpha self-corr ALPHA_ID"],
+    "alpha describe": ['alpha describe ALPHA_ID --name "quality signal" --category FUNDAMENTAL'],
+    "alpha submit": ["alpha submit ALPHA_ID"],
+    "alpha explain": ["alpha explain ALPHA_ID --no-corr"],
+    "alpha list": ["alpha list --limit 10 --min-fitness 1"],
+    "alpha self-check": ["alpha self-check ALPHA_ID"],
+    "alpha corr": ["alpha corr ALPHA_A ALPHA_B --vs-book"],
+    "alpha book": ["alpha book --limit 10"],
+    "ledger": ["ledger list --family quality", "ledger coverage --list-missing"],
+    "ledger record": ['ledger record ALPHA_ID --family quality --mechanism "profitability"'],
+    "ledger list": ["ledger list --family quality --min-fitness 1", "ledger list --field close"],
+    "ledger label": ["ledger label ALPHA_ID --family quality --verdict candidate"],
+    "ledger impact": ["ledger impact ALPHA_ID"],
+    "ledger lineage": ["ledger lineage ALPHA_ID"],
+    "ledger coverage": ["ledger coverage --list-missing"],
+}
+
+
+def _command_children(parser):
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            summaries = {child.dest: child.help for child in action._choices_actions}
+            return {name: (child, summaries.get(name, ""))
+                    for name, child in action.choices.items()}
+    return {}
+
+
+def _examples(parser):
+    path = " ".join(parser.prog.split()[1:])
+    return ["python research_cli.py " + example for example in _COMMAND_EXAMPLES.get(path, [])]
+
+
+def _attach_examples(parser):
+    examples = _examples(parser)
+    if examples:
+        parser.epilog = "Examples:\n  " + "\n  ".join(examples)
+    for child, summary in _command_children(parser).values():
+        if child.description is None:
+            child.description = summary
+        _attach_examples(child)
+
+
+def _find_command_parser(path):
+    parser = build_parser()
+    parts = path.split() if isinstance(path, str) else [word for part in path or [] for word in part.split()]
+    for part in parts:
+        children = _command_children(parser)
+        if part not in children:
+            parser.error("unknown command %r" % part,
+                         suggestions=difflib.get_close_matches(part, children, n=3, cutoff=0.6))
+        parser = children[part][0]
     return parser
 
 
 def _type_name(action):
     if isinstance(action, (argparse._StoreTrueAction, argparse._StoreFalseAction)):
         return "boolean"
-    if action.type is not None:
-        if action.type is _positive_seconds:
-            return "number"
-        return getattr(action.type, "__name__", str(action.type))
+    if action.type is int:
+        return "integer"
+    if action.type in (float, _positive_seconds, _non_negative_seconds):
+        return "number"
     return "string"
 
 
-def describe_parser(parser, name="research_cli.py"):
-    """Turn an argparse parser (and its subparsers) into a JSON description."""
+def _describe_options(parser):
     options = []
-    subcommands = {}
     for action in parser._actions:
-        if isinstance(action, argparse._SubParsersAction):
-            for child_name, child in action.choices.items():
-                subcommands[child_name] = describe_parser(child, child_name)
+        if isinstance(action, (argparse._SubParsersAction, argparse._HelpAction, argparse._VersionAction)):
             continue
-        if isinstance(action, (argparse._HelpAction, argparse._VersionAction)):
-            continue
-        entry = {
-            "flags": action.option_strings or [action.dest],
-            "type": _type_name(action),
-        }
+        entry = {"flags": action.option_strings or [action.dest], "type": _type_name(action)}
+        entry["required"] = action.required
+        if action.nargs is not None:
+            entry["nargs"] = action.nargs
+        if isinstance(action, argparse._AppendAction):
+            entry["repeatable"] = True
         if action.choices:
             entry["choices"] = [str(c) for c in action.choices]
         if action.help:
             entry["help"] = action.help
-        if action.default not in (None, False, []):
+        if action.default not in (None, False, [], argparse.SUPPRESS):
             entry["default"] = action.default
         options.append(entry)
-    description = {
-        "command": name,
-        "usage": parser.format_usage().strip(),
-        "options": options,
-    }
-    if subcommands:
-        description["subcommands"] = subcommands
+    return options
+
+
+def describe_parser(parser, name="research_cli.py"):
+    """Derive the complete call contract from the live parser."""
+    description = {"command": name, "usage": parser.format_usage().strip(),
+                   "options": _describe_options(parser), "examples": _examples(parser)}
+    children = _command_children(parser)
+    if children:
+        description["subcommands"] = {name: describe_parser(child, name)
+                                      for name, (child, _summary) in children.items()}
     return description
+
+
+def _help_document(parser):
+    children = _command_children(parser)
+    document = {"usage": parser.format_usage().strip(), "description": parser.description,
+                "examples": _examples(parser)}
+    if children:
+        document["commands"] = {name: summary for name, (_child, summary) in children.items()}
+        document["common_options"] = _describe_options(parser)
+    else:
+        document["options"] = _describe_options(parser)
+    document["next"] = "Use --help for terminal help, or schema COMMAND [SUBCOMMAND] for the JSON contract."
+    return document
+
+
+def cmd_help(args, _sink):
+    return _help_document(_find_command_parser(getattr(args, "path", [])))
 
 
 # ---------------------------------------------------------------------------
@@ -946,18 +1121,27 @@ def with_session(args, work):
 
 
 def collect_alphas(args):
-    """Merge ``--expr`` values and the research file into ``(settings, alphas)``."""
+    """Merge files in order, then positional and repeated inline expressions."""
     file_settings, alphas = {}, []
-    if args.file:
+    paths = ([args.file] if getattr(args, "file", None) else [])
+    paths.extend(getattr(args, "files", None) or [])
+    if sum(str(path) == "-" for path in paths) > 1:
+        raise CliError("INVALID_INPUT", "stdin (-) may be read only once")
+    for path in paths:
         try:
-            file_settings, alphas = config_io.load_research_file(args.file)
+            settings, entries = config_io.load_research_file(path)
         except config_io.ResearchError as exc:
-            raise CliError("INVALID_INPUT", str(exc))
-    if args.expr:
-        alphas = alphas + list(args.expr)
+            raise CliError("INVALID_INPUT", str(exc)) from exc
+        file_settings.update(settings)
+        alphas.extend(entries)
+    if getattr(args, "expression", None) is not None:
+        alphas.append(args.expression)
+    expressions = getattr(args, "expr", None)
+    if expressions is not None:
+        alphas.extend([expressions] if isinstance(expressions, str) else expressions)
     if not alphas:
-        raise CliError("USAGE", "no alphas to simulate",
-                       "pass a research FILE or at least one --expr")
+        raise CliError("USAGE", "no expressions supplied",
+                       "pass a research file, --file, or at least one --expr")
     return file_settings, alphas
 
 
@@ -965,15 +1149,16 @@ def merge_settings(file_settings, args):
     """CLI flags win over the file, which wins over machine_lib defaults."""
     overrides = dict(file_settings)
     for key, value in {
-        "region": args.region,
-        "universe": args.universe,
-        "neutralization": args.neutralization,
-        "decay": args.decay,
-        "delay": args.delay,
-        "truncation": args.truncation,
-        "pasteurization": args.pasteurization,
-        "nanHandling": args.nan_handling,
-        "testPeriod": args.test_period,
+        "region": getattr(args, "region", None),
+        "universe": getattr(args, "universe", None),
+        "instrumentType": getattr(args, "instrument_type", None),
+        "neutralization": getattr(args, "neutralization", None),
+        "decay": getattr(args, "decay", None),
+        "delay": getattr(args, "delay", None),
+        "truncation": getattr(args, "truncation", None),
+        "pasteurization": getattr(args, "pasteurization", None),
+        "nanHandling": getattr(args, "nan_handling", None),
+        "testPeriod": getattr(args, "test_period", None),
     }.items():
         if value is not None:
             overrides[key] = value
@@ -1057,6 +1242,11 @@ def _compact_metrics(record):
 # Commands
 # ---------------------------------------------------------------------------
 def cmd_schema(args, _sink):
+    if args.name:
+        selected = _find_command_parser(args.name)
+        return {"tool": "research_cli.py", "version": VERSION,
+                "exit_codes": EXIT_CODES, "error_codes": ERROR_CODES,
+                "command": describe_parser(selected, " ".join(selected.prog.split()[1:]))}
     described = describe_parser(build_parser())
     contract = {
         "tool": "research_cli.py",
@@ -1109,17 +1299,6 @@ def cmd_schema(args, _sink):
         "research_paths": research_paths.describe(),
         "commands": described,
     }
-    if args.name:
-        if args.name not in described["subcommands"]:
-            raise CliError("USAGE", "unknown command %r" % args.name,
-                           "known: " + ", ".join(sorted(described["subcommands"])))
-        contract = {
-            "tool": "research_cli.py",
-            "version": VERSION,
-            "exit_codes": EXIT_CODES,
-            "error_codes": ERROR_CODES,
-            "command": described["subcommands"][args.name],
-        }
     return contract
 
 
@@ -1236,11 +1415,22 @@ def cmd_cache_clear(args, _sink):
     }
 
 
-def _maybe_save(args, data):
-    target = getattr(args, "save", None)
-    if target:
-        Path(target).write_text(json.dumps(data, ensure_ascii=False, indent=2, default=str))
-        note("wrote %s" % target)
+def _prepare_output(target):
+    """Check the destination before a command can spend quota or change state."""
+    if not target or target == "-":
+        return None
+    path = Path(target).expanduser().resolve()
+    try:
+        if path.is_dir() or (path.exists() and not os.access(path, os.W_OK)):
+            raise OSError("destination is not a writable file")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(prefix=".%s." % path.name,
+                                                 suffix=".tmp", dir=str(path.parent))
+        os.close(descriptor)
+    except OSError as exc:
+        raise CliError("INVALID_INPUT", "cannot save output to %s: %s" % (path, exc),
+                       "choose a writable --save path, or use --save - for stdout") from exc
+    return path, Path(temporary)
 
 
 def cmd_catalog_operators(args, _sink):
@@ -1281,7 +1471,7 @@ def cmd_catalog_operators(args, _sink):
         return data
 
     data = with_session(args, work)
-    _maybe_save(args, data)
+
     return data
 
 
@@ -1299,7 +1489,7 @@ def cmd_catalog_datasets(args, _sink):
     if not datasets:
         data["hint"] = ("no datasets for this combination; the account may lack "
                         "permission (a TUTORIAL account only sees USA)")
-    _maybe_save(args, data)
+
     return data
 
 
@@ -1368,7 +1558,7 @@ def cmd_catalog_fields(args, _sink):
         data["search"] = search_note
     if args.expressions:
         data["expressions"] = ml.process_datafields(fields)
-    _maybe_save(args, data)
+
     return data
 
 
@@ -1429,7 +1619,7 @@ def cmd_catalog_concepts(args, _sink):
         "note": ("grouping is literal token matching after --ignore-words; "
                  "coverage_spread is best minus worst member"),
     }
-    _maybe_save(args, data)
+
     return data
 
 
@@ -1472,7 +1662,7 @@ def cmd_catalog_verify(args, _sink):
             "run `catalog concepts --search <word>` to see the real variants for that idea",
             details=data,
         )
-    _maybe_save(args, data)
+
     return data
 
 
@@ -1486,7 +1676,7 @@ def cmd_catalog_categories(args, _sink):
         "count": len(categories), "categories": categories, "cache": cache_report,
         "note": "alphaCount is a crowding signal: higher means more mined",
     }
-    _maybe_save(args, data)
+
     return data
 
 
@@ -1654,42 +1844,42 @@ def cmd_ablate(args, _sink):
     """
     expression = args.expr
     decay = args.decay
-    # Settings must be carried explicitly. An ablation file without a settings
-    # block falls back to the defaults, so a TOP500 study would silently run on
-    # TOP3000 and the comparison would be across two universes.
+    if args.file and expression is not None:
+        raise CliError("INVALID_INPUT", "ablate accepts either a file or --expr, not both")
+    if args.ids and (args.file or expression is not None):
+        raise CliError("INVALID_INPUT", "--ids cannot be combined with a file or --expr")
     settings = {}
     settings_source = "defaults"
+    alphas = None
     if args.file:
-        loaded_settings, alphas = config_io.load_research_file(args.file)
-        pairs = ml.normalize_alphas(alphas, loaded_settings)
-        if len(pairs) != 1 and not expression:
-            raise CliError(
-                "INVALID_INPUT",
-                "ablate takes exactly one composite expression, found %d"
-                % len(pairs),
-                "split the file, or pass --expr with one composite")
-        if not expression:
-            expression = pairs[0][0]
+        try:
+            settings, alphas = config_io.load_research_file(args.file)
+        except config_io.ResearchError as exc:
+            raise CliError("INVALID_INPUT", str(exc)) from exc
+        settings_source = args.file
+    resolved = merge_settings(settings, args)
+    if any(getattr(args, flag, None) is not None for flag in (
+            "region", "universe", "instrument_type", "neutralization", "decay",
+            "delay", "truncation", "pasteurization", "nan_handling", "test_period")):
+        settings_source = "flags"
+    if alphas is not None:
+        try:
+            _settings, pairs = config_io.build_config(resolved, alphas)
+        except config_io.ResearchError as exc:
+            raise CliError("INVALID_INPUT", str(exc)) from exc
+        if len(pairs) != 1:
+            raise CliError("INVALID_INPUT",
+                           "ablate takes exactly one composite expression, found %d" % len(pairs),
+                           "split the file, or pass --expr with one composite")
+        expression = pairs[0][0]
         if decay is None:
             decay = pairs[0][1]
-        settings = dict(loaded_settings)
-        settings_source = args.file
-
-    overrides = {
-        "universe": getattr(args, "universe", None),
-        "neutralization": getattr(args, "neutralization", None),
-        "region": getattr(args, "region", None),
-        "delay": getattr(args, "delay", None),
-        "testPeriod": getattr(args, "test_period", None),
-    }
-    applied = {key: value for key, value in overrides.items() if value is not None}
-    if applied:
-        settings.update(applied)
-        settings_source = "flags"
-    # Resolve against the documented defaults so the emitted file is complete
-    # rather than relying on whatever the simulator happens to fill in.
-    resolved = dict(ml.DEFAULT_SETTINGS)
-    resolved.update(settings)
+    elif expression is not None:
+        try:
+            _settings, pairs = config_io.build_config(resolved, [expression])
+        except config_io.ResearchError as exc:
+            raise CliError("INVALID_INPUT", str(exc)) from exc
+        expression, decay = pairs[0]
 
     if args.ids:
         # Batch form. One file per alpha, because `compare --contributions` groups by
@@ -1712,15 +1902,13 @@ def cmd_ablate(args, _sink):
             except ablation.AblationError as exc:
                 skipped.append({"alpha_id": raw, "reason": str(exc)})
                 continue
-            alpha_settings = dict(ml.DEFAULT_SETTINGS)
-            alpha_settings.update(entry.get("settings") or {})
+            alpha_settings = merge_settings(entry.get("settings") or {}, args)
             alphas = []
             for item in plan:
                 item_entry = {"expression": item["expression"],
                               "candidate_id": item["candidate_id"],
                               "mechanism": entry.get("mechanism") or raw}
-                if entry.get("settings", {}).get("decay") is not None:
-                    item_entry["decay"] = entry["settings"]["decay"]
+                item_entry["decay"] = alpha_settings["decay"]
                 alphas.append(item_entry)
             target = out_dir / ("%s-ablation.json" % raw)
             target.write_text(json.dumps({"settings": alpha_settings, "alphas": alphas},
@@ -1770,7 +1958,7 @@ def cmd_ablate(args, _sink):
         "next": ("run with `simulate %s`, then `compare <results> --contributions`"
                  % (args.out or "<file>")),
     }
-    _maybe_save(args, data)
+
     return data
 
 
@@ -1808,13 +1996,15 @@ def cmd_compare(args, _sink):
         raise CliError("INVALID_INPUT",
                        "%s is not a simulate result document" % path,
                        "expected {\"results\": [...]} or a bare list of records; "
-                       "`alpha registry --format json` rows are not records")
+                       "`ledger list --format json` rows are not records")
 
+    if sum(str(path) == "-" for path in args.files) > 1:
+        raise CliError("INVALID_INPUT", "stdin (-) may be read only once")
     records = []
     for path in args.files:
         try:
-            payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
+            payload = json.loads(config_io.read_input_text(path))
+        except (config_io.ResearchError, ValueError) as exc:
             raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc),
                            "point at a file written by `simulate`") from exc
         records.extend(records_from(path, payload))
@@ -1877,15 +2067,15 @@ def cmd_compare(args, _sink):
         data["contributions"] = ablation.report(
             records, metrics_of=None if frozen else _train_metrics)
         data["contributions"]["view"] = "frozen" if frozen else "train"
-    _maybe_save(args, data)
+
     return data
 
 
 def _load_probe_spec(path):
     """Read and validate a probe spec: settings plus a list of labelled arms."""
     try:
-        spec = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
+        spec = json.loads(config_io.read_input_text(path))
+    except (config_io.ResearchError, ValueError) as exc:
         raise CliError("INVALID_INPUT", "cannot read spec %s: %s" % (path, exc),
                        "pass a JSON file shaped like "
                        "{\"name\": ..., \"settings\": {...}, \"arms\": [{\"label\", "
@@ -1904,12 +2094,16 @@ def _load_probe_spec(path):
         # run the whole batch on the defaults and look like a failed hypothesis.
         note("spec: ignoring unknown key(s) %s (known: %s)"
              % (", ".join(unknown), ", ".join(sorted(known))))
+    if "settings" in spec and not isinstance(spec["settings"], dict):
+        raise CliError("INVALID_INPUT", "spec settings must be an object")
     for index, arm in enumerate(arms, 1):
         if not isinstance(arm, dict) or not isinstance(arm.get("expression"), str) \
                 or not arm["expression"].strip():
             raise CliError("INVALID_INPUT", "arm %d has no expression" % index,
                            "an arm is {\"label\": ..., \"expression\": ..., "
                            "\"settings\": {...} (optional)}")
+        if "settings" in arm and not isinstance(arm["settings"], dict):
+            raise CliError("INVALID_INPUT", "arm %d settings must be an object" % index)
         arm.setdefault("label", "arm%d" % index)
     return spec
 
@@ -1930,18 +2124,35 @@ def cmd_probe(args, _sink):
     ``--show-test`` is passed - selecting on the test year turns the only
     out-of-sample evidence into training data.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
-    import guarded_sim  # noqa: E402 - lives in tools/, imported lazily
-
+    # Resolve every arm before authenticating or spending quota on the first group.
     spec = _load_probe_spec(args.spec)
     settings = dict(spec.get("settings") or {})
     arms = spec["arms"]
-    name = args.name or spec.get("name") or Path(args.spec).stem
+    name = args.name or spec.get("name") or ("stdin" if args.spec == "-" else Path(args.spec).stem)
+
+    raw_groups = {}
+    for arm in arms:
+        overrides = merge_settings({**settings, **arm.get("settings", {})}, args)
+        key = json.dumps(overrides, sort_keys=True)
+        raw_groups.setdefault(key, {"settings": overrides, "arms": []})["arms"].append(arm)
 
     groups = {}
-    for arm in arms:
-        key = json.dumps({**settings, **(arm.get("settings") or {})}, sort_keys=True)
-        groups.setdefault(key, []).append(arm)
+    for group in raw_groups.values():
+        entries = [{key: value for key, value in arm.items() if key != "settings"}
+                   for arm in group["arms"]]
+        try:
+            resolved, pairs = config_io.build_config(group["settings"], entries)
+        except config_io.ResearchError as exc:
+            raise CliError("INVALID_INPUT", str(exc)) from exc
+        for arm, (expression, decay) in zip(group["arms"], pairs):
+            # guarded_sim lints strings, so each group must share the effective
+            # decay as well as the other request settings. Explicit defaults and
+            # per-arm decay overrides then coalesce into identical payload scopes.
+            effective = {**resolved, "decay": decay}
+            key = json.dumps(effective, sort_keys=True)
+            prepared = groups.setdefault(key, {"settings": effective, "arms": [], "pairs": []})
+            prepared["arms"].append({**arm, "expression": expression})
+            prepared["pairs"].append((expression, decay))
 
     # The output path and its collision rule are decided before anything is spent:
     # an existing batch file used to raise only after the simulations had run, so a
@@ -1952,41 +2163,55 @@ def cmd_probe(args, _sink):
                        "pass --name to label this batch, or --force to overwrite it")
 
     if args.dry_run:
-        blocking = []
-        for key, group in groups.items():
-            # Lint each group against its own settings: a per-arm universe or region
-            # change moves the datafield catalogue, so one shared lint can pass a name
-            # that does not exist in the scope the arm actually runs in.
-            arm_settings = json.loads(key)
-            report = guarded_sim.check([arm["expression"] for arm in group], arm_settings)
-            for item in report["errors"]:
-                if item["code"] in {"unknown_operator", "unknown_identifier",
-                                    "unused_variable", "operator_arg_constraint",
-                                    "signal_type", "undefined_variable"}:
-                    blocking.append(item)
-                    note("lint %-16s %s" % (item["code"],
-                                            item.get("identifier") or item.get("operator")))
+        results = []
+        pairs = []
+        for group in groups.values():
+            labels = [arm["label"] for arm in group["arms"]]
+            preview = ml.simulate_alphas(
+                None, group["pairs"], settings=group["settings"],
+                dry_run=True, labels=labels)
+            for record, label in zip(preview, labels):
+                record["label"] = label
+                record["settings"] = dict(group["settings"])
+            results.extend(preview)
+            pairs.extend(group["pairs"])
+        report = expression_lint.lint_all(
+            pairs, denylist=expression_lint.load_denylist())
+        blocking = report["errors"]
         note("dry run: %d arm(s) in %d settings group(s), %d blocking finding(s)"
              % (len(arms), len(groups), len(blocking)))
         return {"dry_run": True, "arms": len(arms), "groups": len(groups),
-                "blocking": blocking}
+                "blocking": blocking,
+                "settings": [group["settings"] for group in groups.values()],
+                "results": results,
+                "lint": {"operator_catalog_checked": False,
+                         "field_catalog_checked": False,
+                         "hint": "Live operator and field catalogs were not checked; "
+                                 "run `lint` for authoritative catalog checks.",
+                         "ok": report["ok"], "errors": report["errors"],
+                         "warnings": report["warnings"]}}
 
-    records = []
-    for key, group in groups.items():
-        arm_settings = json.loads(key)
-        note("simulating %d arm(s) under %s/%s/%s"
-             % (len(group), arm_settings.get("region"), arm_settings.get("universe"),
-                arm_settings.get("neutralization")))
-        produced = guarded_sim.simulate(
-            [arm["expression"] for arm in group], arm_settings,
-            labels=[arm["label"] for arm in group],
-            on_event=lambda kind, payload: note("  %s" % kind))
-        for record in produced:
-            # Carry the settings this arm actually ran under. The ledger used to be
-            # written with the spec's global settings, so an INDUSTRY arm was filed as
-            # SUBINDUSTRY and the comparison could not be reproduced later.
-            record["settings"] = dict(arm_settings)
-        records.extend(produced)
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "tools"))
+    import guarded_sim  # noqa: E402 - lives in tools/, imported lazily
+
+    def work(session):
+        records = []
+        for group in groups.values():
+            arm_settings = group["settings"]
+            note("simulating %d arm(s) under %s/%s/%s"
+                 % (len(group["arms"]), arm_settings.get("region"), arm_settings.get("universe"),
+                    arm_settings.get("neutralization")))
+            produced = guarded_sim.simulate(
+                [expression for expression, _decay in group["pairs"]], arm_settings,
+                labels=[arm["label"] for arm in group["arms"]], session=session,
+                on_event=lambda kind, payload: note("  %s" % kind))
+            for record in produced:
+                # The ledger must carry the complete settings this arm actually used.
+                record["settings"] = dict(arm_settings)
+            records.extend(produced)
+        return records
+
+    records = with_session(args, work)
 
     rows = []
     note("")
@@ -1994,7 +2219,7 @@ def cmd_probe(args, _sink):
     if args.show_test:
         header += " %7s %6s %7s %7s" % ("S", "F", "T", "testS")
     note(header)
-    for record, arm in zip(records, [a for group in groups.values() for a in group]):
+    for record, arm in zip(records, [a for group in groups.values() for a in group["arms"]]):
         metrics = record.get("metrics") or {}
         split = record.get("out_of_sample") or {}
         train = split.get("train") or {}
@@ -2005,7 +2230,7 @@ def cmd_probe(args, _sink):
         # ranking on test - hiding one column would not have fixed that.
         row = {"label": arm["label"], "alpha_id": record.get("alpha_id"),
                "expression": arm["expression"],
-               "settings": {**settings, **(arm.get("settings") or {})},
+               "decay": record.get("decay"), "settings": dict(record["settings"]),
                "status": record.get("status"), "error": record.get("error"),
                "train_sharpe": train.get("sharpe"),
                "train_fitness": train.get("fitness"),
@@ -2038,7 +2263,7 @@ def cmd_probe(args, _sink):
         summary["registry"] = alpha_registry.record_simulation(
             records, settings, idea=spec.get("idea"), mechanism=spec.get("mechanism"),
             note=spec.get("note"), registry_path=args.registry, source="simulate")
-    _maybe_save(args, summary)
+
     return summary
 
 
@@ -2202,7 +2427,7 @@ def cmd_brief(args, _sink):
         "documents": documents,
         "threads": threads,
     }
-    _maybe_save(args, data)
+
     return data
 
 
@@ -2256,7 +2481,7 @@ def cmd_search(args, _sink):
             "content": content,
             "chars": len(content),
         }
-        _maybe_save(args, data)
+
         return data
 
     if not args.query:
@@ -2302,7 +2527,7 @@ def cmd_search(args, _sink):
         "note": ("rerank_score 1.5+ is high quality and authority 3+ is "
                  "authoritative; prefer the paper over posts about it"),
     }
-    _maybe_save(args, data)
+
     return data
 
 
@@ -2348,10 +2573,10 @@ def _preflight_lint(session, pairs, settings, args):
             # raw CLI flags instead meant a research file asking for TOP500 was still
             # linted against TOP3000: different field catalogue, so the check could
             # reject a valid field or wave an unavailable one through.
-            region=settings.get("region") or "USA",
-            universe=settings.get("universe") or "TOP3000",
-            delay=settings.get("delay") if settings.get("delay") is not None else 1,
-            instrument_type=settings.get("instrumentType") or "EQUITY",
+            region=settings.get("region") or ml.DEFAULT_SETTINGS["region"],
+            universe=settings.get("universe") or ml.DEFAULT_SETTINGS["universe"],
+            delay=settings.get("delay") if settings.get("delay") is not None else ml.DEFAULT_SETTINGS["delay"],
+            instrument_type=settings.get("instrumentType") or ml.DEFAULT_SETTINGS["instrumentType"],
         )
         known_fields = field_index.field_ids(records)
         field_note = "checked (%d names)" % len(known_fields)
@@ -2433,12 +2658,6 @@ def cmd_paper(args, _sink):
     except Exception as exc:  # noqa: BLE001 - network and DNS both land here
         raise CliError("SERVICE_ERROR", "OpenAlex request failed: %s" % exc,
                        "the API is public and needs no key; retry shortly") from exc
-    if args.save:
-        # `_write_json` never existed; `--save` was a NameError waiting for the first
-        # caller. `_maybe_save` is the helper every other command uses, and it also
-        # reports the path on stderr so stdout stays one JSON document.
-        _maybe_save(args, data)
-        data["saved_to"] = args.save
     return data
 
 
@@ -2611,7 +2830,7 @@ def cmd_alpha_get(args, _sink):
     split = ml.extract_split(payload)
     if split:
         document["out_of_sample"] = split
-    _maybe_save(args, document)
+
     return document
 
 
@@ -2639,7 +2858,7 @@ def cmd_alpha_check(args, _sink):
         "self_correlation": result.get("self_correlation"),
         "checks": result.get("checks"),
     }
-    _maybe_save(args, document)
+
     return document
 
 
@@ -2675,7 +2894,7 @@ def cmd_alpha_submit(args, _sink):
         return result
 
     result = with_session(args, work)
-    _maybe_save(args, result)
+
     return result
 
 
@@ -2753,34 +2972,31 @@ def cmd_alpha_list(args, _sink):
             "date_created": alpha.get("dateCreated"),
         })
     document = {"count": len(compact), "offset": args.offset, "alphas": compact}
-    _maybe_save(args, document)
+
     return document
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def run(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if not getattr(args, "command", None):
-        args.command, args.func, args.name = "schema", cmd_schema, None
-    elif not getattr(args, "func", None):
-        children = sorted(describe_parser(build_parser())["subcommands"])
-        raise CliError("USAGE", "`%s` needs a subcommand" % args.command,
-                       "known subcommands: %s" % ", ".join(children))
+def _dispatch(args):
+    for name, value in vars(args).items():
+        if isinstance(value, float) and not math.isfinite(value):
+            args._parser.error("--%s must be finite" % name.replace("_", "-"))
+        if name in {"limit", "offset", "top", "days", "tail_tokens", "min_members",
+                    "min_shared", "min_overlap", "peer_limit"} and value is not None and value < 0:
+            raise CliError("INVALID_INPUT", "--%s must be zero or greater" % name.replace("_", "-"),
+                           "use a non-negative value")
+    if not getattr(args, "func", None):
+        args.command = getattr(args, "command", None) or "help"
+        return _help_document(args._parser)
     sink = make_event_sink(getattr(args, "stream", False), getattr(args, "verbose", False))
-    # Catalog caching is on by default; the flags only tune it. Library
-    # diagnostics are routed through the same stderr channel as our own notes,
-    # so stdout stays a single JSON document.
     ml.set_diagnostic_handler(note)
     ml.configure_metadata_cache(
         max_age=getattr(args, "meta_max_age", None),
         refresh=getattr(args, "refresh_meta", None),
     )
-    data = args.func(args, sink)
-    emit({"ok": True, "command": args.command, "data": data})
-    return EXIT_CODES["OK"]
+    return args.func(args, sink)
 
 
 # ---------------------------------------------------------------------------
@@ -2789,15 +3005,12 @@ def run(argv=None):
 
 def _collect_lint_pairs(args):
     """Return ``(settings, [(expression, decay), ...])`` for the lint target."""
-    if getattr(args, "file", None):
-        file_settings, alphas = config_io.load_research_file(args.file)
-        return config_io.build_config(file_settings, alphas)
-    expression = getattr(args, "expression", None)
-    if not expression:
-        raise CliError(
-            "USAGE", "lint needs an expression or --file",
-            "pass it positionally, e.g. `lint 'rank(ts_delta(close, 5))'`")
-    return {}, [(expression, None)]
+    file_settings, alphas = collect_alphas(args)
+    settings = merge_settings(file_settings, args)
+    try:
+        return config_io.build_config(settings, alphas)
+    except config_io.ResearchError as exc:
+        raise CliError("INVALID_INPUT", str(exc)) from exc
 
 
 def _operator_index_from_catalog(session):
@@ -2819,7 +3032,7 @@ def _dataset_id(record):
     return dataset.get("id") if isinstance(dataset, dict) else dataset
 
 
-def _field_scope(session, args):
+def _field_scope(session, settings):
     """Return ``(known_field_ids, market_field_ids)`` from one catalogue fetch.
 
     Two views on purpose: the first answers "is this a real field", the second "does
@@ -2827,10 +3040,10 @@ def _field_scope(session, args):
     """
     records = field_index.fetch_all_fields(
         session,
-        region=getattr(args, "region", None) or "USA",
-        universe=getattr(args, "universe", None) or "TOP3000",
-        delay=getattr(args, "delay", None) if getattr(args, "delay", None) is not None else 1,
-        instrument_type=getattr(args, "instrument_type", None) or "EQUITY",
+        region=settings["region"],
+        universe=settings["universe"],
+        delay=settings["delay"],
+        instrument_type=settings["instrumentType"],
     )
     known = field_index.field_ids(records)
     market = {record.get("id") for record in records
@@ -2847,7 +3060,7 @@ def cmd_lint(args, sink):
     catalog_checked = False
     if not getattr(args, "offline", False):
         def work(session):
-            known, market = _field_scope(session, args)
+            known, market = _field_scope(session, settings)
             return _operator_index_from_catalog(session), known, market
 
         operator_index, known_fields, market_fields = with_session(args, work)
@@ -2884,7 +3097,7 @@ def cmd_lint(args, sink):
         },
         "results": results,
     }
-    _maybe_save(args, document)
+
     if failed:
         raise CliError(
             "INVALID_INPUT",
@@ -2903,10 +3116,10 @@ def cmd_lint(args, sink):
 def _fetch_raw_fields(session, args, dataset=None, search=""):
     return ml.get_datafields(
         session,
-        instrument_type=getattr(args, "instrument_type", "EQUITY"),
-        region=getattr(args, "region", "USA"),
-        delay=getattr(args, "delay", 1),
-        universe=getattr(args, "universe", "TOP3000"),
+        instrument_type=getattr(args, "instrument_type", ml.DEFAULT_SETTINGS["instrumentType"]),
+        region=getattr(args, "region", ml.DEFAULT_SETTINGS["region"]),
+        delay=getattr(args, "delay", ml.DEFAULT_SETTINGS["delay"]),
+        universe=getattr(args, "universe", ml.DEFAULT_SETTINGS["universe"]),
         dataset_id=dataset or "",
         search=search,
         limit=getattr(args, "limit", None),
@@ -2933,10 +3146,10 @@ def _resolve_fields_by_id(session, args, field_ids):
 
     datasets = ml.get_datasets(
         session,
-        instrument_type=getattr(args, "instrument_type", "EQUITY"),
-        region=getattr(args, "region", "USA"),
-        delay=getattr(args, "delay", 1),
-        universe=getattr(args, "universe", "TOP3000"),
+        instrument_type=getattr(args, "instrument_type", ml.DEFAULT_SETTINGS["instrumentType"]),
+        region=getattr(args, "region", ml.DEFAULT_SETTINGS["region"]),
+        delay=getattr(args, "delay", ml.DEFAULT_SETTINGS["delay"]),
+        universe=getattr(args, "universe", ml.DEFAULT_SETTINGS["universe"]),
     )
     remaining = set(wanted)
     for dataset in datasets:
@@ -2981,21 +3194,21 @@ def cmd_catalog_field_audit(args, sink):
     document = field_contract.audit_fields(
         raw_records, operation=getattr(args, "operation", None))
     document["catalog"] = {
-        "region": getattr(args, "region", "USA"),
-        "universe": getattr(args, "universe", "TOP3000"),
-        "delay": getattr(args, "delay", 1),
-        "instrument_type": getattr(args, "instrument_type", "EQUITY"),
+        "region": getattr(args, "region", ml.DEFAULT_SETTINGS["region"]),
+        "universe": getattr(args, "universe", ml.DEFAULT_SETTINGS["universe"]),
+        "delay": getattr(args, "delay", ml.DEFAULT_SETTINGS["delay"]),
+        "instrument_type": getattr(args, "instrument_type", ml.DEFAULT_SETTINGS["instrumentType"]),
     }
     if field_ids:
         document["requested_fields"] = field_ids
     if missing:
         document["missing_fields"] = missing
-    _maybe_save(args, document)
+
     return document
 
 
 # ---------------------------------------------------------------------------
-# alpha record / alpha registry -- the durable ledger
+# ledger -- the durable local research history
 # ---------------------------------------------------------------------------
 
 def _record_simulation(records, settings, args):
@@ -3015,11 +3228,11 @@ def _record_simulation(records, settings, args):
         source="simulate")
 
 
-def cmd_alpha_record(args, sink):
+def cmd_ledger_record(args, sink):
     alpha_id = getattr(args, "alpha_id", None)
     if not alpha_id:
         raise CliError(
-            "USAGE", "alpha record needs an alpha id",
+            "USAGE", "ledger record needs an alpha id",
             "use `alpha list` to find one; a record without an alpha id has no "
             "metrics to persist")
 
@@ -3056,10 +3269,12 @@ def cmd_alpha_record(args, sink):
     }
 
 
-def cmd_alpha_find(args, sink):
-    registry_path = (getattr(args, "registry", None)
-                     or alpha_registry.default_registry_path())
-    entries = alpha_registry.load_entries(registry_path)
+def cmd_ledger_list(args, _sink):
+    registry_path, entries = _ledger(args)
+    limit = getattr(args, "limit", 0)
+    if limit is not None and limit < 0:
+        raise CliError("INVALID_INPUT", "--limit must be zero or positive",
+                       "use --limit 0 to show all matching entries")
     matched = alpha_registry.find_entries(
         entries,
         field=getattr(args, "field", None),
@@ -3069,24 +3284,23 @@ def cmd_alpha_find(args, sink):
         verdicts=getattr(args, "verdict", None),
         min_fitness=getattr(args, "min_fitness", None),
         family=getattr(args, "family", None),
+        min_sharpe=getattr(args, "min_sharpe", None),
     )
-    matched.sort(
-        key=lambda e: ((e.get("metrics") or {}).get("fitness") or float("-inf")),
-        reverse=True,
-    )
-    limit = getattr(args, "limit", None)
+
+    def fitness_key(entry):
+        value = (entry.get("metrics") or {}).get("fitness")
+        return value if isinstance(value, (int, float)) else float("-inf")
+
+    matched.sort(key=fitness_key, reverse=True)
     shown = matched[:limit] if limit else matched
-    verdict_counts = {}
+    verdict_counts, mechanisms, families = {}, {}, {}
     for entry in matched:
-        key = entry.get("verdict") or "unknown"
-        verdict_counts[key] = verdict_counts.get(key, 0) + 1
-    mechanisms = {}
-    families = {}
-    for entry in matched:
-        key = entry.get("mechanism") or "unlabelled"
-        mechanisms[key] = mechanisms.get(key, 0) + 1
-        fam = entry.get("family") or "unclassified"
-        families[fam] = families.get(fam, 0) + 1
+        verdict = entry.get("verdict") or "unknown"
+        verdict_counts[verdict] = verdict_counts.get(verdict, 0) + 1
+        mechanism = entry.get("mechanism") or "unlabelled"
+        mechanisms[mechanism] = mechanisms.get(mechanism, 0) + 1
+        family = entry.get("family") or "unclassified"
+        families[family] = families.get(family, 0) + 1
     document = {
         "registry": registry_path,
         "registry_entries": len(entries),
@@ -3098,15 +3312,19 @@ def cmd_alpha_find(args, sink):
             "idea": getattr(args, "idea", None),
             "expression": getattr(args, "expression", None),
             "verdict": list(getattr(args, "verdict", None) or []),
+            "family": getattr(args, "family", None),
             "min_fitness": getattr(args, "min_fitness", None),
+            "min_sharpe": getattr(args, "min_sharpe", None),
         },
         "verdict_counts": verdict_counts,
         "mechanism_counts": mechanisms,
         "family_counts": families,
+        "summary": alpha_registry.summarize(matched),
         "already_tested": bool(matched),
-        "alphas": shown,
+        "entries": shown,
     }
-    _maybe_save(args, document)
+    if getattr(args, "format", "json") == "markdown":
+        document["markdown"] = alpha_registry.render_markdown(shown, title="Research ledger")
     return document
 
 
@@ -3116,22 +3334,20 @@ def _ledger(args):
     return path, alpha_registry.load_entries(path)
 
 
-def cmd_alpha_label(args, _sink):
+def cmd_ledger_label(args, _sink):
     """Rewrite the judgement columns of one entry.
 
     Appends rather than edits: the ledger is append-only and the newest record for
     a key wins, so a relabel keeps the earlier judgement visible.
 
-    The response mirrors `alpha record`: ``registry``, ``written`` and the stored
-    ``entry``, plus the summary fields. It used to return only the summary, so a
-    caller that wanted the whole row had to reload the ledger - and the first
-    attempt to read ``data["entry"]`` silently produced ``None``.
+    The response contains the stored ``entry`` and whether a new history row was
+    ``written``, alongside the changed judgement columns and their earlier values.
     """
     path, entries = _ledger(args)
     target = alpha_registry.resolve(entries, args.alpha_id)
     if target is None:
         raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id,
-                       "run `alpha find` or `alpha registry` to see what is recorded")
+                       "run `ledger list` to see what is recorded")
     if all(getattr(args, name, None) is None
            for name in ("family", "verdict", "mechanism", "idea", "note")):
         raise CliError("USAGE", "nothing to change",
@@ -3157,7 +3373,7 @@ def cmd_alpha_label(args, _sink):
                    "verdict": target.get("verdict"),
                    "mechanism": target.get("mechanism")},
     }
-    _maybe_save(args, data)
+
     return data
 
 
@@ -3242,7 +3458,7 @@ def cmd_alpha_explain(args, _sink):
         "caveat": "a leg weight is a multiplier, not a contribution; which leg carries "
                   "the alpha is only known if an ablation was run",
     }
-    _maybe_save(args, document)
+
     return document
 
 
@@ -3305,7 +3521,7 @@ def _closed_reason(family):
     return reason
 
 
-def cmd_alpha_impact(args, _sink):
+def cmd_ledger_impact(args, _sink):
     """Alphas that share a leg body with the given one."""
     _path, entries = _ledger(args)
     target = alpha_registry.resolve(entries, args.alpha_id)
@@ -3324,11 +3540,11 @@ def cmd_alpha_impact(args, _sink):
         "note": ("legs are matched on the sub-expression body; a shared letter "
                  "means nothing on its own"),
     }
-    _maybe_save(args, data)
+
     return data
 
 
-def cmd_alpha_lineage(args, _sink):
+def cmd_ledger_lineage(args, _sink):
     """Parent chain for one alpha."""
     _path, entries = _ledger(args)
     chain = alpha_registry.lineage(entries, args.alpha_id)
@@ -3350,11 +3566,11 @@ def cmd_alpha_lineage(args, _sink):
         "note": ("lineage is recorded, never inferred; an empty op means the "
                  "record predates lineage capture"),
     }
-    _maybe_save(args, data)
+
     return data
 
 
-def cmd_alpha_coverage(args, _sink):
+def cmd_ledger_coverage(args, _sink):
     """How far the ledger is from having a countable family column."""
     _path, entries = _ledger(args)
     summary = alpha_registry.unlabeled_summary(entries)
@@ -3369,7 +3585,7 @@ def cmd_alpha_coverage(args, _sink):
              "mechanism": entry.get("mechanism")}
             for entry in missing[: args.limit]
         ]
-    _maybe_save(args, data)
+
     return data
 
 
@@ -3397,7 +3613,7 @@ def cmd_alpha_self_corr(args, _sink):
                     else ("sharpe route" if qualifies else "blocked")),
         "counterparts": verdict["counterparts"],
     }
-    _maybe_save(args, data)
+
     return data
 
 
@@ -3425,7 +3641,7 @@ def cmd_alpha_describe(args, _sink):
         "note": "name, category and tags are top-level; description is nested under "
                 "`regular`",
     }
-    _maybe_save(args, data)
+
     return data
 
 
@@ -3755,7 +3971,7 @@ def cmd_alpha_corr(args, sink):
             "matrix": residual_matrix,
         }
 
-    _maybe_save(args, data)
+
     return data
 
 
@@ -3840,77 +4056,84 @@ def cmd_alpha_book(args, sink):
                       and self_correlation["value"] <= self_correlation["limit"]),
         }
 
-    _maybe_save(args, document)
+
     return document
 
 
-def cmd_alpha_registry(args, sink):
-    registry_path = (getattr(args, "registry", None)
-                     or alpha_registry.default_registry_path())
-    entries = alpha_registry.load_entries(registry_path)
-    verdicts = set(getattr(args, "verdict", None) or [])
-    idea = getattr(args, "idea", None)
-    min_sharpe = getattr(args, "min_sharpe", None)
-    selected = []
-    for entry in entries:
-        if verdicts and entry.get("verdict") not in verdicts:
-            continue
-        if idea and entry.get("idea") != idea:
-            continue
-        if min_sharpe is not None:
-            sharpe = (entry.get("metrics") or {}).get("sharpe")
-            if not isinstance(sharpe, (int, float)) or sharpe < min_sharpe:
-                continue
-        selected.append(entry)
-    document = {
-        "registry": registry_path,
-        "filtered": len(selected),
-        "summary": alpha_registry.summarize(selected),
-    }
-    if getattr(args, "format", "json") == "markdown":
-        document["markdown"] = alpha_registry.render_markdown(selected)
-    document["entries"] = selected
-    _maybe_save(args, document)
-    return document
 
 
 def main(argv=None):
+    """One boundary for parsing, workspace selection, saving and error envelopes."""
+    global _QUIET
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    options = argparse.Namespace(save=None, compact=False, quiet=False, research_dir=None,
+                                 command="help")
+    prepared = None
+    previous_quiet = _QUIET
+    previous_directory = os.environ.get(research_paths.ENV_VAR)
+    previous_policy = ml.metadata_cache_policy()
+    code = EXIT_CODES["OK"]
     try:
-        return run(argv)
-    except CliError as exc:
-        emit({"ok": False, "command": _command_of(argv),
-              "error": _error_body(exc)})
-        note("%s: %s" % (exc.code, exc.message))
-        return exc.exit_code
-    except ml.BrainError as exc:
-        code = getattr(exc, "code", "SERVICE_ERROR")
-        if str(code).startswith("AUTH"):
-            # The cookie is known-bad; keeping it would make every later call
-            # replay the same rejection instead of logging in again.
-            if ml.invalidate_session():
-                note("session cache cleared after %s" % code)
-        hint = getattr(exc, "hint", None)
-        emit({"ok": False, "command": _command_of(argv),
-              "error": {"code": code, "message": str(exc), "hint": hint}})
-        note("%s: %s" % (code, exc))
-        return EXIT_CODES.get(code, EXIT_CODES["SERVICE_ERROR"])
-    except KeyboardInterrupt:
-        emit({"ok": False, "command": _command_of(argv),
-              "error": {"code": "INTERRUPTED", "message": "cancelled", "hint": None}})
-        return EXIT_CODES["INTERRUPTED"]
-    except Exception as exc:  # unexpected: stdout must stay parseable anyway
-        emit({"ok": False, "command": _command_of(argv),
-              "error": {"code": "SERVICE_ERROR",
-                        "message": "%s: %s" % (type(exc).__name__, exc),
-                        "hint": "unexpected failure; see stderr for the traceback"}})
-        import traceback
-        traceback.print_exc(file=sys.stderr)
-        return EXIT_CODES["SERVICE_ERROR"]
+        try:
+            # Read only common options first, so errors honour --save/--compact too.
+            common = JsonArgumentParser(prog="research_cli.py", add_help=False, common=False)
+            _add_common_args(common)
+            common.parse_known_args(arguments, namespace=options)
+            _QUIET = options.quiet
+            if options.research_dir is not None:
+                os.environ[research_paths.ENV_VAR] = str(Path(options.research_dir).expanduser().resolve())
+            prepared = _prepare_output(options.save)
+            parser = build_parser()
+            parser.parse_args(arguments, namespace=options)
+            data = _dispatch(options)
+            payload = {"ok": True, "command": options.command, "data": data}
+        except CliError as exc:
+            payload = {"ok": False, "command": getattr(exc, "command", options.command),
+                       "error": _error_body(exc)}
+            code = exc.exit_code
+        except ml.BrainError as exc:
+            error_code = getattr(exc, "code", "SERVICE_ERROR")
+            if str(error_code).startswith("AUTH") and ml.invalidate_session():
+                note("session cache cleared after %s" % error_code)
+            payload = {"ok": False, "command": options.command,
+                       "error": {"code": error_code, "message": str(exc),
+                                 "hint": getattr(exc, "hint", None)}}
+            code = EXIT_CODES.get(error_code, EXIT_CODES["SERVICE_ERROR"])
+        except KeyboardInterrupt:
+            payload = {"ok": False, "command": options.command,
+                       "error": {"code": "INTERRUPTED", "message": "cancelled", "hint": None}}
+            code = EXIT_CODES["INTERRUPTED"]
+        except Exception as exc:
+            payload = {"ok": False, "command": options.command,
+                       "error": {"code": "SERVICE_ERROR", "message": "%s: %s" % (type(exc).__name__, exc),
+                                 "hint": "unexpected failure; see stderr for the traceback"}}
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            code = EXIT_CODES["SERVICE_ERROR"]
 
-
-def _command_of(argv):
-    argv = sys.argv[1:] if argv is None else list(argv)
-    return next((a for a in argv if not a.startswith("-")), "schema")
+        try:
+            emit(payload, compact=options.compact, prepared=prepared)
+        except OSError as exc:
+            payload = {"ok": False, "command": options.command,
+                       "error": {"code": "INVALID_INPUT", "message": "cannot write output: %s" % exc,
+                                 "hint": "choose a writable --save path"}}
+            emit(payload, compact=options.compact)
+            code = EXIT_CODES["INVALID_INPUT"]
+        if not payload["ok"]:
+            error = payload["error"]
+            note("%s: %s" % (error["code"], error["message"]), force=True)
+            if error.get("hint"):
+                note(error["hint"], force=True)
+        return code
+    finally:
+        if prepared:
+            prepared[1].unlink(missing_ok=True)
+        _QUIET = previous_quiet
+        ml.configure_metadata_cache(**previous_policy)
+        if previous_directory is None:
+            os.environ.pop(research_paths.ENV_VAR, None)
+        else:
+            os.environ[research_paths.ENV_VAR] = previous_directory
 
 
 if __name__ == "__main__":

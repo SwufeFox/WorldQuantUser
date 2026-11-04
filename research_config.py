@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Research-file parsing and validation, shared by the CLI and the GUI.
+"""Research-file parsing and validation, shared by the CLI and research scripts.
 
 A "research file" is the unit of work this toolchain trades in: a set of
 expressions plus the settings to simulate them with. Keeping the format here
-means the CLI, the GUI and any test agree on exactly one definition.
+means the CLI, research scripts and tests agree on exactly one definition.
 
 Two shapes are accepted:
 
@@ -16,12 +16,14 @@ Two shapes are accepted:
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import machine_lib as ml
 
 RESEARCH_FILE_SPEC = {
-    "description": "Input to `simulate`. Either JSON or a plain line-based file.",
+    "description": "Input to `lint`, `simulate`, and `ablate`: JSON or plain text. "
+                   "Use - as the file path to read UTF-8 stdin (an optional BOM is accepted).",
     "json": {
         "array": ["raw(liabilities/assets)", {"expression": "rank(cap)", "decay": 4}],
         "object": {
@@ -35,6 +37,9 @@ RESEARCH_FILE_SPEC = {
         "notes": [
             "A bare object with 'expression' is treated as a single alpha.",
             "settings in the file are overridden by explicit command-line flags.",
+            "lint and simulate merge repeated --file and --expr inputs; later file "
+            "settings override earlier files. Each invocation accepts stdin only once.",
+            "ablate requires exactly one composite; its file and --expr inputs are mutually exclusive.",
             "alphas entries may be plain strings, {expression, decay} objects, or "
             "[expression, decay] pairs.",
         ],
@@ -96,12 +101,22 @@ def parse_research_text(text, source="<text>"):
     return {}, entries
 
 
+def read_input_text(path):
+    """Read UTF-8 text from a path or one complete stdin stream (``-``)."""
+    try:
+        if str(path) == "-":
+            stream = getattr(sys.stdin, "buffer", sys.stdin)
+            text = stream.read()
+            return (text.decode("utf-8-sig") if isinstance(text, bytes)
+                    else text.removeprefix("\ufeff"))
+        return Path(path).read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeError) as exc:
+        raise ResearchError("cannot read %s: %s" % (path, exc)) from exc
+
+
 def load_research_file(path):
-    """Read a research file from disk and return ``(settings, alphas)``."""
-    path = Path(path)
-    if not path.is_file():
-        raise ResearchError("research file not found: %s" % path)
-    return parse_research_text(path.read_text(), str(path))
+    """Read a research file or stdin and return ``(settings, alphas)``."""
+    return parse_research_text(read_input_text(path), str(path))
 
 
 def build_config(settings=None, alphas=None):

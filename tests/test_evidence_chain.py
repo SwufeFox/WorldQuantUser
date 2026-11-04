@@ -120,7 +120,7 @@ class JudgementInheritanceTests(unittest.TestCase):
 
 class LabelResponseTests(unittest.TestCase):
     def test_label_returns_the_stored_entry(self):
-        # `alpha record` returns the row it wrote; `alpha label` returned only a
+        # `ledger record` returns the row it wrote; `ledger label` returned only a
         # summary, so `data["entry"]` came back None and the caller had to reload the
         # ledger to see what had actually been stored.
         tmp = tempfile.mkdtemp()
@@ -133,7 +133,7 @@ class LabelResponseTests(unittest.TestCase):
         args = argparse.Namespace(alpha_id="A1", family="event", verdict=None,
                                   mechanism="m", idea=None, note=None,
                                   registry=path, save=None)
-        data = cli.cmd_alpha_label(args, mock.MagicMock())
+        data = cli.cmd_ledger_label(args, mock.MagicMock())
         self.assertTrue(data["written"])
         self.assertEqual(data["registry"], path)
         self.assertEqual(data["entry"]["family"], "event")

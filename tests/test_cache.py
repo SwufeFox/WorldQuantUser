@@ -41,6 +41,7 @@ class AtomicWriteTests(TempCacheCase):
         leftovers = [n for n in os.listdir(os.path.dirname(target)) if n.endswith(".tmp")]
         self.assertEqual(leftovers, [])
 
+    @unittest.skipUnless(os.name == "posix", "POSIX mode bits are unavailable on Windows")
     def test_file_mode_defaults_to_private(self):
         target = self.path("secret.json")
         cache_store.write_json_atomic(target, {"ok": True})

@@ -46,6 +46,10 @@ visible rather than remembered.
   counted **per key**;
 * anything deliberately excluded.
 
+Member paths in the manifest and archive use `/` on every platform. Windows
+backups therefore verify against the same names that tar stores, and nested
+results restore with the same layout on Windows and POSIX.
+
 Two counts in there are deliberately different. On 2026-11-01 the ledger held
 **2134 rows over 1267 keys**, and **117 rows carry an `ACTIVE` status while the book
 is 48 keys** — the same alpha filed at several universes. A manifest that reports

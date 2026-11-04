@@ -51,7 +51,7 @@ __all__ = [
 # ``falsified`` - a pre-registered hypothesis was put on trial with controls
 #                 and the controls won. This is a *result*, not a failure: it
 #                 tells a later round not to re-open the mechanism, and it is
-#                 the reason `alpha find` exists. Keep the note specific about
+#                 the reason `ledger list` exists. Keep the note specific about
 #                 which control killed it.
 # ``no_go``     - abandoned before a fair test (data blocked, unusable fields).
 VERDICTS = ("candidate", "watch", "rejected", "falsified", "no_go")
@@ -452,7 +452,7 @@ def _inherit_judgement(entry, previous, pinned_verdict=False):
     """Keep human labels when a simulation is re-recorded without them.
 
     Metrics and checks are measurements and are always replaced. Family,
-    mechanism, idea, note and lineage are judgement - ``alpha label`` exists
+    mechanism, idea, note and lineage are judgement - ``ledger label`` exists
     precisely so a person can set them - and a re-run that carries no opinion must
     not erase them. Before this, re-simulating an id blanked ``family`` and
     ``mechanism`` and dropped ``parent``/``op``, so the ledger's lineage view lost
@@ -542,7 +542,7 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
 
 def find_entries(entries, field=None, mechanism=None, idea=None,
                  expression=None, verdicts=None, min_fitness=None,
-                 family=None):
+                 family=None, min_sharpe=None):
     """Filter ledger entries by field usage, mechanism, idea or expression.
 
     ``field`` is matched as a substring of the recorded expression, which is
@@ -576,6 +576,10 @@ def find_entries(entries, field=None, mechanism=None, idea=None,
         if min_fitness is not None:
             fitness = (entry.get("metrics") or {}).get("fitness")
             if not isinstance(fitness, (int, float)) or fitness < min_fitness:
+                continue
+        if min_sharpe is not None:
+            sharpe = (entry.get("metrics") or {}).get("sharpe")
+            if not isinstance(sharpe, (int, float)) or sharpe < min_sharpe:
                 continue
         matched.append(entry)
     return matched

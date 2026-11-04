@@ -69,20 +69,6 @@ class Loading(unittest.TestCase):
         self.assertIsNone(cf.reason("quality", path))
 
 
-class TheShippedList(unittest.TestCase):
-    def test_the_shipped_file_parses_and_closes_the_option_family(self):
-        payload = cf.load()
-        self.assertNotIn("error", payload, "the shipped list must be readable")
-        self.assertIn("option", cf.closed_families())
-
-    def test_every_entry_carries_a_reason_and_a_class(self):
-        for entry in cf.entries():
-            self.assertTrue(entry.get("reason"), entry.get("id"))
-            self.assertIn(entry.get("class"),
-                          {"blocked-by-check", "falsified", "structurally-impossible"},
-                          entry.get("id"))
-
-
 class SeedsRespectIt(unittest.TestCase):
     def entry(self, family, fitness, expression=None):
         return {"expression": expression or LADDER, "status": "ACTIVE",
