@@ -37,26 +37,13 @@ def _catalog(session, settings):
     operators = ml.fetch_operators(session)
     operator_index = expression_lint.build_operator_index(operators)
 
-    datasets = ml.get_datasets(
+    records = field_index.fetch_all_fields(
         session,
-        instrument_type=settings.get("instrumentType", "EQUITY"),
-        region=settings.get("region", "USA"),
-        delay=settings.get("delay", 1),
-        universe=settings.get("universe", "TOP3000"),
-    ) or []
-    records = []
-    for item in datasets:
-        dataset_id = item.get("id")
-        if not dataset_id:
-            continue
-        records.extend(ml.get_datafields(
-            session,
-            instrument_type=settings.get("instrumentType", "EQUITY"),
-            region=settings.get("region", "USA"),
-            delay=settings.get("delay", 1),
-            universe=settings.get("universe", "TOP3000"),
-            dataset_id=dataset_id,
-        ) or [])
+        instrument_type=settings.get("instrumentType", ml.DEFAULT_SETTINGS["instrumentType"]),
+        region=settings.get("region", ml.DEFAULT_SETTINGS["region"]),
+        delay=settings.get("delay", ml.DEFAULT_SETTINGS["delay"]),
+        universe=settings.get("universe", ml.DEFAULT_SETTINGS["universe"]),
+    )
     known = field_index.field_ids(records)
     types = {r.get("id"): r.get("type") for r in records if r.get("id")}
     return operator_index, known, types

@@ -35,6 +35,11 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 文献检索分别在 `account.py`、`campaign.py`、`literature.py`。
 这些是内部模块，入口仍是 `research_cli.py`；改命令时直接修改、测试所属模块。
 
+字段枚举统一走 `field_index.fetch_all_fields`。`validation.py` 的在线 lint 和
+模拟预检从一次查询同时生成字段名、类型及市场/披露分类，避免两条路径给出
+不同诊断；`tools.guarded_sim` 复用同一枚举。基础安装只需 `requests`，
+`pandas` 在调用 `fields_to_df()` 时按需加载，DataFrame 用户再单独安装。
+
 ## 我要回答……
 
 ### 台账里有什么、对不对

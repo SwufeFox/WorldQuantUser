@@ -107,6 +107,9 @@ Command modules return data or raise a typed error; the execution boundary owns
 stdout, saving, workspace overrides and exit codes. The parser binds handlers
 explicitly and generates help/schema from those same declarations.
 
+Each CLI invocation restores the caller's diagnostic handler, metadata cache policy
+and workspace settings when it exits, including on command failures.
+
 The root libraries (`machine_lib`, `research_config`, `alpha_registry`, the expression
 and field modules) implement reusable research behavior and never import the CLI
 application. Add a command in its owning module, declare its arguments in
@@ -142,10 +145,17 @@ and the reasons do not.
 ## Install
 
 ```bash
-pip install -r requirements.txt      # requests (required), pandas (optional)
+pip install -r requirements.txt      # required: requests
 ```
 
-`pandas` is only needed by `fields_to_df()`; the CLI runs without it.
+`pandas` is imported only when `fields_to_df()` is called. Install it separately
+for DataFrame helpers or notebooks:
+
+```bash
+pip install "pandas>=2.0"
+```
+
+The CLI, list-based field processing and submission checks run without it.
 
 ## Credentials
 
@@ -733,6 +743,12 @@ page exists, the operator does not.) `simulate` runs the same check before
 submitting and refuses to spend quota on an expression that cannot work; pass
 `--allow-lint-errors` to override. Exit code is `2` on a lint failure and the
 error envelope carries every finding under `error.details`.
+
+Online `lint` and simulation preflight derive field names, types and market/disclosure
+classification from one scoped field-catalog fetch per check. Both reject a raw
+VECTOR passed to `rank`; reduce it first, for example `rank(vec_avg(vector_field))`.
+`tools.guarded_sim` uses the same field enumerator. Offline lint skips live metadata
+and authentication.
 
 Rejections the simulator reports are written back to
 `<research_dir>/operator-denylist.json` with a severity: `block` when the operator

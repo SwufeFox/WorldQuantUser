@@ -15,6 +15,7 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+import machine_lib as ml
 import paper_search
 import research_paths
 from research_app import alphas as cli_alphas
@@ -38,6 +39,29 @@ class PaperSaveTests(unittest.TestCase):
                 saved = handle.read()
             self.assertEqual(saved, stdout.getvalue())
             self.assertEqual(json.loads(saved)["data"]["results"][0]["title"], "Anomalies")
+
+
+class DiagnosticLifecycleTests(unittest.TestCase):
+    def test_library_diagnostics_survive_successful_and_failed_cli_calls(self):
+        cases = [
+            (["schema", "resume"], 0),
+            (["schema", "resume", "--unknown-architecture-option"], 2),
+            (["simulate", "--expr", "rank(close)", "--batch-size", "0"], 2),
+        ]
+        for arguments, expected_code in cases:
+            with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as directory:
+                messages = []
+                previous = ml.set_diagnostic_handler(messages.append)
+                try:
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+                        code = cli_app.main(["--research-dir", directory, "--quiet", *arguments])
+                        ml.note("library diagnostic after CLI")
+                    self.assertEqual(code, expected_code, stderr.getvalue())
+                    self.assertEqual(json.loads(stdout.getvalue())["ok"], expected_code == 0)
+                    self.assertEqual(messages, ["library diagnostic after CLI"])
+                finally:
+                    ml.set_diagnostic_handler(previous)
 
 
 class NegativeMaxWaitTests(unittest.TestCase):

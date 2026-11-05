@@ -59,12 +59,6 @@ import requests
 import cache_store
 import research_paths
 
-try:  # pandas is optional: only the dataframe helpers and the notebook need it
-    import pandas as pd
-except ImportError:  # pragma: no cover - exercised only when pandas is absent
-    pd = None
-
-
 # ---------------------------------------------------------------------------
 # Diagnostics
 #
@@ -76,9 +70,11 @@ _diagnostic_handler = None
 
 
 def set_diagnostic_handler(handler):
-    """Route this module's diagnostics through ``handler`` (``None`` resets)."""
+    """Install a diagnostic handler and return the previous one for restoration."""
     global _diagnostic_handler
+    previous = _diagnostic_handler
     _diagnostic_handler = handler
+    return previous
 
 
 def note(message):
@@ -856,9 +852,11 @@ def field_ids(fields, field_type=None, search=""):
 
 def fields_to_df(fields):
     """Wrap ``list[dict]`` metadata in a DataFrame when pandas is installed."""
-    if pd is None:
-        raise RuntimeError("pandas is required for fields_to_df(); pip install pandas")
-    return pd.DataFrame(fields)
+    try:
+        import pandas
+    except ImportError as exc:
+        raise RuntimeError("pandas is required for fields_to_df(); pip install pandas") from exc
+    return pandas.DataFrame(fields)
 
 
 def process_datafields(fields):
@@ -868,7 +866,7 @@ def process_datafields(fields):
     older notebooks). MATRIX fields are winsorized + backfilled, VECTOR fields
     are converted to a scalar via ``vec_avg``.
     """
-    if pd is not None and hasattr(fields, "to_dict"):
+    if hasattr(fields, "to_dict"):
         fields = fields.to_dict("records")
     matrix = [
         'winsorize(ts_backfill(%s, 120), std=4)' % f["id"]
@@ -2071,11 +2069,12 @@ def get_check_submission(s, alpha_id):
         if result.json().get("is", 0) == 0:
             print("logged out")
             return "sleep"
-        checks_df = pd.DataFrame(
-                result.json()["is"]["checks"]
-        )
-        pc = checks_df[checks_df.name == "SELF_CORRELATION"]["value"].values[0]
-        if not any(checks_df["result"] == "FAIL"):
+        checks = result.json()["is"]["checks"]
+        if not any("value" in check for check in checks) or not any("result" in check for check in checks):
+            raise KeyError("checks require value and result columns")
+        pc = next(check.get("value", math.nan) for check in checks
+                  if check.get("name") == "SELF_CORRELATION")
+        if not any(check.get("result") == "FAIL" for check in checks):
             return pc
         else:
             return "fail"

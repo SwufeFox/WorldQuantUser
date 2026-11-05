@@ -12,6 +12,7 @@ Run with::
 
 from __future__ import annotations
 
+import argparse
 import re
 import os
 import sys
@@ -29,6 +30,8 @@ import correlation
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import book_audit
 import expression_lint
+import field_index
+import guarded_sim
 import paper_search
 import expression_types
 import expression_units
@@ -37,6 +40,7 @@ import probe_units  # noqa: E402
 import field_contract  # noqa: E402
 import machine_lib
 import research_paths  # noqa: E402
+from research_app import validation as cli_validation
 
 
 def datafield(field_id, description, dataset="fundamental6", delay=1,
@@ -438,6 +442,123 @@ class ExpressionLintTests(unittest.TestCase):
         self.assertEqual(report["expressions"], 2)
         self.assertEqual(len(report["errors"]), 1)
         self.assertIn("expression", report["errors"][0])
+
+
+class CatalogValidationTests(unittest.TestCase):
+    """Lint and simulation preflight share a catalog without touching user data."""
+
+    def setUp(self):
+        self.session = object()
+        records = [
+            datafield("catalog_vector", "Events", dataset="pv1", type_="VECTOR"),
+            datafield("close", "Close", dataset="pv1"),
+            datafield("annual_field", "Annual", dataset="fundamental6"),
+            {"id": "forecast_field", "type": "MATRIX", "dataset": "analyst4"},
+        ]
+        operators = OPERATORS + [{"name": "vec_avg", "category": "Vector",
+                                  "definition": "vec_avg(x)"}]
+        patches = {
+            "fields": mock.patch.object(field_index, "fetch_all_fields", return_value=records),
+            "operators": mock.patch.object(machine_lib, "fetch_operators", return_value=operators),
+            "denylist": mock.patch.object(expression_lint, "load_denylist", return_value={}),
+            "units": mock.patch.object(expression_units, "load_field_units", return_value={}),
+            "sessions": mock.patch.object(cli_validation, "with_session",
+                                          side_effect=lambda args, work: work(self.session)),
+            "notes": mock.patch.object(cli_validation, "note"),
+        }
+        for name, patcher in patches.items():
+            setattr(self, name, patcher.start())
+            self.addCleanup(patcher.stop)
+
+    def args(self, expression="rank(close)", **overrides):
+        values = {"expression": expression, "offline": False,
+                  "strict_fields": False, "allow_lint_errors": True}
+        values.update(overrides)
+        return argparse.Namespace(**values)
+
+    def test_lint_and_preflight_agree_on_catalog_types_and_market_fields(self):
+        for expression, error, turnover in [
+            ("rank(catalog_vector)", "type_mismatch", False),
+            ("rank(vec_avg(catalog_vector))", None, False),
+            ("rank(annual_field)", None, True),
+            ("rank(forecast_field)", None, True),
+        ]:
+            with self.subTest(expression=expression):
+                args = self.args(expression)
+                self.fields.reset_mock()
+                if error:
+                    with self.assertRaises(cli_validation.CliError) as failure:
+                        cli_validation.cmd_lint(args, None)
+                    document = failure.exception.details
+                else:
+                    document = cli_validation.cmd_lint(args, None)
+                self.fields.assert_called_once()
+                self.assertEqual(document["known_field_count"], 4)
+                self.fields.reset_mock()
+                preflight = cli_validation._preflight_lint(
+                    self.session, [(expression, 4)], document["settings"], args)
+                self.fields.assert_called_once()
+                result = document["results"][0]
+                self.assertEqual(result["errors"], preflight["results"][0]["errors"])
+                self.assertEqual(result["warnings"], preflight["results"][0]["warnings"])
+                self.assertEqual({item["code"] for item in result["errors"]},
+                                 {error} if error else set())
+                self.assertEqual("turnover_floor_risk" in
+                                 {item["code"] for item in result["warnings"]}, turnover)
+
+
+    def test_offline_lint_never_opens_a_session_or_fetches_metadata(self):
+        args = self.args("rank(catalog_vector)", offline=True,
+                         strict_fields=True, denylist="chosen-denylist.json")
+        with mock.patch.object(machine_lib, "load_session") as load_session, \
+                mock.patch.object(machine_lib, "login") as login:
+            document = cli_validation.cmd_lint(args, None)
+        self.assertTrue(document["ok"])
+        self.assertFalse(document["catalog_checked"])
+        self.assertIsNone(document["known_field_count"])
+        self.sessions.assert_not_called()
+        load_session.assert_not_called()
+        login.assert_not_called()
+        self.fields.assert_not_called()
+        self.operators.assert_not_called()
+
+    def test_unknown_fields_still_follow_strict_mode(self):
+        args = self.args("rank(missing_catalog_field)")
+        report = cli_validation.cmd_lint(args, None)["results"][0]
+        self.assertIn("unknown_identifier", {item["code"] for item in report["warnings"]})
+        args.strict_fields = True
+        with self.assertRaises(cli_validation.CliError) as failure:
+            cli_validation.cmd_lint(args, None)
+        errors = failure.exception.details["results"][0]["errors"]
+        self.assertIn("unknown_identifier", {item["code"] for item in errors})
+
+    def test_preflight_preserves_refusal_override_and_metadata_degradation(self):
+        args = self.args(allow_lint_errors=False)
+        with self.assertRaises(cli_validation.CliError):
+            cli_validation._preflight_lint(self.session, [("rank(catalog_vector)", 4)], {}, args)
+        args.allow_lint_errors = True
+        report = cli_validation._preflight_lint(
+            self.session, [("rank(catalog_vector)", 4)], {}, args)
+        self.assertFalse(report["ok"])
+        self.fields.side_effect = RuntimeError("field metadata unavailable")
+        self.operators.side_effect = RuntimeError("operator metadata unavailable")
+        args.allow_lint_errors = False
+        report = cli_validation._preflight_lint(
+            self.session, [("rank(missing_catalog_field)", 4)], {}, args)
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["field_catalog"].startswith("unavailable:"))
+        self.assertTrue(report["operator_catalog"].startswith("unavailable:"))
+        self.denylist.return_value = {"rank": {"severity": "block", "reason": "rejected"}}
+        with self.assertRaises(cli_validation.CliError):
+            cli_validation._preflight_lint(self.session, [("rank(close)", 4)], {}, args)
+
+    def test_guarded_check_rejects_vector_but_accepts_reduction(self):
+        report = guarded_sim.check(
+            ["rank(catalog_vector)", "rank(vec_avg(catalog_vector))"],
+            session=self.session)
+        self.assertEqual({item["code"] for item in report["results"][0]["errors"]},
+                         {"type_mismatch"})
+        self.assertTrue(report["results"][1]["ok"])
 
 
 class AlphaRegistryTests(unittest.TestCase):

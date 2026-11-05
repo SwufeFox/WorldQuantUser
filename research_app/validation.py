@@ -42,37 +42,8 @@ def _preflight_lint(session, pairs, settings, args):
     market_fields = None
     field_note = "unavailable"
     try:
-        # One fetch, three views. The dataset split feeds the turnover check: a construct
-        # with no daily leg turned over 0.006-0.010 against a 0.01 floor, while the same
-        # disclosure fields with such a leg cleared it comfortably and entered the book.
-        # The list is kept here, visible, rather than buried in the linter.
-        slow_datasets = {"fundamental2", "fundamental6", "analyst4"}
-        records = field_index.fetch_all_fields(
-            session,
-            # Lint against the settings the simulation will actually use. Reading the
-            # raw CLI flags instead meant a research file asking for TOP500 was still
-            # linted against TOP3000: different field catalogue, so the check could
-            # reject a valid field or wave an unavailable one through.
-            region=settings.get("region") or ml.DEFAULT_SETTINGS["region"],
-            universe=settings.get("universe") or ml.DEFAULT_SETTINGS["universe"],
-            delay=settings.get("delay") if settings.get("delay") is not None else ml.DEFAULT_SETTINGS["delay"],
-            instrument_type=settings.get("instrumentType") or ml.DEFAULT_SETTINGS["instrumentType"],
-        )
-        known_fields = field_index.field_ids(records)
+        known_fields, field_types, market_fields = _field_scope(session, settings)
         field_note = "checked (%d names)" % len(known_fields)
-        # Field type decides whether an operator can read the field at all: a third
-        # of the catalogue is VECTOR and most operators reject event inputs.
-        field_types = {record.get("id"): record.get("type")
-                       for record in records if record.get("id")}
-        market_fields = set()
-        for record in records:
-            field_id = record.get("id")
-            if not field_id:
-                continue
-            dataset = record.get("dataset")
-            dataset_id = dataset.get("id") if isinstance(dataset, dict) else dataset
-            if dataset_id not in slow_datasets:
-                market_fields.add(field_id)
     except Exception as exc:  # noqa: BLE001
         field_note = "unavailable: %s: %s" % (type(exc).__name__, exc)
         note("lint: field catalog unavailable (%s); field names are NOT verified "
@@ -145,22 +116,20 @@ def _dataset_id(record):
 
 
 def _field_scope(session, settings):
-    """Return ``(known_field_ids, market_field_ids)`` from one catalogue fetch.
-
-    Two views on purpose: the first answers "is this a real field", the second "does
-    anything here move with the market". Fetching twice would let them disagree.
-    """
+    """Return known ids, types and market ids from one resolved-scope fetch."""
     records = field_index.fetch_all_fields(
         session,
-        region=settings["region"],
-        universe=settings["universe"],
-        delay=settings["delay"],
-        instrument_type=settings["instrumentType"],
+        region=settings.get("region") or ml.DEFAULT_SETTINGS["region"],
+        universe=settings.get("universe") or ml.DEFAULT_SETTINGS["universe"],
+        delay=settings.get("delay") if settings.get("delay") is not None else ml.DEFAULT_SETTINGS["delay"],
+        instrument_type=settings.get("instrumentType") or ml.DEFAULT_SETTINGS["instrumentType"],
     )
     known = field_index.field_ids(records)
+    types = {record.get("id"): record.get("type")
+             for record in records if record.get("id")}
     market = {record.get("id") for record in records
               if record.get("id") and _dataset_id(record) not in DISCLOSURE_DATASETS}
-    return known, market
+    return known, types, market
 
 
 def cmd_lint(args, sink):
@@ -169,14 +138,15 @@ def cmd_lint(args, sink):
     denylist = expression_lint.load_denylist(getattr(args, "denylist", None))
     operator_index = None
     known_fields = None
+    field_types = None
     market_fields = None
     catalog_checked = False
     if not getattr(args, "offline", False):
         def work(session):
-            known, market = _field_scope(session, settings)
-            return _operator_index_from_catalog(session), known, market
+            known, types, market = _field_scope(session, settings)
+            return _operator_index_from_catalog(session), known, types, market
 
-        operator_index, known_fields, market_fields = with_session(args, work)
+        operator_index, known_fields, field_types, market_fields = with_session(args, work)
         catalog_checked = operator_index is not None
 
     results = []
@@ -187,6 +157,7 @@ def cmd_lint(args, sink):
             denylist=denylist,
             known_fields=known_fields,
             strict_fields=getattr(args, "strict_fields", False),
+            field_types=field_types,
             market_fields=market_fields,
             field_units=expression_units.load_field_units(),
         )

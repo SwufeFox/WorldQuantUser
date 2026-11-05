@@ -29,7 +29,6 @@ def _dispatch(args):
         args.command = getattr(args, "command", None) or "help"
         return _help_document(args._parser)
     sink = make_event_sink(getattr(args, "stream", False), getattr(args, "verbose", False))
-    ml.set_diagnostic_handler(note)
     ml.configure_metadata_cache(
         max_age=getattr(args, "meta_max_age", None),
         refresh=getattr(args, "refresh_meta", None),
@@ -47,6 +46,7 @@ def main(argv=None):
     previous_quiet = runtime._QUIET
     previous_directory = os.environ.get(research_paths.ENV_VAR)
     previous_policy = ml.metadata_cache_policy()
+    previous_handler = ml.set_diagnostic_handler(note)
     code = EXIT_CODES["OK"]
     try:
         try:
@@ -101,6 +101,7 @@ def main(argv=None):
                 note(error["hint"], force=True)
         return code
     finally:
+        ml.set_diagnostic_handler(previous_handler)
         if prepared:
             prepared[1].unlink(missing_ok=True)
         runtime._QUIET = previous_quiet

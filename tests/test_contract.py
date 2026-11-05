@@ -77,6 +77,78 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(parse(proc)["error"]["code"], "USAGE")
 
 
+class OptionalPandasTests(unittest.TestCase):
+    fields = [
+        {"id": "close", "type": "MATRIX"},
+        {"id": "news_vector", "type": "VECTOR"},
+        {"id": "sector", "type": "GROUP"},
+    ]
+    expressions = [
+        "winsorize(ts_backfill(close, 120), std=4)",
+        "vec_avg(news_vector)",
+    ]
+
+    def block_pandas(self, error):
+        original_import = __import__
+
+        def import_without_pandas(name, *args, **kwargs):
+            if name == "pandas" or name.startswith("pandas."):
+                raise error
+            return original_import(name, *args, **kwargs)
+
+        return mock.patch("builtins.__import__", side_effect=import_without_pandas)
+
+    def test_cli_offline_commands_work_with_missing_or_broken_pandas(self):
+        script = """import builtins, runpy, sys
+original_import = builtins.__import__
+error_type = getattr(builtins, sys.argv.pop(1))
+def import_without_pandas(name, *args, **kwargs):
+    if name == "pandas" or name.startswith("pandas."):
+        raise error_type("unusable pandas installation")
+    return original_import(name, *args, **kwargs)
+builtins.__import__ = import_without_pandas
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+        commands = [
+            ("schema",),
+            ("brief",),
+            ("lint", "rank(close)", "--offline"),
+            ("simulate", "--expr", "rank(close)", "--dry-run"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            env = {k: v for k, v in os.environ.items() if not k.startswith("BRAIN_")}
+            env["BRAIN_RESEARCH_DIR"] = directory
+            for error in ("ImportError", "ValueError"):
+                for command in commands:
+                    with self.subTest(error=error, command=command):
+                        proc = subprocess.run(
+                            [sys.executable, "-c", script, error,
+                             str(ROOT / "research_cli.py"), *command],
+                            capture_output=True, encoding="utf-8", cwd=str(ROOT), env=env,
+                        )
+                        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                        self.assertTrue(parse(proc)["ok"])
+
+    def test_field_lists_work_with_broken_pandas(self):
+        with self.block_pandas(ValueError("broken pandas installation")):
+            self.assertEqual(ml.process_datafields(self.fields), self.expressions)
+
+    def test_fields_to_df_converts_real_dataframe_and_processes_records(self):
+        try:
+            import pandas
+        except ImportError:
+            self.skipTest("pandas is optional")
+        frame = ml.fields_to_df(self.fields)
+        self.assertIsInstance(frame, pandas.DataFrame)
+        self.assertEqual(ml.process_datafields(frame), self.expressions)
+
+    def test_fields_to_df_requires_optional_dependency(self):
+        with self.block_pandas(ImportError("pandas is absent")):
+            with self.assertRaises(RuntimeError):
+                ml.fields_to_df(self.fields)
+
+
 class ErrorEnvelopeTests(unittest.TestCase):
     def test_unknown_command_still_prints_json_on_stdout(self):
         proc = run_cli("bogus")
@@ -553,6 +625,58 @@ class CheckExtractionTests(unittest.TestCase):
 
     def test_extract_checks_returns_none_when_absent(self):
         self.assertIsNone(ml._extract_checks({}))
+
+    def test_legacy_submission_check_returns_correlation_or_fail(self):
+        for status, expected in (("PASS", 0.24), ("PENDING", 0.24), ("FAIL", "fail")):
+            with self.subTest(status=status):
+                session = mock.Mock()
+                session.get.return_value.headers = {}
+                session.get.return_value.json.return_value = {"is": {"checks": [
+                    {"name": "SELF_CORRELATION", "value": 0.24, "result": "PASS"},
+                    {"name": "LOW_SHARPE", "value": 1.5, "result": status},
+                    {"name": "WAITING_CHECK"},
+                ]}}
+                self.assertEqual(ml.get_check_submission(session, "alpha-1"), expected)
+
+    def test_legacy_submission_check_keeps_missing_correlation_value_as_nan(self):
+        session = mock.Mock()
+        session.get.return_value.headers = {}
+        session.get.return_value.json.return_value = {"is": {"checks": [
+            {"name": "SELF_CORRELATION", "result": "PENDING"},
+            {"name": "LOW_SHARPE", "value": 1.5, "result": "PASS"},
+        ]}}
+        value = ml.get_check_submission(session, "alpha-1")
+        self.assertIsInstance(value, float)
+        self.assertNotEqual(value, value)  # NaN, as in the former DataFrame result.
+
+    def test_legacy_submission_check_preserves_sleep_and_error_results(self):
+        for payload, expected in (
+                ({}, "sleep"),
+                ({"is": {"checks": []}}, "error"),
+                ({"is": {"checks": [{"name": "SELF_CORRELATION", "value": 0.24}]}},
+                 "error"),
+                ({"is": {"checks": [{"name": "SELF_CORRELATION"}]}},
+                 "error")):
+            with self.subTest(payload=payload):
+                session = mock.Mock()
+                session.get.return_value.headers = {}
+                session.get.return_value.json.return_value = payload
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "stdout", stdout):
+                    self.assertEqual(ml.get_check_submission(session, "alpha-1"), expected)
+
+    def test_legacy_submission_check_keeps_retry_after_polling(self):
+        pending, complete = mock.Mock(), mock.Mock()
+        pending.headers = ml.requests.structures.CaseInsensitiveDict({"Retry-After": "0.25"})
+        complete.headers = {}
+        complete.json.return_value = {"is": {"checks": [
+            {"name": "SELF_CORRELATION", "value": 0.24, "result": "PASS"},
+        ]}}
+        session = mock.Mock()
+        session.get.side_effect = [pending, complete]
+        with mock.patch.object(ml.time, "sleep") as sleep:
+            self.assertEqual(ml.get_check_submission(session, "alpha-1"), 0.24)
+        sleep.assert_called_once_with(0.25)
 
 
 class SummaryTests(unittest.TestCase):
