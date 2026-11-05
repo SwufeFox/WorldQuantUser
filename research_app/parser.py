@@ -528,7 +528,11 @@ def build_parser():
                      help="Pairwise correlation over cached PnL of matched entries.")
     ask.add_argument("--matrix-within", default="expr",
                      choices=["none", "expr", "family", "neutralization"],
-                     help="Restrict matrix pairs to entries sharing this key.")
+                     help="Restrict matrix pairs to entries sharing this key. The "
+                          "default (expr) answers 'same construction, different "
+                          "settings' and therefore reports very few pairs when every "
+                          "entry is a distinct expression - use --matrix-within none "
+                          "for the whole matched set.")
     ask.add_argument("--min-overlap", type=int, default=200,
                      help="Shared trading days required for each correlation pair.")
     ask.add_argument("--list", action="store_true",
