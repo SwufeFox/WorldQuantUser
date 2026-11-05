@@ -24,6 +24,7 @@ from __future__ import annotations
 
 __all__ = [
     "align",
+    "spectrum",
     "pearson",
     "matrix",
     "max_against",
@@ -221,3 +222,47 @@ def classify(daily_correlation, threshold=0.7, platform_bias=PLATFORM_BIAS):
     if estimate >= threshold - BORDERLINE_BAND:
         return "borderline", estimate
     return "clear", estimate
+
+
+def spectrum(ids, pairs):
+    """How many *independent* bets a correlated set really is.
+
+    ``effective_bets`` is ``(sum lambda)^2 / sum lambda^2`` - the squared Frobenius
+    norm gives the denominator without ever forming the eigenvalues - and
+    ``pc1_share`` is the largest eigenvalue over the trace, found by power iteration
+    so this module stays free of numpy.
+
+    The cluster count answers a different question. Twenty-five alphas can sit in
+    twenty-four clusters at ``|r| >= 0.7`` and still behave like seven bets, because
+    the correlation is diffuse rather than blocked; the quality family measured
+    exactly that (24 clusters, 7.12 effective bets).
+    """
+    n = len(ids)
+    if n < 2:
+        return {"effective_bets": None, "pc1_share": None, "median_abs_r": None,
+                "pairs_measured": 0}
+    index = {name: position for position, name in enumerate(ids)}
+    matrix = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+    off = []
+    for pair in pairs:
+        i, j = index[pair["a"]], index[pair["b"]]
+        value = pair["r"]
+        matrix[i][j] = matrix[j][i] = value
+        off.append(abs(value))
+    frobenius = sum(cell * cell for row in matrix for cell in row)
+    effective = (n * n / frobenius) if frobenius else None
+    vector = [1.0] * n
+    for _ in range(80):
+        product = [sum(matrix[i][j] * vector[j] for j in range(n)) for i in range(n)]
+        scale = max(abs(value) for value in product) or 1.0
+        vector = [value / scale for value in product]
+    numerator = sum(sum(matrix[i][j] * vector[j] for j in range(n)) * vector[i]
+                    for i in range(n))
+    denominator = sum(value * value for value in vector)
+    lam1 = numerator / denominator if denominator else 0.0
+    ordered = sorted(off)
+    median = ordered[len(ordered) // 2] if ordered else None
+    return {"effective_bets": round(effective, 2) if effective else None,
+            "pc1_share": round(lam1 / n, 3),
+            "median_abs_r": round(median, 3) if median is not None else None,
+            "pairs_measured": len(off)}

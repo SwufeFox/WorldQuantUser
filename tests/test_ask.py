@@ -146,6 +146,25 @@ class MatrixTests(unittest.TestCase):
             self.assertAlmostEqual(block["pairs"][0]["r"], 1.0, places=6)
             self.assertEqual(block["pairs_skipped"], 0)
 
+    def test_the_matrix_reports_effective_bets_not_just_pair_counts(self):
+        # The count of clusters answers "how many groups", not "how many bets": a pool
+        # can split into many clusters and still move as one. The spectrum is the
+        # number a portfolio decision needs, so it has to come out of `ask` too.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {("2026-01-%02d" % day): float(day % 7) for day in range(1, 29)}
+            other = {key: float(value + index) for index, (key, value) in
+                     enumerate(base.items())}
+            self._write(tmp, "A1", base)
+            self._write(tmp, "A2", other)
+            entries = [entry("A1"), entry("A2")]
+            with mock.patch.object(cli.research_paths, "ensure_dir",
+                                   return_value=tmp):
+                block = cli._ask_matrix(entries, "none", min_overlap=10)
+            self.assertEqual(block["pairs_measured"], 1)
+            self.assertIsNotNone(block["effective_bets"])
+            self.assertIsNotNone(block["pc1_share"])
+            self.assertEqual(block["groups"][0]["within"], None)
+
     def test_a_pnl_outside_the_overlap_guard_is_skipped_not_dropped(self):
         with tempfile.TemporaryDirectory() as tmp:
             series = {("2026-01-%02d" % day): float(day) for day in range(1, 29)}

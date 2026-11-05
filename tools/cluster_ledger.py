@@ -176,47 +176,8 @@ def independent_set(ids, pairs, threshold, priority):
 
 
 def spectral_summary(ids, pairs):
-    """How many *independent* bets a set of alphas really is.
-
-    Two numbers, both from the correlation matrix and both pure arithmetic:
-    ``effective_bets`` is ``(sum lambda)^2 / sum lambda^2`` and ``pc1_share`` is the
-    largest eigenvalue over the trace. They answer a different question from the
-    cluster count: 25 alphas can sit in 24 clusters at |r| >= 0.7 and still behave
-    like seven bets, because the correlation is diffuse rather than blocked. Counting
-    clusters alone made the quality family look un-saturated.
-
-    ``sum lambda^2`` is the squared Frobenius norm, so only ``lambda_1`` needs
-    iteration - computed here by power iteration to keep this module free of numpy.
-    """
-    n = len(ids)
-    if n < 2:
-        return {"effective_bets": None, "pc1_share": None, "median_abs_r": None,
-                "pairs_measured": 0}
-    index = {name: position for position, name in enumerate(ids)}
-    matrix = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
-    off = []
-    for pair in pairs:
-        i, j = index[pair["a"]], index[pair["b"]]
-        value = pair["r"]
-        matrix[i][j] = matrix[j][i] = value
-        off.append(abs(value))
-    frobenius = sum(cell * cell for row in matrix for cell in row)
-    effective = (n * n / frobenius) if frobenius else None
-    vector = [1.0] * n
-    for _ in range(80):
-        product = [sum(matrix[i][j] * vector[j] for j in range(n)) for i in range(n)]
-        scale = max(abs(value) for value in product) or 1.0
-        vector = [value / scale for value in product]
-    numerator = sum(sum(matrix[i][j] * vector[j] for j in range(n)) * vector[i]
-                    for i in range(n))
-    denominator = sum(value * value for value in vector)
-    lam1 = numerator / denominator if denominator else 0.0
-    ordered = sorted(off)
-    median = ordered[len(ordered) // 2] if ordered else None
-    return {"effective_bets": round(effective, 2) if effective else None,
-            "pc1_share": round(lam1 / n, 3),
-            "median_abs_r": round(median, 3) if median is not None else None,
-            "pairs_measured": len(off)}
+    """Thin alias over :func:`correlation.spectrum` for this tool's callers."""
+    return correlation.spectrum(ids, pairs)
 
 
 def main(argv=None):

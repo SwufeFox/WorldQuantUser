@@ -425,11 +425,29 @@ def _ask_matrix(entries, within, min_overlap):
             skipped.append({**pair, "within": key})
     ordered = sorted(pairs, key=lambda item: abs(item["r"]), reverse=True)
     absolute = [abs(pair["r"]) for pair in pairs]
+    # Every measured id belongs to one group; the spectrum is computed per group and
+    # once over the whole matched set. `median_abs_r` says how tight the typical pair
+    # is, the effective bet count says how many bets the set actually is - 24 clusters
+    # can still be 7 bets.
+    members = {}
+    for key, pnls in groups.items():
+        if len(pnls) >= 2:
+            members[key] = sorted(pnls)
+    per_group = []
+    for key, names in members.items():
+        block = [pair for pair in pairs if pair["within"] == key]
+        spectrum = correlation.spectrum(names, block)
+        per_group.append({"within": key, "n": len(names), **spectrum})
+    everything = sorted({name for names in members.values() for name in names})
+    overall = correlation.spectrum(everything, pairs) if len(members) == 1 else None
     return {
         "pairs_measured": len(pairs),
         "pairs_skipped": len(skipped),
         "median_abs_r": round(_ask_quantile(absolute, 0.5), 4) if absolute else None,
         "largest": ordered[0] if ordered else None,
+        "effective_bets": (overall or {}).get("effective_bets"),
+        "pc1_share": (overall or {}).get("pc1_share"),
+        "groups": per_group,
         "pairs": ordered,
         "skipped": skipped[:20],
         "missing_pnl": missing[:20],
