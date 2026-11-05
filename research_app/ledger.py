@@ -560,9 +560,19 @@ def cmd_ask(args, _sink):
         document["panel"] = _ask_panel(matched, args.by, args.panel)
     if args.matrix:
         document["matrix"] = _ask_matrix(matched, args.matrix_within, args.min_overlap)
-    if getattr(args, "factor_ids", None):
+    factor_ids = None
+    if getattr(args, "factor_where", None):
+        # Build the factor from a query instead of a pasted id list: "correlate every
+        # candidate against the book" is `--factor-where status=ACTIVE`, and typing 51
+        # ids by hand is how a probe becomes stale the moment the book changes.
+        factor_ids = [entry.get("alpha_id") for entry in entries
+                      if _ask_passes(entry, _ask_filters(args.factor_where))
+                      and entry.get("alpha_id")]
+    elif getattr(args, "factor_ids", None):
         factor_ids = [part.strip() for part in str(args.factor_ids).replace(",", " ").split()
                       if part.strip()]
+    if factor_ids:
+        document.setdefault("query", {})["factor_where"] = getattr(args, "factor_where", None)
         document["factor"] = _ask_factor(matched, factor_ids, args.min_overlap,
                                          getattr(args, "factor_threshold", 0.8))
     if args.list:

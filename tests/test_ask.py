@@ -6,6 +6,7 @@ real use of `ask` already corrected two hand-rolled numbers, so the arithmetic h
 is checked against hand-computable cases rather than against itself.
 """
 
+import argparse
 import json
 import sys
 import tempfile
@@ -145,6 +146,26 @@ class MatrixTests(unittest.TestCase):
             self.assertEqual(block["pairs_measured"], 1)
             self.assertAlmostEqual(block["pairs"][0]["r"], 1.0, places=6)
             self.assertEqual(block["pairs_skipped"], 0)
+
+    def test_the_factor_can_be_built_from_a_query(self):
+        # Typing 51 ids by hand is how a probe goes stale the moment the book changes;
+        # --factor-where builds the factor from the same selector syntax as --where.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {("2026-01-%02d" % day): float((day * 5) % 9) for day in range(1, 41)}
+            self._write(tmp, "BOOK1", base)
+            self._write(tmp, "CAND", {key: value + 0.5 for key, value in base.items()})
+            args = argparse.Namespace(
+                where="status=UNSUBMITTED", by=None, stat=None, panel=None,
+                matrix=None, matrix_within="expr", min_overlap=10, list=False,
+                limit=20, registry=None, save=None, factor_ids=None,
+                factor_where="status=ACTIVE", factor_threshold=0.8)
+            entries = [entry("BOOK1", status="ACTIVE"), entry("CAND", status="UNSUBMITTED")]
+            with mock.patch.object(cli, "_ledger", lambda a: (None, entries)), \
+                    mock.patch.object(cli.research_paths, "ensure_dir", return_value=tmp):
+                document = cli.cmd_ask(args, mock.MagicMock())
+            self.assertEqual(document["rows_matched"], 1)
+            self.assertEqual(document["factor"]["n"], 1)
+            self.assertEqual(document["factor"]["ids"], ["BOOK1"])
 
     def test_a_factor_probe_names_the_variants_of_one_leg(self):
         # The question the cluster count cannot answer: if a dozen alphas are the same

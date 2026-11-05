@@ -528,6 +528,10 @@ def build_parser():
                      help="Comma-separated ids whose average PnL becomes a factor; every "
                           "matched entry is correlated against it. Use it to ask how "
                           "many alphas are re-parameterisations of one measured leg.")
+    ask.add_argument("--factor-where", default=None,
+                     help="Build the factor from a ledger query instead of --factor-ids, "
+                          "e.g. --factor-where status=ACTIVE for 'correlate every match "
+                          "against the live book'.")
     ask.add_argument("--factor-threshold", type=float, default=0.8,
                      help="|r| at or above this counts as a variant of the factor "
                           "(default 0.8).")
