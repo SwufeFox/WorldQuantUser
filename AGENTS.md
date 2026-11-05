@@ -191,7 +191,14 @@ or a proven parent with one token swapped N times (`PARENT` + `SUBSTITUTIONS`).
 
 | Path | Contents |
 | --- | --- |
-| `research_cli.py` | CLI + envelope/exit-code contract. |
+| `research_cli.py` | Executable entry point only. |
+| `research_app/app.py` | Invocation boundary: workspace, JSON envelope, saving and exit codes. |
+| `research_app/parser.py` | Arguments, help and the schema generated from the live parser. |
+| `research_app/runtime.py` | Shared CLI errors/constants, output, input settings and session handling. |
+| `research_app/experiments.py` | Simulate/resume/probe/ablate/compare orchestration. |
+| `research_app/catalog.py`, `research_app/validation.py` | Catalog commands, lint and preflight. |
+| `research_app/alphas.py`, `research_app/ledger.py` | Platform alpha operations and local ledger commands. |
+| `research_app/account.py`, `research_app/campaign.py`, `research_app/literature.py` | Account/cache commands, briefs/view history and literature search. |
 | `research_config.py` | Research-file parsing and validation (`build_config`). |
 | `machine_lib.py` | BRAIN API client, typed errors, FASTEXPR factories. |
 | `tests/test_contract.py` | Offline contract tests — run these after any change. |
@@ -200,6 +207,9 @@ or a proven parent with one token swapped N times (`PARENT` + `SUBSTITUTIONS`).
 
 * Keep the contract: new commands must emit the standard envelope and map
   their failures to a documented `error.code` / exit code.
+* Put command behavior in its owning `research_app` module and bind it explicitly
+  in `research_app/parser.py`. Tests import that module; the executable entry point
+  exposes no internal helpers. Core research libraries must not import `research_app`.
 * Add or update a test in `tests/test_contract.py`; the suite must run offline
   and pass without credentials:
 

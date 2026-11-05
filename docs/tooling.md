@@ -28,6 +28,13 @@ python3 research_cli.py schema alpha get      # 单个命令的机器契约
 CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的命令用 `-`
 读取 stdin，每次调用只能读一次。`probe` 同样接受模拟设置和会话参数。
 
+实现位置也按用途固定：参数、帮助和 schema 在 `research_app/parser.py`；
+执行边界在 `app.py`，公共 CLI 约定在 `runtime.py`。目录查询、表达式检查、
+实验、平台 alpha、本地台账分别在 `catalog.py`、`validation.py`、
+`experiments.py`、`alphas.py`、`ledger.py`。账户与缓存、研究摘要与查看记录、
+文献检索分别在 `account.py`、`campaign.py`、`literature.py`。
+这些是内部模块，入口仍是 `research_cli.py`；改命令时直接修改、测试所属模块。
+
 ## 我要回答……
 
 ### 台账里有什么、对不对

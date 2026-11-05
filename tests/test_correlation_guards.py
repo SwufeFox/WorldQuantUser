@@ -23,7 +23,11 @@ sys.path.insert(0, ROOT)
 
 import ablation  # noqa: E402
 import correlation  # noqa: E402
-import research_cli as cli  # noqa: E402
+import field_index
+import machine_lib as ml
+import research_paths
+from research_app import alphas as cli_alphas
+from research_app import validation as cli_validation
 
 
 class PeerRankingTests(unittest.TestCase):
@@ -33,13 +37,13 @@ class PeerRankingTests(unittest.TestCase):
         scored = [{"alpha_id": "A", "correlation": -0.95},
                   {"alpha_id": "B", "correlation": 0.20},
                   {"alpha_id": "C", "correlation": 0.12}]
-        self.assertEqual(cli._rank_peers(scored)[0]["alpha_id"], "A")
+        self.assertEqual(cli_alphas._rank_peers(scored)[0]["alpha_id"], "A")
 
     def test_ordering_is_descending_by_absolute_value(self):
         scored = [{"alpha_id": "x", "correlation": 0.3},
                   {"alpha_id": "y", "correlation": -0.8},
                   {"alpha_id": "z", "correlation": 0.6}]
-        self.assertEqual([row["alpha_id"] for row in cli._rank_peers(scored)],
+        self.assertEqual([row["alpha_id"] for row in cli_alphas._rank_peers(scored)],
                          ["y", "z", "x"])
 
 
@@ -64,18 +68,18 @@ class IndependenceStateTests(unittest.TestCase):
     def test_skipped_pair_is_unknown(self):
         # Wrong answer this prevents: no measured pair above the line -> `independent`
         # even though the unmeasurable pair is the likeliest duplicate.
-        self.assertEqual(cli._independence_state([], [{"a": "x", "b": "y", "n": 100}], 0),
+        self.assertEqual(cli_alphas._independence_state([], [{"a": "x", "b": "y", "n": 100}], 0),
                          "unknown")
 
     def test_no_pairs_at_all_is_unknown(self):
-        self.assertEqual(cli._independence_state([], [], 0), "unknown")
+        self.assertEqual(cli_alphas._independence_state([], [], 0), "unknown")
 
     def test_flag_wins_over_skipped(self):
-        self.assertEqual(cli._independence_state([{"r": 0.9}], [{"a": "x"}], 1),
+        self.assertEqual(cli_alphas._independence_state([{"r": 0.9}], [{"a": "x"}], 1),
                          "dependent")
 
     def test_fully_measured_and_clean_is_independent(self):
-        self.assertEqual(cli._independence_state([], [], 3), "independent")
+        self.assertEqual(cli_alphas._independence_state([], [], 3), "independent")
 
 
 def _series(days, seed, shape):
@@ -99,10 +103,10 @@ class CorrCommandTests(unittest.TestCase):
         def fake_fetch(session, alpha_id, cache_dir=None, max_age_hours=None):
             return payload[alpha_id]
 
-        with mock.patch.object(cli, "with_session", lambda a, fn: fn(None)), \
-                mock.patch.object(cli.ml, "fetch_daily_pnl", fake_fetch), \
-                mock.patch.object(cli.research_paths, "ensure_dir", lambda: "/tmp"):
-            return cli.cmd_alpha_corr(args, sink)
+        with mock.patch.object(cli_alphas, "with_session", lambda a, fn: fn(None)), \
+                mock.patch.object(ml, "fetch_daily_pnl", fake_fetch), \
+                mock.patch.object(research_paths, "ensure_dir", lambda: "/tmp"):
+            return cli_alphas.cmd_alpha_corr(args, sink)
 
     def test_short_overlap_reports_unknown_not_independent(self):
         import math
@@ -144,9 +148,9 @@ class PreflightSettingsTests(unittest.TestCase):
                                   delay=None, instrument_type=None)
         settings = {"region": "USA", "universe": "TOP500", "delay": 1,
                     "instrumentType": "EQUITY"}
-        with mock.patch.object(cli, "_operator_index_from_catalog", return_value={}), \
-                mock.patch.object(cli.field_index, "fetch_all_fields", fake_fetch):
-            cli._preflight_lint(None, [("x", "rank(close)")], settings, args)
+        with mock.patch.object(cli_validation, "_operator_index_from_catalog", return_value={}), \
+                mock.patch.object(field_index, "fetch_all_fields", fake_fetch):
+            cli_validation._preflight_lint(None, [("x", "rank(close)")], settings, args)
         self.assertEqual(captured.get("universe"), "TOP500")
 
 
@@ -173,12 +177,12 @@ class VerdictGapTests(unittest.TestCase):
     """`clear` is a claim about every peer, so a gap has to weaken it."""
 
     def test_no_gaps_leaves_the_verdict_alone(self):
-        self.assertEqual(cli._verdict_with_gaps("clear", []), ("clear", None))
+        self.assertEqual(cli_alphas._verdict_with_gaps("clear", []), ("clear", None))
 
     def test_a_gap_turns_clear_into_unknown_and_says_why(self):
         gaps = [{"alpha_id": "X", "reason": "undefined", "n": 400},
                 {"alpha_id": "Y", "reason": "no_pnl", "n": 0}]
-        verdict, note = cli._verdict_with_gaps("clear", gaps)
+        verdict, note = cli_alphas._verdict_with_gaps("clear", gaps)
         self.assertEqual(verdict, "unknown")
         self.assertIn("2 peer(s)", note)
         self.assertIn("no_pnl 1", note)
@@ -187,8 +191,8 @@ class VerdictGapTests(unittest.TestCase):
     def test_a_gap_cannot_rescue_a_block(self):
         # Missing evidence can only add a reason to refuse, never remove one.
         gaps = [{"alpha_id": "X", "reason": "undefined", "n": 400}]
-        self.assertEqual(cli._verdict_with_gaps("blocked", gaps)[0], "blocked")
-        self.assertEqual(cli._verdict_with_gaps("borderline", gaps)[0], "borderline")
+        self.assertEqual(cli_alphas._verdict_with_gaps("blocked", gaps)[0], "blocked")
+        self.assertEqual(cli_alphas._verdict_with_gaps("borderline", gaps)[0], "borderline")
 
 
 class SelfCheckGapTests(unittest.TestCase):
@@ -221,14 +225,14 @@ class SelfCheckGapTests(unittest.TestCase):
         def fake_pnl(session, alpha_id, cache_dir=None, max_age_hours=None):
             return candidate if alpha_id == "CAND" else series.get(alpha_id)
 
-        with mock.patch.object(cli, "with_session", lambda a, fn: fn(None)), \
-                mock.patch.object(cli.ml, "list_alphas", fake_list), \
-                mock.patch.object(cli.ml, "fetch_daily_pnl", fake_pnl), \
-                mock.patch.object(cli.ml, "fetch_alpha_metrics",
+        with mock.patch.object(cli_alphas, "with_session", lambda a, fn: fn(None)), \
+                mock.patch.object(ml, "list_alphas", fake_list), \
+                mock.patch.object(ml, "fetch_daily_pnl", fake_pnl), \
+                mock.patch.object(ml, "fetch_alpha_metrics",
                                   lambda s, i: {"dateCreated": "2026-10-01T00:00:00Z",
                                                 "dateSubmitted": None}), \
-                mock.patch.object(cli.research_paths, "ensure_dir", lambda: "/tmp"):
-            return cli.cmd_alpha_self_check(args, mock.MagicMock())
+                mock.patch.object(research_paths, "ensure_dir", lambda: "/tmp"):
+            return cli_alphas.cmd_alpha_self_check(args, mock.MagicMock())
 
     def test_flat_peer_is_unmeasured_not_a_crash_and_not_a_zero(self):
         flat = {"d%05d" % i: 0.25 for i in range(self.DAYS)}

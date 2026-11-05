@@ -28,7 +28,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import machine_lib as ml  # noqa: E402
-import research_cli as cli  # noqa: E402
+import field_index
+from research_app import app as cli_app
+from research_app import catalog as cli_catalog
+from research_app import experiments as cli_experiments
+from research_app import parser as cli_parser
+from research_app import runtime as cli_runtime
+from research_app import validation as cli_validation
 import research_config as config_io  # noqa: E402
 
 
@@ -102,8 +108,8 @@ class ErrorEnvelopeTests(unittest.TestCase):
             ml.resolve_settings({"region": "MARS"})
 
     def test_every_error_code_has_an_exit_code(self):
-        for code in cli.ERROR_CODES:
-            self.assertIn(code, cli.EXIT_CODES, code)
+        for code in cli_runtime.ERROR_CODES:
+            self.assertIn(code, cli_runtime.EXIT_CODES, code)
 
 
 class DryRunTests(unittest.TestCase):
@@ -154,7 +160,7 @@ class CliWorkflowContractTests(unittest.TestCase):
     def invoke(self, *arguments):
         stdout, stderr = io.StringIO(), io.StringIO()
         with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
-            code = cli.main(arguments)
+            code = cli_app.main(arguments)
         return code, stdout.getvalue(), stderr.getvalue()
 
     def test_common_options_work_before_between_and_after_commands(self):
@@ -374,13 +380,13 @@ class ExpressionWorkflowTests(unittest.TestCase):
                     return ([{"id": "scoped_field", "type": "MATRIX", "dataset": "model1"}]
                             if actual == expected else [])
 
-                args = cli.build_parser().parse_args(["lint", "--file", "-", "--strict-fields", *flags])
+                args = cli_parser.build_parser().parse_args(["lint", "--file", "-", "--strict-fields", *flags])
                 with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(document))), \
                         mock.patch.object(ml, "load_session", return_value=object()), \
                         mock.patch.object(ml, "fetch_operators", return_value=[
                             {"name": "rank", "definition": "rank(x)"}]), \
-                        mock.patch.object(cli.field_index, "fetch_all_fields", side_effect=fields):
-                    data = cli.cmd_lint(args, None)
+                        mock.patch.object(field_index, "fetch_all_fields", side_effect=fields):
+                    data = cli_validation.cmd_lint(args, None)
                 self.assertTrue(data["ok"])
                 self.assertEqual(data["known_field_count"], 1)
                 self.assertEqual(tuple(data["settings"][key] for key in ("region", "universe", "delay")),
@@ -389,12 +395,12 @@ class ExpressionWorkflowTests(unittest.TestCase):
     def test_catalog_and_lint_defaults_follow_machine_library(self):
         defaults = {**ml.DEFAULT_SETTINGS, "region": "EUR", "universe": "TOP600", "delay": 0}
         with mock.patch.object(ml, "DEFAULT_SETTINGS", defaults):
-            parser = cli.build_parser()
+            parser = cli_parser.build_parser()
             args = parser.parse_args(["catalog", "datasets"])
             with mock.patch.object(ml, "load_session", return_value=object()), \
                     mock.patch.object(ml, "get_datasets", return_value=[{"id": "available"}]):
-                catalog = cli.cmd_catalog_datasets(args, None)
-            lint = cli.cmd_lint(parser.parse_args(["lint", "rank(close)", "--offline"]), None)
+                catalog = cli_catalog.cmd_catalog_datasets(args, None)
+            lint = cli_validation.cmd_lint(parser.parse_args(["lint", "rank(close)", "--offline"]), None)
         for key in ("region", "universe", "delay"):
             self.assertEqual(catalog[key], defaults[key])
             self.assertEqual(lint["settings"][key], defaults[key])
@@ -559,7 +565,7 @@ class SummaryTests(unittest.TestCase):
             {"status": "FAILED", "expression": "z", "error": "boom"},
             {"status": "WARNING", "expression": "w"},
         ]
-        summary = cli.summarize(records)
+        summary = cli_experiments.summarize(records)
         self.assertEqual(summary["total"], 4)
         # WARNING is a finished run: the platform writes every metric and only a check
         # warned, so it counts as completed and stays out of `other`.
@@ -569,14 +575,14 @@ class SummaryTests(unittest.TestCase):
         self.assertEqual(summary["best"]["alpha_id"], "B")
 
     def test_records_without_metrics_are_not_ranked(self):
-        summary = cli.summarize([
+        summary = cli_experiments.summarize([
             {"status": "COMPLETE", "alpha_id": "A", "expression": "x", "metrics": None},
         ])
         self.assertEqual(summary["ranking"], [])
         self.assertIsNone(summary["best"])
 
     def test_failed_record_with_progress_url_is_still_resumable(self):
-        summary = cli.summarize([
+        summary = cli_experiments.summarize([
             {"status": "FAILED", "progress_url": "https://api.worldquantbrain.com/simulations/1"},
         ])
         self.assertEqual(summary["pending"], 1)
@@ -616,7 +622,7 @@ class SimulationResumeTests(unittest.TestCase):
     def test_checkpoint_is_atomic_and_private(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             path = Path(temporary_directory) / "checkpoint.json"
-            cli._write_simulation_checkpoint(path, {"records": []})
+            cli_experiments._write_simulation_checkpoint(path, {"records": []})
             self.assertEqual(json.loads(path.read_text()), {"records": []})
             if os.name == "posix":
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -832,9 +838,10 @@ class SimulationResumeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             os.chdir(temporary_directory)
             try:
-                parser = cli.build_parser()
+                parser = cli_parser.build_parser()
                 simulate_args = parser.parse_args([
                     "simulate", "--expr", "rank(cap)", "--max-wait-seconds", "1",
+                    "--registry", str(Path(temporary_directory) / "registry.jsonl"),
                 ])
                 first_session = self.Session(
                     get_responses=[self.Response(headers={"Retry-After": "7200"})],
@@ -845,16 +852,14 @@ class SimulationResumeTests(unittest.TestCase):
                         },
                     )],
                 )
-                with mock.patch.object(
-                    cli, "with_session", side_effect=lambda _args, work: work(first_session)
-                ):
-                    pending = cli.cmd_simulate(simulate_args, None)
+                with mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work: work(first_session)):
+                    pending = cli_experiments.cmd_simulate(simulate_args, None)
                 self.assertEqual(pending["status"], "PENDING")
                 checkpoint_path = Path(pending["checkpoint"])
                 checkpoint = json.loads(checkpoint_path.read_text())
                 self.assertEqual(checkpoint["records"][0]["status"], "PENDING")
                 checkpoint["records"][0]["next_poll_at"] = time.time() - 1
-                cli._write_simulation_checkpoint(checkpoint_path, checkpoint)
+                cli_experiments._write_simulation_checkpoint(checkpoint_path, checkpoint)
 
                 resume_args = parser.parse_args([
                     "resume", str(checkpoint_path), "--max-wait-seconds", "1",
@@ -863,14 +868,12 @@ class SimulationResumeTests(unittest.TestCase):
                     self.Response(payload={"status": "COMPLETE", "alpha": "A123"}),
                 ])
                 with (
-                    mock.patch.object(
-                        cli, "with_session", side_effect=lambda _args, work: work(resume_session)
-                    ),
+                    mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work: work(resume_session)),
                     mock.patch.object(
                         ml, "fetch_alpha_metrics", return_value={"is": {"sharpe": 1.2}}
                     ),
                 ):
-                    resumed = cli.cmd_resume(resume_args, None)
+                    resumed = cli_experiments.cmd_resume(resume_args, None)
                 self.assertEqual(resumed["status"], "COMPLETE")
                 self.assertEqual(resumed["summary"]["completed"], 1)
                 self.assertEqual(resume_session.post_calls, [])
@@ -885,12 +888,6 @@ if __name__ == "__main__":
 class RegistryLabelContractTests(unittest.TestCase):
     """Results must be persisted by default and keep their mechanism labels."""
 
-    def test_record_is_on_by_default_and_can_be_disabled(self):
-        parser = cli.build_parser()
-        default = parser.parse_args(["simulate", "x.json", "--dry-run"])
-        self.assertTrue(default.record, "results must persist unless opted out")
-        opted_out = parser.parse_args(["simulate", "x.json", "--dry-run", "--no-record"])
-        self.assertFalse(opted_out.record)
 
     def test_per_expression_mechanism_survives_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -23,7 +23,9 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import alpha_registry  # noqa: E402
 import placebo_controls  # noqa: E402
-import research_cli as cli  # noqa: E402
+import ablation
+from research_app import experiments as cli_experiments
+from research_app import ledger as cli_ledger
 import research_template  # noqa: E402
 
 
@@ -38,7 +40,7 @@ class WarningStatusTests(unittest.TestCase):
         # Wrong behaviour this prevents: a batch of WARNING records (a UNITS warning
         # is enough) summarised as completed=0, so `simulate` raised
         # SIMULATION_FAILED on a run that had every number it needed.
-        summary = cli.summarize([record(status="WARNING", sharpe=2.37, fitness=1.68)])
+        summary = cli_experiments.summarize([record(status="WARNING", sharpe=2.37, fitness=1.68)])
         self.assertEqual(summary["completed"], 1)
         self.assertEqual(summary["failed"], 0)
         self.assertEqual(summary["best"]["sharpe"], 2.37)
@@ -53,7 +55,7 @@ class WarningStatusTests(unittest.TestCase):
         args = argparse.Namespace(sort="none", top=None, record=False)
         records = [record(alpha_id="A1", status="WARNING"),
                    record(alpha_id="A2", status="WARNING", sharpe=1.9)]
-        result = cli._finalize_simulation(records, {"region": "USA"}, args,
+        result = cli_experiments._finalize_simulation(records, {"region": "USA"}, args,
                                           checkpoint_path, {"records": []}, explicit=True)
         self.assertEqual(result["summary"]["completed"], 2)
 
@@ -74,8 +76,8 @@ class TopTruncationTests(unittest.TestCase):
 
         args = argparse.Namespace(sort="sharpe", top=2, record=True, registry=registry)
         records = [record(alpha_id="A%d" % i, sharpe=2.0 - i * 0.1) for i in range(5)]
-        with mock.patch.object(cli, "_record_simulation", fake_record):
-            result = cli._finalize_simulation(records, {"region": "USA"}, args,
+        with mock.patch.object(cli_experiments, "_record_simulation", fake_record):
+            result = cli_experiments._finalize_simulation(records, {"region": "USA"}, args,
                                               checkpoint_path, {"records": []},
                                               explicit=True)
         self.assertEqual(len(captured["ids"]), 5)
@@ -133,7 +135,7 @@ class LabelResponseTests(unittest.TestCase):
         args = argparse.Namespace(alpha_id="A1", family="event", verdict=None,
                                   mechanism="m", idea=None, note=None,
                                   registry=path, save=None)
-        data = cli.cmd_ledger_label(args, mock.MagicMock())
+        data = cli_ledger.cmd_ledger_label(args, mock.MagicMock())
         self.assertTrue(data["written"])
         self.assertEqual(data["registry"], path)
         self.assertEqual(data["entry"]["family"], "event")
@@ -170,8 +172,8 @@ class AblationViewTests(unittest.TestCase):
             {"candidate_id": "loo:a", "metrics": {"fitness": 1.9},
              "out_of_sample": {"train": {"fitness": 1.4}}},
         ]
-        frozen = cli.ablation.report(records)
-        train = cli.ablation.report(
+        frozen = ablation.report(records)
+        train = ablation.report(
             records, metrics_of=lambda r: (r.get("out_of_sample") or {}).get("train", {}))
         self.assertEqual(frozen["legs"][0]["verdict"], "adds")
         self.assertEqual(train["legs"][0]["verdict"], "hurts")
@@ -187,7 +189,7 @@ class AblationPendingTests(unittest.TestCase):
             {"candidate_id": "loo:a", "status": "PENDING", "metrics": None},
             {"candidate_id": "loo:b", "status": "COMPLETE", "metrics": {"fitness": 1.9}},
         ]
-        report = cli.ablation.report(records)
+        report = ablation.report(records)
         legs = {row["leg"]: row for row in report["legs"]}
         self.assertEqual(legs["a"]["verdict"], "pending")
         self.assertEqual(legs["a"]["status"], "PENDING")

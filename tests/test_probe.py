@@ -21,7 +21,13 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import research_cli as cli  # noqa: E402
+import alpha_registry
+import expression_lint
+import machine_lib as ml
+import research_paths
+from research_app import experiments as cli_experiments
+from research_app import parser as cli_parser
+from research_app import runtime as cli_runtime
 
 
 def record(alpha_id, sharpe, fitness, turnover=0.12, train=1.5, test=0.9, fails=()):
@@ -44,7 +50,7 @@ class FakeGuard(types.ModuleType):
         return {"errors": [], "warnings": []}
 
     def simulate(self, expressions, settings=None, labels=None, session=None, **kwargs):
-        preview = cli.ml.simulate_alphas(
+        preview = ml.simulate_alphas(
             None, expressions, settings=settings, labels=labels, dry_run=True)
         self.calls.append({"expressions": expressions, "labels": labels,
                            "settings": dict(settings or {}), "session": session,
@@ -68,11 +74,11 @@ class ProbeTests(unittest.TestCase):
         }
         self._write(self.spec)
         self.fake = FakeGuard([record("A1", 2.0, 1.5), record("B1", 1.1, 0.6)])
-        self._patched = mock.patch.dict(sys.modules, {"guarded_sim": self.fake})
+        self._patched = mock.patch.object(cli_experiments, "guarded_sim", self.fake)
         self._patched.start()
         self.addCleanup(self._patched.stop)
         self.session = object()
-        session_patch = mock.patch.object(cli.ml, "load_session", return_value=self.session)
+        session_patch = mock.patch.object(ml, "load_session", return_value=self.session)
         self.load_session = session_patch.start()
         self.addCleanup(session_patch.stop)
 
@@ -87,9 +93,9 @@ class ProbeTests(unittest.TestCase):
         return argparse.Namespace(**base)
 
     def _run(self, **overrides):
-        with mock.patch.object(cli.research_paths, "ensure_dir",
+        with mock.patch.object(research_paths, "ensure_dir",
                                lambda: self.output_dir):
-            return cli.cmd_probe(self._args(**overrides), mock.MagicMock())
+            return cli_experiments.cmd_probe(self._args(**overrides), mock.MagicMock())
 
     def test_train_is_always_present_and_test_only_on_request(self):
         # Wrong behaviour this prevents: choosing between arms while looking at the
@@ -109,7 +115,7 @@ class ProbeTests(unittest.TestCase):
         # `guarded_sim.simulate` had already been called.
         self._run()
         self.fake.calls.clear()
-        with self.assertRaises(cli.CliError):
+        with self.assertRaises(cli_runtime.CliError):
             self._run()
         self.assertEqual(self.fake.calls, [])
 
@@ -117,7 +123,7 @@ class ProbeTests(unittest.TestCase):
         # Wrong behaviour this prevents: a second run reusing the same NAME wrote over
         # the previous batch's JSON, which is how a 6-arm result disappeared.
         self._run()
-        with self.assertRaises(cli.CliError) as caught:
+        with self.assertRaises(cli_runtime.CliError) as caught:
             self._run()
         self.assertEqual(caught.exception.code, "INVALID_INPUT")
         self.assertIn("already exists", str(caught.exception))
@@ -144,7 +150,7 @@ class ProbeTests(unittest.TestCase):
             {"label": "settings", "expression": "rank(cap)", "settings": {"decay": 1}},
         ]
         self._write(self.spec)
-        args = cli.build_parser().parse_args([
+        args = cli_parser.build_parser().parse_args([
             "probe", self.spec_path, "--dry-run", "--region", "usa", "--universe", "top500",
             "--neutralization", "industry", "--delay", "1", "--decay", "7",
             "--pasteurization", "off", "--nan-handling", "verify", "--test-period", "p1y",
@@ -155,7 +161,7 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual({label: record["decay"] for label, record in by_label.items()},
                          {"default": 7, "explicit": 2, "settings": 7})
         for label, item in by_label.items():
-            expected = {**cli.ml.DEFAULT_SETTINGS, "universe": "TOP500", "neutralization": "INDUSTRY",
+            expected = {**ml.DEFAULT_SETTINGS, "universe": "TOP500", "neutralization": "INDUSTRY",
                         "pasteurization": "OFF", "nanHandling": "VERIFY", "testPeriod": "P1Y",
                         "decay": 2 if label == "explicit" else 7}
             self.assertEqual(item["payload"]["settings"], expected)
@@ -175,7 +181,7 @@ class ProbeTests(unittest.TestCase):
     def test_multiple_groups_share_the_requested_session_policy(self):
         self.spec["arms"][1]["settings"] = {"neutralization": "INDUSTRY"}
         self._write(self.spec)
-        args = cli.build_parser().parse_args([
+        args = cli_parser.build_parser().parse_args([
             "probe", self.spec_path, "--no-cache", "--relogin", "--no-record"])
         data = self._run(**vars(args))
         self.assertEqual(data["simulated"], 2)
@@ -185,7 +191,7 @@ class ProbeTests(unittest.TestCase):
 
     def test_a_spec_without_arms_is_refused_with_a_code(self):
         self._write({"name": "x", "arms": []})
-        with self.assertRaises(cli.CliError) as caught:
+        with self.assertRaises(cli_runtime.CliError) as caught:
             self._run()
         self.assertEqual(caught.exception.code, "INVALID_INPUT")
 
@@ -194,16 +200,16 @@ class ProbeTests(unittest.TestCase):
         # defaults and read as a failed hypothesis rather than a typo.
         self.spec["setting"] = {"universe": "TOP500"}
         self._write(self.spec)
-        with mock.patch.object(cli, "note") as spy:
+        with mock.patch.object(cli_experiments, "note") as spy:
             self._run()
         self.assertTrue(any("unknown key" in call.args[0] for call in spy.call_args_list))
 
     def test_dry_run_is_offline_and_does_not_load_a_session(self):
-        with mock.patch.object(cli.ml, "login", side_effect=AssertionError("login")), \
-                mock.patch.object(cli.ml, "get_credentials", side_effect=AssertionError("credentials")), \
-                mock.patch.object(cli.ml, "fetch_operators", side_effect=AssertionError("catalog")), \
+        with mock.patch.object(ml, "login", side_effect=AssertionError("login")), \
+                mock.patch.object(ml, "get_credentials", side_effect=AssertionError("credentials")), \
+                mock.patch.object(ml, "fetch_operators", side_effect=AssertionError("catalog")), \
                 mock.patch.object(self.fake, "check", side_effect=AssertionError("live lint")), \
-                mock.patch.object(cli.ml.requests.sessions.Session, "request",
+                mock.patch.object(ml.requests.sessions.Session, "request",
                                   side_effect=AssertionError("network")):
             data = self._run(dry_run=True)
         self.load_session.assert_not_called()
@@ -224,7 +230,7 @@ class ProbeTests(unittest.TestCase):
         ]
         self._write(self.spec)
         data = self._run(dry_run=True)
-        default = {**cli.ml.DEFAULT_SETTINGS, "decay": 4}
+        default = {**ml.DEFAULT_SETTINGS, "decay": 4}
         fast = {**default, "decay": 2, "neutralization": "INDUSTRY", "universe": "TOP500"}
         self.assertEqual(data["settings"], [default, fast])
         self.assertEqual(data["groups"], 2)
@@ -243,7 +249,7 @@ class ProbeTests(unittest.TestCase):
             {"label": "unbalanced", "expression": "rank(close"},
         ]
         self._write(self.spec)
-        with mock.patch.object(cli.expression_lint, "load_denylist", return_value={
+        with mock.patch.object(expression_lint, "load_denylist", return_value={
                 "rank": {"severity": "block", "message": "observed rejection"}}):
             data = self._run(dry_run=True)
         self.assertFalse(data["lint"]["ok"])
@@ -285,7 +291,7 @@ class ProbeTests(unittest.TestCase):
                     self.spec["arms"] = [{"label": "valid", "expression": "rank(close)"},
                                          {"label": "invalid", **invalid}]
                     self._write(self.spec)
-                    with self.assertRaises(cli.CliError) as caught:
+                    with self.assertRaises(cli_runtime.CliError) as caught:
                         self._run(dry_run=dry_run)
                     self.assertEqual(caught.exception.code, "INVALID_INPUT")
                     self.load_session.assert_not_called()
@@ -299,7 +305,7 @@ class ProbeTests(unittest.TestCase):
                     original = owner.get("settings", {})
                     owner["settings"] = invalid
                     self._write(self.spec)
-                    with self.assertRaises(cli.CliError) as caught:
+                    with self.assertRaises(cli_runtime.CliError) as caught:
                         self._run(dry_run=True)
                     self.assertEqual(caught.exception.code, "INVALID_INPUT")
                     self.load_session.assert_not_called()
@@ -313,7 +319,7 @@ class ProbeTests(unittest.TestCase):
         ]
         self._write(self.spec)
         preview = self._run(dry_run=True)
-        with mock.patch.object(cli.alpha_registry, "record_simulation", return_value={}) as ledger:
+        with mock.patch.object(alpha_registry, "record_simulation", return_value={}) as ledger:
             data = self._run(no_record=False)
         self.assertEqual(len(self.fake.calls), 2)
         self.assertEqual([call["settings"]["decay"] for call in self.fake.calls], [4, 2])
@@ -349,14 +355,14 @@ class ProbeTests(unittest.TestCase):
         args = argparse.Namespace(files=[data["path"]], min_fitness=None,
                                   sort="sharpe", contributions=False, save=None,
                                   frozen=False)
-        compared = cli.cmd_compare(args, mock.MagicMock())
+        compared = cli_experiments.cmd_compare(args, mock.MagicMock())
         self.assertEqual(compared["count"], 2)
 
     def test_showing_the_test_period_is_written_to_the_views_log(self):
         # Hiding a column does not stop the leak; the log is what tells a frozen
         # validation apart from an iterative peek three rounds later.
         log = os.path.join(self.output_dir, "views.jsonl")
-        with mock.patch.object(cli.research_paths, "views_log_path", lambda: log):
+        with mock.patch.object(research_paths, "views_log_path", lambda: log):
             self._run(force=True, show_test=True)
             self._run(force=True)
         entries = [json.loads(line) for line in open(log, encoding="utf-8")]

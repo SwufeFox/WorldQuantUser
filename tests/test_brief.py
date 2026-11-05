@@ -22,7 +22,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import alpha_registry  # noqa: E402
-import research_cli as cli  # noqa: E402
+import research_paths
+from research_app import campaign as cli_campaign
 
 
 def entry(alpha_id, status, sharpe, source="manual", family="quality"):
@@ -57,8 +58,8 @@ class BriefTests(unittest.TestCase):
         args = argparse.Namespace(days=7.0, top=5, registry=self.registry, save=None)
         for key, value in overrides.items():
             setattr(args, key, value)
-        with mock.patch.object(cli.research_paths, "ensure_dir", lambda: self.research):
-            return cli.cmd_brief(args, mock.MagicMock())
+        with mock.patch.object(research_paths, "ensure_dir", lambda: self.research):
+            return cli_campaign.cmd_brief(args, mock.MagicMock())
 
     def test_book_is_counted_by_family_and_universe(self):
         data = self._run()

@@ -15,7 +15,13 @@ from unittest import mock
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-import research_cli as cli  # noqa: E402
+import paper_search
+import research_paths
+from research_app import alphas as cli_alphas
+from research_app import app as cli_app
+from research_app import campaign as cli_campaign
+from research_app import experiments as cli_experiments
+from research_app import runtime as cli_runtime
 
 
 class PaperSaveTests(unittest.TestCase):
@@ -24,9 +30,9 @@ class PaperSaveTests(unittest.TestCase):
             target = os.path.join(directory, "nested", "papers.json")
             stdout, stderr = io.StringIO(), io.StringIO()
             payload = {"results": [{"title": "Anomalies", "year": 1996}]}
-            with mock.patch.object(cli.paper_search, "search_papers", return_value=payload), \
+            with mock.patch.object(paper_search, "search_papers", return_value=payload), \
                     mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
-                code = cli.main(["paper", "accruals", "--save", target])
+                code = cli_app.main(["paper", "accruals", "--save", target])
             self.assertEqual(code, 0, stderr.getvalue())
             with open(target, encoding="utf-8") as handle:
                 saved = handle.read()
@@ -37,14 +43,14 @@ class PaperSaveTests(unittest.TestCase):
 class NegativeMaxWaitTests(unittest.TestCase):
     def test_alpha_check_refuses_negative_wait_with_a_code(self):
         args = argparse.Namespace(max_wait=-1, alpha_id="X", save=None)
-        with self.assertRaises(cli.CliError) as caught:
-            cli.cmd_alpha_check(args, mock.MagicMock())
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            cli_alphas.cmd_alpha_check(args, mock.MagicMock())
         self.assertEqual(caught.exception.code, "USAGE")
 
     def test_alpha_submit_refuses_negative_wait_with_a_code(self):
         args = argparse.Namespace(max_wait=-5, alpha_id="X", save=None)
-        with self.assertRaises(cli.CliError) as caught:
-            cli.cmd_alpha_submit(args, mock.MagicMock())
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            cli_alphas.cmd_alpha_submit(args, mock.MagicMock())
         self.assertEqual(caught.exception.code, "USAGE")
 
 
@@ -68,7 +74,7 @@ class CompareShapeTests(unittest.TestCase):
             paths.append(path)
         args = argparse.Namespace(files=paths, min_fitness=None, sort="sharpe",
                                   contributions=False, save=None, frozen=True)
-        return cli.cmd_compare(args, mock.MagicMock())
+        return cli_experiments.cmd_compare(args, mock.MagicMock())
 
     def test_a_bare_list_is_accepted(self):
         # Wrong behaviour this prevents: the research template writes a bare list of
@@ -87,7 +93,7 @@ class CompareShapeTests(unittest.TestCase):
         # records would print a table of nulls instead of saying what is wrong.
         rows = {"files": ["x.json"], "count": 1,
                 "rows": [{"alpha_id": "A1", "sharpe": 2.0, "fitness": 1.5}]}
-        with self.assertRaises(cli.CliError) as caught:
+        with self.assertRaises(cli_runtime.CliError) as caught:
             self._run(rows)
         self.assertEqual(caught.exception.code, "INVALID_INPUT")
         self.assertIn("not a simulate result document", str(caught.exception))
@@ -104,8 +110,8 @@ class AlphaGetMetadataTests(unittest.TestCase):
                    "settings": {"region": "USA"}, "status": "UNSUBMITTED",
                    "is": {"sharpe": 2.0}, "checks": []}
         args = argparse.Namespace(alpha_id="A1", save=None)
-        with mock.patch.object(cli, "with_session", lambda a, fn: payload):
-            data = cli.cmd_alpha_get(args, mock.MagicMock())
+        with mock.patch.object(cli_alphas, "with_session", lambda a, fn: payload):
+            data = cli_alphas.cmd_alpha_get(args, mock.MagicMock())
         self.assertEqual(data["name"], "qf dispersion change")
         self.assertEqual(data["category"], "ANALYST")
         self.assertEqual(data["tags"], ["dispersion"])
@@ -120,7 +126,7 @@ class CompareSortAndContributionTests(unittest.TestCase):
                                   contributions=False, save=None, frozen=False)
         for key, value in overrides.items():
             setattr(args, key, value)
-        return cli.cmd_compare(args, mock.MagicMock())
+        return cli_experiments.cmd_compare(args, mock.MagicMock())
 
     def test_every_allowed_sort_key_exists_in_the_train_view(self):
         # `--sort returns` raised KeyError: the row had train_sharpe/fitness/turnover
@@ -156,20 +162,20 @@ class ViewsCommandTests(unittest.TestCase):
         log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
         args = argparse.Namespace(files=[path], min_fitness=None, sort="sharpe",
                                   contributions=False, save=None, frozen=False)
-        with mock.patch.object(cli.research_paths, "views_log_path", lambda: log):
-            cli.cmd_compare(args, mock.MagicMock())
+        with mock.patch.object(research_paths, "views_log_path", lambda: log):
+            cli_experiments.cmd_compare(args, mock.MagicMock())
             self.assertFalse(os.path.exists(log))
             args.frozen = True
-            cli.cmd_compare(args, mock.MagicMock())
+            cli_experiments.cmd_compare(args, mock.MagicMock())
         entries = [json.loads(line) for line in open(log, encoding="utf-8")]
         self.assertEqual(entries[0]["tool"], "compare")
         self.assertEqual(entries[0]["alpha_ids"], ["A1"])
 
-        with mock.patch.object(cli.research_paths, "views_log_path", lambda: log):
-            listing = cli.cmd_views(argparse.Namespace(alpha="A1", limit=10, save=None),
+        with mock.patch.object(research_paths, "views_log_path", lambda: log):
+            listing = cli_campaign.cmd_views(argparse.Namespace(alpha="A1", limit=10, save=None),
                                     mock.MagicMock())
         self.assertEqual(listing["count"], 1)
-        empty = cli.cmd_views(argparse.Namespace(alpha="NOPE", limit=10, save=None),
+        empty = cli_campaign.cmd_views(argparse.Namespace(alpha="NOPE", limit=10, save=None),
                               mock.MagicMock()) if False else None
         self.assertIsNone(empty)
 
@@ -186,9 +192,9 @@ class CompareMinFitnessTests(unittest.TestCase):
                                           "test": {"sharpe": 0.8}}}], handle)
         args = argparse.Namespace(files=[path], min_fitness=1.0, sort="fitness",
                                   contributions=False, save=None, frozen=False)
-        self.assertEqual(cli.cmd_compare(args, mock.MagicMock())["count"], 0)
+        self.assertEqual(cli_experiments.cmd_compare(args, mock.MagicMock())["count"], 0)
         args.frozen = True
-        self.assertEqual(cli.cmd_compare(args, mock.MagicMock())["count"], 1)
+        self.assertEqual(cli_experiments.cmd_compare(args, mock.MagicMock())["count"], 1)
 
 
 if __name__ == "__main__":

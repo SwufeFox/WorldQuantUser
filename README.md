@@ -16,7 +16,18 @@ research_cli.py schema      # the whole contract, as JSON
 
 | File | Job |
 | --- | --- |
-| `research_cli.py` | The machine-readable CLI. stdout is always one JSON document. |
+| `research_cli.py` | Thin executable entry point. stdout is always one JSON document. |
+| `research_app/app.py` | Command execution, workspace selection, error envelopes and exit codes. |
+| `research_app/parser.py` | Argument declarations, terminal help and the schema derived from the live parser. |
+| `research_app/runtime.py` | Shared CLI contract, JSON output, input settings and authenticated sessions. |
+| `research_app/account.py` | Account access and local cache commands. |
+| `research_app/catalog.py` | Dataset, datafield and operator discovery. |
+| `research_app/validation.py` | Expression lint and simulation preflight checks. |
+| `research_app/experiments.py` | Simulation, resumption, labelled probes, ablation and comparison. |
+| `research_app/alphas.py` | Platform alpha inspection, metadata, submission and correlation. |
+| `research_app/ledger.py` | Local ledger recording, labels, lineage, coverage and shared legs. |
+| `research_app/campaign.py` | Research briefs and train/test view history. |
+| `research_app/literature.py` | Web literature search and OpenAlex paper discovery. |
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and research scripts. |
 | `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
@@ -77,6 +88,34 @@ all live in a results directory outside the working tree, resolved by
 `research_cli.py schema` reports the resolved path under `research_paths`. A
 `research/` directory inside the repo is git-ignored as a guard rail, so a stray
 run cannot quietly add data to the history.
+
+## Application boundaries
+
+```mermaid
+flowchart TD
+    entry[research_cli.py] --> app[Application execution]
+    app --> parser[Arguments, help and schema]
+    parser --> commands[Command modules]
+    app -->|dispatch| commands
+    app --> runtime[CLI contract and runtime]
+    commands --> runtime
+    commands --> core[API client and research libraries]
+    runtime --> core
+```
+
+Command modules return data or raise a typed error; the execution boundary owns
+stdout, saving, workspace overrides and exit codes. The parser binds handlers
+explicitly and generates help/schema from those same declarations.
+
+The root libraries (`machine_lib`, `research_config`, `alpha_registry`, the expression
+and field modules) implement reusable research behavior and never import the CLI
+application. Add a command in its owning module, declare its arguments in
+`research_app/parser.py`, and test the implementation module or the executable
+contract. The entry point exports no command handlers or compatibility aliases.
+
+`research_app` adds internal modules, with no additional tool entry points. Probes
+import `tools.guarded_sim` directly; command execution does not change the module
+search path to locate it.
 
 ## The expression tree
 

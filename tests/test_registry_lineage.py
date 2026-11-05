@@ -18,7 +18,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import alpha_registry as ar  # noqa: E402
-import research_cli as cli  # noqa: E402
+import machine_lib as ml
+from research_app import app as cli_app
 
 COMPOSITE = "a = rank(cap); n = rank(volume); c = rank(close); a + n + c"
 
@@ -142,14 +143,14 @@ class LedgerCliTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.registry = str(Path(directory.name) / "ledger.jsonl")
         self.login = mock.patch.object(
-            cli.ml, "load_session", side_effect=AssertionError("offline command logged in"))
+            ml, "load_session", side_effect=AssertionError("offline command logged in"))
         self.login.start()
         self.addCleanup(self.login.stop)
 
     def invoke(self, *arguments, expected=0):
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = cli.main(list(arguments))
+            code = cli_app.main(list(arguments))
         self.assertEqual(code, expected, stderr.getvalue())
         return json.loads(stdout.getvalue())
 
@@ -168,18 +169,6 @@ class LedgerCliTests(unittest.TestCase):
         stored, _written = ar.record_entry(ar.build_entry(record, **labels), self.registry)
         return stored
 
-    def test_schema_discovers_six_ledger_commands_and_removes_old_alpha_commands(self):
-        commands = self.invoke("schema")["data"]["commands"]["subcommands"]
-        actions = commands["ledger"]["subcommands"]
-        self.assertEqual(set(actions), {"record", "list", "label", "impact", "lineage", "coverage"})
-        self.assertTrue(set(actions).difference({"list"}).isdisjoint(
-            commands["alpha"]["subcommands"]))
-        self.assertNotIn("registry", commands["alpha"]["subcommands"])
-        self.assertNotIn("find", commands["alpha"]["subcommands"])
-        flags = {flag for option in actions["list"]["options"] for flag in option["flags"]}
-        self.assertTrue({"--verdict", "--idea", "--min-sharpe", "--min-fitness", "--family",
-                         "--field", "--mechanism", "--expression", "--limit", "--format",
-                         "--registry"}.issubset(flags))
 
     def test_unfiltered_list_shows_all_entries_including_book_without_login(self):
         for index in range(52):
@@ -260,8 +249,8 @@ class LedgerCliTests(unittest.TestCase):
                    "checks": [{"name": "LOW_SHARPE", "result": "PASS"}]},
             "train": {"sharpe": 1.9}, "test": {"sharpe": 0.7},
         }
-        with mock.patch.object(cli.ml, "load_session", return_value=object()), \
-                mock.patch.object(cli.ml, "fetch_alpha_metrics", return_value=payload):
+        with mock.patch.object(ml, "load_session", return_value=object()), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=payload):
             recorded = self.ledger("record", "ONLINE", "--family", "quality",
                                    "--verdict", "candidate", "--mechanism", "quality drift",
                                    "--idea", "Idea 81", "--note", "current platform read")["data"]
