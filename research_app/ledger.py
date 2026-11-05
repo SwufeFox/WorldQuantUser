@@ -11,6 +11,7 @@ import correlation
 import machine_lib as ml
 import research_paths
 
+from . import styles
 from .runtime import CliError, with_session
 
 
@@ -230,6 +231,32 @@ def cmd_ledger_coverage(args, _sink):
             for entry in missing[: args.limit]
         ]
 
+    return data
+
+
+def cmd_ledger_styles(args, _sink):
+    """What each alpha compares against: other stocks, its own history, or nothing.
+
+    The screen exists because one batch measured a 2.3x Fitness gap between the same
+    variable read cross-sectionally (0.87) and against its own history (2.05). Where a
+    book alpha never reads a field against its own past, that re-read is cheap and has
+    a prior; where it already does, the question is answered.
+    """
+    _path, entries = _ledger(args)
+    selected = [entry for entry in entries
+                if _ask_passes(entry, _ask_filters(args.where))]
+    if getattr(args, "status", None):
+        wanted = {part.strip().upper() for part in str(args.status).split(",") if part.strip()}
+        selected = [entry for entry in selected
+                    if str(entry.get("status") or "").upper() in wanted]
+    data = styles.summarize(selected)
+    data["filter"] = {"where": getattr(args, "where", None),
+                      "status": getattr(args, "status", None)}
+    if args.list:
+        data["static"] = [row for row in data["rows"] if row["comparison"] == "static"]
+    if not args.list:
+        for row in data["rows"]:
+            row.pop("expression", None)
     return data
 
 

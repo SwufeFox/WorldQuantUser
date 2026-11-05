@@ -791,6 +791,22 @@ def build_parser():
     l_cov.add_argument("--limit", type=int, default=40)
     l_cov.set_defaults(func=ledger.cmd_ledger_coverage)
 
+    l_sty = ledger_sub.add_parser(
+        "styles",
+        help="Classify what each alpha compares against: history, peers, or nothing (offline).",
+        description="One batch measured 0.87 for a value read cross-sectionally against "
+                    "2.05 for the same value read against its own history. This reports "
+                    "which book alphas have never been re-read that way, so the cheap "
+                    "re-estimation can be aimed instead of guessed.")
+    l_sty.add_argument("--registry", default=None)
+    l_sty.add_argument("--where", default=None,
+                       help="Ledger filter, e.g. status=ACTIVE or family=quality.")
+    l_sty.add_argument("--status", default=None,
+                       help="Bare status filter, e.g. ACTIVE (comma separated).")
+    l_sty.add_argument("--list", action="store_true",
+                       help="Also list the level-only alphas in full.")
+    l_sty.set_defaults(func=ledger.cmd_ledger_styles)
+
     a_self = alpha_sub.add_parser(
         "self-check",
         help="Reproduce the platform's self-correlation check locally (quota-free).",
