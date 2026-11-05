@@ -67,6 +67,7 @@ class SchemaContractTests(unittest.TestCase):
             self.assertIn(key, data)
 
 
+
     def test_schema_can_describe_one_command(self):
         payload = parse(run_cli("schema", "simulate"))["data"]
         self.assertEqual(payload["command"]["command"], "simulate")
@@ -179,6 +180,20 @@ class ErrorEnvelopeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ml.resolve_settings({"region": "MARS"})
 
+    def test_well_formed_unknown_neutralization_is_sent(self):
+        # The platform owns this enum. Refusing a value locally made "we never
+        # tried STATISTICAL" indistinguishable from "the tool cannot say it"
+        # (2026-11-04). A well-formed unknown token now goes out and the
+        # platform's own answer is the record.
+        for value in ("STATISTICAL", "FAST", "SOME_FUTURE_SCHEME"):
+            resolved = ml.resolve_settings({"neutralization": value})
+            self.assertEqual(resolved["neutralization"], value)
+
+    def test_malformed_neutralization_is_still_a_local_typo(self):
+        for value in ("", "sub industry", "Statistical", "SUB-IND"):
+            with self.assertRaises(ValueError):
+                ml.resolve_settings({"neutralization": value})
+
     def test_every_error_code_has_an_exit_code(self):
         for code in cli_runtime.ERROR_CODES:
             self.assertIn(code, cli_runtime.EXIT_CODES, code)
@@ -203,6 +218,15 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(payload["regular"], "rank(cap)")
         self.assertEqual(payload["settings"]["decay"], 4)
         self.assertEqual(payload["settings"]["region"], "USA")
+
+    def test_dry_run_accepts_a_neutralization_outside_the_local_list(self):
+        # The CLI must not be a second gate: one validation point, in
+        # machine_lib.resolve_settings.
+        proc = run_cli("simulate", "--expr", "rank(cap)",
+                       "--neutralization", "STATISTICAL", "--dry-run")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(parse(proc)["data"]["settings"]["neutralization"],
+                         "STATISTICAL")
 
     def test_cli_flags_override_research_file_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -963,8 +987,10 @@ class SimulationResumeTests(unittest.TestCase):
             os.chdir(temporary_directory)
             try:
                 parser = cli_parser.build_parser()
+                source = {"alphas": [{"expression": "rank(cap)", "candidate_id": "loo:l0"}],
+                          "legs": {"l0": {"fields": ["cap"], "role": "value", "weight": 1}}}
                 simulate_args = parser.parse_args([
-                    "simulate", "--expr", "rank(cap)", "--max-wait-seconds", "1",
+                    "simulate", "-", "--max-wait-seconds", "1",
                     "--registry", str(Path(temporary_directory) / "registry.jsonl"),
                 ])
                 first_session = self.Session(
@@ -976,7 +1002,8 @@ class SimulationResumeTests(unittest.TestCase):
                         },
                     )],
                 )
-                with mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work: work(first_session)):
+                with mock.patch.object(sys, "stdin", io.StringIO("\ufeff" + json.dumps(source))), \
+                        mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work: work(first_session)):
                     pending = cli_experiments.cmd_simulate(simulate_args, None)
                 self.assertEqual(pending["status"], "PENDING")
                 checkpoint_path = Path(pending["checkpoint"])
@@ -994,13 +1021,23 @@ class SimulationResumeTests(unittest.TestCase):
                 with (
                     mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work: work(resume_session)),
                     mock.patch.object(
-                        ml, "fetch_alpha_metrics", return_value={"is": {"sharpe": 1.2}}
+                        ml, "fetch_alpha_metrics", return_value={
+                            "is": {"sharpe": 1.2, "fitness": 1.0}, "train": {"fitness": 1.0}}
                     ),
                 ):
                     resumed = cli_experiments.cmd_resume(resume_args, None)
                 self.assertEqual(resumed["status"], "COMPLETE")
                 self.assertEqual(resumed["summary"]["completed"], 1)
                 self.assertEqual(resume_session.post_calls, [])
+                results_path = Path(temporary_directory) / "resumed-results.json"
+                full = {"candidate_id": "full", "status": "COMPLETE",
+                        "out_of_sample": {"train": {"fitness": 2.0}}}
+                results_path.write_text(json.dumps({
+                    **resumed, "results": [full, *resumed["results"]]}), encoding="utf-8")
+                compare_args = parser.parse_args(["compare", str(results_path), "--per-file"])
+                contribution = cli_experiments.cmd_compare(compare_args, None)["per_file"][0]["top_leg"]
+                self.assertEqual(contribution["fields"], ["cap"])
+                self.assertAlmostEqual(contribution["contribution"], 1.0)
             finally:
                 os.chdir(original_directory)
 

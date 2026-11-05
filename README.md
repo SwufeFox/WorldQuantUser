@@ -25,7 +25,7 @@ research_cli.py schema      # the whole contract, as JSON
 | `research_app/validation.py` | Expression lint and simulation preflight checks. |
 | `research_app/experiments.py` | Simulation, resumption, labelled probes, ablation and comparison. |
 | `research_app/alphas.py` | Platform alpha inspection, metadata, submission and correlation. |
-| `research_app/ledger.py` | Local ledger recording, labels, lineage, coverage and shared legs. |
+| `research_app/ledger.py` | Local ledger recording, labels, lineage, coverage, shared legs and offline queries. |
 | `research_app/campaign.py` | Research briefs and train/test view history. |
 | `research_app/literature.py` | Web literature search and OpenAlex paper discovery. |
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and research scripts. |
@@ -364,8 +364,14 @@ the command only fails outright when *every* expression failed.
 
 Use one spec for a batch of arms and their settings:
 
+Every controlled experiment has exactly one arm marked `design: "control"`.
+Other arms use `add`, `drop`, `parallel` or `rescue`: add/drop/rescue keep the
+control's effective settings; parallel changes exactly one setting; rescue also
+names `proxy_of`. Validation uses resolved settings, including CLI overrides and
+explicit arm decay. A scan declares `"design": "explore"` at the spec's top level:
+
 ```json
-{"name": "neutralization-sweep", "settings": {"decay": 4},
+{"name": "neutralization-sweep", "design": "explore", "settings": {"decay": 4},
  "arms": [{"label": "subindustry", "expression": "rank(close)"},
           {"label": "industry-fast", "expression": "rank(close)", "decay": 2,
            "settings": {"neutralization": "INDUSTRY"}}]}
@@ -908,6 +914,11 @@ expression **and** a fingerprint of the settings that alter results (universe,
 region, delay, decay, neutralisation, truncation, test period). Keying on the
 expression alone silently merged the same formula run under two universes.
 
+`ask` reads the same ledger offline for filters, grouped statistics, within-panel
+comparisons and cached-PnL correlations. For example,
+`python research_cli.py ask --by neutralization --stat n,median:sharpe,floor_share`
+reports each scheme's count, median Sharpe and share below the turnover floor.
+
 ## Ask whether a leg earns its place
 
 Adding a leg felt productive and was often a loss: a five-leg version scored below
@@ -925,14 +936,19 @@ this leg)`, so a leg that subtracts from the composite is named instead of
 inferred. `solo` arms separate a driver from a carrier: a carrier can add value
 while scoring poorly alone.
 
-Variants are generated only when the combination is a plain sum of named legs.
-A product, a gated leg like `r*(1-rank(cap))`, or a call inside the combination is
-refused with the reason, because "remove a leg" has no syntactic meaning there and
-a silently wrong variant costs quota and returns something that looks like
-evidence.
+For `--expr` and file inputs, the combination must be a plain sum of named legs;
+products, gated legs and calls inside that combination are refused with a reason.
+`ablate --ids` also supports other parseable expressions through the unit layer's
+structural drop-term variants and writes a legend describing each leg's fields.
+
+`simulate` carries `legs`, `legend` and `note` metadata into results and checkpoints,
+including stdin inputs and resumed runs. Later files override earlier metadata keys.
 
 `compare` also merges batches: several result files become one table sorted by
 fitness, with failing checks and the train/test split side by side.
+Use `compare A-results.json B-results.json --per-file` to compute each batch's leg
+contributions separately. It adds fields and data families from the embedded leg
+legend or a neighbouring `<id>-ablation.json`, keeping identically named arms apart.
 
 ## Test an independence claim
 
@@ -1070,8 +1086,9 @@ Errors are typed and subclass `machine_lib.BrainError`: `MissingCredentials`,
   budget is exhausted.
 * **Pagination.** BRAIN caps `limit` at 50 per page; `get_datafields` pages
   internally.
-* **Region access is account-scoped.** Unknown region/neutralization values are
-  rejected before any request is made.
+* **Region access is account-scoped.** Unknown regions and malformed neutralization
+  tokens are rejected locally. Well-formed neutralization tokens pass through to
+  BRAIN, which decides whether the scheme is available.
 * **No interactive prompts.** Every authentication failure raises -- `MissingCredentials`,
   `AuthError`, or `CaptchaRequired` -- instead of blocking on `input()`. A prompt is a
   hang for an automated caller, and a hang looks like a slow request rather than a

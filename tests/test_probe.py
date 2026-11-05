@@ -68,6 +68,9 @@ class ProbeTests(unittest.TestCase):
         self.spec = {
             "name": "unit-test-batch",
             "idea": "test idea", "mechanism": "test mechanism",
+            # These fixtures are scans, and saying so is the point: `explore` is the
+            # recorded opt-out from the control-arm rule, not a default.
+            "design": "explore",
             "settings": {"region": "USA", "universe": "TOP3000", "decay": 4},
             "arms": [{"label": "a", "expression": "rank(close)"},
                      {"label": "b", "expression": "rank(volume)"}],
@@ -279,7 +282,7 @@ class ProbeTests(unittest.TestCase):
     def test_invalid_later_group_never_authenticates_or_spends_quota(self):
         invalid_arms = [
             {"expression": "rank(volume)", "settings": {"region": "INVALID"}},
-            {"expression": "rank(volume)", "settings": {"neutralization": "INVALID"}},
+            {"expression": "rank(volume)", "settings": {"neutralization": "BAD SCHEME"}},
             {"expression": "rank(volume)", "settings": {"delay": 2}},
             {"expression": "rank(volume)", "settings": {"decay": -1}},
             {"expression": "rank(volume)", "decay": True},
@@ -376,6 +379,193 @@ class ProbeTests(unittest.TestCase):
                              record("B1", 2.0, 1.5)]
         data = self._run()
         self.assertEqual(data["rows"][0]["failed_checks"], ["LOW_SHARPE"])
+
+
+class DesignTests(unittest.TestCase):
+    """The control-arm rules: a batch must be able to attribute what it measures."""
+
+    def setUp(self):
+        # Reuse the probe harness without re-running its twelve tests here.
+        ProbeTests.setUp(self)
+
+    _write = ProbeTests._write
+    _args = ProbeTests._args
+    _run = ProbeTests._run
+
+    def _controlled(self, arms):
+        self.spec.pop("design", None)
+        self.spec["arms"] = arms
+        self._write(self.spec)
+
+    def test_arms_without_a_design_are_refused(self):
+        self._controlled([{"label": "a", "expression": "rank(close)"}])
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            self._run(force=True)
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_comparison_without_a_control_arm_is_refused(self):
+        # Wrong behaviour this prevents: on 2026-11-03 four gated arms were compared
+        # against a base that itself failed the gate, so "worse" had no referent.
+        self._controlled([{"label": "gated", "expression": "rank(close)",
+                           "design": "add"}])
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            self._run(force=True)
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_two_control_arms_are_ambiguous(self):
+        self._controlled([{"label": "c1", "expression": "rank(close)", "design": "control"},
+                          {"label": "c2", "expression": "rank(open)", "design": "control"}])
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            self._run(force=True)
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_invalid_designs_are_refused_before_authentication(self):
+        for spec_design, arm_design in (("typo", "control"), (None, "typo")):
+            with self.subTest(spec_design=spec_design, arm_design=arm_design):
+                self._controlled([
+                    {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+                    {"label": "other", "expression": "rank(volume)", "design": arm_design},
+                ])
+                if spec_design is not None:
+                    self.spec["design"] = spec_design
+                    self._write(self.spec)
+                with self.assertRaises(cli_runtime.CliError) as caught:
+                    self._run(dry_run=True)
+                self.assertEqual(caught.exception.code, "INVALID_INPUT")
+                self.load_session.assert_not_called()
+                self.assertEqual(self.fake.calls, [])
+
+    def test_explicit_arm_decay_counts_as_a_setting_change(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "plus", "expression": "rank(close) + rank(volume)",
+             "design": "add", "decay": 8},
+        ])
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                with self.assertRaises(cli_runtime.CliError) as caught:
+                    self._run(dry_run=dry_run)
+                self.assertEqual(caught.exception.code, "INVALID_INPUT")
+                self.load_session.assert_not_called()
+                self.assertEqual(self.fake.calls, [])
+
+    def test_equivalent_resolved_settings_allow_an_add_arm(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "plus", "expression": "rank(close) + rank(volume)", "design": "add",
+             "settings": {"neutralization": ml.DEFAULT_SETTINGS["neutralization"],
+                          "delay": ml.DEFAULT_SETTINGS["delay"],
+                          "decay": self.spec["settings"]["decay"]}},
+        ])
+        data = self._run(dry_run=True)
+        self.assertEqual(data["groups"], 1)
+        self.assertEqual(data["design"]["designs"], {"ctrl": "control", "plus": "add"})
+        self.load_session.assert_not_called()
+
+    def test_cli_decay_override_can_remove_a_parallel_setting_change(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "dose", "expression": "rank(close)", "design": "parallel",
+             "settings": {"decay": 8}},
+        ])
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            self._run(dry_run=True, decay=7)
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_parallel_explicit_decay_survives_cli_default_override(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "dose", "expression": "rank(close)", "design": "parallel", "decay": 8},
+        ])
+        data = self._run(dry_run=True, decay=7)
+        self.assertEqual(data["design"]["mode"], "controlled")
+        self.assertEqual([item["payload"]["settings"]["decay"] for item in data["results"]],
+                         [7, 8])
+        self.load_session.assert_not_called()
+
+    def test_a_parallel_arm_may_move_exactly_one_knob(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "d8", "expression": "rank(close)", "design": "parallel",
+             "settings": {"decay": 8}},
+        ])
+        data = self._run(force=True)
+        self.assertEqual(data["design"]["mode"], "controlled")
+        self.assertEqual(data["design"]["control"], "ctrl")
+
+    def test_a_parallel_arm_moving_two_knobs_is_refused(self):
+        # Two knobs at once is a confound wearing a dose series' clothes.
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "both", "expression": "rank(close)", "design": "parallel",
+             "settings": {"decay": 8, "neutralization": "INDUSTRY"}},
+        ])
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            self._run(force=True)
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_an_add_arm_may_not_also_move_a_setting(self):
+        # Otherwise a gain could come from the added leg or from the setting.
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "plus", "expression": "rank(close) + rank(volume)",
+             "design": "add", "settings": {"decay": 8}},
+        ])
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            self._run(force=True)
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_rescue_arm_must_name_the_proxy_it_substitutes(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(gross_profit/assets)", "design": "control"},
+            {"label": "rescue", "expression": "rank(operating_income/assets)",
+             "design": "rescue"},
+        ])
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            self._run(force=True)
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_complete_batch_records_its_design_in_the_batch_file(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(gross_profit/assets)", "design": "control"},
+            {"label": "rescue", "expression": "rank(operating_income/assets)",
+             "design": "rescue", "proxy_of": "gross_profit/assets"},
+        ])
+        data = self._run(force=True)
+        self.assertEqual(data["design"]["designs"],
+                         {"ctrl": "control", "rescue": "rescue"})
+        self.assertEqual([row["design"] for row in data["rows"]], ["control", "rescue"])
+        written = json.load(open(data["path"], encoding="utf-8"))
+        self.assertEqual(written["design"], data["design"])
+
+    def test_design_metadata_is_accepted_without_unknown_alpha_key_warnings(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "rescue", "expression": "rank(volume)", "design": "rescue",
+             "proxy_of": "close"},
+        ])
+        self.spec["design"] = "rescue"
+        self._write(self.spec)
+        with mock.patch.object(ml, "note") as alpha_note, \
+                mock.patch.object(cli_experiments, "note") as spec_note:
+            data = self._run(dry_run=True)
+        self.assertEqual(data["design"]["designs"], {"ctrl": "control", "rescue": "rescue"})
+        self.assertFalse(any("unknown" in str(call) for call in alpha_note.call_args_list))
+        self.assertFalse(any("unknown key" in str(call) for call in spec_note.call_args_list))
 
 
 if __name__ == "__main__":

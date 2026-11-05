@@ -10,6 +10,7 @@ from pathlib import Path
 
 import ablation
 import alpha_registry
+import alpha_unit
 import expression_lint
 import machine_lib as ml
 import research_config as config_io
@@ -152,7 +153,7 @@ def _simulation_result(records, settings, checkpoint_path=None, dry_run=False):
 
 
 def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg,
-                            labels=None, families=None, candidates=None):
+                            labels=None, families=None, candidates=None, metadata=None):
     if checkpoint_arg:
         path = Path(checkpoint_arg).expanduser().resolve()
         if path.exists():
@@ -193,6 +194,8 @@ def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg,
         "batch_size": batch_size,
         "records": records,
     }
+    if metadata:
+        checkpoint["metadata"] = dict(metadata)
     _write_simulation_checkpoint(path, checkpoint)
     return path, checkpoint
 
@@ -230,6 +233,10 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
     result = _simulation_result(every, settings, checkpoint_path)
     result["results"] = display
     result["results_total"] = len(every)
+    for key in ("legs", "legend", "note"):
+        value = (checkpoint.get("metadata") or {}).get(key)
+        if value is not None:
+            result[key] = value
     pending_ids = [record.get("alpha_id") or record.get("candidate_id")
                    for record in every
                    if (record.get("status") or "").upper() in {"PENDING", "QUEUED"}]
@@ -304,11 +311,33 @@ def cmd_ablate(args, _sink):
                 skipped.append({"alpha_id": raw, "reason": "not in the ledger"})
                 continue
             source = entry.get("expression") or ""
+            legs_legend = None
             try:
                 plan = ablation.variants(source, modes)
             except ablation.AblationError as exc:
-                skipped.append({"alpha_id": raw, "reason": str(exc)})
-                continue
+                point = alpha_unit.split(source)
+                if point is None:
+                    skipped.append({"alpha_id": raw,
+                                    "reason": "%s; and it does not parse" % exc})
+                    continue
+                legs_legend = {
+                    "l%d" % index: {"fields": list(leg.fields),
+                                    "role": leg.role, "weight": leg.weight}
+                    for index, leg in enumerate(getattr(point, "legs", ()) or ())
+                }
+                plan = []
+                if "full" in modes:
+                    plan.append({"candidate_id": "full", "expression": source})
+                for variant in alpha_unit.derive(point):
+                    if variant.rule != "drop_term":
+                        continue
+                    name = variant.detail or "t%d" % len(plan)
+                    plan.append({"candidate_id": "loo:%s" % name,
+                                 "expression": variant.expression})
+                if not plan:
+                    skipped.append({"alpha_id": raw,
+                                    "reason": "unit layer derived no ablations"})
+                    continue
             alpha_settings = merge_settings(entry.get("settings") or {}, args)
             alphas = []
             for item in plan:
@@ -318,9 +347,12 @@ def cmd_ablate(args, _sink):
                 item_entry["decay"] = alpha_settings["decay"]
                 alphas.append(item_entry)
             target = out_dir / ("%s-ablation.json" % raw)
-            target.write_text(json.dumps({"settings": alpha_settings, "alphas": alphas},
-                                         ensure_ascii=False, indent=2))
-            done.append({"alpha_id": raw, "file": str(target), "variants": len(plan)})
+            document = {"settings": alpha_settings, "alphas": alphas}
+            if legs_legend:
+                document["legs"] = legs_legend
+            target.write_text(json.dumps(document, ensure_ascii=False, indent=2))
+            done.append({"alpha_id": raw, "file": str(target), "variants": len(plan),
+                         "source": "unit" if legs_legend else "named-legs"})
             note("wrote %s (%d variants)" % (target, len(plan)))
         return {"mode": "ids", "written": done, "skipped": skipped,
                 "count": sum(item["variants"] for item in done),
@@ -408,13 +440,16 @@ def cmd_compare(args, _sink):
     if sum(str(path) == "-" for path in args.files) > 1:
         raise CliError("INVALID_INPUT", "stdin (-) may be read only once")
     records = []
+    inputs = []
     for path in args.files:
         try:
             payload = json.loads(config_io.read_input_text(path))
         except (config_io.ResearchError, ValueError) as exc:
             raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc),
                            "point at a file written by `simulate`") from exc
-        records.extend(records_from(path, payload))
+        file_records = records_from(path, payload)
+        records.extend(file_records)
+        inputs.append((path, payload, file_records))
 
     if not records:
         raise CliError("NOT_FOUND", "no result records in the given files",
@@ -466,7 +501,47 @@ def cmd_compare(args, _sink):
     if frozen:
         research_paths.log_view("compare", "frozen", [row.get("alpha_id") for row in rows],
                                 note=", ".join(str(path) for path in args.files))
-    if args.contributions:
+    if getattr(args, "per_file", False):
+        # Variant ids repeat across files, so keep their contributions separate.
+        rules = alpha_unit.load_rules() or {}
+        dataset_family = rules.get("datasets") or {}
+        field_family = {field: dataset_family.get(dataset, dataset)
+                        for field, dataset in (alpha_unit.load_field_datasets() or {}).items()}
+        per_file = []
+        for path, payload, file_records in inputs:
+            while isinstance(payload, dict) and "data" in payload:
+                payload = payload["data"]
+            legend = payload.get("legs") if isinstance(payload, dict) else None
+            if not legend and str(path) != "-":
+                sibling = Path(path).with_name(
+                    Path(path).name.replace("-results.json", "-ablation.json"))
+                if sibling != Path(path) and sibling.exists():
+                    try:
+                        sibling_payload = json.loads(config_io.read_input_text(sibling))
+                        if isinstance(sibling_payload, dict):
+                            legend = sibling_payload.get("legs")
+                    except (config_io.ResearchError, ValueError):
+                        pass
+            report = ablation.report(
+                file_records, metrics_of=None if frozen else _train_metrics)
+            for row in report["legs"]:
+                if legend and row["leg"] in legend:
+                    row["fields"] = legend[row["leg"]].get("fields")
+                    row["role"] = legend[row["leg"]].get("role")
+                    row["families"] = sorted({field_family.get(field, "?")
+                                              for field in (row["fields"] or [])})
+            scored = [row for row in report["legs"]
+                      if isinstance(row.get("contribution"), (int, float))]
+            per_file.append({
+                "file": path,
+                "alpha_id": Path(path).stem.split("-")[0],
+                "full_fitness": report["full_fitness"],
+                "top_leg": max(scored, key=lambda row: row["contribution"]) if scored else None,
+                "contributions": report,
+            })
+        data["per_file"] = per_file
+        data["per_file_view"] = "frozen" if frozen else "train"
+    elif args.contributions:
         # The contribution is a selection decision ("does this leg earn its place"),
         # so in the exploration view it has to be computed from train-period fitness.
         # It used to read the full-window block regardless, which put the test year
@@ -494,7 +569,7 @@ def _load_probe_spec(path):
     if not isinstance(arms, list) or not arms:
         raise CliError("INVALID_INPUT", "spec has no arms",
                        "each arm needs at least {\"expression\": ...}")
-    known = {"name", "idea", "mechanism", "note", "settings", "arms"}
+    known = {"name", "idea", "mechanism", "note", "settings", "arms", "design"}
     unknown = sorted(set(spec) - known)
     if unknown:
         # A typo here is silent otherwise: `"setting"` instead of `"settings"` would
@@ -513,6 +588,70 @@ def _load_probe_spec(path):
             raise CliError("INVALID_INPUT", "arm %d settings must be an object" % index)
         arm.setdefault("label", "arm%d" % index)
     return spec
+
+
+# Explore is an explicit, recorded opt-out from the controlled-design rules.
+_DESIGNS = ("control", "add", "drop", "parallel", "rescue")
+
+
+def _probe_design(spec, settings):
+    """Validate a control and its interventions before authenticating or spending."""
+    mode = spec.get("design")
+    if mode is not None and mode not in _DESIGNS + ("explore",):
+        raise CliError("INVALID_INPUT", "spec design %r is not a design" % (mode,),
+                       "use one of " + ", ".join(_DESIGNS + ("explore",)))
+    if mode == "explore":
+        return {"mode": "explore", "control": None,
+                "note": "scan, not an experiment: no arm pair is being compared"}
+
+    arms = spec["arms"]
+    unlabelled = [arm["label"] for arm in arms if not arm.get("design")]
+    if unlabelled:
+        raise CliError(
+            "INVALID_INPUT", "arm(s) %s carry no design" % ", ".join(unlabelled),
+            "label every arm control/add/drop/parallel/rescue, or set "
+            "\"design\": \"explore\" on the spec to record that this is a scan")
+    controls = [arm for arm in arms if arm.get("design") == "control"]
+    if not controls:
+        raise CliError("INVALID_INPUT", "no control arm",
+                       "run the parent expression unchanged as a control arm")
+    if len(controls) > 1:
+        raise CliError("INVALID_INPUT",
+                       "%d control arms; a batch has exactly one" % len(controls),
+                       "the other arms compare against it")
+    control = controls[0]
+    base = {**settings, **(control.get("settings") or {})}
+    for arm in arms:
+        design = arm.get("design")
+        if design == "control":
+            continue
+        if design not in _DESIGNS:
+            raise CliError("INVALID_INPUT",
+                           "arm %r has design %r" % (arm["label"], design),
+                           "use " + ", ".join(_DESIGNS))
+        if design == "rescue" and not arm.get("proxy_of"):
+            raise CliError(
+                "INVALID_INPUT", "rescue arm %r has no proxy_of" % (arm["label"],),
+                "name the different implementation of the same economic quantity, "
+                "e.g. \"proxy_of\": \"gross_profit/assets\"")
+        effective = {**settings, **(arm.get("settings") or {})}
+        moved = sorted(key for key in set(base) | set(effective)
+                       if base.get(key) != effective.get(key))
+        if design == "parallel":
+            if len(moved) != 1:
+                raise CliError(
+                    "INVALID_INPUT",
+                    "parallel arm %r moves %d settings (%s)"
+                    % (arm["label"], len(moved), ", ".join(moved) or "none"),
+                    "a dose series moves exactly one knob; split the batch instead")
+        elif moved:
+            raise CliError(
+                "INVALID_INPUT",
+                "%s arm %r also moves %s" % (design, arm["label"], ", ".join(moved)),
+                "only a parallel arm may change a setting; an add/drop/rescue arm "
+                "changes the expression and nothing else")
+    return {"mode": "controlled", "control": control["label"],
+            "designs": {arm["label"]: arm["design"] for arm in arms}}
 
 
 def cmd_probe(args, _sink):
@@ -545,7 +684,8 @@ def cmd_probe(args, _sink):
 
     groups = {}
     for group in raw_groups.values():
-        entries = [{key: value for key, value in arm.items() if key != "settings"}
+        entries = [{key: value for key, value in arm.items()
+                    if key not in {"settings", "design", "proxy_of"}}
                    for arm in group["arms"]]
         try:
             resolved, pairs = config_io.build_config(group["settings"], entries)
@@ -560,6 +700,13 @@ def cmd_probe(args, _sink):
             prepared = groups.setdefault(key, {"settings": effective, "arms": [], "pairs": []})
             prepared["arms"].append({**arm, "expression": expression})
             prepared["pairs"].append((expression, decay))
+
+    # Compare the actual requests, including explicit per-arm decay and CLI flags.
+    design_arms = [{**arm, "settings": group["settings"]}
+                   for group in groups.values() for arm in group["arms"]]
+    design = _probe_design({**spec, "arms": design_arms}, {})
+    if design["mode"] == "explore":
+        note("design: explore -- no control arm, so no arm is being attributed")
 
     # The output path and its collision rule are decided before anything is spent:
     # an existing batch file used to raise only after the simulations had run, so a
@@ -588,7 +735,7 @@ def cmd_probe(args, _sink):
         note("dry run: %d arm(s) in %d settings group(s), %d blocking finding(s)"
              % (len(arms), len(groups), len(blocking)))
         return {"dry_run": True, "arms": len(arms), "groups": len(groups),
-                "blocking": blocking,
+                "blocking": blocking, "design": design,
                 "settings": [group["settings"] for group in groups.values()],
                 "results": results,
                 "lint": {"operator_catalog_checked": False,
@@ -635,6 +782,7 @@ def cmd_probe(args, _sink):
         # the full window, which *contains* the test year, so ranking on them is
         # ranking on test - hiding one column would not have fixed that.
         row = {"label": arm["label"], "alpha_id": record.get("alpha_id"),
+               "design": arm.get("design"),
                "expression": arm["expression"],
                "decay": record.get("decay"), "settings": dict(record["settings"]),
                "status": record.get("status"), "error": record.get("error"),
@@ -656,7 +804,7 @@ def cmd_probe(args, _sink):
 
     Path(target).write_text(
         json.dumps({"spec": str(args.spec), "name": name, "rows": rows,
-                    "records": records},
+                    "design": design, "records": records},
                    ensure_ascii=False, indent=1), encoding="utf-8")
     if args.show_test:
         research_paths.log_view("probe", "test", [row.get("alpha_id") for row in rows],
@@ -664,7 +812,8 @@ def cmd_probe(args, _sink):
     note("wrote %s" % target)
 
     summary = {"name": name, "path": str(target), "rows": rows,
-               "simulated": len(rows), "show_test": bool(args.show_test)}
+               "simulated": len(rows), "show_test": bool(args.show_test),
+               "design": design}
     if not args.no_record:
         summary["registry"] = alpha_registry.record_simulation(
             records, settings, idea=spec.get("idea"), mechanism=spec.get("mechanism"),
@@ -677,7 +826,8 @@ def cmd_simulate(args, sink):
     """Simulate a batch of expressions, or dry-run exact payloads offline."""
     if not 1 <= args.batch_size <= 3:
         raise CliError("INVALID_INPUT", "--batch-size must be between 1 and 3")
-    file_settings, alphas = collect_alphas(args)
+    metadata = {}
+    file_settings, alphas = collect_alphas(args, metadata=metadata)
     settings = merge_settings(file_settings, args)
     try:
         settings, pairs = config_io.build_config(settings, alphas)
@@ -712,6 +862,7 @@ def cmd_simulate(args, sink):
                 "warnings": offline_lint["warnings"],
             },
             "results": records,
+            **metadata,
         }
 
     # Real submission: lint against the operator catalog first. An unknown
@@ -721,7 +872,7 @@ def cmd_simulate(args, sink):
 
     checkpoint_path, checkpoint = _prepare_simulation_run(
         settings, pairs, args.batch_size, args.checkpoint,
-        labels=labels, families=families, candidates=candidates,
+        labels=labels, families=families, candidates=candidates, metadata=metadata,
     )
     on_event = _simulation_checkpoint_callback(checkpoint_path, checkpoint, sink)
     records = with_session(

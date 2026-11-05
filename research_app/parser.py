@@ -127,8 +127,8 @@ def _add_settings_args(parser):
     parser.add_argument("--universe", type=str.upper, help="Universe, e.g. TOP3000.")
     parser.add_argument("--instrument-type", type=str.upper,
                         help="BRAIN instrument type.")
-    parser.add_argument("--neutralization", type=str.upper, choices=ml.NEUTRALIZATIONS,
-                        help="Neutralization scheme.")
+    parser.add_argument("--neutralization", type=str.upper,
+                        help="Neutralization token; validated by machine_lib, with availability decided by BRAIN.")
     parser.add_argument("--decay", type=int,
                         help="Default decay for alphas that do not set their own.")
     parser.add_argument("--delay", type=int, choices=[0, 1],
@@ -460,9 +460,8 @@ def build_parser():
     abl.add_argument("--expr", default=None,
                      help="Composite expression: 'a = ...; b = ...; a + b'.")
     abl.add_argument("--ids", default=None,
-                     help="Comma-separated ledger ids: write one ablation file per "
-                          "alpha instead of one for --expr/--file. Expressions that "
-                          "are not a sum of named legs are reported, not guessed at.")
+                     help="Comma-separated ledger ids: write one ablation file per alpha. "
+                          "Named sums use named legs; other parseable expressions use structural drop-term variants.")
     abl.add_argument("--out-dir", default=None,
                      help="With --ids, write <id>.json here (default: the research dir).")
     abl.add_argument("--modes", default="full,loo,solo",
@@ -489,6 +488,8 @@ def build_parser():
                            "the test year.")
     cmp_.add_argument("--contributions", action="store_true",
                       help="Also compute per-leg contributions from ablate labels.")
+    cmp_.add_argument("--per-file", action="store_true",
+                      help="Report contributions per input file so identically named ablation arms stay separate.")
 
     cmp_.set_defaults(func=experiments.cmd_compare)
 
@@ -507,6 +508,36 @@ def build_parser():
 
     brief.set_defaults(func=campaign.cmd_brief)
 
+    ask = sub.add_parser(
+        "ask",
+        help="Query the local ledger: filter, group, summarise, correlate.",
+        description="Filter ledger entries, group statistics, measure within-panel slopes, "
+                    "or correlate cached PnL without network requests.")
+    ask.add_argument("--where", default="",
+                     help="Comma list of field=value / field!=value; fields: " +
+                          ", ".join(ledger._ASK_FIELDS) +
+                          " plus check=NAME:RESULT and has=metrics|pnl|checks.")
+    ask.add_argument("--by", default=None,
+                     help="Grouping axis; one of " + ", ".join(ledger._ASK_FIELDS) + ".")
+    ask.add_argument("--stat", default="n",
+                     help="Comma list: n, floor_share, median:METRIC, mean:METRIC, "
+                          "p25:METRIC, p75:METRIC, min:METRIC, max:METRIC.")
+    ask.add_argument("--panel", default="",
+                     help="Comma list of metrics whose within-panel slope against numeric --by is reported.")
+    ask.add_argument("--matrix", default=None, choices=["corr"],
+                     help="Pairwise correlation over cached PnL of matched entries.")
+    ask.add_argument("--matrix-within", default="expr",
+                     choices=["none", "expr", "family", "neutralization"],
+                     help="Restrict matrix pairs to entries sharing this key.")
+    ask.add_argument("--min-overlap", type=int, default=200,
+                     help="Shared trading days required for each correlation pair.")
+    ask.add_argument("--list", action="store_true",
+                     help="Include one line per matched entry.")
+    ask.add_argument("--limit", type=int, default=20,
+                     help="Maximum listed entries or correlation pairs.")
+    ask.add_argument("--registry", default=None)
+    ask.set_defaults(func=ledger.cmd_ask)
+
     probe = sub.add_parser(
         "probe",
         help="Run a batch of arms from a spec file (lint, simulate, table, record).",
@@ -516,7 +547,7 @@ def build_parser():
                     "ledger entry per arm. The table hides the test period unless "
                     "--show-test is passed, because selecting on it destroys the only "
                     "out-of-sample evidence there is.")
-    probe.add_argument("spec", help="JSON spec: {name, settings, arms:[{label, expression, settings?}]}.")
+    probe.add_argument("spec", help="JSON spec: {name, design?, settings, arms:[{label, expression, design?, proxy_of?, settings?}]}; use design=explore for scans.")
     _add_settings_args(probe)
     _add_session_args(probe)
     probe.add_argument("--name", default=None,
@@ -839,6 +870,8 @@ _COMMAND_EXAMPLES = {
     "ablate": ['ablate --expr "a = rank(close); b = rank(volume); a + b" --out variants.json'],
     "compare": ["compare results.json --sort fitness"],
     "brief": ["brief", "brief --days 7 --top 5"],
+    "ask": ["ask --by neutralization --stat n,median:sharpe,floor_share",
+            "ask --where status=ACTIVE --list"],
     "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],

@@ -129,8 +129,8 @@ def with_session(args, work):
         return work(session)
 
 
-def collect_alphas(args):
-    """Merge files in order, then positional and repeated inline expressions."""
+def collect_alphas(args, metadata=None):
+    """Merge inputs in order, optionally collecting research-file side metadata."""
     file_settings, alphas = {}, []
     paths = ([args.file] if getattr(args, "file", None) else [])
     paths.extend(getattr(args, "files", None) or [])
@@ -138,9 +138,15 @@ def collect_alphas(args):
         raise CliError("INVALID_INPUT", "stdin (-) may be read only once")
     for path in paths:
         try:
-            settings, entries = config_io.load_research_file(path)
+            text = config_io.read_input_text(path)
+            settings, entries = config_io.parse_research_text(text, source=str(path))
         except config_io.ResearchError as exc:
             raise CliError("INVALID_INPUT", str(exc)) from exc
+        if metadata is not None and text.lstrip().startswith("{"):
+            payload = json.loads(text)
+            for key in ("legs", "legend", "note"):
+                if payload.get(key) is not None:
+                    metadata[key] = payload[key]
         file_settings.update(settings)
         alphas.extend(entries)
     if getattr(args, "expression", None) is not None:
