@@ -384,7 +384,8 @@ def build_parser():
     papers.set_defaults(func=literature.cmd_paper)
 
     sim = sub.add_parser(
-        "simulate", help="Simulate alphas (spends simulation quota unless --dry-run).")
+        "simulate", help="Simulate alphas (no per-simulation fee on this account; "
+                                "time is the only cost - sweep wide).")
     sim.add_argument("file", nargs="?",
                      help="Research file: JSON, or one expression per line. "
                           "Omit when using --expr.")
@@ -420,7 +421,7 @@ def build_parser():
                      help="Override the alpha registry path.")
     sim.add_argument("--allow-lint-errors", action="store_true",
                      help="Submit even when the operator lint fails (the previous "
-                          "behaviour). Not recommended: the failure costs quota.")
+                          "behaviour). Not recommended: the failure costs a rerun.")
     sim.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
                      help="Sort results by this metric, best first.")
     sim.add_argument("--top", type=int, default=None,
@@ -562,7 +563,14 @@ def build_parser():
                     "ledger entry per arm. The table hides the test period unless "
                     "--show-test is passed, because selecting on it destroys the only "
                     "out-of-sample evidence there is.")
-    probe.add_argument("spec", help="JSON spec: {name, design?, settings, arms:[{label, expression, design?, proxy_of?, settings?}]}; use design=explore for scans.")
+    probe.add_argument("--recover", default=None, metavar="BATCH_JSON",
+                       help="Fill a batch file's empty arms by matching expressions to "
+                            "alphas already on the platform (no simulation). Use after a "
+                            "killed run or a rate-limited batch.")
+    probe.add_argument("spec", nargs="?", default=None,
+                       help="JSON spec: {name, design?, settings, arms:[{label, expression, "
+                            "design?, proxy_of?, settings?}]}; use design=explore for scans. "
+                            "Omitted when --recover is given.")
     _add_settings_args(probe)
     _add_session_args(probe)
     probe.add_argument("--name", default=None,
@@ -696,7 +704,7 @@ def build_parser():
     l_rec = ledger_sub.add_parser(
         "record", help="Fetch one alpha from BRAIN and append it to the ledger (online).",
         description="Requires a BRAIN session and an existing alpha id. Fetches "
-                    "current metrics without spending simulation quota. To change "
+                    "current metrics without a new simulation. To change "
                     "judgement labels on a stored entry offline, use ledger label.")
     l_rec.add_argument("alpha_id")
     l_rec.add_argument("--idea", default=None, help="e.g. 'Idea 47'.")

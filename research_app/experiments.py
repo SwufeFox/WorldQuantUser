@@ -654,6 +654,97 @@ def _probe_design(spec, settings):
             "designs": {arm["label"]: arm["design"] for arm in arms}}
 
 
+
+def _normalized_expression(text):
+    """Whitespace-free form so a platform expression matches its spec arm."""
+    return "".join((text or "").split())
+
+
+def _recover_probe_rows(session, rows, limit=400, pages=3):
+    """Fill arms that came back empty by matching them to alphas on the platform.
+
+    A batch can lose arms two ways, both seen on 2026-11-05: the whole run stalls and
+    gets killed, or individual submissions are rate-limited after the backoff budget.
+    Either way the simulations *did* run (or are still running), so the honest repair
+    is to read the platform back rather than spend another twenty minutes re-running.
+
+    Matching is by expression, because that is the only stable key: labels live in the
+    spec, ids live in a stdout that a killed process never flushed. ``alpha get``
+    already exposes ``out_of_sample.train``, so no simulation is needed.
+    """
+    missing = [row for row in rows if row.get("train_fitness") is None]
+    if not missing:
+        return {"recovered": 0, "still_missing": [], "matched": {}}
+    index = {}
+    for page in range(pages):
+        batch = ml.list_alphas(session, limit=limit, offset=page * limit,
+                               order="-dateCreated", status="UNSUBMITTED")
+        for alpha in batch:
+            code, _description, _ops = ml.regular_expression(alpha)
+            key = _normalized_expression(code)
+            if key and key not in index:
+                index[key] = alpha.get("id")
+        if len(batch) < limit:
+            break
+    matched, still_missing = {}, []
+    for row in missing:
+        key = _normalized_expression(row.get("expression"))
+        alpha_id = index.get(key)
+        if not alpha_id:
+            still_missing.append(row["label"])
+            continue
+        payload = ml.fetch_alpha_metrics(session, alpha_id)
+        train = (ml.extract_split(payload) or {}).get("train") or {}
+        if train.get("fitness") is None:
+            still_missing.append(row["label"])
+            continue
+        row.update({"alpha_id": alpha_id, "status": payload.get("status"),
+                    "train_sharpe": train.get("sharpe"),
+                    "train_fitness": train.get("fitness"),
+                    "train_turnover": train.get("turnover"),
+                    "train_returns": train.get("returns"),
+                    "error": None})
+        matched[row["label"]] = alpha_id
+    return {"recovered": len(matched), "still_missing": still_missing, "matched": matched}
+
+
+def _cmd_probe_recover(args):
+    """Rebuild a batch file's empty rows from the platform, then re-record them."""
+    path = Path(args.recover).expanduser().resolve()
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise CliError("INVALID_INPUT", "cannot read batch file %s" % path, str(exc))
+    rows = document.get("rows") or []
+    if not rows:
+        raise CliError("INVALID_INPUT", "%s has no rows" % path.name)
+    outcome = with_session(args, lambda s: _recover_probe_rows(s, rows))
+    for row in rows:
+        if row.get("train_fitness") is not None:
+            note("%-28s %7s %6s %7s" % (row["label"], row.get("train_sharpe"),
+                                        row.get("train_fitness"), row.get("train_turnover")))
+    document["rows"] = rows
+    document["complete"] = not outcome["still_missing"]
+    document["incomplete"] = outcome["still_missing"]
+    document["recovered"] = outcome["matched"]
+    path.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
+    note("recovered %d arm(s) from the platform; still missing: %s"
+         % (outcome["recovered"], ", ".join(outcome["still_missing"]) or "none"))
+    note("wrote %s" % path)
+    return {"name": document.get("name"), "path": str(path),
+            "recovered": outcome["recovered"],
+            "still_missing": outcome["still_missing"], "rows": rows}
+
+
+def _require_spec(args):
+    """`probe --recover` needs no spec; every other mode does."""
+    spec = getattr(args, "spec", None)
+    if spec:
+        return spec
+    raise CliError("USAGE", "probe needs a spec file",
+                   "pass spec.json, or --recover BATCH_JSON to repair an existing batch")
+
+
 def cmd_probe(args, _sink):
     """Run a batch of arms from one spec file: lint, simulate, table, record.
 
@@ -670,6 +761,10 @@ def cmd_probe(args, _sink):
     ``--show-test`` is passed - selecting on the test year turns the only
     out-of-sample evidence into training data.
     """
+    if getattr(args, "recover", None):
+        return _cmd_probe_recover(args)
+    _require_spec(args)
+
     # Resolve every arm before authenticating or spending quota on the first group.
     spec = _load_probe_spec(args.spec)
     settings = dict(spec.get("settings") or {})
@@ -802,9 +897,22 @@ def cmd_probe(args, _sink):
         rows.append(row)
         note(line + ("  fail=" + ",".join(failed) if failed else ""))
 
+    # An arm can come back QUEUED with no metrics - the platform rate-limits a batch
+    # and `guarded_sim` gives up after its backoff budget. The batch file then looks
+    # complete while seven rows are empty, which is how a 34-arm sweep quietly became
+    # a 27-arm one. Say it out loud, in the table and in the document.
+    incomplete = [row["label"] for row in rows if row.get("train_fitness") is None]
+    if incomplete:
+        note("")
+        note("INCOMPLETE: %d arm(s) produced no train metrics: %s"
+             % (len(incomplete), ", ".join(incomplete)))
+        note("  the platform rate-limited or never finished them; rerun those arms "
+             "in a smaller batch (free) rather than reading this table as complete")
+
     Path(target).write_text(
         json.dumps({"spec": str(args.spec), "name": name, "rows": rows,
-                    "design": design, "records": records},
+                    "design": design, "records": records,
+                    "complete": not incomplete, "incomplete": incomplete},
                    ensure_ascii=False, indent=1), encoding="utf-8")
     if args.show_test:
         research_paths.log_view("probe", "test", [row.get("alpha_id") for row in rows],
@@ -813,7 +921,8 @@ def cmd_probe(args, _sink):
 
     summary = {"name": name, "path": str(target), "rows": rows,
                "simulated": len(rows), "show_test": bool(args.show_test),
-               "design": design}
+               "design": design, "complete": not incomplete,
+               "incomplete": incomplete}
     if not args.no_record:
         summary["registry"] = alpha_registry.record_simulation(
             records, settings, idea=spec.get("idea"), mechanism=spec.get("mechanism"),

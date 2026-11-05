@@ -100,6 +100,47 @@ class ProbeTests(unittest.TestCase):
                                lambda: self.output_dir):
             return cli_experiments.cmd_probe(self._args(**overrides), mock.MagicMock())
 
+
+    def test_arms_that_come_back_empty_are_reported_as_incomplete(self):
+        # A rate-limited arm comes back QUEUED with no metrics. The batch file used to
+        # look complete anyway: on 2026-11-05 a 34-arm sweep was quietly a 27-arm one.
+        good = record("A1", 2.0, 1.5)
+        good["out_of_sample"]["train"] = {"sharpe": 1.7, "fitness": 1.4,
+                                          "turnover": 0.05, "returns": 0.08}
+        self.fake = FakeGuard([good,
+                               {"alpha_id": None, "status": "QUEUED",
+                                "error": "RATE_LIMITED", "metrics": {}}])
+        with mock.patch.object(cli_experiments, "guarded_sim", self.fake):
+            data = self._run()
+        self.assertFalse(data["complete"])
+        self.assertEqual(data["incomplete"], ["b"])
+        saved = json.loads(open(data["path"], encoding="utf-8").read())
+        self.assertFalse(saved["complete"])
+        self.assertEqual(saved["incomplete"], ["b"])
+
+    def test_recover_fills_empty_arms_from_the_platform(self):
+        # After a killed run the sims may already exist on the platform; reading them
+        # back is cheaper and more honest than re-running twenty minutes of work.
+        rows = [
+            {"label": "a", "expression": "rank( close )", "train_fitness": None},
+            {"label": "b", "expression": "rank(volume)", "train_fitness": 1.0},
+        ]
+        platform = [{"id": "Z1", "regular": "rank(close)"}]
+        payload = {"id": "Z1", "status": "COMPLETE",
+                   "oos": {"train": {"sharpe": 1.8, "fitness": 1.4,
+                                     "turnover": 0.05, "returns": 0.09}}}
+        with mock.patch.object(ml, "list_alphas", return_value=platform), \
+                mock.patch.object(ml, "regular_expression",
+                                  lambda a: (a["regular"], None, 1)), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=payload), \
+                mock.patch.object(ml, "extract_split",
+                                  lambda a: a.get("oos") or {}):
+            outcome = cli_experiments._recover_probe_rows(object(), rows)
+        self.assertEqual(outcome["recovered"], 1)
+        self.assertEqual(outcome["still_missing"], [])
+        self.assertEqual(rows[0]["alpha_id"], "Z1")
+        self.assertEqual(rows[0]["train_fitness"], 1.4)
+
     def test_train_is_always_present_and_test_only_on_request(self):
         # Wrong behaviour this prevents: choosing between arms while looking at the
         # test year, which is the only out-of-sample evidence the API exposes.
