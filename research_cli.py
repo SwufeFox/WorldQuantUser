@@ -1679,6 +1679,18 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
     result = _simulation_result(every, settings, checkpoint_path)
     result["results"] = display
     result["results_total"] = len(every)
+    # Carry a research file's side metadata through. `ablate --ids` writes a `legs`
+    # legend naming what l0/l1 are; without it a later `compare --per-file` can say
+    # "l1 contributed 0.56" but not which fields that leg reads.
+    if getattr(args, "file", None):
+        try:
+            payload = json.loads(Path(args.file).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("legs", "legend", "note"):
+                if payload.get(key) is not None:
+                    result[key] = payload[key]
     pending_ids = [record.get("alpha_id") or record.get("candidate_id")
                    for record in every
                    if (record.get("status") or "").upper() in {"PENDING", "QUEUED"}]
@@ -1950,6 +1962,12 @@ def cmd_compare(args, _sink):
         # One report per input file. A merged report cannot work here: every ablation
         # file names its arms `full` / `loo:l0`, so merging twenty-five of them mixes
         # one alpha's legs into another's contribution.
+        # Field -> data family, so a leg can be named by what it reads ("price",
+        # "fundamental", "analyst"...) instead of by its slot name l0/l1.
+        rules = alpha_unit.load_rules() or {}
+        dataset_family = rules.get("datasets") or {}
+        field_family = {field: dataset_family.get(dataset, dataset)
+                        for field, dataset in (alpha_unit.load_field_datasets() or {}).items()}
         per_file = []
         for path in args.files:
             try:
@@ -1958,12 +1976,24 @@ def cmd_compare(args, _sink):
                 continue
             file_records = records_from(path, payload)
             legend = payload.get("legs") if isinstance(payload, dict) else None
+            if not legend:
+                # Results written before `simulate` carried the legend still sit next
+                # to the file they came from; `X-results.json` -> `X-ablation.json`.
+                sibling = Path(path).with_name(
+                    Path(path).name.replace("-results.json", "-ablation.json"))
+                if sibling.exists():
+                    try:
+                        legend = json.loads(sibling.read_text(encoding="utf-8")).get("legs")
+                    except (OSError, ValueError):
+                        legend = None
             report = ablation.report(
                 file_records, metrics_of=None if frozen else _train_metrics)
             for row in report["legs"]:
                 if legend and row["leg"] in legend:
                     row["fields"] = legend[row["leg"]].get("fields")
                     row["role"] = legend[row["leg"]].get("role")
+                    row["families"] = sorted({field_family.get(field, "?")
+                                              for field in (row["fields"] or [])})
             scored = [row for row in report["legs"]
                       if isinstance(row.get("contribution"), (int, float))]
             per_file.append({

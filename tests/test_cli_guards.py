@@ -184,6 +184,33 @@ class ComparePerFileTests(unittest.TestCase):
         self.assertEqual(first["top_leg"]["fields"], ["atq"])
 
 
+class CompareLegendTests(unittest.TestCase):
+    def test_a_results_file_finds_its_leg_legend_next_to_it(self):
+        # `simulate` only started carrying the file's `legs` legend recently; older
+        # results still sit beside their ablation file, and without the legend a
+        # contribution report can say "l1 added 0.56" but not what l1 reads.
+        folder = tempfile.mkdtemp()
+        results = os.path.join(folder, "X-results.json")
+        ablation = os.path.join(folder, "X-ablation.json")
+        payload = [{"candidate_id": "full", "status": "COMPLETE", "metrics": {"fitness": 2.0},
+                    "out_of_sample": {"train": {"fitness": 2.0}}},
+                   {"candidate_id": "loo:l0", "status": "COMPLETE", "metrics": {"fitness": 1.0},
+                    "out_of_sample": {"train": {"fitness": 1.0}}}]
+        with open(results, "w", encoding="utf-8") as handle:
+            json.dump({"records": payload}, handle)
+        with open(ablation, "w", encoding="utf-8") as handle:
+            json.dump({"alphas": payload,
+                       "legs": {"l0": {"fields": ["accrued_liabilities_total_2",
+                                                  "fnd6_cptnewqv1300_atq"]}}}, handle)
+        args = argparse.Namespace(files=[results], min_fitness=None, sort="sharpe",
+                                  contributions=False, save=None, frozen=False,
+                                  per_file=True)
+        data = cli.cmd_compare(args, mock.MagicMock())
+        top = data["per_file"][0]["top_leg"]
+        self.assertEqual(top["fields"][0], "accrued_liabilities_total_2")
+        self.assertIn("fundamental", top["families"])
+
+
 class ViewsCommandTests(unittest.TestCase):
     def test_the_frozen_view_is_logged_and_train_is_not(self):
         path = os.path.join(tempfile.mkdtemp(), "batch.json")
