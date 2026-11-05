@@ -104,6 +104,28 @@ class BriefTests(unittest.TestCase):
         self.assertEqual(data["ledger"]["book_rows_missing_labels"], 1)
         self.assertGreaterEqual(data["ledger"]["rows_with_metrics_but_no_checks"], 1)
 
+    def test_the_book_is_screened_for_same_bet_pairs(self):
+        # The platform compares a submission against a periodically refreshed snapshot,
+        # so two alphas 0.88 correlated can both be in the book. Nothing was scanning
+        # the book after the fact; `brief` now does it on monthly PnL.
+        import math
+        days = ["2026-%02d-%02d" % (month, day) for month in range(1, 25)
+                for day in range(1, 28)]
+        base = {day: math.sin(index * 0.4) for index, day in enumerate(days)}
+        twin = {day: value * 2 + 0.001 for day, value in base.items()}
+        for name, series in (("BOOK1", base), ("BOOK2", twin)):
+            folder = os.path.join(self.research, "pnl")
+            os.makedirs(folder, exist_ok=True)
+            with open(os.path.join(folder, "%s.json" % name), "w",
+                      encoding="utf-8") as handle:
+                json.dump(series, handle)
+            alpha_registry.record_entry(entry(name, "ACTIVE", 2.0), self.registry)
+        data = self._run()
+        screen = data["book"]["self_duplicates"]
+        self.assertGreaterEqual(screen["count"], 1)
+        pair = screen["pairs"][0]
+        self.assertEqual({pair["a"], pair["b"]}, {"BOOK1", "BOOK2"})
+
     def test_the_document_stays_small(self):
         # The bound is the point: a digest is useful only while it is cheaper to read
         # than the archive it replaces.

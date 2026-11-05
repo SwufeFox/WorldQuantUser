@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import alpha_registry
+import correlation
 import json
 import research_paths
 
@@ -46,6 +47,47 @@ def _first_heading(path):
     except OSError:
         return None
     return None
+
+
+
+def _book_duplicates(book, threshold=0.9, limit=3):
+    """Pairs inside the book that are the same bet, screened on monthly PnL.
+
+    Why this belongs in `brief`: the platform compares a submission against a
+    *periodically refreshed snapshot*, so two alphas that are 0.88 correlated can both
+    sit in the book when the second was submitted before the snapshot refreshed. The
+    local scan catches that in seconds, and nothing was scanning the book after the
+    fact - `WjbJO0vZ` and `vR2e0z1z` have been 0.879 correlated since 2026-10-04.
+
+    Monthly buckets keep the scan cheap (1275 pairs would be 1.5M daily comparisons).
+    That overstates correlation, so the threshold is 0.9 and the result is reported as
+    indicative: a hit means "look at this pair", not "these are duplicates".
+    """
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+    series = {}
+    for alpha_id in book:
+        path = pnl_dir / ("%s.json" % alpha_id)
+        if not path.exists():
+            continue
+        try:
+            series[alpha_id] = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+    monthly = {name: correlation.aggregate(values, "m") for name, values in series.items()}
+    names = sorted(monthly)
+    hits = []
+    for index, left in enumerate(names):
+        for right in names[index + 1:]:
+            x, y, dates = correlation.align(monthly[left], monthly[right], min_overlap=12)
+            if not x:
+                continue
+            value = correlation.pearson(x, y)
+            if value is None or abs(value) < threshold:
+                continue
+            hits.append({"a": left, "b": right, "r": round(value, 3), "months": len(dates)})
+    hits.sort(key=lambda row: abs(row["r"]), reverse=True)
+    return {"threshold": threshold, "frequency": "monthly", "count": len(hits),
+            "pairs": hits[:limit]}
 
 
 def cmd_brief(args, _sink):
@@ -164,6 +206,8 @@ def cmd_brief(args, _sink):
                               if sharpes else None),
             "by_family": dict(sorted(families.items(), key=lambda item: -item[1])),
             "by_universe": dict(sorted(universes.items(), key=lambda item: -item[1])),
+            # Same-bet pairs the submission gate could have missed (snapshot lag).
+            "self_duplicates": _book_duplicates(sorted(book)),
         },
         "recent": {"runs": len(runs), "by_verdict": by_verdict, "best": best},
         "documents": documents,
