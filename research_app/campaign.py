@@ -50,18 +50,19 @@ def _first_heading(path):
 
 
 
-def _book_duplicates(book, threshold=0.9, limit=3):
-    """Pairs inside the book that are the same bet, screened on monthly PnL.
+def _book_duplicates(book, gate=0.70, prefilter=0.75, limit=8):
+    """Book pairs that break the platform's own correlation gate.
 
     Why this belongs in `brief`: the platform compares a submission against a
-    *periodically refreshed snapshot*, so two alphas that are 0.88 correlated can both
-    sit in the book when the second was submitted before the snapshot refreshed. The
-    local scan catches that in seconds, and nothing was scanning the book after the
-    fact - `WjbJO0vZ` and `vR2e0z1z` have been 0.879 correlated since 2026-10-04.
+    *periodically refreshed snapshot*, so two alphas 0.88 correlated can both sit in
+    the book when the second was submitted before the snapshot refreshed. Measured on
+    2026-11-05, the book holds **eight** pairs above the 0.70 gate - `O0J6Aeag` and
+    `gJWre33J` at 0.975 among them - and nothing was scanning the book after the fact.
 
-    Monthly buckets keep the scan cheap (1275 pairs would be 1.5M daily comparisons).
-    That overstates correlation, so the threshold is 0.9 and the result is reported as
-    indicative: a hit means "look at this pair", not "these are duplicates".
+    Two stages, because 1275 pairs on 1236 daily points is too slow for a session
+    start: a stride prefilter on every fifth day at 0.75, then the survivors are
+    confirmed on full daily PnL at the real gate. The summary therefore reports the
+    gate the platform would have applied, not the prefilter.
     """
     pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
     series = {}
@@ -73,21 +74,36 @@ def _book_duplicates(book, threshold=0.9, limit=3):
             series[alpha_id] = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-    monthly = {name: correlation.aggregate(values, "m") for name, values in series.items()}
-    names = sorted(monthly)
-    hits = []
+    # Prefilter on every fifth day rather than on monthly buckets: monthly averaging
+    # lost two of the eight violations (a 0.77 daily pair can read 0.80 monthly), and a
+    # screen that under-reports is worse than no screen. A stride keeps ~250 points per
+    # pair, which is cheap and tracks daily closely enough to be conservative at 0.80.
+    sampled = {name: {day: values[day] for day in sorted(values)[::5]}
+               for name, values in series.items()}
+    names = sorted(sampled)
+    suspects = []
     for index, left in enumerate(names):
         for right in names[index + 1:]:
-            x, y, dates = correlation.align(monthly[left], monthly[right], min_overlap=12)
+            x, y, dates = correlation.align(sampled[left], sampled[right], min_overlap=40)
             if not x:
                 continue
             value = correlation.pearson(x, y)
-            if value is None or abs(value) < threshold:
+            if value is None or abs(value) < prefilter:
                 continue
-            hits.append({"a": left, "b": right, "r": round(value, 3), "months": len(dates)})
+            suspects.append((left, right, value))
+    hits = []
+    for left, right, strided_r in suspects:
+        x, y, dates = correlation.align(series[left], series[right], min_overlap=200)
+        if not x:
+            continue
+        value = correlation.pearson(x, y)
+        if value is None or abs(value) < gate:
+            continue
+        hits.append({"a": left, "b": right, "r": round(value, 4),
+                     "strided_r": round(strided_r, 3), "days": len(dates)})
     hits.sort(key=lambda row: abs(row["r"]), reverse=True)
-    return {"threshold": threshold, "frequency": "monthly", "count": len(hits),
-            "pairs": hits[:limit]}
+    return {"gate": gate, "prefilter": prefilter, "frequency": "daily",
+            "count": len(hits), "pairs": hits[:limit]}
 
 
 def cmd_brief(args, _sink):
