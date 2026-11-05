@@ -164,6 +164,7 @@ def _field_scope(session, settings):
 
 
 def cmd_lint(args, sink):
+    """Lint FASTEXPR expressions against operator/field catalogs, learned denylists, and syntax rules."""
     settings, pairs = _collect_lint_pairs(args)
     denylist = expression_lint.load_denylist(getattr(args, "denylist", None))
     operator_index = None

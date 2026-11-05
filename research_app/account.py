@@ -10,6 +10,7 @@ import research_paths
 
 
 def cmd_auth_check(args, _sink):
+    """Verify BRAIN credentials, report permissions, session cache state and accessible data regions."""
     meta = {}
     session = ml.load_session(use_cache=not args.no_cache, refresh=args.relogin,
                               meta=meta)

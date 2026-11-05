@@ -54,7 +54,7 @@ Two counts in there are deliberately different. On 2026-11-01 the ledger held
 **2134 rows over 1267 keys**, and **117 rows carry an `ACTIVE` status while the book
 is 48 keys** — the same alpha filed at several universes. A manifest that reports
 117 is a manifest that will be quoted as 117, so both numbers are printed with their
-单位 spelled out.
+units spelled out.
 
 ## Verification is inside the write
 

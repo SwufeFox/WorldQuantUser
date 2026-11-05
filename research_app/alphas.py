@@ -14,6 +14,7 @@ from .runtime import CliError, METRIC_KEYS, note, with_session
 
 
 def cmd_alpha_get(args, _sink):
+    """Fetch one alpha's metrics, checks, metadata and out-of-sample split from BRAIN."""
     payload = with_session(args, lambda s: ml.fetch_alpha_metrics(s, args.alpha_id))
     in_sample = payload.get("is") or {}
     code, description, operator_count = ml.regular_expression(payload)
@@ -154,6 +155,7 @@ def _record_submitted_alpha(session, alpha_id):
 
 
 def cmd_alpha_list(args, _sink):
+    """List platform alphas matching filters such as status, region, universe or minimum Sharpe."""
     alphas = with_session(args, lambda s: ml.list_alphas(
         s, limit=args.limit, offset=args.offset, order=args.order,
         status=args.status, region=args.region, universe=args.universe,
@@ -716,6 +718,7 @@ def cmd_alpha_corr(args, sink):
 
 
 def cmd_alpha_book(args, sink):
+    """Inspect currently submitted/ACTIVE alphas joined with local ledger mechanisms and families."""
     registry_path = (getattr(args, "registry", None)
                      or alpha_registry.default_registry_path())
     entries = alpha_registry.load_entries(registry_path)

@@ -9,6 +9,7 @@ from .runtime import CliError, with_session
 
 
 def cmd_ledger_record(args, sink):
+    """Fetch metrics for an alpha from the platform and record a new entry in the local ledger."""
     alpha_id = getattr(args, "alpha_id", None)
     if not alpha_id:
         raise CliError(
@@ -50,6 +51,7 @@ def cmd_ledger_record(args, sink):
 
 
 def cmd_ledger_list(args, _sink):
+    """List and filter ledger entries by field, mechanism, verdict, family or metrics."""
     registry_path, entries = _ledger(args)
     limit = getattr(args, "limit", 0)
     if limit is not None and limit < 0:

@@ -674,6 +674,7 @@ def cmd_probe(args, _sink):
 
 
 def cmd_simulate(args, sink):
+    """Simulate a batch of expressions, or dry-run exact payloads offline."""
     if not 1 <= args.batch_size <= 3:
         raise CliError("INVALID_INPUT", "--batch-size must be between 1 and 3")
     file_settings, alphas = collect_alphas(args)
@@ -749,6 +750,7 @@ def cmd_simulate(args, sink):
 
 
 def cmd_resume(args, sink):
+    """Resume pending, queued or unpolled simulations from an atomic checkpoint file."""
     path = Path(args.checkpoint).expanduser().resolve()
     try:
         checkpoint = json.loads(path.read_text(encoding="utf-8"))

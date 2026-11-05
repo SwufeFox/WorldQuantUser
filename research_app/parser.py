@@ -141,6 +141,7 @@ def _add_settings_args(parser):
 
 
 def build_parser():
+    """Build the complete CLI argument parser with subcommands, defaults and examples."""
     parser = JsonArgumentParser(
         prog="research_cli.py",
         description="WorldQuant research: discover data, check expressions, run experiments, "
@@ -953,10 +954,12 @@ def _help_document(parser):
 
 
 def cmd_help(args, _sink):
+    """Return structured usage and command options for a command path."""
     return _help_document(_find_command_parser(getattr(args, "path", [])))
 
 
 def cmd_schema(args, _sink):
+    """Emit the full machine-readable call contract or one command's schema."""
     if args.name:
         selected = _find_command_parser(args.name)
         return {"tool": "research_cli.py", "version": VERSION,

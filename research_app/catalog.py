@@ -11,6 +11,7 @@ from .runtime import CliError, with_session
 
 
 def cmd_catalog_operators(args, _sink):
+    """List supported operators with ranked local search and optional documentation fetch."""
     cache_report = {}
 
     def work(session):
@@ -53,6 +54,7 @@ def cmd_catalog_operators(args, _sink):
 
 
 def cmd_catalog_datasets(args, _sink):
+    """List accessible datasets for a region, universe, delay and instrument type."""
     cache_report = {}
     datasets = with_session(args, lambda s: ml.get_datasets(
         s, instrument_type=args.instrument_type, region=args.region,
@@ -244,6 +246,7 @@ def cmd_catalog_verify(args, _sink):
 
 
 def cmd_catalog_categories(args, _sink):
+    """List data categories with field and alpha counts indicating namespace crowding."""
     cache_report = {}
     categories = with_session(args, lambda s: ml.fetch_data_categories(
         s, region=args.region, universe=args.universe, delay=args.delay,

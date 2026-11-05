@@ -17,7 +17,7 @@ built to be smaller than the archive it summarises. Its open-question list comes
 `- [open] …` or `- [closed] …` line per question, because it is what survives a
 context reset.
 
-That prints the complete contract as JSON: every command, every argument with
+`schema` prints the complete contract as JSON: every command, every argument with
 its type and choices, the research-file format, the error codes and the exit
 codes. It is generated from the live argument parser, so it cannot drift from
 the implementation. **Do not read `research_cli.py` to learn the interface.**
@@ -46,6 +46,7 @@ the implementation. **Do not read `research_cli.py` to learn the interface.**
    settings and prints the exact request payloads, with no credentials and no
    quota spent.
    `python research_cli.py simulate research.json --dry-run`
+   `python research_cli.py probe batch.spec.json --dry-run`
 2. **Simulations cost quota.** `catalog ...` and `alpha ...` are free. Do not
    re-simulate something you can read with `alpha get` / `alpha list`.
 3. **Check access before designing around data.** `auth check` reports the

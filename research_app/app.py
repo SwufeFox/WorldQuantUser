@@ -17,6 +17,7 @@ from .runtime import CliError, EXIT_CODES, _error_body, _prepare_output, emit, m
 
 
 def _dispatch(args):
+    """Validate common argument constraints, configure logging and caches, and invoke command."""
     for name, value in vars(args).items():
         if isinstance(value, float) and not math.isfinite(value):
             args._parser.error("--%s must be finite" % name.replace("_", "-"))
