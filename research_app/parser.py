@@ -524,6 +524,13 @@ def build_parser():
                           "p25:METRIC, p75:METRIC, min:METRIC, max:METRIC.")
     ask.add_argument("--panel", default="",
                      help="Comma list of metrics whose within-panel slope against numeric --by is reported.")
+    ask.add_argument("--factor-ids", default=None,
+                     help="Comma-separated ids whose average PnL becomes a factor; every "
+                          "matched entry is correlated against it. Use it to ask how "
+                          "many alphas are re-parameterisations of one measured leg.")
+    ask.add_argument("--factor-threshold", type=float, default=0.8,
+                     help="|r| at or above this counts as a variant of the factor "
+                          "(default 0.8).")
     ask.add_argument("--matrix", default=None, choices=["corr"],
                      help="Pairwise correlation over cached PnL of matched entries.")
     ask.add_argument("--matrix-within", default="expr",

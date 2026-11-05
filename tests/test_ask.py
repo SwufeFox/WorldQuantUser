@@ -146,6 +146,28 @@ class MatrixTests(unittest.TestCase):
             self.assertAlmostEqual(block["pairs"][0]["r"], 1.0, places=6)
             self.assertEqual(block["pairs_skipped"], 0)
 
+    def test_a_factor_probe_names_the_variants_of_one_leg(self):
+        # The question the cluster count cannot answer: if a dozen alphas are the same
+        # leg re-parameterised, they correlate ~1 with a factor built from any one of
+        # them - and the book holds one bet, not a dozen.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = {("2026-01-%02d" % day): float((day * 7) % 11) for day in range(1, 41)}
+            scaled = {key: value * 3.0 for key, value in base.items()}
+            other = {key: float((day * 3) % 5) for day, key in
+                     enumerate(base, start=1)}
+            self._write(tmp, "F1", base)
+            self._write(tmp, "COPY", scaled)
+            self._write(tmp, "OTHER", other)
+            entries = [entry("COPY"), entry("OTHER")]
+            with mock.patch.object(cli.research_paths, "ensure_dir",
+                                   return_value=tmp):
+                block = cli._ask_factor(entries, ["F1"], min_overlap=10)
+            self.assertEqual(block["n"], 1)
+            listed = {row["alpha_id"]: row["r"] for row in block["correlations"]}
+            self.assertAlmostEqual(abs(listed["COPY"]), 1.0, places=4)
+            self.assertLess(abs(listed["OTHER"]), 0.9)
+            self.assertEqual(block["at_or_above_threshold"], ["COPY"])
+
     def test_the_matrix_reports_effective_bets_not_just_pair_counts(self):
         # The count of clusters answers "how many groups", not "how many bets": a pool
         # can split into many clusters and still move as one. The spectrum is the

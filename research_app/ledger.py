@@ -454,6 +454,73 @@ def _ask_matrix(entries, within, min_overlap):
     }
 
 
+
+def _ask_factor(entries, factor_ids, min_overlap, threshold=0.8):
+    """Correlate every matched alpha against the average PnL of ``factor_ids``.
+
+    This is the question a cluster count cannot answer: if a dozen alphas are all a
+    re-parameterisation of one price leg, they correlate ~1 with the same factor and
+    the book holds one bet, not a dozen. Building the factor from *already measured*
+    members is what makes it a decomposition rather than a guess - the members come
+    from an ablation that said "this leg carries that alpha".
+    """
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+    series, missing = {}, []
+    for alpha in factor_ids:
+        path = pnl_dir / ("%s.json" % alpha)
+        if not path.exists():
+            missing.append(alpha)
+            continue
+        try:
+            series[alpha] = json.loads(path.read_text())
+        except (OSError, ValueError):
+            missing.append(alpha)
+    if not series:
+        return {"ids": list(factor_ids), "n": 0, "missing_pnl": missing[:20],
+                "note": "no cached PnL for any factor member"}
+    dates = sorted(set.intersection(*(set(value) for value in series.values())))
+    if len(dates) < min_overlap:
+        return {"ids": list(factor_ids), "n": len(series), "missing_pnl": missing[:20],
+                "note": "factor members overlap only %d days" % len(dates)}
+    rows = []
+    for value in series.values():
+        window = [value[day] for day in dates]
+        mean = sum(window) / len(window)
+        spread = (sum((item - mean) ** 2 for item in window) / (len(window) - 1)) ** 0.5
+        rows.append([(item - mean) / spread if spread else 0.0 for item in window])
+    factor = {day: sum(row[index] for row in rows) / len(rows)
+              for index, day in enumerate(dates)}
+    correlations = []
+    for entry in entries:
+        alpha = entry.get("alpha_id")
+        if not alpha or alpha in series:
+            continue
+        path = pnl_dir / ("%s.json" % alpha)
+        if not path.exists():
+            continue
+        try:
+            other = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        left, right, shared = correlation.align(factor, other, min_overlap)
+        if not left:
+            continue
+        value = correlation.pearson(left, right)
+        if value is None:
+            continue
+        correlations.append({"alpha_id": alpha, "r": round(value, 4), "n": len(shared)})
+    correlations.sort(key=lambda row: abs(row["r"]), reverse=True)
+    above = [row for row in correlations if abs(row["r"]) >= threshold]
+    others = [abs(row["r"]) for row in correlations if abs(row["r"]) < threshold]
+    return {"ids": list(factor_ids), "n": len(series), "missing_pnl": missing[:20],
+            "days": len(dates), "threshold": threshold,
+            "correlations": correlations,
+            "at_or_above_threshold": [row["alpha_id"] for row in above],
+            "count_at_or_above_threshold": len(above),
+            "median_abs_r_below_threshold": (round(sorted(others)[len(others) // 2], 4)
+                                             if others else None)}
+
+
 def cmd_ask(args, _sink):
     """Answer one read-only question about the ledger, in the shape it is asked.
 
@@ -493,6 +560,11 @@ def cmd_ask(args, _sink):
         document["panel"] = _ask_panel(matched, args.by, args.panel)
     if args.matrix:
         document["matrix"] = _ask_matrix(matched, args.matrix_within, args.min_overlap)
+    if getattr(args, "factor_ids", None):
+        factor_ids = [part.strip() for part in str(args.factor_ids).replace(",", " ").split()
+                      if part.strip()]
+        document["factor"] = _ask_factor(matched, factor_ids, args.min_overlap,
+                                         getattr(args, "factor_threshold", 0.8))
     if args.list:
         document["rows"] = [
             {"alpha_id": entry.get("alpha_id"), "status": entry.get("status"),
