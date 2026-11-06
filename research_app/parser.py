@@ -791,6 +791,21 @@ def build_parser():
     l_cov.add_argument("--limit", type=int, default=40)
     l_cov.set_defaults(func=ledger.cmd_ledger_coverage)
 
+    l_stab = ledger_sub.add_parser(
+        "stability",
+        help="Train first-half vs second-half Sharpe per alpha; flags sign flips (offline).",
+        description="A single train Sharpe can be the average of two opposite regimes. "
+                    "The halves stay inside train, so this is evidence selection may use "
+                    "before choosing rather than test data after the fact.")
+    l_stab.add_argument("--registry", default=None)
+    l_stab.add_argument("--where", default=None, help="Ledger filter, e.g. family=quality.")
+    l_stab.add_argument("--status", default=None, help="Bare status filter, e.g. ACTIVE.")
+    l_stab.add_argument("--min-move", type=float, default=0.3,
+                        help="Both halves must exceed this |Sharpe| to count as a flip.")
+    l_stab.add_argument("--limit", type=int, default=10)
+    l_stab.add_argument("--list", action="store_true", help="Also list every flip.")
+    l_stab.set_defaults(func=ledger.cmd_ledger_stability)
+
     l_sty = ledger_sub.add_parser(
         "styles",
         help="Classify what each alpha compares against: history, peers, or nothing (offline).",

@@ -11,7 +11,7 @@ import correlation
 import machine_lib as ml
 import research_paths
 
-from . import styles
+from . import experiments, styles
 from .runtime import CliError, with_session
 
 
@@ -231,6 +231,63 @@ def cmd_ledger_coverage(args, _sink):
             for entry in missing[: args.limit]
         ]
 
+    return data
+
+
+def cmd_ledger_stability(args, _sink):
+    """Which book alphas earn their train Sharpe in only one half of train.
+
+    `omEaaMl2` made the case: a 2.11 train Sharpe whose following year went negative.
+    A single aggregate number cannot show that, and the test year may not be used to
+    select. Splitting train in half keeps the evidence inside the period selection is
+    allowed to see, and a sign flip between halves is the cheapest warning that an
+    edge is regime-bound rather than structural.
+    """
+    _path, entries = _ledger(args)
+    selected = [entry for entry in entries if _ask_passes(entry, _ask_filters(args.where))]
+    if getattr(args, "status", None):
+        wanted = {part.strip().upper() for part in str(args.status).split(",") if part.strip()}
+        selected = [entry for entry in selected
+                    if str(entry.get("status") or "").upper() in wanted]
+    latest = {}
+    for entry in selected:
+        key = entry.get("alpha_id")
+        if key:
+            latest[key] = entry          # ledger is append-only; last row wins
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+    rows = []
+    for alpha_id, entry in latest.items():
+        path = pnl_dir / ("%s.json" % alpha_id)
+        if not path.exists():
+            rows.append({"alpha_id": alpha_id, "status": entry.get("status"),
+                         "family": entry.get("family"), "missing_pnl": True})
+            continue
+        try:
+            pnl = {k: float(v) for k, v in json.loads(path.read_text()).items()}
+        except (OSError, ValueError):
+            rows.append({"alpha_id": alpha_id, "status": entry.get("status"),
+                         "family": entry.get("family"), "missing_pnl": True})
+            continue
+        test_start = (entry.get("out_of_sample", {}).get("test") or {}).get("startDate")
+        first, second = experiments.half_split_sharpes(pnl, test_start)
+        flip = (first is not None and second is not None
+                and first * second < 0 and min(abs(first), abs(second)) >= args.min_move)
+        rows.append({"alpha_id": alpha_id, "status": entry.get("status"),
+                     "family": entry.get("family"),
+                     "h1": None if first is None else round(first, 2),
+                     "h2": None if second is None else round(second, 2),
+                     "gap": None if first is None or second is None else round(abs(first - second), 2),
+                     "flip": flip})
+    measured = [row for row in rows if not row.get("missing_pnl")]
+    flips = [row for row in measured if row.get("flip")]
+    measured.sort(key=lambda row: -(row.get("gap") or 0))
+    data = {"count": len(measured), "flips": len(flips),
+            "min_move": args.min_move,
+            "median_gap": (sorted(row["gap"] for row in measured)[len(measured) // 2]
+                           if measured else None),
+            "worst": measured[: args.limit]}
+    if args.list:
+        data["flip_list"] = flips
     return data
 
 
