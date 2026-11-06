@@ -611,3 +611,23 @@ class DesignTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HalfSplitTests(unittest.TestCase):
+    def test_the_split_stays_inside_train(self):
+        # The whole point is that this number may be looked at before choosing: the
+        # test year is excluded by construction, not by discipline.
+        pnl = {}
+        for day in range(1, 121):
+            pnl["2019-%03d" % day] = 1.0 if day % 2 else -0.5
+        for day in range(1, 40):
+            pnl["2023-%03d" % day] = -5.0
+        first, second = cli_experiments.half_split_sharpes(pnl, "2023-001")
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(second)
+        self.assertGreater(first, 0)
+        self.assertGreater(second, 0)
+
+    def test_too_short_a_series_returns_nothing(self):
+        self.assertEqual(cli_experiments.half_split_sharpes({"2019-001": 1.0}, None),
+                         (None, None))

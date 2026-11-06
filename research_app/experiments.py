@@ -21,6 +21,38 @@ from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note
 from .validation import _preflight_lint
 
 
+def half_split_sharpes(pnl, test_start=None):
+    """Sharpe of the first and second half of the train window.
+
+    Selection uses the train period, and a train Sharpe can be the average of two very
+    different halves. `omEaaMl2` read as 2.11 in train while the following year turned
+    negative - a fact only visible afterwards, because that year is test data and may
+    not drive selection. The halves stay inside train, so this is legal to look at
+    *before* choosing, and it says whether the edge is stable or lives in one regime.
+
+    PnL rather than returns: only the PnL series is exposed, and Sharpe is
+    scale-invariant, so a within-alpha comparison is unaffected.
+    """
+    if not pnl:
+        return None, None
+    days = sorted(pnl)
+    if test_start:
+        days = [day for day in days if day < test_start]
+    if len(days) < 120:
+        return None, None
+    middle = len(days) // 2
+
+    def sharpe(subset):
+        values = [pnl[day] for day in subset]
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        if variance <= 0:
+            return None
+        return mean / (variance ** 0.5) * (252 ** 0.5)
+
+    return sharpe(days[:middle]), sharpe(days[middle:])
+
+
 def _train_metrics(record):
     """The metrics a selection decision is allowed to see: the train period only.
 
@@ -857,13 +889,30 @@ def cmd_probe(args, _sink):
                 # The ledger must carry the complete settings this arm actually used.
                 record["settings"] = dict(arm_settings)
             records.extend(produced)
+        # Half-split stability, from the daily PnL the platform already exposes.
+        # Inside the session because this is the only place one is open; the fetch is
+        # cached, so a re-run costs nothing and no simulation is involved.
+        pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+        for record in records:
+            if (record.get("status") or "").upper() not in alpha_registry.FINISHED_STATUSES:
+                continue
+            alpha_id = record.get("alpha_id")
+            if not alpha_id:
+                continue
+            test_start = ((record.get("out_of_sample") or {}).get("test") or {}).get("startDate")
+            try:
+                pnl = ml.fetch_daily_pnl(session, alpha_id, cache_dir=pnl_dir,
+                                         max_age_hours=24)
+            except Exception:  # noqa: BLE001 - a cache miss must not fail the batch
+                pnl = None
+            record["half_sharpes"] = half_split_sharpes(pnl, test_start)
         return records
 
     records = with_session(args, work)
 
     rows = []
     note("")
-    header = "%-28s %7s %6s %7s" % ("label", "trS", "trF", "trT")
+    header = "%-28s %7s %6s %7s %7s %7s" % ("label", "trS", "trF", "trT", "trH1", "trH2")
     if args.show_test:
         header += " %7s %6s %7s %7s" % ("S", "F", "T", "testS")
     note(header)
@@ -885,9 +934,14 @@ def cmd_probe(args, _sink):
                "train_fitness": train.get("fitness"),
                "train_turnover": train.get("turnover"),
                "train_returns": train.get("returns"),
+               "train_sharpe_h1": (record.get("half_sharpes") or (None, None))[0],
+               "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
                "failed_checks": failed}
-        line = "%-28s %7s %6s %7s" % (arm["label"], row["train_sharpe"],
-                                      row["train_fitness"], row["train_turnover"])
+        line = "%-28s %7s %6s %7s %7s %7s" % (
+            arm["label"], row["train_sharpe"], row["train_fitness"],
+            row["train_turnover"],
+            None if row["train_sharpe_h1"] is None else round(row["train_sharpe_h1"], 2),
+            None if row["train_sharpe_h2"] is None else round(row["train_sharpe_h2"], 2))
         if args.show_test:
             row.update({"sharpe": metrics.get("sharpe"), "fitness": metrics.get("fitness"),
                         "turnover": metrics.get("turnover"),
