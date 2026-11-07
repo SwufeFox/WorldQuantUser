@@ -53,6 +53,52 @@ def _first_heading(path):
 
 
 
+
+def _drift_check():
+    """Compare the platform's ACTIVE set with the ledger's, online.
+
+    `brief` is offline by design, so this runs only when asked. It exists because the
+    ledger only grows when something records an alpha: on 2026-11-07 an alpha was
+    submitted on the platform while the local row still said COMPLETE, so the reported
+    book was one short and the alpha looked like an unused candidate.
+    """
+    import machine_lib as ml
+    from .runtime import CliError
+
+    def work(session):
+        platform = {}
+        for page in range(3):
+            batch = ml.list_alphas(session, limit=100, offset=page * 100,
+                                   order="-dateCreated", status="ACTIVE")
+            for alpha in batch:
+                alpha_id = alpha.get("id")
+                if alpha_id:
+                    platform[alpha_id] = (alpha.get("status") or "").upper()
+            if len(batch) < 100:
+                break
+        return platform
+
+    args = type("DriftArgs", (), {"no_cache": False, "relogin": False,
+                                  "meta_max_age": None})()
+    try:
+        from .runtime import with_session
+        platform = with_session(args, work)
+    except Exception as error:  # noqa: BLE001 - a brief must survive a network failure
+        return {"error": "%s: %s" % (type(error).__name__, str(error)[:120])}
+    return {"platform": platform}
+
+
+def _book_drift(book, platform):
+    """Ids where the platform says ACTIVE and the ledger disagrees, both ways."""
+    ledger_active = {alpha_id for alpha_id, entry in (book or {}).items()
+                     if str(entry.get("status") or "").upper() == "ACTIVE"}
+    platform_ids = set(platform or {})
+    return {"platform_active": len(platform_ids), "ledger_active": len(ledger_active),
+            "on_platform_not_in_ledger": sorted(platform_ids - ledger_active),
+            "in_ledger_not_on_platform": sorted(ledger_active - platform_ids),
+            "in_sync": platform_ids == ledger_active}
+
+
 def _book_stability(book, min_move=0.3, limit=3):
     """How many book alphas earn their train Sharpe in only one half of train.
 
@@ -276,6 +322,8 @@ def cmd_brief(args, _sink):
         },
         "recent": {"runs": len(runs), "by_verdict": by_verdict, "best": best},
         "documents": documents,
+        "drift": (_book_drift(book, _drift_check().get("platform"))
+                  if getattr(args, "drift", False) else None),
         "threads": threads,
     }
 

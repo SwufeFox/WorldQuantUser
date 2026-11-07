@@ -166,3 +166,19 @@ class BriefTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class DriftTests(unittest.TestCase):
+    def test_a_submitted_alpha_missing_from_the_ledger_shows_as_drift(self):
+        # 2026-11-07: `P0o5QGZK` was ACTIVE on the platform while the ledger still said
+        # COMPLETE, so the reported book was one short.
+        book = {"A": {"status": "ACTIVE"}, "B": {"status": "COMPLETE"}}
+        drift = cli_campaign._book_drift(book, {"A": "ACTIVE", "B": "ACTIVE"})
+        self.assertFalse(drift["in_sync"])
+        self.assertEqual(drift["on_platform_not_in_ledger"], ["B"])
+        self.assertEqual(drift["platform_active"], 2)
+        self.assertEqual(drift["ledger_active"], 1)
+
+    def test_a_matching_set_is_in_sync(self):
+        book = {"A": {"status": "ACTIVE"}}
+        drift = cli_campaign._book_drift(book, {"A": "ACTIVE"})
+        self.assertTrue(drift["in_sync"])

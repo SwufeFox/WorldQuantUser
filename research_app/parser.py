@@ -880,6 +880,11 @@ def build_parser():
     b_sub.add_argument("--registry", default=None)
     b_sub.set_defaults(func=buffer_cmd.cmd_buffer_submit)
 
+    br = sub.choices["brief"]
+    br.add_argument("--drift", action="store_true",
+                    help="Also compare the platform's ACTIVE set with the ledger "
+                         "(online; the rest of brief is offline).")
+
     a_self = alpha_sub.add_parser(
         "self-check",
         help="Reproduce the platform's self-correlation check locally (quota-free).",
