@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -821,6 +821,45 @@ def build_parser():
     l_sty.add_argument("--list", action="store_true",
                        help="Also list the level-only alphas in full.")
     l_sty.set_defaults(func=ledger.cmd_ledger_styles)
+
+    buf = sub.add_parser(
+        "buffer", help="Hold alphas that passed every check but were not submitted.",
+        description="A shelf for finished work. The platform's self-correlation is "
+                    "measured against a snapshot, so a held alpha's value decays as the "
+                    "book grows; each entry records the book size at shelving time and "
+                    "`buffer submit` re-checks before spending the irreversible step.")
+    buf_sub = buf.add_subparsers(dest="buffer_command", required=True,
+                                 parser_class=JsonArgumentParser)
+
+    b_add = buf_sub.add_parser("add", help="Run the checks and shelve the alpha.")
+    b_add.add_argument("alpha_id")
+    b_add.add_argument("--note", default=None)
+    b_add.add_argument("--max-wait", type=int, default=None, dest="max_wait")
+    b_add.add_argument("--buffer", default=None, help="Shelf file (default: in research dir).")
+    b_add.add_argument("--registry", default=None)
+    b_add.set_defaults(func=buffer_cmd.cmd_buffer_add)
+
+    b_list = buf_sub.add_parser("list", help="Show the shelf and how stale it is.")
+    b_list.add_argument("--buffer", default=None)
+    b_list.add_argument("--registry", default=None)
+    b_list.set_defaults(func=buffer_cmd.cmd_buffer_list)
+
+    b_drop = buf_sub.add_parser("drop", help="Take an alpha off the shelf.")
+    b_drop.add_argument("alpha_id")
+    b_drop.add_argument("--note", default=None)
+    b_drop.add_argument("--buffer", default=None)
+    b_drop.add_argument("--registry", default=None)
+    b_drop.set_defaults(func=buffer_cmd.cmd_buffer_drop)
+
+    b_sub = buf_sub.add_parser("submit", help="Submit a shelved alpha (irreversible).")
+    b_sub.add_argument("alpha_id")
+    b_sub.add_argument("--yes", action="store_true")
+    b_sub.add_argument("--force", action="store_true",
+                       help="Submit even if the fresh self-correlation is above the gate.")
+    b_sub.add_argument("--max-wait", type=int, default=None, dest="max_wait")
+    b_sub.add_argument("--buffer", default=None)
+    b_sub.add_argument("--registry", default=None)
+    b_sub.set_defaults(func=buffer_cmd.cmd_buffer_submit)
 
     a_self = alpha_sub.add_parser(
         "self-check",
