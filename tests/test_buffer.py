@@ -127,3 +127,30 @@ class BufferTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SyncDriftTests(unittest.TestCase):
+    """`ledger sync` must catch status drift, not just unknown ids."""
+
+    def test_a_submitted_alpha_whose_row_says_complete_is_a_drift(self):
+        import tempfile, os
+        from research_app import ledger as cli_ledger
+
+        tmp = tempfile.mkdtemp()
+        registry = os.path.join(tmp, "r.jsonl")
+        import alpha_registry
+        alpha_registry.record_entry(
+            alpha_registry.build_entry({"alpha_id": "DRIFT1", "expression": "rank(close)",
+                                        "metrics": {}, "status": "COMPLETE"}),
+            registry)
+        platform = {"DRIFT1": {"id": "DRIFT1", "status": "ACTIVE"}}
+        args = argparse.Namespace(platform_status="ACTIVE", status=None, limit=100,
+                                  pages=1, order="-dateCreated", limit_record=10,
+                                  dry_run=True, registry=registry)
+        with mock.patch.object(cli_ledger, "with_session",
+                               lambda a, work: platform), \
+                mock.patch.object(cli_ledger, "_ledger",
+                                  lambda a: (None, alpha_registry.load_entries(registry))):
+            data = cli_ledger.cmd_ledger_sync(args, mock.MagicMock())
+        self.assertEqual(data["missing"], [])
+        self.assertEqual(data["drifted"], ["DRIFT1"])

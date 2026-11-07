@@ -234,6 +234,92 @@ def cmd_ledger_coverage(args, _sink):
     return data
 
 
+def cmd_ledger_sync(args, _sink):
+    """Reconcile the ledger with the account: record alphas it has never seen.
+
+    The ledger is append-only and only ever grows when something explicitly records an
+    alpha, so the platform and the ledger drift: alphas are created in a sweep, or
+    submitted by hand, and the local book is quietly wrong afterwards. This walks the
+    account, finds ids the ledger has no row for, and records them.
+
+    It does not re-record alphas that already exist: the ledger is append-only and a
+    re-record would add a duplicate row without new information. Use `ledger record`
+    for a deliberate refresh of one alpha.
+    """
+    wanted = [part.strip().upper() for part in str(args.status).split(",") if part.strip()]
+
+    def work(session):
+        platform = {}
+        for page in range(max(1, args.pages)):
+            batch = ml.list_alphas(session, limit=args.limit, offset=page * args.limit,
+                                   order=args.order, status=args.platform_status)
+            for alpha in batch:
+                alpha_id = alpha.get("id")
+                if alpha_id:
+                    platform[alpha_id] = alpha
+            if len(batch) < args.limit:
+                break
+        return platform
+
+    platform = with_session(args, work)
+    _path, entries = _ledger(args)
+    latest = {}
+    for entry in entries:
+        alpha_id = entry.get("alpha_id")
+        if alpha_id:
+            latest[alpha_id] = entry
+    known = set(latest)
+    missing = [alpha_id for alpha_id in platform if alpha_id not in known]
+    # Status drift is the more dangerous half of a sync: `P0o5QGZK` was submitted on the
+    # platform while the ledger still said COMPLETE, so every local book count was one
+    # short and the alpha looked like a candidate that had never been spent.
+    drifted = [alpha_id for alpha_id in platform
+               if alpha_id in latest
+               and str((latest[alpha_id] or {}).get("status") or "").upper()
+               != str((platform[alpha_id] or {}).get("status") or "").upper()]
+    if wanted:
+        missing = [alpha_id for alpha_id in missing
+                   if str((platform[alpha_id] or {}).get("status") or "").upper() in wanted]
+    missing.sort()
+    drifted.sort()
+    if args.dry_run:
+        return {"platform": len(platform), "ledger_ids": len(known),
+                "missing": missing, "drifted": drifted,
+                "recorded": 0, "dry_run": True}
+
+    def record(session):
+        written = []
+        targets = missing + drifted
+        for alpha_id in targets[: args.limit_record]:
+            current = ml.fetch_alpha_metrics(session, alpha_id)
+            code, _description, _count = ml.regular_expression(current)
+            checks = ml._extract_checks(current)
+            entry = alpha_registry.build_entry(
+                {"alpha_id": alpha_id, "expression": code,
+                 "settings": current.get("settings") or {},
+                 "metrics": current.get("is") or {},
+                 "checks": checks, "status": current.get("status"),
+                 "out_of_sample": {"train": current.get("train") or {},
+                                   "test": current.get("test") or {},
+                                   "test_period": "P1Y"}},
+                verdict=alpha_registry.auto_verdict(
+                    {"status": current.get("status"),
+                     "metrics": current.get("is") or {}, "checks": checks}),
+                note="recorded by `ledger sync`" + (" (status drift)" if alpha_id in drifted else ""),
+                source="sync")
+            stored, was_written = alpha_registry.record_entry(
+                entry, getattr(args, "registry", None))
+            written.append({"alpha_id": alpha_id, "written": was_written,
+                            "status": stored.get("status")})
+        return written
+
+    written = with_session(args, record)
+    return {"platform": len(platform), "ledger_ids": len(known),
+            "missing": missing, "drifted": drifted,
+            "recorded": len(written), "rows": written,
+            "skipped_beyond_limit": max(0, len(missing) + len(drifted) - len(written))}
+
+
 def cmd_ledger_stability(args, _sink):
     """Which book alphas earn their train Sharpe in only one half of train.
 

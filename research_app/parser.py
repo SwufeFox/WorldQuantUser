@@ -791,6 +791,25 @@ def build_parser():
     l_cov.add_argument("--limit", type=int, default=40)
     l_cov.set_defaults(func=ledger.cmd_ledger_coverage)
 
+    l_sync = ledger_sub.add_parser(
+        "sync",
+        help="Record platform alphas the ledger has never seen (online, no simulations).",
+        description="The ledger only grows when something records an alpha, so it drifts "
+                    "from the account after any sweep or manual submission. This walks "
+                    "the account and appends rows for ids that are missing; it does not "
+                    "re-record existing ones (append-only: that would duplicate a row).")
+    l_sync.add_argument("--platform-status", default="ACTIVE",
+                        help="Status filter for the listing (default ACTIVE).")
+    l_sync.add_argument("--status", default=None,
+                        help="Only record alphas whose own status is in this list.")
+    l_sync.add_argument("--limit", type=int, default=100, help="Page size for the listing.")
+    l_sync.add_argument("--pages", type=int, default=10)
+    l_sync.add_argument("--order", default="-dateCreated")
+    l_sync.add_argument("--limit-record", type=int, default=25, dest="limit_record")
+    l_sync.add_argument("--dry-run", action="store_true", dest="dry_run")
+    l_sync.add_argument("--registry", default=None)
+    l_sync.set_defaults(func=ledger.cmd_ledger_sync)
+
     l_stab = ledger_sub.add_parser(
         "stability",
         help="Train first-half vs second-half Sharpe per alpha; flags sign flips (offline).",
