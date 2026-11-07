@@ -141,6 +141,21 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(rows[0]["alpha_id"], "Z1")
         self.assertEqual(rows[0]["train_fitness"], 1.4)
 
+
+    def test_each_arm_reports_its_operator_count(self):
+        # Simplicity is a design rule: a dense arm has more room to fit, and the one
+        # 22-operator candidate of 2026-11-07 was also the one that failed to transfer.
+        # Counting it here makes the trade-off visible while choosing.
+        dense = ("rank(ts_rank(close, 5) + ts_rank(volume, 5) + ts_rank(high, 5)"
+                 " + ts_rank(low, 5) + ts_rank(vwap, 5) + ts_rank(open, 5))")
+        self.spec["arms"] = [{"label": "dense", "expression": dense}]
+        self._write(self.spec)
+        self.fake = FakeGuard([record("D1", 1.5, 1.0)])
+        with mock.patch.object(cli_experiments, "guarded_sim", self.fake):
+            data = self._run()
+        self.assertGreater(data["rows"][0]["ops"],
+                           cli_experiments.SIMPLE_OPERATOR_LIMIT)
+
     def test_train_is_always_present_and_test_only_on_request(self):
         # Wrong behaviour this prevents: choosing between arms while looking at the
         # test year, which is the only out-of-sample evidence the API exposes.

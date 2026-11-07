@@ -21,6 +21,12 @@ from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note
 from .validation import _preflight_lint
 
 
+#: Operators per arm above which the report says so. Not a hard limit (the platform's
+#: is 64); a research limit. The user's rule from 2026-11-07: many operators means more
+#: room to fit, and mixed signals blur what a result actually tests.
+SIMPLE_OPERATOR_LIMIT = 8
+
+
 def half_split_sharpes(pnl, test_start=None):
     """Sharpe of the first and second half of the train window.
 
@@ -912,7 +918,8 @@ def cmd_probe(args, _sink):
 
     rows = []
     note("")
-    header = "%-28s %7s %6s %7s %7s %7s" % ("label", "trS", "trF", "trT", "trH1", "trH2")
+    header = "%-28s %7s %6s %7s %4s %7s %7s" % ("label", "trS", "trF", "trT", "ops",
+                                               "trH1", "trH2")
     if args.show_test:
         header += " %7s %6s %7s %7s" % ("S", "F", "T", "testS")
     note(header)
@@ -936,10 +943,14 @@ def cmd_probe(args, _sink):
                "train_returns": train.get("returns"),
                "train_sharpe_h1": (record.get("half_sharpes") or (None, None))[0],
                "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
+               # Simplicity is a design rule here, not an aesthetic: a factor with many
+               # operators has more room to fit, and the one operator-heavy candidate of
+               # 2026-11-07 was also the one that failed its mechanism-transfer check.
+               "ops": expression_lint.estimate_operator_count(arm["expression"]),
                "failed_checks": failed}
-        line = "%-28s %7s %6s %7s %7s %7s" % (
+        line = "%-28s %7s %6s %7s %4s %7s %7s" % (
             arm["label"], row["train_sharpe"], row["train_fitness"],
-            row["train_turnover"],
+            row["train_turnover"], row["ops"],
             None if row["train_sharpe_h1"] is None else round(row["train_sharpe_h1"], 2),
             None if row["train_sharpe_h2"] is None else round(row["train_sharpe_h2"], 2))
         if args.show_test:
@@ -950,6 +961,14 @@ def cmd_probe(args, _sink):
                                           row["turnover"], row["test_sharpe"])
         rows.append(row)
         note(line + ("  fail=" + ",".join(failed) if failed else ""))
+
+    dense = [row["label"] for row in rows if (row.get("ops") or 0) > SIMPLE_OPERATOR_LIMIT]
+    if dense:
+        note("")
+        note("complexity: %d arm(s) above %d operators: %s"
+             % (len(dense), SIMPLE_OPERATOR_LIMIT, ", ".join(dense)))
+        note("  when two arms score alike, prefer the simpler one - and do not read a "
+             "dense arm as evidence for a mechanism until it transfers")
 
     # An arm can come back QUEUED with no metrics - the platform rate-limits a batch
     # and `guarded_sim` gives up after its backoff budget. The batch file then looks
