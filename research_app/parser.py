@@ -885,6 +885,14 @@ def build_parser():
         description="A book of 55 is not 55 bets, and equal weighting pays every member "
                     "the same. This reports each alpha's marginal contribution "
                     "S_i - rho_i * S_book from cached PnL, so dead weight is visible.")
+    health.add_argument("--window", choices=["train", "full"], default="train",
+                        help="Train window by default: selecting on the full window "
+                             "means selecting on the test year.")
+    health.add_argument("--train-end", default="2023-01-01", dest="train_end",
+                        help="Exclusive end of the train window (test starts here).")
+    health.add_argument("--pool", action="store_true",
+                        help="Also score every non-book alpha with cached PnL against "
+                             "this book, ranked by marginal contribution.")
     health.add_argument("--limit", type=int, default=8)
     health.add_argument("--min-overlap", type=int, default=500, dest="min_overlap")
     health.add_argument("--registry", default=None)

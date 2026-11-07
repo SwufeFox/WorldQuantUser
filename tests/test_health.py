@@ -62,6 +62,33 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(data["count"], 3)
         self.assertTrue(all(row["marginal"] <= 0.01 for row in data["weakest"]))
 
+    def test_the_default_window_stops_before_the_test_year(self):
+        # Ranking a pool on the full window would be ranking on the test year.
+        tmp = tempfile.mkdtemp()
+        research = tempfile.mkdtemp()
+        os.makedirs(os.path.join(research, "pnl"))
+        registry = os.path.join(tmp, "r.jsonl")
+        import datetime
+        def _dates(year, count):
+            start = datetime.date(year, 1, 1)
+            return [(start + datetime.timedelta(days=k)).isoformat() for k in range(count)]
+        series = {}
+        for index, day in enumerate(_dates(2021, 400)):
+            series[day] = 1.0 if index % 2 else 0.4
+        for day in _dates(2023, 100):
+            series[day] = -5.0
+        alpha_registry.record_entry(
+            alpha_registry.build_entry({"alpha_id": "W1", "expression": "rank(close)",
+                                        "metrics": {}, "status": "ACTIVE"}), registry)
+        with open(os.path.join(research, "pnl", "W1.json"), "w") as handle:
+            json.dump(series, handle)
+        args = argparse.Namespace(limit=4, min_overlap=100, registry=registry,
+                                  window="train", train_end="2023-01-01", pool=False)
+        with mock.patch.object(research_paths, "ensure_dir", lambda: research):
+            data = cli_campaign.cmd_health(args, mock.MagicMock())
+        self.assertEqual(data["days"], 400)
+        self.assertEqual(data["window"], "train")
+
 
 if __name__ == "__main__":
     unittest.main()

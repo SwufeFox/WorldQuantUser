@@ -143,6 +143,13 @@ def cmd_health(args, _sink):
         raise CliError("INVALID_INPUT", "no cached PnL for the book",
                        "run `ledger sync` or `alpha get` to warm the cache")
     dates = sorted(set.intersection(*(set(series[a]) for a in ids)))
+    # Default to the train window. The cached series runs to 2023; ranking candidates on
+    # the full window would be ranking on the test year, which is the one thing this
+    # workspace refuses to select on.
+    if getattr(args, "window", "train") == "train" and getattr(args, "train_end", None):
+        dates = [day for day in dates if day < args.train_end]
+        if not dates:
+            raise CliError("INVALID_INPUT", "no days before --train-end %s" % args.train_end)
     if len(dates) < args.min_overlap:
         raise CliError("INVALID_INPUT", "only %d common days" % len(dates),
                        "lower --min-overlap or refresh the PnL cache")
@@ -152,9 +159,11 @@ def cmd_health(args, _sink):
     book_sharpe = _annual_sharpe(book_series)
     rows = []
     for alpha_id in ids:
-        rest = [sum(aligned[b][i] for b in ids if b != alpha_id) / (len(ids) - 1)
-                for i in range(len(dates))]
-        rho = correlation.pearson(aligned[alpha_id], rest)
+        # Marginal is a statement about the *other* members, so a single-alpha book has
+        # no marginal to report (and dividing by len-1 would crash).
+        rest = ([sum(aligned[b][i] for b in ids if b != alpha_id) / (len(ids) - 1)
+                 for i in range(len(dates))] if len(ids) > 1 else [])
+        rho = correlation.pearson(aligned[alpha_id], rest) if rest else None
         sharpe = sharpes[alpha_id]
         marginal = None
         if sharpe is not None and rho is not None and book_sharpe is not None:
@@ -164,14 +173,76 @@ def cmd_health(args, _sink):
                      "sharpe": None if sharpe is None else round(sharpe, 2),
                      "rho_rest": None if rho is None else round(rho, 3),
                      "marginal": None if marginal is None else round(marginal, 2)})
+    # Optional second pass: score the *pool* (alphas the ledger knows, PnL cached, not in
+    # the book) against this same book. Ranking a finished candidate by its Fitness hid
+    # the alphas that are weak alone but genuinely add; ranking by marginal is the
+    # criterion the book is actually optimised on.
+    pool = []
+    if getattr(args, "pool", False):
+        book_ids = set(ids)
+        for alpha_id, entry in latest.items():
+            if alpha_id in book_ids:
+                continue
+            if str(entry.get("status") or "").upper() == "ACTIVE":
+                continue
+            path = pnl_dir / ("%s.json" % alpha_id)
+            if not path.exists():
+                continue
+            try:
+                series_map = {k: float(v) for k, v in json.loads(path.read_text()).items()}
+            except (OSError, ValueError):
+                continue
+            common = sorted(set(series_map) & set(dates))
+            if len(common) < args.min_overlap:
+                continue
+            values = [series_map[d] for d in common]
+            sharpe = _annual_sharpe(values)
+            index = {d: i for i, d in enumerate(dates)}
+            book_aligned = [book_series[index[d]] for d in common]
+            rho = correlation.pearson(values, book_aligned)
+            if sharpe is None or rho is None or book_sharpe is None:
+                continue
+            pool.append({"alpha_id": alpha_id,
+                         "family": entry.get("family"),
+                         "status": entry.get("status"),
+                         "sharpe": round(sharpe, 2),
+                         "rho_book": round(rho, 3),
+                         "marginal": round(sharpe - rho * book_sharpe, 2)})
+        pool.sort(key=lambda row: -(row["marginal"] or 0))
+        # Marginal is measured against the *portfolio*, but the platform's gate is the
+        # max against any single member - and they disagree in practice: `LL58p8ee`
+        # scored rho_book 0.18 yet 0.972 against `rKd0g0bj`, i.e. a duplicate of one
+        # member that looks diversified against the average. Report both for the rows we
+        # show, otherwise the marginal alone would wave duplicates through.
+        for row in pool[: max(args.limit, 1) * 2]:
+            path = pnl_dir / ("%s.json" % row["alpha_id"])
+            try:
+                series_map = {k: float(v) for k, v in json.loads(path.read_text()).items()}
+            except (OSError, ValueError):
+                continue
+            values = [series_map.get(d) for d in dates]
+            if any(v is None for v in values):
+                row["max_single"] = None
+                continue
+            worst, partner = 0.0, None
+            for other in ids:
+                r = correlation.pearson(values, aligned[other])
+                if r is not None and abs(r) > abs(worst):
+                    worst, partner = r, other
+            row["max_single"] = round(worst, 3)
+            row["max_single_vs"] = partner
+
     rows.sort(key=lambda row: (row["marginal"] if row["marginal"] is not None else 0))
     measured = [row for row in rows if row["marginal"] is not None]
-    return {"days": len(dates), "count": len(measured),
+    return {"window": getattr(args, "window", "train"), "train_end": getattr(args, "train_end", None),
+            "days": len(dates), "count": len(measured),
             "book_sharpe": None if book_sharpe is None else round(book_sharpe, 2),
             "negative": [row for row in measured if row["marginal"] < 0][: args.limit],
             "weakest": measured[: args.limit],
             "strongest": sorted(measured, key=lambda row: -(row["marginal"] or 0))[: args.limit],
-            "negative_count": sum(1 for row in measured if row["marginal"] < 0)}
+            "negative_count": sum(1 for row in measured if row["marginal"] < 0),
+            "pool": pool[: args.limit] if getattr(args, "pool", False) else None,
+            "pool_size": len(pool) if getattr(args, "pool", False) else None}
 
 
 def _book_stability(book, min_move=0.3, limit=3):
