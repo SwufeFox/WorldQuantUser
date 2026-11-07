@@ -880,6 +880,16 @@ def build_parser():
     b_sub.add_argument("--registry", default=None)
     b_sub.set_defaults(func=buffer_cmd.cmd_buffer_submit)
 
+    health = sub.add_parser(
+        "health", help="Per-alpha marginal contribution to the book (offline, no sims).",
+        description="A book of 55 is not 55 bets, and equal weighting pays every member "
+                    "the same. This reports each alpha's marginal contribution "
+                    "S_i - rho_i * S_book from cached PnL, so dead weight is visible.")
+    health.add_argument("--limit", type=int, default=8)
+    health.add_argument("--min-overlap", type=int, default=500, dest="min_overlap")
+    health.add_argument("--registry", default=None)
+    health.set_defaults(func=campaign.cmd_health)
+
     br = sub.choices["brief"]
     br.add_argument("--drift", action="store_true",
                     help="Also compare the platform's ACTIVE set with the ledger "

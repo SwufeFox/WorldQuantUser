@@ -99,6 +99,81 @@ def _book_drift(book, platform):
             "in_sync": platform_ids == ledger_active}
 
 
+def _annual_sharpe(values):
+    if not values:
+        return None
+    mean = sum(values) / len(values)
+    var = sum((v - mean) ** 2 for v in values) / len(values)
+    if var <= 0:
+        return None
+    return mean / (var ** 0.5) * (252 ** 0.5)
+
+
+def cmd_health(args, _sink):
+    """The book's own accounting: who contributes, who is dead weight, what is duplicated.
+
+    A book of 55 alphas is not 55 bets, and equal weighting means every member is paid
+    the same regardless of what it adds. The one number that decides whether a member
+    earns its slot is its marginal contribution, `S_i - rho_i * S_book`, and it needs
+    two things this workspace already has: each alpha's daily PnL and its correlation
+    against the rest of the book.
+
+    Read-only and offline: it never simulates, and it never submits.
+    """
+    entries = alpha_registry.load_entries(args.registry or alpha_registry.default_registry_path())
+    latest = {}
+    for entry in entries:
+        alpha_id = entry.get("alpha_id")
+        if alpha_id:
+            latest[alpha_id] = entry
+    book = {alpha_id: entry for alpha_id, entry in latest.items()
+            if str(entry.get("status") or "").upper() == "ACTIVE"}
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+    series = {}
+    for alpha_id in book:
+        path = pnl_dir / ("%s.json" % alpha_id)
+        if not path.exists():
+            continue
+        try:
+            series[alpha_id] = {k: float(v) for k, v in json.loads(path.read_text()).items()}
+        except (OSError, ValueError):
+            continue
+    ids = sorted(series)
+    if not ids:
+        raise CliError("INVALID_INPUT", "no cached PnL for the book",
+                       "run `ledger sync` or `alpha get` to warm the cache")
+    dates = sorted(set.intersection(*(set(series[a]) for a in ids)))
+    if len(dates) < args.min_overlap:
+        raise CliError("INVALID_INPUT", "only %d common days" % len(dates),
+                       "lower --min-overlap or refresh the PnL cache")
+    aligned = {a: [series[a][d] for d in dates] for a in ids}
+    sharpes = {a: _annual_sharpe(aligned[a]) for a in ids}
+    book_series = [sum(aligned[a][i] for a in ids) / len(ids) for i in range(len(dates))]
+    book_sharpe = _annual_sharpe(book_series)
+    rows = []
+    for alpha_id in ids:
+        rest = [sum(aligned[b][i] for b in ids if b != alpha_id) / (len(ids) - 1)
+                for i in range(len(dates))]
+        rho = correlation.pearson(aligned[alpha_id], rest)
+        sharpe = sharpes[alpha_id]
+        marginal = None
+        if sharpe is not None and rho is not None and book_sharpe is not None:
+            marginal = sharpe - rho * book_sharpe
+        rows.append({"alpha_id": alpha_id,
+                     "family": (book.get(alpha_id) or {}).get("family"),
+                     "sharpe": None if sharpe is None else round(sharpe, 2),
+                     "rho_rest": None if rho is None else round(rho, 3),
+                     "marginal": None if marginal is None else round(marginal, 2)})
+    rows.sort(key=lambda row: (row["marginal"] if row["marginal"] is not None else 0))
+    measured = [row for row in rows if row["marginal"] is not None]
+    return {"days": len(dates), "count": len(measured),
+            "book_sharpe": None if book_sharpe is None else round(book_sharpe, 2),
+            "negative": [row for row in measured if row["marginal"] < 0][: args.limit],
+            "weakest": measured[: args.limit],
+            "strongest": sorted(measured, key=lambda row: -(row["marginal"] or 0))[: args.limit],
+            "negative_count": sum(1 for row in measured if row["marginal"] < 0)}
+
+
 def _book_stability(book, min_move=0.3, limit=3):
     """How many book alphas earn their train Sharpe in only one half of train.
 
