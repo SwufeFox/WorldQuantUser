@@ -126,6 +126,37 @@ class BriefTests(unittest.TestCase):
         pair = screen["pairs"][0]
         self.assertEqual({pair["a"], pair["b"]}, {"BOOK1", "BOOK2"})
 
+
+    def test_stability_ignores_the_test_year(self):
+        # The halves must stay inside train: a violent test-year tail must not turn a
+        # steady book alpha into a "flip", because that would smuggle test data into a
+        # selection-grade number.
+        folder = os.path.join(self.research, "pnl")
+        os.makedirs(folder, exist_ok=True)
+        # ISO dates, because the split compares date strings: a "%03d" fixture is not
+        # a date and would quietly defeat the test-start filter.
+        import datetime
+        def _dates(year, count):
+            start = datetime.date(year, 1, 1)
+            return [(start + datetime.timedelta(days=offset)).isoformat()
+                    for offset in range(count)]
+        series = {}
+        for index, day in enumerate(_dates(2020, 199)):
+            series[day] = 1.0 if index % 2 else 0.6
+        for index, day in enumerate(_dates(2021, 59)):
+            series[day] = 1.2 if index % 2 else 0.8
+        for day in _dates(2023, 59):
+            series[day] = -40.0
+        with open(os.path.join(folder, "STAB1.json"), "w", encoding="utf-8") as handle:
+            json.dump(series, handle)
+        payload = entry("STAB1", "ACTIVE", 2.0)
+        payload["out_of_sample"] = {"test": {"startDate": "2023-01-01"}}
+        alpha_registry.record_entry(payload, self.registry)
+        data = self._run()
+        stability = data["book"]["stability"]
+        self.assertEqual(stability["flips"], 0)
+        self.assertEqual(stability["measured"], 1)
+
     def test_the_document_stays_small(self):
         # The bound is the point: a digest is useful only while it is cheaper to read
         # than the archive it replaces.

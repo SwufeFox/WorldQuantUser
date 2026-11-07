@@ -21,6 +21,12 @@ import research_paths
 from research_app import ledger as cli_ledger
 
 
+def _dates(year, count):
+    import datetime
+    start = datetime.date(year, 1, 1)
+    return [(start + datetime.timedelta(days=offset)).isoformat() for offset in range(count)]
+
+
 def _series(days, first, second):
     out = {}
     for index, day in enumerate(days):
@@ -45,28 +51,28 @@ class StabilityTests(unittest.TestCase):
             return cli_ledger.cmd_ledger_stability(args, mock.MagicMock())
 
     def test_a_steady_alpha_is_not_a_flip(self):
-        days = ["2020-%03d" % day for day in range(1, 200)]
+        days = _dates(2020, 199)
         data = self._run({"STEADY": _series(days, 1.0, 0.5)})
         self.assertEqual(data["count"], 1)
         self.assertEqual(data["flips"], 0)
 
     def test_a_sign_flip_between_halves_is_reported(self):
-        first = ["2020-%03d" % day for day in range(1, 100)]
-        second = ["2021-%03d" % day for day in range(1, 100)]
+        first = _dates(2020, 99)
+        second = _dates(2021, 99)
         flipping = {}
-        for day in first:
-            flipping[day] = 9.0 if int(day[-3:]) % 2 else 3.0
-        for day in second:
-            flipping[day] = -9.0 if int(day[-3:]) % 2 else -3.0
+        for index, day in enumerate(first):
+            flipping[day] = 9.0 if index % 2 else 3.0
+        for index, day in enumerate(second):
+            flipping[day] = -9.0 if index % 2 else -3.0
         data = self._run({"FLIP": flipping})
         self.assertEqual(data["flips"], 1)
         self.assertLess(data["flip_list"][0]["h1"] * data["flip_list"][0]["h2"], 0)
 
     def test_a_quiet_first_half_is_reported_as_a_gap_not_a_flip(self):
-        first = ["2020-%03d" % day for day in range(1, 100)]
-        second = ["2021-%03d" % day for day in range(1, 100)]
-        late = {day: (0.1 if int(day[-3:]) % 2 else -0.1) for day in first}
-        late.update({day: (12.0 if int(day[-3:]) % 2 else 4.0) for day in second})
+        first = _dates(2020, 99)
+        second = _dates(2021, 99)
+        late = {day: (0.1 if index % 2 else -0.1) for index, day in enumerate(first)}
+        late.update({day: (12.0 if index % 2 else 4.0) for index, day in enumerate(second)})
         data = self._run({"LATE": late})
         self.assertEqual(data["flips"], 0)
         self.assertGreater(data["worst"][0]["gap"], 1.0)

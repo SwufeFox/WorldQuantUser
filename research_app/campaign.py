@@ -8,6 +8,8 @@ import correlation
 import json
 import research_paths
 
+from . import experiments
+
 
 
 def cmd_views(args, _sink):
@@ -48,6 +50,48 @@ def _first_heading(path):
         return None
     return None
 
+
+
+
+def _book_stability(book, min_move=0.3, limit=3):
+    """How many book alphas earn their train Sharpe in only one half of train.
+
+    A single train Sharpe can be the average of two opposite regimes, and the test
+    year may not be used to select. Splitting train in half keeps the evidence inside
+    the window selection is allowed to read, so a flip is visible at session start
+    instead of after a submission disappoints.
+
+    Honest limit, worth keeping in the code: this catches *train-internal* regime
+    dependence, not future decay. `omEaaMl2` is stable by this measure (2.50 -> 1.81)
+    and still turned negative the following year.
+    """
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+    gaps, flips, late = [], [], []
+    for alpha_id in book:
+        path = pnl_dir / ("%s.json" % alpha_id)
+        if not path.exists():
+            continue
+        try:
+            pnl = {k: float(v) for k, v in json.loads(path.read_text()).items()}
+        except (OSError, ValueError):
+            continue
+        # The halves must stay inside train: the test year is not selection evidence,
+        # and splitting the whole series would quietly make it so.
+        entry = (book.get(alpha_id) if isinstance(book, dict) else None) or {}
+        test_start = ((entry.get("out_of_sample") or {}).get("test") or {}).get("startDate")
+        first, second = experiments.half_split_sharpes(pnl, test_start)
+        if first is None or second is None:
+            continue
+        gaps.append(abs(first - second))
+        if first * second < 0 and min(abs(first), abs(second)) >= min_move:
+            flips.append({"alpha_id": alpha_id, "h1": round(first, 2), "h2": round(second, 2)})
+        elif first < 0.5 and second > 1.5:
+            late.append({"alpha_id": alpha_id, "h1": round(first, 2), "h2": round(second, 2)})
+    gaps.sort()
+    return {"measured": len(gaps), "flips": len(flips),
+            "late_bloomers": len(late),
+            "median_gap": round(gaps[len(gaps) // 2], 2) if gaps else None,
+            "worst": flips[:limit] + late[:limit]}
 
 
 def _book_duplicates(book, gate=0.70, prefilter=0.75, limit=8):
@@ -147,7 +191,10 @@ def cmd_brief(args, _sink):
         if (entry.get("status") or "").upper() != "ACTIVE":
             continue
         alpha_id = entry.get("alpha_id")
-        if alpha_id and alpha_id not in book:
+        if alpha_id:
+            # The ledger is append-only, so the last row for an alpha is its current
+            # truth. Keeping the first one hid fields added later - the out-of-sample
+            # split among them, which is what the stability split needs.
             book[alpha_id] = entry
 
     sharpes = [metric(entry, "sharpe") for entry in book.values()
@@ -224,6 +271,8 @@ def cmd_brief(args, _sink):
             "by_universe": dict(sorted(universes.items(), key=lambda item: -item[1])),
             # Same-bet pairs the submission gate could have missed (snapshot lag).
             "self_duplicates": _book_duplicates(sorted(book)),
+            # A train Sharpe can hide a single-regime edge; the halves stay in train.
+            "stability": _book_stability(book),
         },
         "recent": {"runs": len(runs), "by_verdict": by_verdict, "best": best},
         "documents": documents,
