@@ -770,6 +770,11 @@ def build_parser():
                         help="Case-insensitive substring of the mechanism label.")
     l_list.add_argument("--expression", default=None,
                         help="Case-insensitive substring of a recorded expression.")
+    l_list.add_argument("--regex", action="store_true",
+                        help="Treat --expression as a regular expression.")
+    l_list.add_argument("--all-fields", default=None, dest="all_fields",
+                        help="Comma-separated field ids that must ALL appear, e.g. "
+                             "debt_st,assets.")
     l_list.add_argument("--limit", type=int, default=0,
                         help="Maximum entries to show, ranked by fitness; 0 shows all (default).")
     l_list.add_argument("--format", choices=["json", "markdown"], default="json",
@@ -802,6 +807,8 @@ def build_parser():
     l_imp.add_argument("--registry", default=None)
     l_imp.set_defaults(func=ledger.cmd_ledger_impact)
 
+    for parser_name in ("l_lst",):
+        pass
     l_lin = ledger_sub.add_parser(
         "lineage",
         help="Walk the parent edges of an alpha (offline).",

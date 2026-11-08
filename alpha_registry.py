@@ -30,6 +30,7 @@ from __future__ import annotations
 import datetime
 import hashlib
 import json
+import re
 import os
 
 import research_paths
@@ -542,7 +543,7 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
 
 def find_entries(entries, field=None, mechanism=None, idea=None,
                  expression=None, verdicts=None, min_fitness=None,
-                 family=None, min_sharpe=None):
+                 family=None, min_sharpe=None, regex=False, all_fields=None):
     """Filter ledger entries by field usage, mechanism, idea or expression.
 
     ``field`` is matched as a substring of the recorded expression, which is
@@ -550,6 +551,18 @@ def find_entries(entries, field=None, mechanism=None, idea=None,
     without spending a simulation to find out. Matching is case-insensitive
     and every supplied filter must agree (AND).
     """
+    # `all_fields` answers a different question than `field`: not "does this id appear"
+    # but "does this expression use both A and B", which is how a leg combination is
+    # recognised. `regex` exists because substring matching cannot say "any ts_corr of an
+    # absolute series".
+    wanted_fields = [part.strip().lower() for part in (all_fields or "").split(",")
+                     if part.strip()]
+    pattern = None
+    if regex and expression:
+        try:
+            pattern = re.compile(expression, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError("bad --regex: %s" % exc) from exc
     needle_field = (field or "").lower()
     needle_mechanism = (mechanism or "").lower()
     needle_idea = (idea or "").lower()
@@ -562,7 +575,12 @@ def find_entries(entries, field=None, mechanism=None, idea=None,
         code = (entry.get("expression") or "").lower()
         if needle_field and needle_field not in code:
             continue
-        if needle_expression and needle_expression not in code:
+        if pattern is not None:
+            if not pattern.search(entry.get("expression") or ""):
+                continue
+        elif needle_expression and needle_expression not in code:
+            continue
+        if wanted_fields and not all(needle in code for needle in wanted_fields):
             continue
         if needle_mechanism and needle_mechanism not in (
                 entry.get("mechanism") or "").lower():

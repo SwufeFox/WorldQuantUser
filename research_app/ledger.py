@@ -70,6 +70,8 @@ def cmd_ledger_list(args, _sink):
         mechanism=getattr(args, "mechanism", None),
         idea=getattr(args, "idea", None),
         expression=getattr(args, "expression", None),
+        regex=getattr(args, "regex", False),
+        all_fields=getattr(args, "all_fields", None),
         verdicts=getattr(args, "verdict", None),
         min_fitness=getattr(args, "min_fitness", None),
         family=getattr(args, "family", None),
