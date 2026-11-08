@@ -630,6 +630,116 @@ def group_product_findings(expression):
                         % ", ".join(present)}]
 
 
+def _split_statements(text):
+    """Split an expression on top-level ``;`` while respecting parens and quotes."""
+    parts, depth, quote, current = [], 0, None, []
+    for char in text:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            current.append(char)
+            continue
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        if char == ";" and depth == 0:
+            parts.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+    return [part for part in parts if part]
+
+
+def _wrap_chain(statement, indent="      ", width=88):
+    """Break a long ``+``/``-`` chain at operator boundaries.
+
+    The book's own expressions do this by hand (`WjbJO0vZ`: `core = rank(` then one leg
+    per line). Reproducing it mechanically keeps long composites readable without
+    touching their semantics - a line break inside a call is whitespace to the parser.
+    """
+    if len(statement) <= width or "(" not in statement:
+        return [statement]
+    head, _, rest = statement.partition("(")
+    if not rest:
+        return [statement]
+    depth, quote, marks = 1, None, []
+    for index, char in enumerate(rest):
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                inner, tail = rest[:index], rest[index:]
+                break
+    else:
+        return [statement]
+    pieces, depth, quote, current = [], 0, None, []
+    for index, char in enumerate(inner):
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and char in "+-" and index > 0 and not inner[index - 1] in "*/+-(":
+            pieces.append("".join(current).strip())
+            current = [char]
+            continue
+        current.append(char)
+    pieces.append("".join(current).strip())
+    pieces = [piece for piece in pieces if piece]
+    if len(pieces) <= 1:
+        return [statement]
+    lines = ["%s(" % head]
+    for position, piece in enumerate(pieces):
+        prefix = indent if position == 0 else indent + "  "
+        lines.append(prefix + piece)
+    lines[-1] = lines[-1] + tail
+    return lines
+
+
+def pretty_expression(expression, indent="      ", width=88):
+    """Format an alpha expression the way the book writes them: one statement per line.
+
+    The platform accepts newlines (every stored expression in the book has them, with
+    hand-aligned continuations), but everything written here - spec files, one-off
+    commands - ends up as a single line, which makes a six-leg composite unreadable and
+    unreviewable. This is idempotent: formatting a formatted expression changes nothing.
+    """
+    # Flatten first so re-running on already formatted text is a no-op: the wrap is
+    # recomputed from a single line, never from the previous layout.
+    flat = " ".join((expression or "").split())
+    statements = _split_statements(flat)
+    lines = []
+    for position, statement in enumerate(statements):
+        # `;` terminates every statement except the last one, which is the output. Dropping
+        # them would silently turn assignments into one long bare expression.
+        terminator = ";" if position < len(statements) - 1 else ""
+        wrapped = _wrap_chain(statement, indent=indent, width=width)
+        wrapped[-1] = wrapped[-1] + terminator
+        lines.extend(wrapped)
+    return "\n".join(lines)
+
+
 def lint_expression(expression, operator_index=None, denylist=None,
                     known_fields=None, strict_fields=False, field_types=None,
                     market_fields=None, field_units=None):

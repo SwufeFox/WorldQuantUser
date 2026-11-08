@@ -880,6 +880,17 @@ def build_parser():
     b_sub.add_argument("--registry", default=None)
     b_sub.set_defaults(func=buffer_cmd.cmd_buffer_submit)
 
+    fmt = sub.add_parser(
+        "fmt", help="Format an alpha expression (or every arm in a spec file).",
+        description="The platform accepts newlines - all 55 stored book expressions are "
+                    "multi-line with aligned continuations - but everything written here "
+                    "ends up on one line. This reformats: one statement per line, wrapped "
+                    "chains, indented legs. Idempotent and semantics-preserving.")
+    fmt.add_argument("target", help="An expression string, or the path to a spec JSON.")
+    fmt.add_argument("--write", action="store_true",
+                     help="Rewrite the spec file in place (only for spec paths).")
+    fmt.set_defaults(func=experiments.cmd_fmt)
+
     health = sub.add_parser(
         "health", help="Per-alpha marginal contribution to the book (offline, no sims).",
         description="A book of 55 is not 55 bets, and equal weighting pays every member "

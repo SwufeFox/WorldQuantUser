@@ -41,3 +41,30 @@ class GroupProductTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class FormatTests(unittest.TestCase):
+    """`fmt`: the book stores multi-line expressions; everything written here did not."""
+
+    SAMPLE = ("leverage = liabilities / assets; gp = (revenue - cogs) / assets; "
+              "core = rank( group_rank(gp, subindustry) + 0.5 * group_rank(leverage, subindustry) ); "
+              "core + rank(leverage)")
+
+    def test_one_statement_per_line_and_semicolons_kept(self):
+        out = expression_lint.pretty_expression(self.SAMPLE)
+        self.assertEqual(out.count(";"), self.SAMPLE.count(";"))
+        # three statements -> at least three lines, and the closing call is on its own
+        self.assertGreaterEqual(len(out.splitlines()), 4)
+        self.assertTrue(out.startswith("leverage ="))
+
+    def test_formatting_preserves_the_expression(self):
+        import re
+        out = expression_lint.pretty_expression(self.SAMPLE)
+        strip = lambda text: re.sub(r"\s+", "", text)
+        self.assertEqual(strip(out), strip(self.SAMPLE))
+
+    def test_formatting_is_idempotent(self):
+        once = expression_lint.pretty_expression(self.SAMPLE)
+        self.assertEqual(expression_lint.pretty_expression(once), once)
+
+    def test_a_short_expression_is_left_alone(self):
+        self.assertEqual(expression_lint.pretty_expression("rank(close)"), "rank(close)")

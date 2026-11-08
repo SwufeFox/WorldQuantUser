@@ -783,6 +783,45 @@ def _require_spec(args):
                    "pass spec.json, or --recover BATCH_JSON to repair an existing batch")
 
 
+def cmd_fmt(args, _sink):
+    """Format alpha expressions: one statement per line, wrapped chains, indented legs.
+
+    Every expression written here lives as a single long line - in a spec file, in a
+    commit message, in a probe invocation - while the book's own 55 expressions are
+    stored multi-line with aligned continuations. A six-leg composite on one line cannot
+    be reviewed, and review is the only defence against silent mistakes.
+    """
+    target = args.target
+    path = Path(target).expanduser()
+    if path.suffix == ".json" and path.exists():
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc))
+        arms = document.get("arms") or []
+        if not arms:
+            raise CliError("INVALID_INPUT", "%s has no arms" % path.name)
+        changed = 0
+        for arm in arms:
+            original = arm.get("expression") or ""
+            formatted = expression_lint.pretty_expression(original)
+            if formatted != original:
+                arm["expression"] = formatted
+                changed += 1
+        if args.write:
+            path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8")
+        return {"path": str(path), "arms": len(arms), "changed": changed,
+                "written": bool(args.write), "formatted": document}
+
+    # Not a spec file: treat the argument as one expression.
+    formatted = expression_lint.pretty_expression(target)
+    if args.write:
+        raise CliError("USAGE", "--write needs a spec file",
+                       "pass the path to a JSON spec instead of a bare expression")
+    return {"formatted": formatted}
+
+
 def cmd_probe(args, _sink):
     """Run a batch of arms from one spec file: lint, simulate, table, record.
 
