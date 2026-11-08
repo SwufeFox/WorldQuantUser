@@ -54,6 +54,40 @@ def _first_heading(path):
 
 
 
+
+def _convergence_snapshot(max_age_hours=48.0):
+    """Read the snapshot `ledger convergence` writes; never compute it here.
+
+    The marginal pass needs hundreds of PnL correlations, which would push `brief` from
+    one second to tens of seconds. Reporting a stale snapshot with its age is the honest
+    alternative to both: the trigger stays visible, and nobody mistakes a 3-day-old
+    reading for the current state.
+    """
+    from datetime import datetime, timezone
+
+    path = Path(research_paths.ensure_dir()) / "convergence.json"
+    if not path.exists():
+        return {"stale": True, "hint": "run `ledger convergence` to record a baseline"}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"stale": True, "hint": "snapshot unreadable; rerun `ledger convergence`"}
+    as_of = payload.get("as_of") or ""
+    age_hours = None
+    try:
+        stamp = datetime.fromisoformat(as_of.replace("Z", "+00:00"))
+        age_hours = round((datetime.now(timezone.utc) - stamp).total_seconds() / 3600, 1)
+    except ValueError:
+        pass
+    return {"as_of": as_of, "age_hours": age_hours,
+            "stale": age_hours is not None and age_hours > max_age_hours,
+            "batches": payload.get("batches"),
+            "recent_productive": payload.get("recent_productive"),
+            "recent_additive": payload.get("recent_additive"),
+            "book_mechanisms": payload.get("book_mechanisms"),
+            "recent": (payload.get("recent") or [])[-3:]}
+
+
 def _drift_check():
     """Compare the platform's ACTIVE set with the ledger's, online.
 
@@ -503,6 +537,8 @@ def cmd_brief(args, _sink):
         },
         "recent": {"runs": len(runs), "by_verdict": by_verdict, "best": best},
         "documents": documents,
+        # The divergence trigger: how many of the last batches produced anything additive.
+        "convergence": _convergence_snapshot(),
         "drift": (_book_drift(book, _drift_check().get("platform"))
                   if getattr(args, "drift", False) else None),
         "threads": threads,

@@ -483,8 +483,19 @@ def cmd_ledger_convergence(args, _sink):
     _path, entries = _ledger(args)
     marginals = _book_marginals(entries) if not args.no_marginal else {}
     data = mechanisms.convergence(entries, marginals, recent_batches=args.batches)
-    data["thresholds"] = {"additive_marginal": 0.3,
+    data["thresholds"] = {"additive_marginal": 0.3, "min_train_sharpe": 1.0,
                           "note": "trigger when recent_productive covers < 2 batches"}
+    # `brief` must stay a sub-second read, and the marginal pass is the expensive part
+    # (hundreds of PnL correlations). So the expensive command writes a snapshot and the
+    # digest reads it, reporting how old it is rather than silently trusting it.
+    from datetime import datetime, timezone
+    snapshot = Path(research_paths.ensure_dir()) / "convergence.json"
+    data["snapshot"] = str(snapshot)
+    data["as_of"] = datetime.now(timezone.utc).isoformat()
+    try:
+        snapshot.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    except OSError:
+        data["snapshot"] = None
     return data
 
 

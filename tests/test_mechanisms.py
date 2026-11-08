@@ -73,3 +73,34 @@ class ConvergenceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_brief_reads_the_snapshot_instead_of_computing(self):
+        import tempfile
+        from unittest import mock
+        import research_paths
+        from research_app import campaign as cli_campaign
+
+        tmp = tempfile.mkdtemp()
+        with mock.patch.object(research_paths, "ensure_dir", lambda: tmp):
+            payload = cli_campaign._convergence_snapshot()
+        self.assertTrue(payload["stale"])
+        self.assertIn("hint", payload)
+
+    def test_a_fresh_snapshot_is_not_stale(self):
+        import json, os, tempfile
+        from datetime import datetime, timezone
+        from unittest import mock
+        import research_paths
+        from research_app import campaign as cli_campaign
+
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "convergence.json"), "w") as handle:
+            json.dump({"as_of": datetime.now(timezone.utc).isoformat(),
+                       "recent_productive": 3, "recent_additive": 5,
+                       "book_mechanisms": 36}, handle)
+        with mock.patch.object(research_paths, "ensure_dir", lambda: tmp):
+            payload = cli_campaign._convergence_snapshot()
+        self.assertFalse(payload["stale"])
+        self.assertEqual(payload["recent_productive"], 3)
