@@ -856,6 +856,30 @@ def build_parser():
     l_fmt.add_argument("--dry-run", action="store_true", dest="dry_run")
     l_fmt.set_defaults(func=ledger.cmd_ledger_format)
 
+    l_mech = ledger_sub.add_parser(
+        "mechanisms", help="Independent mechanisms and their outcomes (offline).",
+        description="Groups by (economic block, AST skeleton): the campaign's rule that "
+                    "parameter variants of one idea count as one bet, made countable "
+                    "without a simulation.")
+    l_mech.add_argument("--where", default=None)
+    l_mech.add_argument("--status", default=None)
+    l_mech.add_argument("--with-marginal", action="store_true", dest="with_marginal",
+                        help="Also compute each book alpha's marginal contribution.")
+    l_mech.add_argument("--list", action="store_true", help="Show every mechanism.")
+    l_mech.add_argument("--limit", type=int, default=15)
+    l_mech.add_argument("--registry", default=None)
+    l_mech.set_defaults(func=ledger.cmd_ledger_mechanisms)
+
+    l_conv = ledger_sub.add_parser(
+        "convergence", help="Per-batch novelty and output, for divergence decisions.",
+        description="Reports arms, distinct mechanisms, structural novelty and additive "
+                    "output per batch. Structural novelty is a weak trigger: the last "
+                    "hundred arms were 93% new skeletons and almost none were additive.")
+    l_conv.add_argument("--batches", type=int, default=8)
+    l_conv.add_argument("--no-marginal", action="store_true", dest="no_marginal")
+    l_conv.add_argument("--registry", default=None)
+    l_conv.set_defaults(func=ledger.cmd_ledger_convergence)
+
     l_stab = ledger_sub.add_parser(
         "stability",
         help="Train first-half vs second-half Sharpe per alpha; flags sign flips (offline).",

@@ -11,7 +11,7 @@ import correlation
 import machine_lib as ml
 import research_paths
 
-from . import experiments, styles
+from . import experiments, mechanisms, styles
 from .runtime import CliError, with_session
 
 
@@ -385,6 +385,107 @@ def cmd_ledger_format(args, _sink):
     temporary.replace(registry)
     return {"path": str(registry), "rows": len(rewritten), "changed": changed,
             "written": True, "backup": str(backup)}
+
+
+def _book_marginals(entries, window_end="2023-01-01"):
+    """Marginal contribution of every alpha with cached PnL, measured against the book.
+
+    Two definitions were wrong before this one, and both looked plausible:
+
+    * leave-one-out over *everything cached* made every dead-end arm look additive, because
+      the "portfolio" was hundreds of unrelated alphas;
+    * leave-one-out over the book only cannot score a candidate that is not in the book.
+
+    So the book is the fixed reference: ``S_own - rho(own, book) * S_book``. For a book
+    member this is the usual marginal (its own weight is 1/56 of the reference, which is
+    negligible), and for an outside candidate it is exactly the entry test.
+    """
+    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+
+    def load(alpha_id):
+        path = pnl_dir / ("%s.json" % alpha_id)
+        if not path.exists():
+            return None
+        try:
+            return {k: float(v) for k, v in json.loads(path.read_text()).items()}
+        except (OSError, ValueError):
+            return None
+
+    def sharpe(values):
+        mean = sum(values) / len(values)
+        var = sum((v - mean) ** 2 for v in values) / len(values)
+        return None if var <= 0 else mean / (var ** 0.5) * (252 ** 0.5)
+
+    series, book_ids = {}, []
+    for entry in entries:
+        alpha_id = entry.get("alpha_id")
+        if not alpha_id:
+            continue
+        values = load(alpha_id)
+        if values is None:
+            continue
+        series[alpha_id] = values
+        if str(entry.get("status") or "").upper() == "ACTIVE":
+            book_ids.append(alpha_id)
+    if len(book_ids) < 2:
+        return {}
+    dates = sorted(set.intersection(*(set(series[a]) for a in book_ids)))
+    dates = [day for day in dates if day < window_end]
+    if len(dates) < 200:
+        return {}
+    book = [sum(series[a][d] for a in book_ids) / len(book_ids) for d in dates]
+    book_sharpe = sharpe(book)
+    if book_sharpe is None:
+        return {}
+    marginals = {}
+    for alpha_id, values in series.items():
+        if any(day not in values for day in dates):
+            continue
+        own = [values[d] for d in dates]
+        rho = correlation.pearson(own, book)
+        own_sharpe = sharpe(own)
+        if rho is None or own_sharpe is None:
+            continue
+        marginals[alpha_id] = round(own_sharpe - rho * book_sharpe, 3)
+    return marginals
+
+
+def cmd_ledger_mechanisms(args, _sink):
+    """How many independent mechanisms the book (or the ledger) actually holds.
+
+    The campaign counts candidates by mechanism, but the only offline keys were the family
+    label (too coarse) and PnL correlation (needs a simulation). This groups by
+    ``(economic block, AST skeleton)`` - the definition "100 parameter variants count as
+    one" - and reports size and median marginal per mechanism.
+    """
+    _path, entries = _ledger(args)
+    selected = [entry for entry in entries
+                if _ask_passes(entry, _ask_filters(args.where))]
+    if args.status:
+        wanted = {part.strip().upper() for part in args.status.split(",")}
+        selected = [entry for entry in selected
+                    if str(entry.get("status") or "").upper() in wanted]
+    marginals = _book_marginals(entries) if args.with_marginal else {}
+    data = mechanisms.summarise(selected, marginals)
+    data["filter"] = {"where": args.where, "status": args.status}
+    if not args.list:
+        data["rows"] = [row for row in data["rows"][: args.limit]]
+    return data
+
+
+def cmd_ledger_convergence(args, _sink):
+    """Per-batch signals for "is this line of work exhausted".
+
+    Structural novelty is not a usable trigger: the last hundred arms were 93% new
+    skeletons and almost none of them were additive. This reports the outcome number next
+    to the structural one so the difference stays visible.
+    """
+    _path, entries = _ledger(args)
+    marginals = _book_marginals(entries) if not args.no_marginal else {}
+    data = mechanisms.convergence(entries, marginals, recent_batches=args.batches)
+    data["thresholds"] = {"additive_marginal": 0.3,
+                          "note": "trigger when recent_productive covers < 2 batches"}
+    return data
 
 
 def cmd_ledger_stability(args, _sink):
