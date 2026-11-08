@@ -320,6 +320,71 @@ def cmd_ledger_sync(args, _sink):
             "skipped_beyond_limit": max(0, len(missing) + len(drifted) - len(written))}
 
 
+def cmd_ledger_format(args, _sink):
+    """Rewrite the ledger's stored expressions in the book's own multi-line style.
+
+    The ledger is append-only and it is the record of what was actually simulated, so this
+    refuses to write unless *every* row keeps its canonical identity: the expression text
+    changes, `expression_hash` does not. A formatting pass that altered a hash would
+    silently re-key the row and change what future dedupe matches against.
+
+    A timestamped backup is written first; there is no undo otherwise.
+    """
+    import shutil
+    from datetime import datetime, timezone
+    import expression_lint
+
+    path, entries = _ledger(args)
+    registry = Path(path)
+    if not registry.exists():
+        raise CliError("INVALID_INPUT", "no ledger at %s" % registry)
+    changed = 0
+    rewritten = []
+    for entry in entries:
+        original = entry.get("expression") or ""
+        if not original.strip():
+            rewritten.append(entry)
+            continue
+        formatted = expression_lint.pretty_expression(original)
+        if formatted != original:
+            changed += 1
+        entry = dict(entry)
+        entry["expression"] = formatted
+        rewritten.append(entry)
+
+    # Identity guard: hash both sides *now* rather than trusting the stored field, which
+    # rows written before 2026-10-31 carry in the older `expr:` form. Comparing a fresh
+    # hash against a legacy one flagged 1208 untouched rows on the first attempt.
+    mismatches = []
+    for before, after in zip(entries, rewritten):
+        old_text = before.get("expression") or ""
+        new_text = after.get("expression") or ""
+        if not old_text.strip():
+            continue
+        if alpha_registry.expression_hash(old_text) != alpha_registry.expression_hash(new_text):
+            mismatches.append(after.get("alpha_id") or after.get("key"))
+    if mismatches:
+        raise CliError("INVALID_INPUT",
+                       "%d row(s) would change identity: %s" % (len(mismatches),
+                                                                ", ".join(mismatches[:5])),
+                       "formatting must be semantic-preserving; nothing was written")
+
+    if args.dry_run:
+        return {"path": str(registry), "rows": len(rewritten), "changed": changed,
+                "written": False, "dry_run": True}
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = registry.with_suffix(registry.suffix + ".bak-%s" % stamp)
+    shutil.copy2(registry, backup)
+    temporary = registry.with_suffix(registry.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for entry in rewritten:
+            handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    temporary.replace(registry)
+    return {"path": str(registry), "rows": len(rewritten), "changed": changed,
+            "written": True, "backup": str(backup)}
+
+
 def cmd_ledger_stability(args, _sink):
     """Which book alphas earn their train Sharpe in only one half of train.
 

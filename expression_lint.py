@@ -725,9 +725,15 @@ def pretty_expression(expression, indent="      ", width=88):
     commands - ends up as a single line, which makes a six-leg composite unreadable and
     unreviewable. This is idempotent: formatting a formatted expression changes nothing.
     """
-    # Flatten first so re-running on already formatted text is a no-op: the wrap is
+    # `#` runs to end of line: flattening the whole text would swallow the newline after a
+    # comment and comment out the statement that followed it. `Grgv90PQ` opens with
+    # `# day1`, and joining it to the first assignment changed its AST.
+    raw_lines = (expression or "").replace("\r\n", "\n").split("\n")
+    comments = [line.strip() for line in raw_lines if line.strip().startswith("#")]
+    code_lines = [line for line in raw_lines if not line.strip().startswith("#")]
+    # Flatten the code so re-running on already formatted text is a no-op: the wrap is
     # recomputed from a single line, never from the previous layout.
-    flat = " ".join((expression or "").split())
+    flat = " ".join(" ".join(code_lines).split())
     statements = _split_statements(flat)
     lines = []
     for position, statement in enumerate(statements):
@@ -737,7 +743,7 @@ def pretty_expression(expression, indent="      ", width=88):
         wrapped = _wrap_chain(statement, indent=indent, width=width)
         wrapped[-1] = wrapped[-1] + terminator
         lines.extend(wrapped)
-    return "\n".join(lines)
+    return "\n".join(comments + lines)
 
 
 def lint_expression(expression, operator_index=None, denylist=None,

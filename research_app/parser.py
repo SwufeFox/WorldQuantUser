@@ -810,6 +810,15 @@ def build_parser():
     l_sync.add_argument("--registry", default=None)
     l_sync.set_defaults(func=ledger.cmd_ledger_sync)
 
+    l_fmt = ledger_sub.add_parser(
+        "fmt", help="Reformat stored expressions in the book's multi-line style.",
+        description="The platform and the ledger both treat newlines as whitespace, so "
+                    "this is presentational - but it refuses to write unless every row "
+                    "keeps its canonical expression_hash, and it backs the file up first.")
+    l_fmt.add_argument("--registry", default=None)
+    l_fmt.add_argument("--dry-run", action="store_true", dest="dry_run")
+    l_fmt.set_defaults(func=ledger.cmd_ledger_format)
+
     l_stab = ledger_sub.add_parser(
         "stability",
         help="Train first-half vs second-half Sharpe per alpha; flags sign flips (offline).",
