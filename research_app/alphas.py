@@ -44,6 +44,92 @@ def cmd_alpha_get(args, _sink):
     return document
 
 
+def cmd_alpha_near(args, _sink):
+    """Find the book alphas closest in *structure* to an expression, before simulating.
+
+    Duplicate detection came in two flavours and both arrive too late: PnL correlation
+    needs the simulation, and eyeballing expressions is not reliable at 55 alphas. On
+    2026-11-08 several composites were built only to discover they were structural
+    variants of what the book already held.
+
+    Structure is compared with the AST skeleton (fields blanked) plus the field set:
+    an identical skeleton means "same construction, different grid point", which is the
+    definition of a duplicate the campaign uses. Overlapping fields with a different
+    skeleton is a much weaker signal and is reported separately.
+    """
+    import fastexpr_ast
+
+    if args.alpha_id and args.expression:
+        raise CliError("USAGE", "pass either --alpha-id or --expression, not both")
+    registry = args.registry or alpha_registry.default_registry_path()
+    entries = alpha_registry.load_entries(registry)
+    latest = {}
+    for entry in entries:
+        alpha_id = entry.get("alpha_id")
+        if alpha_id:
+            latest[alpha_id] = entry
+
+    if args.alpha_id:
+        entry = latest.get(args.alpha_id)
+        if entry is None:
+            raise CliError("INVALID_INPUT", "%s is not in the ledger" % args.alpha_id)
+        expression = entry.get("expression") or ""
+    else:
+        expression = args.expression or ""
+    expression = " ".join(expression.split())
+    if not expression:
+        raise CliError("INVALID_INPUT", "empty expression")
+    try:
+        program = fastexpr_ast.parse(expression)
+    except Exception as exc:  # noqa: BLE001 - unparseable input is a usage error
+        raise CliError("INVALID_INPUT", "cannot parse expression: %s" % exc,
+                       "check the syntax, or pass --alpha-id for a stored alpha")
+
+    skeleton = fastexpr_ast.skeleton(program)
+    fields = set(fastexpr_ast.field_names(program))
+    operators = set(fastexpr_ast.operator_names(program))
+
+    rows = []
+    for alpha_id, entry in latest.items():
+        if args.alpha_id and alpha_id == args.alpha_id:
+            continue
+        if args.status:
+            wanted = {part.strip().upper() for part in args.status.split(",")}
+            if str(entry.get("status") or "").upper() not in wanted:
+                continue
+        other = " ".join((entry.get("expression") or "").split())
+        if not other:
+            continue
+        try:
+            other_program = fastexpr_ast.parse(other)
+        except Exception:  # noqa: BLE001 - a damaged row must not break the search
+            continue
+        other_skeleton = fastexpr_ast.skeleton(other_program)
+        other_fields = set(fastexpr_ast.field_names(other_program))
+        other_ops = set(fastexpr_ast.operator_names(other_program))
+        shared = fields & other_fields
+        union = fields | other_fields
+        rows.append({
+            "alpha_id": alpha_id,
+            "family": entry.get("family"),
+            "status": entry.get("status"),
+            "fitness": (entry.get("metrics") or {}).get("fitness"),
+            "same_skeleton": other_skeleton == skeleton,
+            "field_jaccard": round(len(shared) / len(union), 3) if union else 0.0,
+            "operator_jaccard": (round(len(operators & other_ops) / len(operators | other_ops), 3)
+                                 if (operators | other_ops) else 0.0),
+            "shared_fields": sorted(shared)[:8],
+            "skeleton": other_skeleton[:160],
+        })
+    rows.sort(key=lambda row: (not row["same_skeleton"], -row["field_jaccard"]))
+    limited = rows[: args.limit]
+    same = [row["alpha_id"] for row in rows if row["same_skeleton"]]
+    return {"expression": expression[:200], "skeleton": skeleton[:300],
+            "fields": sorted(fields), "operators": sorted(operators),
+            "count": len(rows), "same_skeleton_count": len(same),
+            "same_skeleton": same[:10], "near": limited}
+
+
 def cmd_alpha_check(args, _sink):
     """Force the platform to compute checks and return the real values.
 

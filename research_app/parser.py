@@ -626,6 +626,19 @@ def build_parser():
 
     a_get.set_defaults(func=alphas.cmd_alpha_get)
 
+    a_near = alpha_sub.add_parser(
+        "near", help="Book alphas closest in structure to an expression (offline).",
+        description="Duplicate detection arrives too late by PnL (needs the simulation) "
+                    "or by eye (unreliable at 55 alphas). This compares AST skeletons and "
+                    "field sets instead: an identical skeleton means 'same construction, "
+                    "different grid point'.")
+    a_near.add_argument("--alpha-id", default=None, dest="alpha_id")
+    a_near.add_argument("--expression", default=None)
+    a_near.add_argument("--status", default=None, help="Filter candidates by status, e.g. ACTIVE.")
+    a_near.add_argument("--limit", type=int, default=8)
+    a_near.add_argument("--registry", default=None)
+    a_near.set_defaults(func=alphas.cmd_alpha_near)
+
     a_chk = alpha_sub.add_parser(
         "check",
         help="Compute live checks (incl. SELF_CORRELATION). 'get' only shows cached values.")
