@@ -141,6 +141,71 @@ def cmd_catalog_fields(args, _sink):
     return data
 
 
+def cmd_catalog_find(args, _sink):
+    """Search every dataset's fields at once, ranked, with the dataset in each row.
+
+    `catalog fields` needs `--dataset`, so "is there a short-term debt field anywhere?"
+    meant paging fourteen datasets by hand - which is what happened four times on
+    2026-11-08 while looking for `debt_st`, `debt_lt`, `*_oi` and growth forecasts.
+    Every field record is already cached per dataset, so the only thing missing was a
+    loop and a ranking rule.
+
+    Ranking: an exact id match first, then coverage (how much of the universe actually
+    has the field), then the local search score. Coverage is the tie-break that matters
+    in practice - a field that exists for 12% of the universe cannot carry an alpha.
+    """
+    cache_report = {}
+    datasets = with_session(args, lambda s: ml.get_datasets(
+        s, instrument_type=args.instrument_type, region=args.region,
+        delay=args.delay, universe=args.universe, limit=None, report=cache_report,
+    ))
+    wanted = [part.strip() for part in (args.dataset or "").split(",") if part.strip()]
+    if wanted:
+        datasets = [d for d in datasets if d.get("id") in wanted]
+    if not datasets:
+        raise CliError("INVALID_INPUT", "no datasets for %s/%s/delay %s"
+                       % (args.region, args.universe, args.delay))
+
+    rows, scanned = [], 0
+    for dataset in datasets:
+        dataset_id = dataset.get("id")
+        try:
+            fields = with_session(args, lambda s, d=dataset_id: ml.get_datafields(
+                s, instrument_type=args.instrument_type, region=args.region,
+                delay=args.delay, universe=args.universe, dataset_id=d,
+                search="", field_type=None, limit=None))
+        except Exception:  # noqa: BLE001 - one unreadable dataset must not sink the search
+            continue
+        scanned += len(fields)
+        hits = field_search.search_records(
+            fields, args.query, limit=None, fuzzy=args.fuzzy,
+            match_all=not args.any_term)
+        for hit in hits:
+            coverage = hit.get("coverage")
+            if args.min_coverage is not None and (coverage or 0) < args.min_coverage:
+                continue
+            rows.append({
+                "id": hit.get("id"), "dataset": dataset_id,
+                "category": (dataset.get("category") or {}).get("name")
+                if isinstance(dataset.get("category"), dict) else dataset.get("category"),
+                "type": hit.get("type"), "coverage": coverage,
+                "description": (hit.get("description") or "").strip()[:120],
+            })
+    lowered = args.query.strip().lower()
+    rows.sort(key=lambda row: (0 if (row["id"] or "").lower() == lowered else 1,
+                               -(row["coverage"] or 0), row["id"] or ""))
+    limited = rows[: args.limit]
+    data = {"query": args.query, "region": args.region, "universe": args.universe,
+            "delay": args.delay, "datasets_scanned": len(datasets),
+            "fields_scanned": scanned, "count": len(rows), "fields": limited,
+            "cache": cache_report,
+            "ranking": "exact id, then coverage, then id"}
+    if not rows:
+        data["hint"] = ("nothing matched across %d datasets; try --fuzzy or --any-term"
+                        % len(datasets))
+    return data
+
+
 def cmd_catalog_concepts(args, _sink):
     """Group fields by shared tokens and show coverage side by side.
 

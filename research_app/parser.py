@@ -219,6 +219,23 @@ def build_parser():
     _add_session_args(cat_ds)
     cat_ds.set_defaults(func=catalog.cmd_catalog_datasets)
 
+    cat_find = cat.add_parser(
+        "find", help="Search every dataset's fields at once (offline once cached).")
+    cat_find.add_argument("query", help="Search terms; multi-word queries are ANDed.")
+    cat_find.add_argument("--dataset", default=None,
+                          help="Comma-separated dataset ids to restrict to.")
+    cat_find.add_argument("--min-coverage", type=float, default=None, dest="min_coverage",
+                          help="Drop fields whose coverage is below this.")
+    cat_find.add_argument("--fuzzy", action="store_true")
+    cat_find.add_argument("--any-term", action="store_true", dest="any_term")
+    cat_find.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_find.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
+    cat_find.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_find.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
+    cat_find.add_argument("--limit", type=int, default=25)
+    _add_session_args(cat_find)
+    cat_find.set_defaults(func=catalog.cmd_catalog_find)
+
     cat_f = cat.add_parser("fields", help="Datafields of one dataset.")
     cat_f.add_argument("--dataset", required=True, help="Dataset id, e.g. fundamental6.")
     cat_f.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
