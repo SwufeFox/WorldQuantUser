@@ -599,6 +599,37 @@ def strip_comments(expression):
     return _COMMENT_HASH.sub(" ", text)
 
 
+_GROUP_PRODUCERS = ("bucket", "densify")
+_GROUP_USE = re.compile(r"group_[a-z_]+\s*\(")
+
+
+def group_product_findings(expression):
+    """Warn when `bucket`/`densify` output is not fed into a ``group_*`` operator.
+
+    `bucket(rank(x), range=...)` does not return a number - it returns a *group label*,
+    which the catalog describes as "these buckets can then be used with group...".
+    Arithmetic on it fails at simulation time with a unit error:
+
+        Incompatible unit for input of "multiply" ... expected "Unit[]", found
+        "Unit[Group:1]"
+
+    Local lint cannot see units, so three arms of the 2026-11-08 calendar probe were
+    written, linted clean, and rejected one by one by the simulator. The name is the
+    only signal available offline, and this rule is what would have caught it.
+    """
+    text = strip_comments(expression or "")
+    present = [name for name in _GROUP_PRODUCERS
+               if re.search(r"\b%s\s*\(" % name, text)]
+    if not present:
+        return []
+    if _GROUP_USE.search(text):
+        return []
+    return [{"code": "group_value_misused", "operators": present,
+             "message": "%s returns a group label, not a number; it is only usable as "
+                        "the group argument of a group_* operator"
+                        % ", ".join(present)}]
+
+
 def lint_expression(expression, operator_index=None, denylist=None,
                     known_fields=None, strict_fields=False, field_types=None,
                     market_fields=None, field_units=None):
@@ -627,6 +658,7 @@ def lint_expression(expression, operator_index=None, denylist=None,
             "warnings": warnings,
         }
 
+    warnings.extend(group_product_findings(expression))
     masked, unterminated = _mask_strings(expression)
     if unterminated:
         errors.append({"code": "unbalanced_string",

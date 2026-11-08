@@ -893,6 +893,13 @@ def build_parser():
     health.add_argument("--pool", action="store_true",
                         help="Also score every non-book alpha with cached PnL against "
                              "this book, ranked by marginal contribution.")
+    health.add_argument("--min-marginal", type=float, default=0.3, dest="min_marginal",
+                        help="Marginal contribution a pool alpha must reach to pass.")
+    health.add_argument("--gate", type=float, default=0.70,
+                        help="Max correlation to any single book member (platform gate).")
+    health.add_argument("--min-sharpe", type=float, default=1.0, dest="min_sharpe",
+                        help="A negative-Sharpe alpha can post a big marginal; require a "
+                             "real Sharpe for a pool alpha to pass.")
     health.add_argument("--limit", type=int, default=8)
     health.add_argument("--min-overlap", type=int, default=500, dest="min_overlap")
     health.add_argument("--registry", default=None)

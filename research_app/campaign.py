@@ -214,6 +214,36 @@ def cmd_health(args, _sink):
         # scored rho_book 0.18 yet 0.972 against `rKd0g0bj`, i.e. a duplicate of one
         # member that looks diversified against the average. Report both for the rows we
         # show, otherwise the marginal alone would wave duplicates through.
+        # Screen every pool row, not just the visible ones: the point of the pool pass is
+        # to answer "what is left after the two quantitative legs of the gate", and that
+        # answer is a count. The strided series keeps 433 x 55 correlations cheap.
+        stride = max(1, len(dates) // 250)
+        strided_dates = dates[::stride]
+        book_strided = {a: [series[a][d] for d in strided_dates] for a in ids}
+        for row in pool:
+            path = pnl_dir / ("%s.json" % row["alpha_id"])
+            try:
+                series_map = {k: float(v) for k, v in json.loads(path.read_text()).items()}
+            except (OSError, ValueError):
+                continue
+            values = [series_map.get(d) for d in strided_dates]
+            if any(v is None for v in values):
+                row["max_single"] = None
+            else:
+                worst, partner = 0.0, None
+                for other in ids:
+                    r = correlation.pearson(values, book_strided[other])
+                    if r is not None and abs(r) > abs(worst):
+                        worst, partner = r, other
+                row["max_single"] = round(worst, 3)
+                row["max_single_vs"] = partner
+            # A negative-Sharpe alpha with negative correlation scores a big "marginal"
+            # and would be nonsense to submit, so the screen also requires a real Sharpe.
+            row["passes"] = bool(row.get("max_single") is not None
+                                 and abs(row["max_single"]) < args.gate
+                                 and row["marginal"] >= args.min_marginal
+                                 and (row.get("sharpe") or 0) >= args.min_sharpe)
+
         for row in pool[: max(args.limit, 1) * 2]:
             path = pnl_dir / ("%s.json" % row["alpha_id"])
             try:
@@ -242,7 +272,12 @@ def cmd_health(args, _sink):
             "strongest": sorted(measured, key=lambda row: -(row["marginal"] or 0))[: args.limit],
             "negative_count": sum(1 for row in measured if row["marginal"] < 0),
             "pool": pool[: args.limit] if getattr(args, "pool", False) else None,
-            "pool_size": len(pool) if getattr(args, "pool", False) else None}
+            "pool_size": len(pool) if getattr(args, "pool", False) else None,
+            "pool_passing": (sum(1 for row in pool if row.get("passes"))
+                             if getattr(args, "pool", False) else None),
+            "gate": {"min_marginal": getattr(args, "min_marginal", 0.3),
+                     "max_single": getattr(args, "gate", 0.70),
+                     "min_sharpe": getattr(args, "min_sharpe", 1.0)}}
 
 
 def _book_stability(book, min_move=0.3, limit=3):
