@@ -18,37 +18,64 @@ count. Two things were missing to make that countable offline:
 
 from __future__ import annotations
 
+import re
 from collections import defaultdict
 from pathlib import PurePosixPath
 
 import fastexpr_ast
 
-#: Which information the expression reads, in the order that decides ties: the first
-#: rule that matches wins, so the list runs from most specific to most generic.
+#: Which information the expression reads, in the order that decides ties: the first rule
+#: that matches wins, so the list runs from most specific to most generic.
+#:
+#: Two kinds of needle, because matching raw text was wrong in a way that took a while to
+#: notice: `_std` was meant to catch `eps_std`-style analyst columns but also matched the
+#: *operator* `ts_std_dev`, so eight book alphas built on realised volatility were counted
+#: as analyst dispersion. Token needles are therefore matched only against identifiers that
+#: are **not** followed by `(` - i.e. fields, never operators. Text needles match the raw
+#: expression and are used for shapes (`open / ts_delay(close`), not for names.
 BLOCK_RULES = (
-    ("derivative_pricing", ("implied_volatility", "option", "straddle", "pcr_")),
-    ("analyst_dispersion", ("eps_high", "eps_low", "sales_high", "sales_low",
-                            "dts_spe", "_std", "_high", "_low")),
-    ("analyst_yield", ("eps_mean", "median_eps", "afv4_eps", "bvps", "cfps",
-                       "estimate")),
-    ("analyst_coverage", ("_number", "count")),
-    ("turnover_structure", ("sharesout",)),
-    ("volatility_structure", ("ts_corr(abs(returns)", "ts_std_dev(ts_sum(returns",
-                              "historical_volatility")),
-    ("price_path", ("ts_arg_max", "ts_arg_min", "open / ts_delay(close",
-                    "close / open", "high / low")),
-    ("debt_structure", ("debt_st", "debt_lt", "liabilities")),
-    ("value_quality", ("equity / cap", "atq", "assets", "revenue", "cogs", "saleq",
-                       "ebitda")),
-    ("news_sentiment", ("news_", "scl12_", "sent")),
+    ("derivative_pricing", ("implied_volatility", "option", "straddle", "pcr_"), ()),
+    ("analyst_dispersion", ("eps_high", "eps_low", "sales_high", "sales_low", "dts_spe"),
+     ()),
+    ("analyst_yield", ("eps_mean", "median_eps", "afv4_eps", "bvps", "cfps", "estimate"),
+     ()),
+    ("analyst_coverage", ("_number", "count"), ()),
+    ("turnover_structure", ("sharesout", "volume"), ()),
+    ("volatility_structure", ("historical_volatility",),
+     ("ts_corr(abs(returns)", "ts_std_dev(ts_sum(returns", "ts_std_dev(returns",
+      "ts_std_dev(if_else(returns")),
+    ("price_path", ("ts_arg_max", "ts_arg_min", "close", "returns"),
+     ("open / ts_delay(close", "close / open", "high / low")),
+    ("debt_structure", ("debt_st", "debt_lt", "liabilities"), ()),
+    ("value_quality", ("equity", "cap", "atq", "assets", "revenue", "cogs", "saleq",
+                       "ebitda", "sales_growth"), ()),
+    ("news_sentiment", ("news_", "scl12_", "sent"), ()),
 )
+
+_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _field_tokens(text):
+    """Identifiers that are used as data, not as operators: a field is never `name(`."""
+    tokens = []
+    for match in _TOKEN.finditer(text):
+        rest = text[match.end():].lstrip()
+        if rest.startswith("("):
+            continue
+        tokens.append(match.group(0))
+    return tokens
 
 
 def block_of(expression):
-    """The information block an expression reads (``value_quality`` when nothing matches)."""
+    """The information block an expression reads (``other`` when nothing matches)."""
     text = " ".join((expression or "").split())
-    for name, needles in BLOCK_RULES:
-        if any(needle in text for needle in needles):
+    if not text:
+        return "other"
+    tokens = _field_tokens(text)
+    for name, needles, text_needles in BLOCK_RULES:
+        if any(needle in token for token in tokens for needle in needles):
+            return name
+        if any(needle in text for needle in text_needles):
             return name
     return "other"
 

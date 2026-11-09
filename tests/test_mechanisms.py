@@ -160,3 +160,23 @@ class CardTests(unittest.TestCase):
         card["status"] = "MAYBE"
         ok, problems = mechanisms.validate_card(card)
         self.assertFalse(ok)
+
+
+class BlockTests(unittest.TestCase):
+    """Block inference must read *fields*, never operator names.
+
+    `_std` was meant to catch `eps_std`-style analyst columns, but it also matched the
+    operator `ts_std_dev`, so eight book alphas built on realised volatility were counted
+    as analyst dispersion - which is how a "saturated analyst block" reading got reported.
+    """
+
+    def test_an_operator_does_not_decide_the_block(self):
+        block = mechanisms.block_of("-rank(ts_std_dev(returns, 120))")
+        self.assertNotEqual(block, "analyst_dispersion")
+        self.assertEqual(block, "volatility_structure")
+
+    def test_a_field_does_decide_the_block(self):
+        self.assertEqual(mechanisms.block_of("rank(eps_high - eps_low)"), "analyst_dispersion")
+
+    def test_a_reversal_on_close_is_a_price_path(self):
+        self.assertEqual(mechanisms.block_of("-rank(ts_delta(close, 5))"), "price_path")
