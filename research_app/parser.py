@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, legs, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -213,6 +213,32 @@ def build_parser():
                              help="The simulated composite to compare against.")
     legs_parser.add_argument("--registry", default=None)
     legs_parser.set_defaults(func=legs.cmd_legs)
+
+    mine_parser = sub.add_parser(
+        "mine",
+        help="Untouched fields whose cadence fits a turnover band, with a spec on demand.",
+        description="Three measured facts decide whether a field is worth a construction: "
+                    "it is untouched, its dataset's realised turnover lands in the band, "
+                    "and its type says how it must be wrapped (VECTOR/EVENT need vec_avg). "
+                    "`--emit` writes a probe spec so the next step is a simulation.")
+    mine_parser.add_argument("--dataset", default=None,
+                             help="Restrict to one dataset id (default: every dataset).")
+    mine_parser.add_argument("--min-coverage", type=float, default=0.3,
+                             dest="min_coverage")
+    mine_parser.add_argument("--turnover-band", default="0.08,0.25", dest="turnover_band",
+                             help="MIN,MAX of realised turnover that is worth mining.")
+    mine_parser.add_argument("--limit", type=int, default=4,
+                             help="Candidate fields to show per dataset.")
+    mine_parser.add_argument("--smooth", type=int, default=0,
+                             help="Wrap each field in ts_mean(x, N) before ranking; daily "
+                                  "attention fields reorder every day without it.")
+    mine_parser.add_argument("--arms", type=int, default=8,
+                             help="Arms to emit in the spec.")
+    mine_parser.add_argument("--emit", default=None, metavar="PATH",
+                             help="Write a probe spec to this path.")
+    mine_parser.add_argument("--name", default=None, help="Spec batch name.")
+    mine_parser.add_argument("--registry", default=None)
+    mine_parser.set_defaults(func=mine.cmd_mine)
 
     prune_parser = sub.add_parser(
         "prune", help="Drop cached results that fail today's bar (dry run by default).",
