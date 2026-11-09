@@ -104,3 +104,24 @@ class SnapshotTests(unittest.TestCase):
             payload = cli_campaign._convergence_snapshot()
         self.assertFalse(payload["stale"])
         self.assertEqual(payload["recent_productive"], 3)
+
+
+class NoveltyGateTests(unittest.TestCase):
+    def test_an_expression_already_in_the_ledger_is_flagged(self):
+        import tempfile
+        from unittest import mock
+        import research_paths
+        from research_app import experiments as cli_experiments
+
+        tmp = tempfile.mkdtemp()
+        registry = os.path.join(tmp, "r.jsonl")
+        import alpha_registry
+        alpha_registry.record_entry(
+            alpha_registry.build_entry({"alpha_id": "A1", "expression": "rank(close)",
+                                        "metrics": {}, "status": "ACTIVE"}), registry)
+        with mock.patch.object(alpha_registry, "default_registry_path",
+                               return_value=registry), \
+                mock.patch.object(research_paths, "ensure_dir", return_value=tmp):
+            verdicts = cli_experiments._novelty_gate(["rank( close )", "rank(volume)"])
+        self.assertTrue(verdicts[0]["already_simulated"])
+        self.assertFalse(verdicts[1]["already_simulated"])

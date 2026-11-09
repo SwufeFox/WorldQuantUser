@@ -580,6 +580,9 @@ def build_parser():
                     "ledger entry per arm. The table hides the test period unless "
                     "--show-test is passed, because selecting on it destroys the only "
                     "out-of-sample evidence there is.")
+    probe.add_argument("--strict-gate", action="store_true", dest="strict_gate",
+                       help="Refuse arms whose canonical expression is already in the "
+                            "ledger. Off by default: a deliberate repeat is sometimes right.")
     probe.add_argument("--recover", default=None, metavar="BATCH_JSON",
                        help="Fill a batch file's empty arms by matching expressions to "
                             "alphas already on the platform (no simulation). Use after a "

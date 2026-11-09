@@ -822,6 +822,69 @@ def cmd_fmt(args, _sink):
     return {"formatted": formatted}
 
 
+def _novelty_gate(expressions):
+    """Pre-simulation screen: is this arm structurally new, and is its block saturated?
+
+    Simulations are free in this account, so the scarce resource is attention and the
+    wall clock. The gate therefore never blocks by default - it annotates, because a
+    deliberate repeat can be the right call (a re-run after a settings change looks
+    identical by skeleton). What it refuses is the one case with no information content:
+    an expression whose canonical hash is already in the ledger.
+
+    Three signals, all offline:
+
+    * ``already_simulated`` - same canonical expression, so the result already exists;
+    * ``duplicate_skeleton_of`` - same construction as a book alpha, i.e. a new grid
+      point on an old bet;
+    * ``block`` / ``block_median_marginal`` - the economic block's median marginal
+      contribution inside the book, read from the convergence snapshot when present.
+    """
+    from . import mechanisms
+
+    registry = alpha_registry.default_registry_path()
+    try:
+        entries = alpha_registry.load_entries(registry)
+    except Exception:  # noqa: BLE001 - the gate must not stop a run
+        return [{} for _ in expressions]
+    latest = {}
+    for entry in entries:
+        key = entry.get("alpha_id") or entry.get("key")
+        if key:
+            latest[key] = entry
+
+    book = [entry for entry in latest.values()
+            if str(entry.get("status") or "").upper() == "ACTIVE"]
+    book_keys = {}
+    for entry in book:
+        key = mechanisms.mechanism_key(entry.get("expression"))
+        if key:
+            book_keys.setdefault(key, entry.get("alpha_id"))
+
+    block_marginals = {}
+    snapshot = Path(research_paths.ensure_dir()) / "convergence.json"
+    if snapshot.exists():
+        try:
+            payload = json.loads(snapshot.read_text(encoding="utf-8"))
+            block_marginals = {row["block"]: row for row in payload.get("blocks") or []}
+        except (OSError, ValueError):
+            block_marginals = {}
+
+    known_hashes = {alpha_registry.expression_hash(entry.get("expression") or "")
+                    for entry in latest.values() if entry.get("expression")}
+    verdicts = []
+    for text in expressions:
+        key = mechanisms.mechanism_key(text)
+        block = key[0] if key else None
+        block_row = block_marginals.get(block) or {}
+        verdicts.append({
+            "block": block,
+            "block_median_marginal": block_row.get("median_marginal"),
+            "duplicate_skeleton_of": book_keys.get(key) if key else None,
+            "already_simulated": alpha_registry.expression_hash(text) in known_hashes,
+        })
+    return verdicts
+
+
 def cmd_probe(args, _sink):
     """Run a batch of arms from one spec file: lint, simulate, table, record.
 
@@ -953,6 +1016,19 @@ def cmd_probe(args, _sink):
             record["half_sharpes"] = half_split_sharpes(pnl, test_start)
         return records
 
+    gate = _novelty_gate([arm["expression"] for group in groups.values() for arm in group["arms"]])
+    duplicates = [text for text, verdict in zip(
+        [arm["expression"] for group in groups.values() for arm in group["arms"]], gate)
+        if verdict.get("already_simulated")]
+    if duplicates:
+        note("")
+        note("novelty gate: %d arm(s) already simulated (same canonical expression): %s"
+             % (len(duplicates), ", ".join(duplicates))[:300])
+        if getattr(args, "strict_gate", False):
+            raise CliError("INVALID_INPUT",
+                           "%d arm(s) repeat an expression already in the ledger" % len(duplicates),
+                           "drop them, or rerun without --strict-gate")
+
     records = with_session(args, work)
 
     rows = []
@@ -962,7 +1038,8 @@ def cmd_probe(args, _sink):
     if args.show_test:
         header += " %7s %6s %7s %7s" % ("S", "F", "T", "testS")
     note(header)
-    for record, arm in zip(records, [a for group in groups.values() for a in group["arms"]]):
+    for position, (record, arm) in enumerate(zip(
+            records, [a for group in groups.values() for a in group["arms"]])):
         metrics = record.get("metrics") or {}
         split = record.get("out_of_sample") or {}
         train = split.get("train") or {}
@@ -986,6 +1063,8 @@ def cmd_probe(args, _sink):
                # operators has more room to fit, and the one operator-heavy candidate of
                # 2026-11-07 was also the one that failed its mechanism-transfer check.
                "ops": expression_lint.estimate_operator_count(arm["expression"]),
+               "gate": None,
+               "gate": gate[position] if position < len(gate) else None,
                "failed_checks": failed}
         line = "%-28s %7s %6s %7s %4s %7s %7s" % (
             arm["label"], row["train_sharpe"], row["train_fitness"],
