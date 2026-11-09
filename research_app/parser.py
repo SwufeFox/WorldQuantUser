@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -174,6 +174,24 @@ def build_parser():
     auth_logout = auth_sub.add_parser(
         "logout", help="Forget the cached session cookie (local only).")
     auth_logout.set_defaults(func=account.cmd_auth_logout)
+
+    prune_parser = sub.add_parser(
+        "prune", help="Drop cached results that fail today's bar (dry run by default).",
+        description="Reads <research>/prune-criteria.json so a changed requirement is a "
+                    "file edit, not a code change. Reports what would go; --apply deletes "
+                    "the cached PnL files. Book members, submitted alphas and anything "
+                    "listed in `protect` are never touched.")
+    prune_parser.add_argument("--apply", action="store_true",
+                              help="Delete the files. Without this nothing is written.")
+    prune_parser.add_argument("--criteria", default=None, metavar="PATH",
+                              help="Criteria file (default <research>/prune-criteria.json).")
+    prune_parser.add_argument("--set", action="append", metavar="KEY=VALUE",
+                              help="Override one criterion, e.g. --set min_fitness=1.2.")
+    prune_parser.add_argument("--show-criteria", action="store_true", dest="show_criteria",
+                              help="Print the criteria in force and stop.")
+    prune_parser.add_argument("--limit", type=int, default=20)
+    prune_parser.add_argument("--registry", default=None)
+    prune_parser.set_defaults(func=prune.cmd_prune)
 
     cache = sub.add_parser(
         "cache", help="Inspect or clear local caches (session, catalog metadata).")
