@@ -97,3 +97,35 @@ class CensusTests(unittest.TestCase):
             data = catalog_cli.cmd_catalog_unused(args, None)
         self.assertEqual(data["used_fields"], 1)          # assets; cogs is not in the catalog
         self.assertEqual(data["unused_fields"], 1)        # unused_thing
+
+
+class VectorFieldPreflightTests(unittest.TestCase):
+    """A VECTOR field in a MATRIX slot must be caught before a simulation is spent.
+
+    Five arms once went to the simulator with `ts_backfill(event_field)` and came back
+    "Operator ts_backfill does not support event inputs" — after a dry run that reported
+    "0 blocking findings", because the dry run had no field types and `probe` never ran
+    the live preflight at all.
+    """
+
+    def test_a_vector_field_in_a_matrix_slot_is_an_error(self):
+        import expression_lint
+        expression = "rank(fnd6_newqeventv110_drcq / (assets + 1))"
+        report = expression_lint.lint_all(
+            [(expression, 4)],
+            field_types={"fnd6_newqeventv110_drcq": "VECTOR", "assets": "MATRIX"},
+            strict_fields=True,
+        )
+        self.assertFalse(report["ok"])
+        codes = {item.get("code") for item in report["errors"]}
+        self.assertIn("type_mismatch", codes)
+
+    def test_an_aggregated_vector_field_passes(self):
+        import expression_lint
+        expression = "rank(vec_avg(composite_sentiment_score_2))"
+        report = expression_lint.lint_all(
+            [(expression, 4)],
+            field_types={"composite_sentiment_score_2": "VECTOR"},
+            strict_fields=True,
+        )
+        self.assertTrue(report["ok"], report["errors"])

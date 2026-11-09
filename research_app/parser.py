@@ -645,6 +645,9 @@ def build_parser():
                     "ledger entry per arm. The table hides the test period unless "
                     "--show-test is passed, because selecting on it destroys the only "
                     "out-of-sample evidence there is.")
+    probe.add_argument("--allow-lint-errors", action="store_true", dest="allow_lint_errors",
+                       help="Simulate even when the lint reports blocking findings. Not "
+                            "recommended: the platform will reject the arm anyway.")
     probe.add_argument("--strict-gate", action="store_true", dest="strict_gate",
                        help="Refuse arms whose canonical expression is already in the "
                             "ledger. Off by default: a deliberate repeat is sometimes right.")

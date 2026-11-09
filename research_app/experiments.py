@@ -18,7 +18,7 @@ import research_paths
 from tools import guarded_sim
 
 from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, with_session
-from .validation import _preflight_lint
+from .validation import _preflight_lint, cached_field_types as _cached_field_types
 
 
 #: Operators per arm above which the report says so. Not a hard limit (the platform's
@@ -964,11 +964,20 @@ def cmd_probe(args, _sink):
                 record["settings"] = dict(group["settings"])
             results.extend(preview)
             pairs.extend(group["pairs"])
+        field_types = _cached_field_types()
         report = expression_lint.lint_all(
-            pairs, denylist=expression_lint.load_denylist())
+            pairs, denylist=expression_lint.load_denylist(),
+            field_types=field_types or None,
+            strict_fields=bool(field_types))
         blocking = report["errors"]
         note("dry run: %d arm(s) in %d settings group(s), %d blocking finding(s)"
              % (len(arms), len(groups), len(blocking)))
+        # A dry run is a preview: it reports blocking findings instead of aborting,
+        # because the caller asked to see the payloads. The real run is where a blocking
+        # finding stops the batch - and it now does, before a session is even opened.
+        if blocking:
+            note("  these would stop a real run: %s"
+                 % ", ".join(sorted({item.get("code") or "?" for item in blocking})))
         return {"dry_run": True, "arms": len(arms), "groups": len(groups),
                 "blocking": blocking, "design": design,
                 "settings": [group["settings"] for group in groups.values()],
@@ -983,6 +992,13 @@ def cmd_probe(args, _sink):
 
 
     def work(session):
+        # The live preflight runs inside this one session, before any arm is submitted:
+        # probe used to lint offline only, so an unknown field or a VECTOR field in a
+        # MATRIX slot was discovered by the simulator - five arms at a time.
+        if not getattr(args, "allow_lint_errors", False):
+            for group in groups.values():
+                _preflight_lint(session, group["pairs"], group["settings"], args)
+
         records = []
         for group in groups.values():
             arm_settings = group["settings"]
@@ -1029,6 +1045,10 @@ def cmd_probe(args, _sink):
                            "%d arm(s) repeat an expression already in the ledger" % len(duplicates),
                            "drop them, or rerun without --strict-gate")
 
+    # probe had no live preflight: the dry run linted offline and the real run went
+    # straight to the simulator, so a VECTOR field in a MATRIX slot was only discovered
+    # by the simulator - five arms at a time. The check runs per settings group because
+    # the field catalog is scoped by region/universe/delay.
     records = with_session(args, work)
 
     rows = []

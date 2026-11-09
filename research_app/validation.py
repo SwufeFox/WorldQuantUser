@@ -11,6 +11,36 @@ import research_config as config_io
 from .runtime import CliError, collect_alphas, merge_settings, note, with_session
 
 
+def cached_field_types():
+    """``{field_id: type}`` from the on-disk catalog cache, or ``{}`` when absent.
+
+    The dry run is supposed to be the cheap, authoritative rehearsal: it must not need a
+    session, but it also must not be blind. The catalog cache already holds every field's
+    type, so a VECTOR field handed to `rank` can be caught before a login - which is
+    exactly the failure that cost a five-arm round: ``Operator ts_backfill does not
+    support event inputs``, five times, after a dry run that said "0 blocking findings".
+    """
+    import glob
+    import json
+    import os
+
+    import research_paths
+
+    types = {}
+    pattern = os.path.join(research_paths.metadata_root(), "datafields", "*.json")
+    for path in glob.glob(pattern):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle).get("payload") or []
+        except (OSError, ValueError):
+            continue
+        for row in payload:
+            field_id = row.get("id")
+            if field_id:
+                types[field_id] = row.get("type")
+    return types
+
+
 def _preflight_lint(session, pairs, settings, args):
     """Lint against the operator catalog before spending simulation quota.
 

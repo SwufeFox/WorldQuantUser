@@ -81,6 +81,7 @@ class ProbeTests(unittest.TestCase):
         self._patched.start()
         self.addCleanup(self._patched.stop)
         self.session = object()
+        self.preflights = []
         session_patch = mock.patch.object(ml, "load_session", return_value=self.session)
         self.load_session = session_patch.start()
         self.addCleanup(session_patch.stop)
@@ -96,8 +97,14 @@ class ProbeTests(unittest.TestCase):
         return argparse.Namespace(**base)
 
     def _run(self, **overrides):
+        # The live preflight needs the operator and field catalogs, which a fake session
+        # cannot provide; probe mechanics are what these tests are about. The preflight
+        # itself is covered in tests/test_legs.py (vector field in a matrix slot) and by
+        # `test_a_real_run_preflights_before_it_submits` below.
         with mock.patch.object(research_paths, "ensure_dir",
-                               lambda: self.output_dir):
+                               lambda: self.output_dir), \
+                mock.patch.object(cli_experiments, "_preflight_lint",
+                                  lambda *a, **k: self.preflights.append(a)):
             return cli_experiments.cmd_probe(self._args(**overrides), mock.MagicMock())
 
 
