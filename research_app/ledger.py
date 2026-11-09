@@ -450,6 +450,83 @@ def _book_marginals(entries, window_end="2023-01-01"):
     return marginals
 
 
+def _cards_path(args):
+    explicit = getattr(args, "cards", None)
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path(research_paths.ensure_dir()) / "mechanism-cards.jsonl"
+
+
+def _known_fields():
+    """Field ids the catalog knows, for the card validation. ``None`` when unavailable."""
+    try:
+        import alpha_unit
+        return set(alpha_unit.load_field_datasets() or {})
+    except Exception:  # noqa: BLE001 - validation must not fail on a missing cache
+        return None
+
+
+def cmd_ledger_cards(args, _sink):
+    """The queue of external knowledge, as mechanism cards.
+
+    Retrieval is deliberately the last thing wired up: a card is the only shape external
+    knowledge may enter in, because the fields that make it checkable (falsification
+    condition, closest family, a real source) are exactly the ones a paper summary omits.
+    Cards that fail validation are reported and *not* stored - a card with an invented
+    field id is worse than no card, since it looks actionable.
+    """
+    path = _cards_path(args)
+    known = _known_fields()
+
+    if args.add:
+        try:
+            payload = json.loads(Path(args.add).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CliError("INVALID_INPUT", "cannot read card file: %s" % exc)
+        incoming = payload if isinstance(payload, list) else [payload]
+        accepted, rejected = [], []
+        for card in incoming:
+            ok, problems = mechanisms.validate_card(card, known_fields=known)
+            if ok:
+                card.setdefault("status", "UNTESTED")
+                accepted.append(card)
+            else:
+                rejected.append({"mechanism_id": (card or {}).get("mechanism_id"),
+                                 "problems": problems})
+        if accepted:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                for card in accepted:
+                    handle.write(json.dumps(card, ensure_ascii=False) + "\n")
+        return {"path": str(path), "accepted": len(accepted), "rejected": rejected,
+                "fields_checked_against": None if known is None else len(known)}
+
+    cards = mechanisms.load_cards(path)
+    if args.status:
+        wanted = {part.strip().upper() for part in args.status.split(",")}
+        cards = [card for card in cards
+                 if str(card.get("status") or "UNTESTED").upper() in wanted]
+    if args.show:
+        for card in cards:
+            if card.get("mechanism_id") == args.show:
+                return {"path": str(path), "card": card,
+                        "validation": mechanisms.validate_card(card, known_fields=known)}
+        raise CliError("INVALID_INPUT", "no card %s" % args.show)
+    by_status = {}
+    for card in cards:
+        key = str(card.get("status") or "UNTESTED").upper()
+        by_status[key] = by_status.get(key, 0) + 1
+    summary = [{"mechanism_id": card.get("mechanism_id"),
+                "status": str(card.get("status") or "UNTESTED").upper(),
+                "block_guess": mechanisms.block_of(
+                    ((card.get("implementation") or {}).get("candidate_expression") or "")),
+                "closest_family": ((card.get("novelty") or {}).get("closest_existing_family")),
+                "title": ((card.get("source") or {}).get("title") or "")[:60]}
+               for card in cards]
+    return {"path": str(path), "count": len(cards), "by_status": by_status,
+            "cards": summary[: args.limit]}
+
+
 def cmd_ledger_mechanisms(args, _sink):
     """How many independent mechanisms the book (or the ledger) actually holds.
 

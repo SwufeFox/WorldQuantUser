@@ -125,3 +125,38 @@ class NoveltyGateTests(unittest.TestCase):
             verdicts = cli_experiments._novelty_gate(["rank( close )", "rank(volume)"])
         self.assertTrue(verdicts[0]["already_simulated"])
         self.assertFalse(verdicts[1]["already_simulated"])
+
+
+class CardTests(unittest.TestCase):
+    _BASE = {
+        "mechanism_id": "M-001",
+        "source": {"title": "paper"},
+        "hypothesis": {"economic_mechanism": "why", "falsification": "what would refute"},
+        "novelty": {"closest_existing_family": "volatility_structure"},
+        "implementation": {"verified_brain_fields": []},
+        "status": "UNTESTED",
+    }
+
+    def test_a_complete_card_validates(self):
+        ok, problems = mechanisms.validate_card(dict(self._BASE))
+        self.assertTrue(ok, problems)
+
+    def test_an_invented_field_is_rejected(self):
+        card = dict(self._BASE)
+        card["implementation"] = {"verified_brain_fields": ["not_a_real_field"]}
+        ok, problems = mechanisms.validate_card(card, known_fields={"assets"})
+        self.assertFalse(ok)
+        self.assertIn("unverified field", problems[0])
+
+    def test_a_missing_falsification_is_rejected(self):
+        card = dict(self._BASE)
+        card["hypothesis"] = {"economic_mechanism": "why"}
+        ok, problems = mechanisms.validate_card(card)
+        self.assertFalse(ok)
+        self.assertIn("hypothesis.falsification", problems[0])
+
+    def test_an_unknown_status_is_rejected(self):
+        card = dict(self._BASE)
+        card["status"] = "MAYBE"
+        ok, problems = mechanisms.validate_card(card)
+        self.assertFalse(ok)

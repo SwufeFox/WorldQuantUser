@@ -182,3 +182,80 @@ def convergence(entries, marginals=None, recent_batches=8):
             "recent_productive": len(productive),
             "recent_additive": sum(row["additive"] for row in tail),
             "book_mechanisms": len(book_keys)}
+
+
+#: A card is the only shape external knowledge is allowed to enter the research in. The
+#: required fields are the ones that make it checkable: without a falsification condition
+#: it is a story, without a closest family it is not new, without a source it cannot be
+#: verified. Everything else is optional.
+CARD_REQUIRED = (
+    ("mechanism_id",),
+    ("source", "title"),
+    ("hypothesis", "economic_mechanism"),
+    ("hypothesis", "falsification"),
+    ("novelty", "closest_existing_family"),
+)
+CARD_STATUSES = ("UNTESTED", "TESTING", "TESTED", "REFUTED", "BLOCKED")
+
+
+def _dig(card, path):
+    node = card
+    for key in path:
+        if not isinstance(node, dict) or key not in node:
+            return None
+        node = node[key]
+    return node
+
+
+def validate_card(card, known_fields=None):
+    """Return ``(ok, problems)`` for one mechanism card.
+
+    The rule that earns its keep is the field check: a card may *describe* a field that
+    does not exist, but it may not claim it in ``verified_brain_fields``. Filling that
+    list from memory is how a plausible-sounding mechanism turns into a wasted batch.
+    """
+    problems = []
+    if not isinstance(card, dict):
+        return False, ["card is not an object"]
+    for path in CARD_REQUIRED:
+        value = _dig(card, path)
+        if value in (None, "", []):
+            problems.append("missing %s" % ".".join(path))
+    status = str(card.get("status") or "").upper()
+    if status and status not in CARD_STATUSES:
+        problems.append("status %r not in %s" % (card.get("status"), ", ".join(CARD_STATUSES)))
+    implementation = card.get("implementation") or {}
+    verified = implementation.get("verified_brain_fields") or []
+    if not isinstance(verified, list):
+        problems.append("implementation.verified_brain_fields must be a list")
+    elif known_fields is not None:
+        unknown = [field for field in verified if field not in known_fields]
+        if unknown:
+            problems.append("unverified field(s) in verified_brain_fields: %s"
+                            % ", ".join(unknown[:5]))
+    return not problems, problems
+
+
+def load_cards(path):
+    """Read the card store (JSON lines); a malformed line is skipped, not fatal."""
+    from pathlib import Path
+    import json
+
+    path = Path(path)
+    if not path.exists():
+        return []
+    cards = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            cards.append(json.loads(line))
+        except ValueError:
+            continue
+    latest = {}
+    for card in cards:
+        key = card.get("mechanism_id")
+        if key:
+            latest[key] = card
+    return list(latest.values())

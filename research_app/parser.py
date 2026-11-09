@@ -859,6 +859,22 @@ def build_parser():
     l_fmt.add_argument("--dry-run", action="store_true", dest="dry_run")
     l_fmt.set_defaults(func=ledger.cmd_ledger_format)
 
+    l_cards = ledger_sub.add_parser(
+        "cards", help="Mechanism cards: the queue of external knowledge (offline).",
+        description="A card is the only shape external knowledge may enter in: source, "
+                    "economic mechanism, falsification condition, closest existing family, "
+                    "and fields split into conceptual vs verified. A card whose "
+                    "verified_brain_fields names a field the catalog does not have is "
+                    "reported and not stored.")
+    l_cards.add_argument("--add", default=None, metavar="FILE",
+                         help="Append cards from a JSON file (object or list).")
+    l_cards.add_argument("--show", default=None, metavar="MECHANISM_ID")
+    l_cards.add_argument("--status", default=None,
+                         help="Filter by status, e.g. UNTESTED,TESTING.")
+    l_cards.add_argument("--limit", type=int, default=20)
+    l_cards.add_argument("--cards", default=None, help="Card store path.")
+    l_cards.set_defaults(func=ledger.cmd_ledger_cards)
+
     l_mech = ledger_sub.add_parser(
         "mechanisms", help="Independent mechanisms and their outcomes (offline).",
         description="Groups by (economic block, AST skeleton): the campaign's rule that "
