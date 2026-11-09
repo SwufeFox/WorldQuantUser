@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, legs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, legs, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -174,6 +174,32 @@ def build_parser():
     auth_logout = auth_sub.add_parser(
         "logout", help="Forget the cached session cookie (local only).")
     auth_logout.set_defaults(func=account.cmd_auth_logout)
+
+    pairs_parser = sub.add_parser(
+        "pairs", help="Screen cached alphas for a combination worth simulating.",
+        description="For every pair of non-book alphas with cached PnL, builds the "
+                    "equal-weight composite, and keeps it only if it stays under the "
+                    "self-correlation gate against every book alpha. Offline.")
+    pairs_parser.add_argument("--min-leg-sharpe", type=float, default=0.7,
+                              dest="min_leg_sharpe",
+                              help="Ignore legs weaker than this in absolute Sharpe.")
+    pairs_parser.add_argument("--max-leg-sharpe", type=float, default=2.0,
+                              dest="max_leg_sharpe",
+                              help="Ignore legs above this: they do not need a partner.")
+    pairs_parser.add_argument("--max-book-rho", type=float, default=0.7, dest="max_book_rho",
+                              help="Reject pairs whose composite correlates above this with "
+                                   "any book alpha (the platform gate is 0.7).")
+    pairs_parser.add_argument("--min-composite-sharpe", type=float, default=1.25,
+                              dest="min_composite_sharpe")
+    pairs_parser.add_argument("--min-marginal", type=float, default=None, dest="min_marginal",
+                              help="Keep only pairs whose composite beats the book as a "
+                                   "whole: S_composite - rho(book) * S_book >= this.")
+    pairs_parser.add_argument("--rank", choices=("sharpe", "marginal"), default="sharpe",
+                              help="Order the kept pairs by their own Sharpe or by what "
+                                   "they would add to the book.")
+    pairs_parser.add_argument("--limit", type=int, default=12)
+    pairs_parser.add_argument("--registry", default=None)
+    pairs_parser.set_defaults(func=pairs.cmd_pairs)
 
     legs_parser = sub.add_parser(
         "legs", help="Did a composite behave like the sum of its legs? (cached PnL only)",

@@ -41,3 +41,26 @@ class LegsTests(unittest.TestCase):
 
     def test_sharpe_of_a_flat_series_is_undefined(self):
         self.assertIsNone(legs.sharpe_of([1.0] * 40))
+
+
+class PairScreenTests(unittest.TestCase):
+    """The screen has to judge a pair against the book, not against one member."""
+
+    def test_marginal_uses_the_book_as_a_whole(self):
+        import numpy as np
+        from research_app import pairs
+        rng = np.random.default_rng(7)
+        days = 400
+        book = rng.normal(0, 1, days)
+        # two pool alphas: one is the book plus noise, one is independent
+        same = book + rng.normal(0, 0.2, days)
+        different = rng.normal(0, 1, days)
+        matrix = np.vstack([same, different])
+        sharpes = pairs._sharpe(matrix)
+        self.assertEqual(len(sharpes), 2)
+        centred_book = book - book.mean()
+        norm = np.linalg.norm(centred_book)
+        rho_same = float((centred_book / norm) @ ((same - same.mean()) / np.linalg.norm(same - same.mean())))
+        rho_diff = float((centred_book / norm) @ ((different - different.mean()) / np.linalg.norm(different - different.mean())))
+        self.assertGreater(rho_same, 0.9)
+        self.assertLess(abs(rho_diff), 0.2)
