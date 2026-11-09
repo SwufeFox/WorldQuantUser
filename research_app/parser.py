@@ -293,6 +293,14 @@ def build_parser():
     _add_session_args(cat_find)
     cat_find.set_defaults(func=catalog.cmd_catalog_find)
 
+    cat_unused = cat.add_parser(
+        "unused",
+        help="Which catalog fields the book has never touched, by dataset.")
+    cat_unused.add_argument("--top", type=int, default=4,
+                            help="Highest-coverage unused fields to show per dataset.")
+    cat_unused.add_argument("--registry", default=None)
+    cat_unused.set_defaults(func=catalog.cmd_catalog_unused)
+
     cat_f = cat.add_parser("fields", help="Datafields of one dataset.")
     cat_f.add_argument("--dataset", required=True, help="Dataset id, e.g. fundamental6.")
     cat_f.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])

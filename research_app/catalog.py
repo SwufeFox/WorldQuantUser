@@ -310,6 +310,80 @@ def cmd_catalog_verify(args, _sink):
     return data
 
 
+def cmd_catalog_unused(args, _sink):
+    """Which catalog fields this book has never touched, by dataset.
+
+    "We only use 13% of the catalog" is true and useless on its own - the interesting
+    part is *which* families are untouched and what they let you ask. This counts the
+    difference between the cached catalog and every identifier that appears in the
+    ledger, per dataset, so the next mining round starts from a measurement instead of
+    from a hunch.
+
+    Operator names are excluded by the same rule the block classifier uses: a field is an
+    identifier that is not followed by `(`.
+    """
+    import glob
+    import json
+    import os
+    import re
+
+    import alpha_registry
+    import research_paths
+
+    fields = {}
+    cache_dir = os.path.join(research_paths.metadata_root(), "datafields")
+    for path in glob.glob(os.path.join(cache_dir, "*.json")):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle).get("payload") or []
+        except (OSError, ValueError):
+            continue
+        for row in payload:
+            field_id = row.get("id")
+            if field_id:
+                fields[field_id] = row
+    if not fields:
+        raise ValueError("no cached catalog fields; run `catalog fields` first")
+
+    token = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+    used = set()
+    for entry in alpha_registry.load_entries(getattr(args, "registry", None)):
+        text = entry.get("expression") or ""
+        for match in token.finditer(text):
+            if text[match.end():].lstrip().startswith("("):
+                continue
+            used.add(match.group(0))
+    used_fields = used & set(fields)
+
+    by_dataset = {}
+    for field_id, row in fields.items():
+        dataset = (row.get("dataset") or {}).get("id") or "?"
+        bucket = by_dataset.setdefault(dataset, {"dataset": dataset, "fields": 0,
+                                                 "used": 0, "unused": []})
+        bucket["fields"] += 1
+        if field_id in used_fields:
+            bucket["used"] += 1
+        else:
+            bucket["unused"].append({"id": field_id,
+                                     "coverage": row.get("coverage"),
+                                     "description": (row.get("description") or "")[:70]})
+
+    rows = []
+    for dataset, bucket in by_dataset.items():
+        sample = sorted(bucket["unused"], key=lambda r: -(r["coverage"] or 0))
+        rows.append({"dataset": dataset,
+                     "fields": bucket["fields"],
+                     "used": bucket["used"],
+                     "unused": len(bucket["unused"]),
+                     "unused_coverage_median": None if not sample else round(
+                         sorted([r["coverage"] or 0 for r in sample])[len(sample) // 2], 3),
+                     "top_unused": sample[: args.top]})
+    rows.sort(key=lambda r: -r["unused"])
+    return {"catalog_fields": len(fields), "used_fields": len(used_fields),
+            "unused_fields": len(fields) - len(used_fields),
+            "datasets": rows}
+
+
 def cmd_catalog_categories(args, _sink):
     """List data categories with field and alpha counts indicating namespace crowding."""
     cache_report = {}

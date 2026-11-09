@@ -64,3 +64,36 @@ class PairScreenTests(unittest.TestCase):
         rho_diff = float((centred_book / norm) @ ((different - different.mean()) / np.linalg.norm(different - different.mean())))
         self.assertGreater(rho_same, 0.9)
         self.assertLess(abs(rho_diff), 0.2)
+
+
+class CensusTests(unittest.TestCase):
+    """`catalog unused` must read fields from the catalog, not from operator names."""
+
+    def test_an_operator_is_not_counted_as_a_field(self):
+        import json
+        import tempfile
+        from unittest import mock
+        import research_paths
+        from research_app import catalog as catalog_cli
+
+        tmp = tempfile.mkdtemp()
+        os.makedirs(os.path.join(tmp, "datafields"), exist_ok=True)
+        with open(os.path.join(tmp, "datafields", "a.json"), "w") as handle:
+            json.dump({"payload": [
+                {"id": "assets", "dataset": {"id": "fundamental6"}, "coverage": 0.9},
+                {"id": "unused_thing", "dataset": {"id": "fundamental6"}, "coverage": 0.5},
+            ]}, handle)
+        registry = os.path.join(tmp, "r.jsonl")
+        with open(registry, "w") as handle:
+            handle.write(json.dumps({"alpha_id": "A", "expression": "rank(assets) + ts_mean(cogs, 5)"}) + "\n")
+
+        class Args:
+            top = 2
+            registry = None
+        args = Args()
+        args.registry = registry
+        with mock.patch.object(research_paths, "ensure_dir", return_value=tmp), \
+                mock.patch.object(research_paths, "metadata_root", return_value=tmp):
+            data = catalog_cli.cmd_catalog_unused(args, None)
+        self.assertEqual(data["used_fields"], 1)          # assets; cogs is not in the catalog
+        self.assertEqual(data["unused_fields"], 1)        # unused_thing
