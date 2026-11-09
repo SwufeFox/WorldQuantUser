@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, legs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -174,6 +174,19 @@ def build_parser():
     auth_logout = auth_sub.add_parser(
         "logout", help="Forget the cached session cookie (local only).")
     auth_logout.set_defaults(func=account.cmd_auth_logout)
+
+    legs_parser = sub.add_parser(
+        "legs", help="Did a composite behave like the sum of its legs? (cached PnL only)",
+        description="Sums the cached daily PnL of the legs with the given weights and "
+                    "compares that Sharpe to the composite's. Both are dollars on the same "
+                    "book, so the sum is the leg model exactly; the ratio is what the "
+                    "platform's per-expression re-neutralisation took away.")
+    legs_parser.add_argument("--leg", action="append", metavar="ID[:WEIGHT]",
+                             help="Leg alpha id with optional weight (default equal).")
+    legs_parser.add_argument("--composite", default=None, metavar="ID",
+                             help="The simulated composite to compare against.")
+    legs_parser.add_argument("--registry", default=None)
+    legs_parser.set_defaults(func=legs.cmd_legs)
 
     prune_parser = sub.add_parser(
         "prune", help="Drop cached results that fail today's bar (dry run by default).",
