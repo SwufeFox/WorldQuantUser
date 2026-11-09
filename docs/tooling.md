@@ -2,7 +2,7 @@
 
 这里不解释怎么用，只回答一个问题：**我想问的那句话，对应哪个命令。**
 
-20 个入口。这个数字是砍出来的：2026-11-01 之前是 26 个，删掉了 8 个——宏子系统（`expression_macros` / `ast_macros` / `macro_parity`，被 `alpha_unit` 的模板+槽位取代）、`sugar_rewrite`（量过一次，结论已在文档里）、`family_tree`（被 `family_graph` 取代）、以及三个跑完的台账迁移（`repair_ledger` / `backfill_registry` / `backfill_reason_codes`，东西已经改了，工具留着只会让人以为还要跑）。2026-11-04 加了 `ask`：一个只读查询入口，替掉每次都要重写一遍的内联脚本。记忆索引另由 `memory_index` 从条目生成，用 `--check` 检测漂移。
+20 个入口。这个数字是砍出来的：2026-11-01 之前是 26 个，删掉了 8 个——宏子系统（`expression_macros` / `ast_macros` / `macro_parity`，被 `alpha_unit` 的模板+槽位取代）、`sugar_rewrite`（量过一次，结论已在文档里）、`family_tree`（被 `family_graph` 取代）、以及三个跑完的台账迁移（`repair_ledger` / `backfill_registry` / `backfill_reason_codes`，东西已经改了，工具留着只会让人以为还要跑）。2026-11-04 加了 `ask`：一个只读查询入口，替掉每次都要重写一遍的内联脚本。2026-11-09 又砍了 9 个：`book_audit` / `reconcile_status` / `pool_stats` / `book_inventory` / `turnover_repair` / `wire_guard` / `research_template` / `family_graph` / `family_graph_png`——前六个被 `ledger sync`、`brief --drift`、`health --pool`、`ledger mechanisms`、`probe` 一一取代，`family_graph` 的历史结论留在 `docs/ast-pipeline.md`，`research_template` 里唯一还有用的整词替换搬进了 `research_app/substitution.py`。记忆索引另由 `memory_index` 从条目生成，用 `--check` 检测漂移。
 
 删除标准只有一条：**被取代，或者跑完就没下次。** 不是"文件不够干净"。
 
@@ -46,7 +46,7 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 
 | 问题 | 命令 |
 | --- | --- |
-| 台账的 status 和平台对不对得上 | `python3 tools/reconcile_status.py` |
+| 台账的 status 和平台对不对得上 | `python3 research_cli.py ledger sync --apply` |
 | 按轴分组看一眼：`n` / 中位数 / 地板税占比 | `python3 research_cli.py ask --by neutralization --stat n,median:sharpe,floor_share` |
 | 某个旋钮在面板内的斜率（不是语料趋势） | `python3 research_cli.py ask --by decay --panel turnover,fitness` |
 | 同一构造换设置之后还相关多少 | `python3 research_cli.py ask --matrix corr --matrix-within expr` |
@@ -61,13 +61,12 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 
 | 问题 | 命令 |
 | --- | --- |
-| 这些 alpha 是不是同一个构造（按结构，不按 PnL） | `python3 tools/family_graph.py --all` |
-| 画出来看 | `python3 tools/family_graph_png.py` |
+| 这些 alpha 是不是同一个构造（按结构，不按 PnL） | `python3 research_cli.py ledger mechanisms --status ACTIVE` |
+| 书在哪些机制上堆得太多、哪些几乎没用 | 同上，看 `median_marginal` 与 `members` 两列 |
 | 有哪些可复用的零件，哪些只服务过一个族 | `python3 tools/parts_catalogue.py --seeds` |
 | 我们到底有几个构造、每个还差什么 | `python3 tools/unit_report.py`（`--gaps` / `--cross` / `--derive`） |
 | 这个数据族以前试过什么形状、最好多少分 | `python3 tools/unit_report.py --dataset model51`（数据集 id 自动映射到族） |
-| 书里现在拿的是什么，按构造分组 | `python3 tools/book_inventory.py --mechanisms` |
-| 台账的 verdict 和真实的书是否一致 | `python3 tools/book_audit.py` |
+| 台账的 verdict 和真实的书是否一致 | `python3 research_cli.py brief --drift` |
 
 ### 写表达式、跑模拟
 
@@ -75,12 +74,10 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 | --- | --- |
 | 我要跑一批臂（常态） | 写一个 spec.json，然后 `python3 research_cli.py probe spec.json`——lint、模拟、train-only 表格、JSON、台账一次做完 |
 | 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe spec.json --dry-run`；逐组验证配置并输出完整 payload，实时目录检查在正式模拟前执行 |
-| 我要开一个单次实验 | 复制 `tools/research_template.py`（`EXPRESSIONS`，或 `PARENT` + `SUBSTITUTIONS` 换一个 token 跑 N 个变体） |
-| 换字段 / 换窗口 / 换权重的批量实验 | 同上，把要换的 token 写进 `SUBSTITUTIONS`；parent 的表达式和设置从台账读，结果自动写回台账 |
+| 我要开一个单次实验 | 直接写一个两三条臂的 spec，`python3 research_cli.py probe spec.json`（没有模板文件了） |
+| 换字段 / 换窗口 / 换权重的批量实验 | `research_app/substitution.py` 的 `expand()` 生成 `(label, expression)` 对，再落成 spec |
 | 我想跑一批，但怕名字写错 | `tools/guarded_sim.py`（库，不是 CLI） |
-| 把脚本里的 `ml.simulate_alphas` 改成走护栏 | `python3 tools/wire_guard.py` |
-| 换手把 Fitness 压住了怎么办 | `python3 tools/turnover_repair.py` |
-| 这个池子够不够厚 | `python3 tools/pool_stats.py` |
+| 这个池子够不够厚 | `python3 research_cli.py health --pool` |
 | 这个字段到底什么量纲 | `python3 tools/probe_units.py` |
 
 日常实验只维护 spec 文件：先离线预览，再正式运行。所有配置组在登录和模拟前完成本地校验；等效设置合并，同一批复用缓存会话。`simulate` 的研究文件和 `probe` 的 spec 文件都按 UTF-8 读取，兼容 BOM。

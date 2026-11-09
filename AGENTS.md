@@ -185,8 +185,8 @@ Per-arm `settings` become separate simulation groups, so a neutralisation sweep 
 spec. The output file is `<name>-<date>.json` and refuses to overwrite an existing
 batch - that is how a six-arm result disappeared once.
 
-`tools/research_template.py` still exists for the other shape: a single exploratory run,
-or a proven parent with one token swapped N times (`PARENT` + `SUBSTITUTIONS`).
+For the other shape - a proven parent with one token swapped N times - build the arms
+with `research_app.substitution.expand()`, which substitutes whole identifiers only.
 
 ## 4. Where things live
 

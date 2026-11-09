@@ -93,7 +93,7 @@ smallest absorbed:    group_rank(anl4_..._eps_median / close, subindustry) - 0.5
 ```
 
 A single-leg expression is a subset of an eight-leg one, so containment merges
-unrelated constructions. This is the same failure `family_graph` hit when it merged on
+unrelated constructions. This is the same failure the old family graph hit when it merged on
 `extends` edges and produced a 467-member "family"; the fix there — merge only on
 siblings — is the fix here — do not merge on containment at all. Subset derivation
 stays available as a *rule* (`drop:lN`), where it is one leg and it is labelled.

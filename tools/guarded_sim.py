@@ -107,7 +107,7 @@ if __name__ == "__main__":
 
     print("guarded_sim is a library, not a command:\n"
           "  from guarded_sim import simulate, check\n"
-          "  or run tools/wire_guard.py to rewrite a research script that still "
+          "  or move the call into research_cli.py probe, the only entry point that "
           "calls machine_lib.simulate_alphas directly",
           file=_sys.stderr)
     raise SystemExit(2)

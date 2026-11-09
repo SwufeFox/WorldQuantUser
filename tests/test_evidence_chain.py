@@ -26,7 +26,7 @@ import placebo_controls  # noqa: E402
 import ablation
 from research_app import experiments as cli_experiments
 from research_app import ledger as cli_ledger
-import research_template  # noqa: E402
+from research_app import substitution  # noqa: E402
 
 
 def record(alpha_id="A1", status="COMPLETE", sharpe=2.0, fitness=1.5):
@@ -201,12 +201,12 @@ class IdentifierSubstitutionTests(unittest.TestCase):
     def test_a_token_that_is_a_prefix_of_another_field_is_not_rewritten(self):
         # Wrong behaviour this prevents: swapping `sales` also rewrote `sales_growth`,
         # so a "single-factor" experiment changed two inputs and its lint still passed.
-        pairs = research_template.expand("rank(sales) + rank(sales_growth)",
+        pairs = substitution.expand("rank(sales) + rank(sales_growth)",
                                         {"sales": ["revenue"]})
         self.assertEqual(pairs[0][1], "rank(revenue) + rank(sales_growth)")
 
     def test_substitution_happens_at_every_whole_token(self):
-        pairs = research_template.expand("sales / sales", {"sales": ["revenue"]})
+        pairs = substitution.expand("sales / sales", {"sales": ["revenue"]})
         self.assertEqual(pairs[0][1], "revenue / revenue")
 
 

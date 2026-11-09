@@ -138,7 +138,7 @@ construction, and the curated list stays the primary signal.
 
 ## The family graph
 
-`tools/family_graph.py` builds nodes from structure and three kinds of edge:
+`research_cli.py ledger mechanisms` builds nodes from structure and three kinds of edge:
 
 | Edge | Test | Meaning |
 | --- | --- | --- |
@@ -155,9 +155,8 @@ lineage and deliberately excluded from the merge: containment is transitive thro
 shared ancestor, so single linkage chains unrelated constructions together — A with one
 leg, B = A + leg1, C = A + leg2 puts B and C in one "family" although they share no
 construction. On the full ledger that inflated a single family to 467 of 951
-expressions; on the book it read as 22 families instead of 32. `tools/family_graph_png.py` draws one component per cell, because a
-single spring layout over 48 nodes is a hairball that hides the only two facts worth
-seeing: how many families there are, and how lopsided the sizes are.
+expressions; on the book it read as 22 families instead of 32. The same counts now come out of `ledger mechanisms`, grouped by economic block rather
+than by connected component.
 
 **Structure is not independence.** The same 48 alphas correlate at ~0.85 pairwise
 while occupying 32 families, and candidates rebuilt from those families are blocked
@@ -205,8 +204,8 @@ one-off repair is removed now that it has run; git history keeps it):
 | Tool | Defect it removes |
 | --- | --- |
 | `repair_ledger` (ran once, removed) | 9 expressions with a variant index glued to the tail (repaired, annotated); 191 rows with no alpha id at all (marked `abandoned`, not deleted) |
-| `tools/reconcile_status.py` | the `status` column lagging the platform — measured 33 ACTIVE against 48 live, i.e. 15 rows that had been submitted but still said COMPLETE or UNSUBMITTED |
-| `tools/research_template.py` | a new script having to remember the guard, the sugar, the annotation check and where results go |
+| `ledger sync` (was `tools/reconcile_status.py`) | the `status` column lagging the platform — measured 33 ACTIVE against 48 live, i.e. 15 rows that had been submitted but still said COMPLETE or UNSUBMITTED |
+| `probe` spec files (were `tools/research_template.py`) | a new script having to remember the guard, the sugar, the annotation check and where results go |
 
 Consequences worth remembering: **191 of 2118 rows are shells**, so "how many alphas
 do I have" needs that subtracted first; and **rows outnumber alphas**, because one

@@ -51,22 +51,14 @@ research_cli.py schema      # the whole contract, as JSON
 | `expression_units.py` | Field units, harvested from the simulator's rejections. |
 | `rejection_reasons.py` | Why a rejection happened: the cause, not just the gate. |
 | `tools/guarded_sim.py` | Simulate only after the catalogue check; refuses unknown names. |
-| `tools/wire_guard.py` | Rewrite a research script so every simulation goes through the guard. |
-| `tools/research_template.py` | Runnable skeleton for a new experiment; copy it, do not start blank. Two shapes: a hand-written `EXPRESSIONS` list, or `PARENT` + `SUBSTITUTIONS` for the swap-one-token batch. Records to the ledger either way. |
 | `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
-| `tools/pool_stats.py` | Report the pool as quartiles rather than as a best alpha. |
+| `research_app/substitution.py` | Whole-token field substitution: the "change exactly one input" batch. Exact and identifier-bounded, because `replace("sales", ...)` also rewrote `sales_growth`. |
 | `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |
 | `tools/dedupe_ledger.py` | Find identical-PnL entries that are one alpha filed twice. |
 | `tools/degenerate_batch.py` | Flag a batch whose different expressions produced the same result. |
-| `tools/reconcile_status.py` | Make the ledger's `status` column agree with the platform. |
 | `tools/derive_family.py` | Derive family labels from the datafield namespace. |
-| `tools/family_graph.py` | Sibling / extends / shares graph over construction, plus components. |
-| `tools/family_graph_png.py` | Draw the graph one family per cell. |
 | `tools/unit_report.py` | How few constructions the ledger is, and what each has not tried. |
 | `tools/parts_catalogue.py` | Reusable parts, screened by how many book families they serve. |
-| `tools/book_inventory.py` | What the live book holds, grouped by construction. |
-| `tools/book_audit.py` | Reconcile the ledger's verdicts against the actual book. |
-| `tools/turnover_repair.py` | Break-even Sharpe for a smoothing decision. |
 | `tools/backup_replay.py` | Snapshot the research directory; replay it as of a date; diff drift. |
 | `tests/` | Offline contract tests. No account required. |
 
@@ -829,7 +821,6 @@ A best-alpha report hides what a pool is: two pools can share a top result and d
 completely in spread, one narrow and correlated, one broad and independent.
 
 ```bash
-python tools/pool_stats.py --min-fitness 1.25 --out pool.json
 ```
 
 ```
