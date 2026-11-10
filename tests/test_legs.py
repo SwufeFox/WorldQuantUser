@@ -129,3 +129,19 @@ class VectorFieldPreflightTests(unittest.TestCase):
             strict_fields=True,
         )
         self.assertTrue(report["ok"], report["errors"])
+
+
+class PlainLegFilterTests(unittest.TestCase):
+    """A centred leg makes the leg-sum an overestimate; the screen must be able to say no."""
+
+    TOKENS = ("group_rank(", "group_zscore(", "group_neutralize(")
+
+    def test_a_centred_leg_is_detected(self):
+        plain = "rank(close) + ts_mean(volume, 5)"
+        centred = "group_rank(close, subindustry) - 0.5"
+        self.assertFalse(any(token in plain for token in self.TOKENS))
+        self.assertTrue(any(token in centred for token in self.TOKENS))
+
+    def test_a_plain_pair_is_kept(self):
+        combined = "rank(close)" + "rank(ts_delta(revenue, 63))"
+        self.assertFalse(any(token in combined for token in self.TOKENS))

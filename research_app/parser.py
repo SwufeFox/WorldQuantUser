@@ -194,6 +194,10 @@ def build_parser():
     pairs_parser.add_argument("--min-marginal", type=float, default=None, dest="min_marginal",
                               help="Keep only pairs whose composite beats the book as a "
                                    "whole: S_composite - rho(book) * S_book >= this.")
+    pairs_parser.add_argument("--plain-legs", action="store_true", dest="plain_legs",
+                              help="Keep only pairs whose legs are plain signals, where "
+                                   "the leg-sum prediction is exact. Centred legs "
+                                   "(group_rank minus its mean) overstate the composite.")
     pairs_parser.add_argument("--rank", choices=("sharpe", "marginal"), default="sharpe",
                               help="Order the kept pairs by their own Sharpe or by what "
                                    "they would add to the book.")

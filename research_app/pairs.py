@@ -114,6 +114,15 @@ def cmd_pairs(args, _sink):
                 continue
             rho = float(np.max(np.abs(book_norm @ (centred / norm)))) if len(book) else 0.0
             rho_book = float(book_centred @ (centred / norm)) if book_norm_total else 0.0
+            # The leg-sum is only exact when the legs are plain signals. A leg that
+            # already subtracts its group mean (`group_rank(x, g) - 0.5`) gets that
+            # subtraction applied a second time inside the composite, so the sum
+            # overstates the result badly: one such pair predicted 2.60 and delivered
+            # 1.53. Say so up front instead of after a batch.
+            centred_legs = any(
+                token in ((latest[pool[i]].get("expression") or "")
+                          + (latest[pool[j]].get("expression") or ""))
+                for token in ("group_rank(", "group_zscore(", "group_neutralize("))
             sharpe = _sharpe(composite[None, :])[0]
             if math.isnan(sharpe):
                 continue
@@ -127,17 +136,14 @@ def cmd_pairs(args, _sink):
                 marginal = float(sharpe) - rho_book * float(book_sharpe)
             if args.min_marginal is not None and (marginal is None or marginal < args.min_marginal):
                 continue
+            # `--plain-legs` keeps only pairs whose leg sum is exact. A centred leg makes
+            # the offline prediction an overestimate (measured: 2.60 predicted, 1.53
+            # delivered), and a screen that ranks on a number it cannot deliver is worse
+            # than no screen.
+            if getattr(args, "plain_legs", False) and centred_legs:
+                continue
             if args.min_composite_sharpe is not None and sharpe < args.min_composite_sharpe:
                 continue
-            # The leg-sum is only exact when the legs are plain signals. A leg that
-            # already subtracts its group mean (`group_rank(x, g) - 0.5`) gets that
-            # subtraction applied a second time inside the composite, so the sum
-            # overstates the result badly: one such pair predicted 2.60 and delivered
-            # 1.53. Say so up front instead of after a batch.
-            centred_legs = any(
-                token in ((latest[pool[i]].get("expression") or "")
-                          + (latest[pool[j]].get("expression") or ""))
-                for token in ("group_rank(", "group_zscore(", "group_neutralize("))
             metrics_a = (latest[pool[i]].get("metrics") or {})
             metrics_b = (latest[pool[j]].get("metrics") or {})
             returns = (float(metrics_a.get("returns") or 0) + float(metrics_b.get("returns") or 0)) / 2
