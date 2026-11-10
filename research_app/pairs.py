@@ -129,6 +129,15 @@ def cmd_pairs(args, _sink):
                 continue
             if args.min_composite_sharpe is not None and sharpe < args.min_composite_sharpe:
                 continue
+            # The leg-sum is only exact when the legs are plain signals. A leg that
+            # already subtracts its group mean (`group_rank(x, g) - 0.5`) gets that
+            # subtraction applied a second time inside the composite, so the sum
+            # overstates the result badly: one such pair predicted 2.60 and delivered
+            # 1.53. Say so up front instead of after a batch.
+            centred_legs = any(
+                token in ((latest[pool[i]].get("expression") or "")
+                          + (latest[pool[j]].get("expression") or ""))
+                for token in ("group_rank(", "group_zscore(", "group_neutralize("))
             metrics_a = (latest[pool[i]].get("metrics") or {})
             metrics_b = (latest[pool[j]].get("metrics") or {})
             returns = (float(metrics_a.get("returns") or 0) + float(metrics_b.get("returns") or 0)) / 2
@@ -146,6 +155,7 @@ def cmd_pairs(args, _sink):
                 "max_book_rho": round(rho, 3),
                 "book_rho": round(rho_book, 3),
                 "marginal_vs_book": None if marginal is None else round(marginal, 3),
+                "leg_sum_risk": "centred" if centred_legs else "plain",
             })
 
     rows.sort(key=lambda row: -row["composite_sharpe"]
