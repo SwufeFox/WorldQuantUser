@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, independence, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -204,6 +204,24 @@ def build_parser():
     pairs_parser.add_argument("--limit", type=int, default=12)
     pairs_parser.add_argument("--registry", default=None)
     pairs_parser.set_defaults(func=pairs.cmd_pairs)
+
+    marginal_parser = sub.add_parser(
+        "marginal", help="What adding one alpha actually does to the book (vs the slope).",
+        description="Reports the theoretical marginal S_a - rho*S_B next to the Sharpe the "
+                    "book actually moves by when the alpha is added equal-weight. The two "
+                    "differ, and only the second one happened.")
+    marginal_parser.add_argument("alpha_id")
+    marginal_parser.add_argument("--registry", default=None)
+    marginal_parser.set_defaults(func=independence.cmd_marginal)
+
+    independence_parser = sub.add_parser(
+        "independence", help="Are the book's alphas one bet or many, calm and stressed?",
+        description="Pairwise correlations over the full sample, the worst decile of book "
+                    "days and the best decile, plus an effective-bet count. Full-sample "
+                    "independence is not independence when the book is losing.")
+    independence_parser.add_argument("--threshold", type=float, default=0.7)
+    independence_parser.add_argument("--registry", default=None)
+    independence_parser.set_defaults(func=independence.cmd_independence)
 
     legs_parser = sub.add_parser(
         "legs", help="Did a composite behave like the sum of its legs? (cached PnL only)",
