@@ -231,6 +231,10 @@ def build_parser():
                     "platform's per-expression re-neutralisation took away.")
     legs_parser.add_argument("--leg", action="append", metavar="ID[:WEIGHT]",
                              help="Leg alpha id with optional weight (default equal).")
+    legs_parser.add_argument("--residual", action="store_true",
+                             help="Fit r_composite ~ a*r_leg1 + b*r_leg2 and report the "
+                                  "calibrated residual, coefficients and date coverage. "
+                                  "Uncalibrated ratios confuse scale with structure.")
     legs_parser.add_argument("--composite", default=None, metavar="ID",
                              help="The simulated composite to compare against.")
     legs_parser.add_argument("--registry", default=None)

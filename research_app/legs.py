@@ -135,6 +135,8 @@ def cmd_legs(args, _sink):
     }
 
     composite = getattr(args, "composite", None)
+    if composite and getattr(args, "residual", False):
+        return residual_report(composite, legs, pnl_dir)
     if composite:
         actual_series = load_pnl(composite, pnl_dir)
         actual = None
@@ -166,3 +168,74 @@ def cmd_legs(args, _sink):
             "verdict": verdict,
         }
     return payload
+
+def residual_report(composite, leg_weights, pnl_dir=None):
+    """Where the leg sum misses, after calibrating the scale.
+
+    The plain ratio "actual / predicted" mixes two failures: the composite may be a
+    different *magnitude* of the same bet (normalisation), or a different bet entirely.
+    Fitting ``r_C ~ a*r_A + b*r_B`` separates them: coefficients near the nominal weights
+    mean the scale is right and the residual is the real deviation; coefficients far from
+    it mean the legs entered the composite with different sizes, and comparing without
+    calibration would blame the wrong layer.
+
+    The date coverage is reported alongside because a residual computed on the wrong
+    overlap looks exactly like a structural break.
+    """
+    import numpy as np
+
+    directory = pnl_dir or os.path.join(research_paths.ensure_dir(), "pnl")
+    ids = list(leg_weights)
+    series = {}
+    coverage = {}
+    for alpha_id in ids + [composite]:
+        values = load_pnl(alpha_id, directory)
+        series[alpha_id] = values
+        if values:
+            dates = sorted(values)
+            coverage[alpha_id] = {"days": len(dates), "start": dates[0], "end": dates[-1]}
+        else:
+            coverage[alpha_id] = {"days": 0, "start": None, "end": None}
+    if not series.get(composite):
+        raise ValueError("%s has no cached PnL" % composite)
+
+    shared = set(series[composite])
+    for alpha_id in ids:
+        if not series[alpha_id]:
+            raise ValueError("%s has no cached PnL" % alpha_id)
+        shared &= set(series[alpha_id])
+    dates = sorted(shared)
+    if len(dates) < 120:
+        raise ValueError("only %d shared days; the arms may not cover the same window" % len(dates))
+
+    design = np.array([[series[alpha_id][d] for alpha_id in ids] for d in dates])
+    target = np.array([series[composite][d] for d in dates])
+    coefficients, _residuals, rank, _singular = np.linalg.lstsq(design, target, rcond=None)
+    fitted = design @ coefficients
+    residual = target - fitted
+    ss_res = float((residual ** 2).sum())
+    ss_tot = float(((target - target.mean()) ** 2).sum())
+    r_squared = 1 - ss_res / ss_tot if ss_tot else None
+
+    # The uncalibrated comparison, kept so the two numbers are not confused.
+    nominal = design @ np.array([leg_weights[alpha_id] for alpha_id in ids])
+    nominal_residual = target - nominal
+
+    return {
+        "composite": composite,
+        "legs": ids,
+        "window": {"start": dates[0], "end": dates[-1], "days": len(dates)},
+        "coverage": coverage,
+        "coefficients": {alpha_id: round(float(value), 3)
+                         for alpha_id, value in zip(ids, coefficients)},
+        "nominal_weights": {alpha_id: leg_weights[alpha_id] for alpha_id in ids},
+        "r_squared": None if r_squared is None else round(float(r_squared), 4),
+        "residual_sharpe": None if sharpe_of(list(residual)) is None
+        else round(sharpe_of(list(residual)), 3),
+        "residual_vol_share": round(float(residual.std() / target.std()), 4) if target.std() else None,
+        "nominal_residual_sharpe": None if sharpe_of(list(nominal_residual)) is None
+        else round(sharpe_of(list(nominal_residual)), 3),
+        "reading": ("coefficients near the nominal weights mean the scale is right and the "
+                    "residual is structure; far from them means the legs entered at "
+                    "different sizes and the raw ratio was measuring scale, not structure."),
+    }

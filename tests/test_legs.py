@@ -145,3 +145,44 @@ class PlainLegFilterTests(unittest.TestCase):
     def test_a_plain_pair_is_kept(self):
         combined = "rank(close)" + "rank(ts_delta(revenue, 63))"
         self.assertFalse(any(token in combined for token in self.TOKENS))
+
+
+class ResidualTests(unittest.TestCase):
+    """Scale and structure are different failures; the fit separates them."""
+
+    def _workspace(self, legs_values, composite_values):
+        import os
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        directory = os.path.join(tmp, "pnl")
+        os.makedirs(directory)
+        dates = ["2020-01-%03d" % (i + 1) for i in range(200)]
+        for name, values in list(legs_values.items()) + [("C", composite_values)]:
+            with open(os.path.join(directory, name + ".json"), "w") as handle:
+                json.dump({d: v for d, v in zip(dates, values)}, handle)
+        return tmp, directory
+
+    def test_a_true_sum_is_recovered_with_high_r_squared(self):
+        import random
+        rng = random.Random(5)
+        a = [rng.gauss(0, 1) for _ in range(200)]
+        b = [rng.gauss(0, 1) for _ in range(200)]
+        c = [0.5 * x + 0.5 * y for x, y in zip(a, b)]
+        tmp, directory = self._workspace({"A": a, "B": b}, c)
+        report = legs.residual_report("C", {"A": 0.5, "B": 0.5}, directory)
+        self.assertGreater(report["r_squared"], 0.99)
+        self.assertAlmostEqual(report["coefficients"]["A"], 0.5, places=2)
+        self.assertLess(report["residual_vol_share"], 0.05)
+
+    def test_a_calibrated_residual_exposes_the_unexplained_part(self):
+        import random
+        rng = random.Random(9)
+        a = [rng.gauss(0, 1) for _ in range(200)]
+        b = [rng.gauss(0, 1) for _ in range(200)]
+        noise = [rng.gauss(0, 2) for _ in range(200)]
+        c = [0.5 * x + 0.5 * y + n for x, y, n in zip(a, b, noise)]
+        tmp, directory = self._workspace({"A": a, "B": b}, c)
+        report = legs.residual_report("C", {"A": 0.5, "B": 0.5}, directory)
+        self.assertLess(report["r_squared"], 0.6)
+        self.assertGreater(report["residual_vol_share"], 0.5)
+        self.assertEqual(report["coverage"]["A"]["days"], 200)
