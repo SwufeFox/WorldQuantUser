@@ -113,6 +113,26 @@ def dataset_turnover(entries=None):
             for dataset, values in buckets.items()}
 
 
+#: Shapes the campaign has measured. Applying one to a field is a different experiment
+#: from applying another, and the same field can go from noise to a live signal across
+#: the set: the mid shape took a volume-autocorrelation leg from F -0.70 to +0.90 while
+#: leaving volatility clustering worse than its plain group_rank.
+SHAPES = {
+    "raw": "rank({x})",
+    "centre": "-(group_rank({x}, subindustry) - 0.5)",
+    "midtier": "-(abs(group_rank({x}, subindustry) - 0.5))",
+    "change": "group_rank(ts_mean(ts_delta({x}, 5), 21), subindustry) - 0.5",
+    "ratio_assets": "rank({x} / (assets + 1))",
+}
+
+
+def apply_shape(shape, expression):
+    template = SHAPES.get(shape)
+    if template is None:
+        raise ValueError("unknown shape %r (known: %s)" % (shape, ", ".join(sorted(SHAPES))))
+    return template.format(x=expression)
+
+
 def wrapper_for(field_type):
     """How the field must be wrapped before arithmetic touches it."""
     if (field_type or "").upper() in AGGREGATED_TYPES:
@@ -189,7 +209,14 @@ def cmd_mine(args, _sink):
 
     if getattr(args, "emit", None):
         arms = []
-        for row in rows:
+        explicit = [part.strip() for part in (getattr(args, "expr", None) or "").split(";")
+                    if part.strip()]
+        if explicit:
+            shape = getattr(args, "shape", None) or "raw"
+            for index, expression in enumerate(explicit):
+                arms.append({"label": "%s_%d" % (shape, index + 1),
+                             "expression": apply_shape(shape, expression)})
+        for row in ([] if explicit else rows):
             for candidate in row["top"]:
                 expression = candidate["id"]
                 if candidate["wrapper"]:

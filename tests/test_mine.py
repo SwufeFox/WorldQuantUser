@@ -91,3 +91,19 @@ class MineTests(unittest.TestCase):
         with mock.patch.object(research_paths, "metadata_root", return_value=tmp):
             stats = mine.dataset_turnover(entries)
         self.assertEqual(stats["fundamental2"]["median"], 0.02)
+
+
+class ShapeTests(unittest.TestCase):
+    """Shape-first mining: keep the construction, change the field."""
+
+    def test_the_known_shapes_apply_to_a_sub_expression(self):
+        expression = "deferred_tax_assets_net_value / (assets + 1)"
+        self.assertEqual(mine.apply_shape("centre", expression),
+                         "-(group_rank(%s, subindustry) - 0.5)" % expression)
+        self.assertEqual(mine.apply_shape("midtier", expression),
+                         "-(abs(group_rank(%s, subindustry) - 0.5))" % expression)
+        self.assertIn("ts_delta(", mine.apply_shape("change", expression))
+
+    def test_an_unknown_shape_is_refused(self):
+        with self.assertRaises(ValueError):
+            mine.apply_shape("magic", "rank(close)")

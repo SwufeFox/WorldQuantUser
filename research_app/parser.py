@@ -233,6 +233,12 @@ def build_parser():
                              help="MIN,MAX of realised turnover that is worth mining.")
     mine_parser.add_argument("--limit", type=int, default=4,
                              help="Candidate fields to show per dataset.")
+    mine_parser.add_argument("--expr", default=None,
+                             help="Semicolon-separated sub-expressions to apply --shape to. "
+                                  "Shape-first mining: keep the construction, change the field.")
+    mine_parser.add_argument("--shape", default="raw",
+                             choices=("raw", "centre", "midtier", "change", "ratio_assets"),
+                             help="Construction to apply to each --expr.")
     mine_parser.add_argument("--smooth", type=int, default=0,
                              help="Wrap each field in ts_mean(x, N) before ranking; daily "
                                   "attention fields reorder every day without it.")
