@@ -114,11 +114,12 @@ def cmd_pairs(args, _sink):
                 continue
             rho = float(np.max(np.abs(book_norm @ (centred / norm)))) if len(book) else 0.0
             rho_book = float(book_centred @ (centred / norm)) if book_norm_total else 0.0
-            # The leg-sum is only exact when the legs are plain signals. A leg that
-            # already subtracts its group mean (`group_rank(x, g) - 0.5`) gets that
-            # subtraction applied a second time inside the composite, so the sum
-            # overstates the result badly: one such pair predicted 2.60 and delivered
-            # 1.53. Say so up front instead of after a batch.
+            # The leg-sum was thought to break for legs that already subtract a group
+            # mean. A controlled test says otherwise: the same two signals built plain and
+            # built with `group_rank - 0.5` are both additive (R^2 0.990 vs 0.999). What
+            # actually broke the earlier predictions was weight bookkeeping inside the
+            # composite - a sub-leg's own 0.5 got multiplied by 0.5 again. The flag is
+            # kept as a reminder to check the arithmetic, not as a claim about algebra.
             centred_legs = any(
                 token in ((latest[pool[i]].get("expression") or "")
                           + (latest[pool[j]].get("expression") or ""))
