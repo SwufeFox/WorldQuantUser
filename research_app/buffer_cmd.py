@@ -102,6 +102,15 @@ def _book_size(args):
                if str(entry.get("status") or "").upper() == "ACTIVE")
 
 
+def _retention(entry):
+    """test Sharpe / train Sharpe, or None when either is missing."""
+    train = (entry.get("train") or {}).get("sharpe")
+    test = (entry.get("test") or {}).get("sharpe")
+    if train in (None, 0) or test is None:
+        return None
+    return round(test / train, 2)
+
+
 def _checks_summary(checks):
     """Split checks into passed / failed / pending.
 
@@ -140,6 +149,7 @@ def cmd_buffer_add(args, _sink):
         checks = computed.get("checks") or ml._extract_checks(payload)
         split = ml.extract_split(payload) or {}
         train = split.get("train") or {}
+        test = split.get("test") or {}
         metrics = payload.get("is") or {}
         self_corr = (computed.get("self_correlation") or {}).get("value") \
             if computed.get("self_correlation") else None
@@ -153,6 +163,7 @@ def cmd_buffer_add(args, _sink):
                 "name": payload.get("name"), "category": payload.get("category"),
                 "status": payload.get("status"),
                 "train": {k: train.get(k) for k in ("sharpe", "fitness", "turnover", "returns")},
+                "test": {k: test.get(k) for k in ("sharpe", "fitness", "turnover")},
                 "full": {k: metrics.get(k) for k in ("sharpe", "fitness", "turnover")},
                 "checks": _checks_summary(checks),
                 "self_correlation": self_corr,
@@ -190,6 +201,11 @@ def cmd_buffer_list(args, _sink):
             "train_sharpe": (entry.get("train") or {}).get("sharpe"),
             "turnover": (entry.get("train") or {}).get("turnover"),
             "self_correlation": entry.get("self_correlation"),
+            # How much of the train-period Sharpe survives the test year. The submit gate
+            # reads the full window, which is four-fifths train, so a candidate can pass
+            # while its out-of-sample behaviour is poor. Shown here, not used to rank:
+            # selecting on it would be selecting on test.
+            "retention": _retention(entry),
             # A pending check is not a failure, but it is also not a measurement. The
             # submit path re-checks anyway; the flag stops a null being read as "passed".
             "self_correlation_measured": entry.get("self_correlation") is not None,

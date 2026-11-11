@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, feed, independence, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, feed, independence, triage, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -294,6 +294,23 @@ def build_parser():
     prune_parser.add_argument("--limit", type=int, default=20)
     prune_parser.add_argument("--registry", default=None)
     prune_parser.set_defaults(func=prune.cmd_prune)
+
+    triage_parser = sub.add_parser(
+        "triage",
+        help="One table per batch: out-of-sample, correlation, book delta, verdict.",
+        description="Answers the four questions a probe row always raises, in one call: "
+                    "does the platform accept it, how correlated is it with the book, how "
+                    "much would the book actually move, and does it survive the test year.")
+    triage_parser.add_argument("--batch", default=None, metavar="BATCH_JSON",
+                               help="Triage every alpha id in this batch file.")
+    triage_parser.add_argument("--ids", nargs="+", default=None, metavar="ID")
+    triage_parser.add_argument("--min-delta", type=float, default=0.02, dest="min_delta")
+    triage_parser.add_argument("--retention-floor", type=float, default=0.2,
+                               dest="retention_floor",
+                               help="Veto a candidate whose test Sharpe is below this "
+                                    "fraction of train. A veto, never a ranking key.")
+    triage_parser.add_argument("--registry", default=None)
+    triage_parser.set_defaults(func=triage.cmd_triage)
 
     feed_parser = sub.add_parser(
         "feed",
