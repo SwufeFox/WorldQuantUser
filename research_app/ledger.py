@@ -556,6 +556,11 @@ def cmd_ledger_form(args, _sink):
 
     Book members are excluded by default: they are survivors of a selection that this
     comparison is trying to characterise, so including them would count the winners twice.
+
+    Caveat measured 2026-11-11: splitting the ledger by record date, no block ever
+    reversed to "level", but several were neutral early and only became "change" later.
+    Part of the edge is therefore about how the arms are written now, not only about the
+    information - read the verdict as a prior, not a law.
     """
     from . import mechanisms
 
