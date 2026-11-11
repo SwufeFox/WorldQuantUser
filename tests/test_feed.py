@@ -101,3 +101,22 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(card["status"], "DRAFT")
         self.assertIsNone(card["hypothesis"]["falsification"])
         self.assertIsNone(card["novelty"]["closest_existing_family"])
+
+
+class FeedActionTests(unittest.TestCase):
+    """The digest has to say which hit is in a neighbourhood the book has not covered."""
+
+    def test_a_block_guess_reads_title_and_abstract(self):
+        paper = {"title": "Analyst forecast dispersion and returns", "abstract": ""}
+        self.assertEqual(feed.guess_block(paper), "analyst_dispersion")
+        paper = {"title": "Textual sentiment in news", "abstract": "media tone"}
+        self.assertEqual(feed.guess_block(paper), "news_sentiment")
+        self.assertIsNone(feed.guess_block({"title": "A paper about nothing"}))
+
+    def test_unexplored_blocks_rank_first(self):
+        explored = {"title": "Accruals and returns", "abstract": "earnings quality",
+                    "citations": 900, "year": 2010}
+        fresh = {"title": "Patent originality and returns", "abstract": "innovation",
+                 "citations": 10, "year": 2015}
+        self.assertEqual(feed.guess_block(explored), "value_quality")
+        self.assertIsNone(feed.guess_block(fresh))

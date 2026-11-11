@@ -359,9 +359,16 @@ def build_parser():
     feed_parser.add_argument("--seen", default=None)
     feed_parser.add_argument("--draft-cards", default=None, dest="draft_cards",
                              metavar="PATH")
+    feed_parser.add_argument("--action", action="store_true", dest="action",
+                             help="Rank by unexplored neighbourhood and say what to do "
+                                  "with each hit.")
     feed_parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                              help="Report only; do not update the seen store.")
-    feed_parser.set_defaults(func=feed.cmd_feed)
+    def _feed_dispatch(args, sink):
+        return feed.cmd_feed_action(args, sink) if getattr(args, "action", False) \
+            else feed.cmd_feed(args, sink)
+
+    feed_parser.set_defaults(func=_feed_dispatch)
 
     api_parser = sub.add_parser(
         "api", help="Probe which BRAIN endpoints this account can actually read.")

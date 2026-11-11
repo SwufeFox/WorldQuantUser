@@ -255,3 +255,75 @@ def cmd_feed(args, _sink):
         "note": ("drafts are deliberately un-promotable: `ledger cards --add` will refuse "
                  "them until the falsification condition and closest family are filled."),
     }
+
+#: Words that map a paper to one of our information blocks. The match is crude on
+#: purpose: the question is only "have we mined this neighbourhood", which a handful of
+#: keywords answers well enough to rank a short list.
+BLOCK_KEYWORDS = (
+    ("analyst_dispersion", ("analyst", "forecast", "dispersion", "disagreement", "consensus")),
+    ("analyst_yield", ("earnings estimate", "revision", "eps", "guidance")),
+    ("value_quality", ("valuation", "book-to-market", "earnings quality", "profitability",
+                       "accrual")),
+    ("debt_structure", ("leverage", "debt", "capital structure", "bankruptcy", "credit")),
+    ("volatility_structure", ("volatility", "variance", "risk", "skewness", "tail")),
+    ("turnover_structure", ("turnover", "liquidity", "trading volume", "attention")),
+    ("price_path", ("momentum", "reversal", "price path", "return predictability")),
+    ("derivative_pricing", ("option", "implied", "derivative", "strike")),
+    ("news_sentiment", ("sentiment", "news", "media", "text")),
+    ("turnover_structure", ("order flow", "inventory", "market microstructure")),
+)
+
+
+def guess_block(paper):
+    """The block a paper most looks like, from its title and abstract."""
+    text = ((paper.get("title") or "") + " " + (paper.get("abstract") or "")).lower()
+    for block, words in BLOCK_KEYWORDS:
+        if any(word in text for word in words):
+            return block
+    return None
+
+
+def cmd_feed_action(args, _sink):
+    """Rank the digest by *unexplored* neighbourhood, and say what to do with each.
+
+    A list of papers is an input, not a decision. What decides the next hour is whether
+    the paper sits in a block we have already mined: a paper about accruals is worth less
+    than a paper about something our 61-alpha book has no exposure to, because the second
+    one can still move the book.
+    """
+    from . import mechanisms
+
+    latest = {}
+    import alpha_registry
+    for entry in alpha_registry.load_entries(getattr(args, "registry", None)):
+        key = entry.get("alpha_id") or entry.get("key")
+        if key:
+            latest[key] = entry
+    exposure = {}
+    for entry in latest.values():
+        if str(entry.get("status") or "").upper() not in ("ACTIVE", "SUBMITTED"):
+            continue
+        block = mechanisms.block_of(entry.get("expression") or "")
+        exposure[block] = exposure.get(block, 0) + 1
+
+    payload = cmd_feed(args, _sink)
+    rows = []
+    for paper in payload["papers"]:
+        block = guess_block(paper)
+        rows.append({
+            "title": paper.get("title"),
+            "year": paper.get("year"),
+            "journal": paper.get("journal"),
+            "citations": paper.get("citations"),
+            "block_guess": block,
+            "block_exposure": exposure.get(block, 0),
+            "next": ("write the falsification condition and closest family, then "
+                     "`wq ledger cards --add`; first arm should be a change of the field, "
+                     "not its level"),
+        })
+    rows.sort(key=lambda row: (row["block_exposure"] is not None and row["block_exposure"] > 0,
+                               -(row["citations"] or 0)))
+    payload["action"] = rows
+    payload["note"] = ("sorted by how *unexplored* the neighbourhood is: a paper in a block "
+                       "our book already covers cannot move it much.")
+    return payload
