@@ -211,7 +211,8 @@ def build_parser():
     pairs_parser.set_defaults(func=pairs.cmd_pairs)
 
     marginal_parser = sub.add_parser(
-        "marginal", help="What adding one alpha actually does to the book (vs the slope).",
+        "marginal",
+        help="[superseded by `triage --ids`] Slope vs the book's actual change.",
         description="Reports the theoretical marginal S_a - rho*S_B next to the Sharpe the "
                     "book actually moves by when the alpha is added equal-weight. The two "
                     "differ, and only the second one happened.")
@@ -297,7 +298,7 @@ def build_parser():
 
     bench_parser = sub.add_parser(
         "benchmark",
-        help="Internal fitness: platform Fitness discounted by what decays here.",
+        help="[superseded by `triage --internal`] Internal fitness vs the platform's.",
         description="Platform Fitness is four-fifths training. This multiplies it by a "
                     "train-Sharpe shrink (a hump measured on the ledger), the book delta, "
                     "and the block's retention. Operator count is warned about, never "
@@ -318,6 +319,12 @@ def build_parser():
     triage_parser.add_argument("--batch", default=None, metavar="BATCH_JSON",
                                help="Triage every alpha id in this batch file.")
     triage_parser.add_argument("--ids", nargs="+", default=None, metavar="ID")
+    triage_parser.add_argument("--book", action="store_true",
+                               help="Score every book member instead of candidates "
+                                    "(this is what `health` did).")
+    triage_parser.add_argument("--internal", action="store_true",
+                               help="Also report the internal fitness, which discounts "
+                                    "the platform's by what decays here (was `benchmark`).")
     triage_parser.add_argument("--min-delta", type=float, default=0.02, dest="min_delta")
     triage_parser.add_argument("--retention-floor", type=float, default=0.2,
                                dest="retention_floor",
@@ -1199,7 +1206,8 @@ def build_parser():
     fmt.set_defaults(func=experiments.cmd_fmt)
 
     health = sub.add_parser(
-        "health", help="Per-alpha marginal contribution to the book (offline, no sims).",
+        "health",
+        help="[superseded by `triage --book`] Per-member contribution to the book.",
         description="A book of 55 is not 55 bets, and equal weighting pays every member "
                     "the same. This reports each alpha's marginal contribution "
                     "S_i - rho_i * S_book from cached PnL, so dead weight is visible.")
