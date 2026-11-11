@@ -544,6 +544,69 @@ def _form_stats(values):
             "net_positive": round(positive - negative, 2)}
 
 
+def cmd_ledger_decay(args, _sink):
+    """How much of the train-period Sharpe survives to the full window.
+
+    Three veins in a row (mid-shape volume persistence, deferred-revenue variants,
+    turnover acceleration) looked stable inside the training window and then failed the
+    platform's full-window fitness floor. The selection rule reads train-only Sharpe; the
+    submit gate reads the full window, which contains the test year. The ratio between the
+    two is therefore a property of the *construction* that the campaign never measured.
+
+    ``train`` comes from the ledger's ``out_of_sample.train`` block, ``full`` from
+    ``metrics.sharpe``; both are what the platform reported, so this needs no simulation.
+    """
+    from . import mechanisms
+
+    latest = {}
+    for entry in alpha_registry.load_entries(getattr(args, "registry", None)):
+        key = entry.get("alpha_id") or entry.get("key")
+        if key:
+            latest[key] = entry
+
+    rows_by_block = {}
+    for entry in latest.values():
+        expression = entry.get("expression") or ""
+        split = entry.get("out_of_sample") or {}
+        train = (split.get("train") or {}).get("sharpe")
+        full = (entry.get("metrics") or {}).get("sharpe")
+        if not expression or train is None or full is None:
+            continue
+        if abs(train) < args.min_train_sharpe:
+            continue
+        block = mechanisms.block_of(expression)
+        rows_by_block.setdefault(block, []).append(
+            (float(train), float(full), entry.get("status")))
+
+    import statistics
+    rows = []
+    for block, values in rows_by_block.items():
+        if len(values) < args.min_arms:
+            continue
+        ratios = [full / train for train, full, _status in values if train]
+        book = [ratio for (train, full, status), ratio in zip(values, ratios)
+                if str(status or "").upper() in ("ACTIVE", "SUBMITTED")]
+        rows.append({
+            "block": block,
+            "n": len(values),
+            "median_train": round(statistics.median([v[0] for v in values]), 2),
+            "median_full": round(statistics.median([v[1] for v in values]), 2),
+            "median_ratio": round(statistics.median(ratios), 3),
+            "share_below_80pct": round(
+                sum(1 for r in ratios if r < 0.8) / len(ratios), 2),
+            "book_ratio": None if not book else round(statistics.median(book), 3),
+        })
+    rows.sort(key=lambda row: row["median_ratio"])
+    return {
+        "min_train_sharpe": args.min_train_sharpe,
+        "min_arms": args.min_arms,
+        "blocks": rows,
+        "note": ("median_ratio = full-window Sharpe / train-period Sharpe. A block well "
+                 "below 1 loses its edge in the test year; `book_ratio` is the same ratio "
+                 "restricted to members that survived into the book."),
+    }
+
+
 def cmd_ledger_form(args, _sink):
     """Which construction reads better, a level or a change - measured per block.
 

@@ -1030,6 +1030,14 @@ def build_parser():
     l_fmt.add_argument("--dry-run", action="store_true", dest="dry_run")
     l_fmt.set_defaults(func=ledger.cmd_ledger_format)
 
+    l_decay = ledger_sub.add_parser(
+        "decay", help="How much train Sharpe survives to the full window, per block.")
+    l_decay.add_argument("--min-train-sharpe", type=float, default=0.8,
+                         dest="min_train_sharpe")
+    l_decay.add_argument("--min-arms", type=int, default=15, dest="min_arms")
+    l_decay.add_argument("--registry", default=None)
+    l_decay.set_defaults(func=ledger.cmd_ledger_decay)
+
     l_form = ledger_sub.add_parser(
         "form", help="Level vs change construction, measured per information block.")
     l_form.add_argument("--min-arms", type=int, default=20, dest="min_arms")
