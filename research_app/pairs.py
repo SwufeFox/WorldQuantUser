@@ -145,6 +145,22 @@ def cmd_pairs(args, _sink):
                 continue
             if args.min_composite_sharpe is not None and sharpe < args.min_composite_sharpe:
                 continue
+            # Support breadth was expected to decide whether the leg sum means anything:
+            # a 400-name leg next to a 3000-name leg should be diluted inside the
+            # composite. It did not survive a test - matched breadth (0.998) gave R^2
+            # 0.576 while mismatched breadth (0.657) gave 0.924. The filter is kept as a
+            # diversity heuristic only; the residual R^2 has to be measured after the
+            # composite is simulated, not predicted from the legs.
+            breadth_a = ((latest[pool[i]].get("metrics") or {}).get("longCount") or 0) + \
+                        ((latest[pool[i]].get("metrics") or {}).get("shortCount") or 0)
+            breadth_b = ((latest[pool[j]].get("metrics") or {}).get("longCount") or 0) + \
+                        ((latest[pool[j]].get("metrics") or {}).get("shortCount") or 0)
+            support_ratio = None
+            if breadth_a and breadth_b:
+                support_ratio = min(breadth_a, breadth_b) / max(breadth_a, breadth_b)
+            if args.min_support_ratio is not None:
+                if support_ratio is None or support_ratio < args.min_support_ratio:
+                    continue
             metrics_a = (latest[pool[i]].get("metrics") or {})
             metrics_b = (latest[pool[j]].get("metrics") or {})
             returns = (float(metrics_a.get("returns") or 0) + float(metrics_b.get("returns") or 0)) / 2
@@ -163,6 +179,7 @@ def cmd_pairs(args, _sink):
                 "book_rho": round(rho_book, 3),
                 "marginal_vs_book": None if marginal is None else round(marginal, 3),
                 "leg_sum_risk": "centred" if centred_legs else "plain",
+                "support_ratio": None if support_ratio is None else round(support_ratio, 3),
             })
 
     rows.sort(key=lambda row: -row["composite_sharpe"]
@@ -177,6 +194,7 @@ def cmd_pairs(args, _sink):
                      "max_book_rho": args.max_book_rho,
                      "min_composite_sharpe": args.min_composite_sharpe,
                      "min_marginal": args.min_marginal,
+                     "min_support_ratio": args.min_support_ratio,
                      "rank": args.rank},
         "book_sharpe": None if math.isnan(book_sharpe) else round(float(book_sharpe), 3),
         "note": ("Sharpe and correlations come from cached daily PnL; fitness is estimated "

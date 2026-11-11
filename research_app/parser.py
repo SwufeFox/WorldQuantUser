@@ -194,6 +194,11 @@ def build_parser():
     pairs_parser.add_argument("--min-marginal", type=float, default=None, dest="min_marginal",
                               help="Keep only pairs whose composite beats the book as a "
                                    "whole: S_composite - rho(book) * S_book >= this.")
+    pairs_parser.add_argument("--min-support-ratio", type=float, default=None,
+                              dest="min_support_ratio",
+                              help="Keep pairs whose legs hold comparable numbers of names "
+                                   "(min/max of long+short). A 400-name leg next to a "
+                                   "3000-name leg cannot be added as alphas.")
     pairs_parser.add_argument("--plain-legs", action="store_true", dest="plain_legs",
                               help="Keep only pairs whose legs are plain signals, where "
                                    "the leg-sum prediction is exact. Centred legs "
