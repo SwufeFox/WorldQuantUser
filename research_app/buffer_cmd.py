@@ -186,6 +186,10 @@ def cmd_buffer_list(args, _sink):
             # A pending check is not a failure, but it is also not a measurement. The
             # submit path re-checks anyway; the flag stops a null being read as "passed".
             "self_correlation_measured": entry.get("self_correlation") is not None,
+            # The platform can pass a check above the gate through its exception rule.
+            # A shelf that stays quiet about that invites a mistake at submit time.
+            "above_gate": (entry.get("self_correlation") is not None
+                           and entry.get("self_correlation") > GATE),
             "book_at_shelving": shelved_book,
             "book_now": current_book,
             # The gate is measured against a snapshot: every alpha added since shifts it.
