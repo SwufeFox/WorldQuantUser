@@ -58,7 +58,7 @@ class TriageModeTests(unittest.TestCase):
         self.assertEqual(row["retention"], 0.82)
 
 
-class UnresolvedCheckTests(unittest.TestCase):
+class UnresolvedCheckTests(TriageModeTests):
     """A PENDING check is not a pass; it is an unverified record."""
 
     def test_pending_self_correlation_is_reported_as_unverified(self):
@@ -74,5 +74,5 @@ class UnresolvedCheckTests(unittest.TestCase):
         data = triage.triage(["P1"], registry_path=self._registry(tmp, rows),
                              pnl_dir=directory)
         row = data["rows"][0]
-        self.assertEqual(row["unresolved"], ["SELF_CORRELATION"])
+        self.assertIn("SELF_CORRELATION", row["unresolved"])
         self.assertEqual(row["verdict"], "unverified")

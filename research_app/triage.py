@@ -146,16 +146,18 @@ def _verdict(row, criteria):
             "removing it %s the book by %.4f" % (direction, abs(row["delta"])))
     if row["failing"]:
         return "blocked", "fails %s" % ", ".join(row["failing"])
-    if row.get("unresolved"):
-        return "unverified", ("never resolved: %s - run `alpha check` before treating "
-                              "this as passing" % ", ".join(row["unresolved"]))
     if row["delta"] is None:
         return "unknown", "no cached PnL to measure the book against"
+    # Disqualifying facts come before "not measured yet": an alpha that already lowers
+    # the book does not become interesting once its checks resolve.
     if row["delta"] <= 0:
         return "dilutive", "adding it lowers the book"
     floor = criteria["retention_floor"]
     if row["retention"] is not None and row["retention"] < floor:
         return "overfit-risk", "test keeps %.0f%% of train" % (row["retention"] * 100)
+    if row.get("unresolved"):
+        return "unverified", ("never resolved: %s - run `alpha check` before treating "
+                              "this as passing" % ", ".join(row["unresolved"]))
     if row["delta"] < criteria["min_delta"]:
         return "weak", "adds %.3f, under the %.2f bar" % (row["delta"], criteria["min_delta"])
     return "shelve", "passes checks and moves the book +%.3f" % row["delta"]
