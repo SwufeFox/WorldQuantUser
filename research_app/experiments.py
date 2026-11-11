@@ -689,6 +689,18 @@ def _probe_design(spec, settings):
 
 
 
+def _settings_signature(settings):
+    """The fields that decide what a simulation *is*, in a stable order.
+
+    Two arms with the same expression under different neutralisation are different
+    experiments that happen to share a formula. Recovery has to compare on this, not on
+    the text alone.
+    """
+    keys = ("region", "universe", "delay", "neutralization", "decay", "truncation",
+            "instrumentType")
+    return "|".join("%s=%s" % (key, (settings or {}).get(key)) for key in keys)
+
+
 def _normalized_expression(text):
     """Whitespace-free form so a platform expression matches its spec arm."""
     return "".join((text or "").split())
@@ -708,7 +720,7 @@ def _recover_probe_rows(session, rows, limit=400, pages=3):
     """
     missing = [row for row in rows if row.get("train_fitness") is None]
     if not missing:
-        return {"recovered": 0, "still_missing": [], "matched": {}}
+        return {"recovered": 0, "still_missing": [], "ambiguous": [], "matched": {}}
     index = {}
     for page in range(pages):
         batch = ml.list_alphas(session, limit=limit, offset=page * limit,
@@ -716,17 +728,37 @@ def _recover_probe_rows(session, rows, limit=400, pages=3):
         for alpha in batch:
             code, _description, _ops = ml.regular_expression(alpha)
             key = _normalized_expression(code)
-            if key and key not in index:
-                index[key] = alpha.get("id")
+            if not key:
+                continue
+            # Several alphas can share a formula; keep them all and let the settings
+            # decide, instead of silently attaching the newest one.
+            index.setdefault(key, []).append({
+                "alpha_id": alpha.get("id"),
+                "signature": _settings_signature(alpha.get("settings")),
+            })
         if len(batch) < limit:
             break
-    matched, still_missing = {}, []
+    matched, still_missing, ambiguous = {}, [], []
     for row in missing:
         key = _normalized_expression(row.get("expression"))
-        alpha_id = index.get(key)
-        if not alpha_id:
+        candidates = index.get(key) or []
+        if not candidates:
             still_missing.append(row["label"])
             continue
+        wanted = row.get("settings_signature") or _settings_signature(row.get("settings"))
+        exact = [c for c in candidates if c["signature"] == wanted]
+        if len(exact) > 1:
+            # Same formula, same settings, several alpha ids: the platform cannot say
+            # which run this arm was. Guessing would put a real number on the wrong row.
+            ambiguous.append({"label": row["label"], "candidates":
+                              [c["alpha_id"] for c in exact]})
+            still_missing.append(row["label"])
+            continue
+        if not exact:
+            # The expression exists, but under settings this arm did not use.
+            still_missing.append(row["label"])
+            continue
+        alpha_id = exact[0]["alpha_id"]
         payload = ml.fetch_alpha_metrics(session, alpha_id)
         train = (ml.extract_split(payload) or {}).get("train") or {}
         if train.get("fitness") is None:
@@ -739,7 +771,9 @@ def _recover_probe_rows(session, rows, limit=400, pages=3):
                     "train_returns": train.get("returns"),
                     "error": None})
         matched[row["label"]] = alpha_id
-    return {"recovered": len(matched), "still_missing": still_missing, "matched": matched}
+        row["settings_signature"] = wanted
+    return {"recovered": len(matched), "still_missing": still_missing,
+            "ambiguous": ambiguous, "matched": matched}
 
 
 def _cmd_probe_recover(args):
@@ -764,6 +798,9 @@ def _cmd_probe_recover(args):
     path.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
     note("recovered %d arm(s) from the platform; still missing: %s"
          % (outcome["recovered"], ", ".join(outcome["still_missing"]) or "none"))
+    for item in outcome.get("ambiguous") or []:
+        note("ambiguous: %s matches several alphas %s - left empty on purpose"
+             % (item["label"], ", ".join(item["candidates"])))
     note("wrote %s" % path)
     return {"name": document.get("name"), "path": str(path),
             "recovered": outcome["recovered"],
@@ -1068,6 +1105,7 @@ def cmd_probe(args, _sink):
                "design": arm.get("design"),
                "expression": arm["expression"],
                "decay": record.get("decay"), "settings": dict(record["settings"]),
+               "settings_signature": _settings_signature(record.get("settings")),
                "status": record.get("status"), "error": record.get("error"),
                "train_sharpe": train.get("sharpe"),
                "train_fitness": train.get("fitness"),
