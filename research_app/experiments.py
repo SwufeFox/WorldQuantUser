@@ -1130,10 +1130,20 @@ def cmd_probe(args, _sink):
                                 note=name)
     note("wrote %s" % target)
 
+    # A batch where every arm came back empty is a failure, not a batch with gaps. The
+    # caller (and any script reading this JSON) should be able to tell the two apart
+    # without parsing row-level metrics: an all-empty run raises, a partial one reports.
+    all_empty = bool(rows) and len(incomplete) == len(rows)
     summary = {"name": name, "path": str(target), "rows": rows,
                "simulated": len(rows), "show_test": bool(args.show_test),
                "design": design, "complete": not incomplete,
+               "all_empty": all_empty,
                "incomplete": incomplete}
+    if all_empty:
+        # Do not raise: recovery (`--recover`) is a legitimate next step, and the batch
+        # file is the record of what was submitted. But say it in the document, not only
+        # on stderr, because stderr is what gets scrolled past.
+        note("ALL EMPTY: none of the %d arm(s) produced train metrics" % len(rows))
     if not args.no_record:
         summary["registry"] = alpha_registry.record_simulation(
             records, settings, idea=spec.get("idea"), mechanism=spec.get("mechanism"),

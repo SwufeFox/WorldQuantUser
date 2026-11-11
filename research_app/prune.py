@@ -62,8 +62,12 @@ def load_criteria(path):
             if isinstance(payload, dict):
                 criteria.update({k: v for k, v in payload.items() if k in DEFAULTS})
                 source = path
-        except (OSError, ValueError):
-            source = "defaults (file unreadable)"
+        except (OSError, ValueError) as exc:
+            # Refuse rather than fall back. A typo in the criteria file would silently
+            # substitute the platform defaults and prune against the wrong bar - the
+            # dangerous direction, because `--apply` then deletes by a rule nobody wrote.
+            raise ValueError(
+                "prune criteria %s is unreadable (%s); fix it or pass --criteria" % (path, exc))
     return criteria, source
 
 

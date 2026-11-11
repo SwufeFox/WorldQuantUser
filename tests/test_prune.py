@@ -84,3 +84,23 @@ class PruneTests(unittest.TestCase):
             data = prune.cmd_prune(
                 self._args(registry=registry, set=["drop_blocks=[\"news_sentiment\"]"]), None)
         self.assertEqual(data["dropped"], 1)
+
+
+class PruneSafetyTests(unittest.TestCase):
+    """A broken criteria file must refuse, not fall back to defaults."""
+
+    def test_unreadable_criteria_refuses_instead_of_using_defaults(self):
+        import tempfile
+        from research_app import prune
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "criteria.json")
+        with open(path, "w") as handle:
+            handle.write("{not json")
+        with self.assertRaises(ValueError):
+            prune.load_criteria(path)
+
+    def test_a_missing_file_still_uses_defaults(self):
+        from research_app import prune
+        criteria, source = prune.load_criteria("/nonexistent/criteria.json")
+        self.assertEqual(source, "defaults")
+        self.assertEqual(criteria["min_sharpe"], prune.DEFAULTS["min_sharpe"])
