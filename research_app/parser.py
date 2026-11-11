@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, independence, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, feed, independence, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -294,6 +294,36 @@ def build_parser():
     prune_parser.add_argument("--limit", type=int, default=20)
     prune_parser.add_argument("--registry", default=None)
     prune_parser.set_defaults(func=prune.cmd_prune)
+
+    feed_parser = sub.add_parser(
+        "feed",
+        help="One literature digest from the open questions (deduped, closed-aware).",
+        description="Turns the live questions into searches, drops what the closed "
+                    "register already killed, skips anything already surfaced, and can "
+                    "write DRAFT mechanism cards for a deliberate pass.")
+    feed_parser.add_argument("--topic", action="append", default=None,
+                             help="Search this instead of deriving from open-threads.")
+    feed_parser.add_argument("--from-threads", action="store_true", dest="from_threads",
+                             help="Derive queries from open-threads.md.")
+    feed_parser.add_argument("--topics", action="store_true",
+                             help="Also read <research>/inspiration/topics.md "
+                                  "(English queries, one per line).")
+    feed_parser.add_argument("--topics-file", default=None, dest="topics_file")
+    feed_parser.add_argument("--limit", type=int, default=5,
+                             help="Papers per query.")
+    feed_parser.add_argument("--total", type=int, default=10,
+                             help="Papers in the digest.")
+    feed_parser.add_argument("--max-topics", type=int, default=4, dest="max_topics")
+    feed_parser.add_argument("--from-year", type=int, default=2005, dest="from_year")
+    feed_parser.add_argument("--min-citations", type=int, default=20,
+                             dest="min_citations")
+    feed_parser.add_argument("--queue", default=None)
+    feed_parser.add_argument("--seen", default=None)
+    feed_parser.add_argument("--draft-cards", default=None, dest="draft_cards",
+                             metavar="PATH")
+    feed_parser.add_argument("--dry-run", action="store_true", dest="dry_run",
+                             help="Report only; do not update the seen store.")
+    feed_parser.set_defaults(func=feed.cmd_feed)
 
     api_parser = sub.add_parser(
         "api", help="Probe which BRAIN endpoints this account can actually read.")
