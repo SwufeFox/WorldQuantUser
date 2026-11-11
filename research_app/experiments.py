@@ -1181,7 +1181,8 @@ def cmd_probe(args, _sink):
     if not args.no_record:
         summary["registry"] = alpha_registry.record_simulation(
             records, settings, idea=spec.get("idea"), mechanism=spec.get("mechanism"),
-            note=spec.get("note"), registry_path=args.registry, source="simulate")
+            note=spec.get("note"), registry_path=args.registry, source="simulate",
+            batch=name)
 
     return summary
 

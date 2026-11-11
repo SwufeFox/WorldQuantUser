@@ -81,3 +81,43 @@ class RecoverTests(unittest.TestCase):
     def test_the_signature_covers_the_settings_that_change_the_experiment(self):
         self.assertNotEqual(experiments._settings_signature(SETTINGS_A),
                             experiments._settings_signature(SETTINGS_B))
+
+
+class BatchProvenanceTests(unittest.TestCase):
+    """The ledger must say which batch produced a row, not leave it to recollection."""
+
+    def test_recording_carries_the_batch_name(self):
+        import json
+        import os
+        import tempfile
+        import alpha_registry
+
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "registry.jsonl")
+        records = [{"alpha_id": "A1", "expression": "rank(close)", "status": "COMPLETE",
+                    "settings": SETTINGS_A, "metrics": {"fitness": 1.2, "sharpe": 1.4},
+                    "checks": {}, "out_of_sample": {}}]
+        alpha_registry.record_simulation(records, SETTINGS_A, registry_path=path,
+                                         batch="h-999-test")
+        entry = json.loads(open(path).read().strip().split("\n")[-1])
+        self.assertEqual(entry["batch"], "h-999-test")
+
+    def test_a_re_record_keeps_the_original_batch_unless_one_is_given(self):
+        import json
+        import os
+        import tempfile
+        import alpha_registry
+
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "registry.jsonl")
+        record = {"alpha_id": "A1", "expression": "rank(close)", "status": "COMPLETE",
+                  "settings": SETTINGS_A, "metrics": {"fitness": 1.2, "sharpe": 1.4},
+                  "checks": {}, "out_of_sample": {}}
+        alpha_registry.record_simulation([record], SETTINGS_A, registry_path=path,
+                                         batch="first-batch")
+        alpha_registry.record_simulation([record], SETTINGS_A, registry_path=path)
+        entries = [json.loads(line) for line in open(path) if line.strip()]
+        latest = {}
+        for entry in entries:
+            latest[entry.get("key")] = entry
+        self.assertEqual(latest["A1"]["batch"], "first-batch")

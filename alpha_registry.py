@@ -227,7 +227,7 @@ def _failing_checks(checks):
 
 
 def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
-                source="manual", extra=None, family=None):
+                source="manual", extra=None, family=None, batch=None):
     """Build one ledger entry from a normalized alpha fact.
 
     ``alpha`` is expected to carry ``alpha_id``, ``expression``, ``decay``,
@@ -272,6 +272,9 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
         "status": alpha.get("status"),
         "error": alpha.get("error"),
         "source": source,
+        # Which batch produced this row. Without it "where did this number come from"
+        # is answered from memory, and memory is exactly what a ledger exists to replace.
+        "batch": batch,
         "recorded_at": _now(),
     }
     if extra:
@@ -459,7 +462,9 @@ def _inherit_judgement(entry, previous, pinned_verdict=False):
     ``mechanism`` and dropped ``parent``/``op``, so the ledger's lineage view lost
     the record while the newest-row-wins rule kept the blank one.
     """
-    for field in ("family", "mechanism", "idea", "note", "parent", "op", "legs"):
+    # `batch` belongs here too: a re-record without a batch name is a refresh of an
+    # existing row, not evidence that the row came from nowhere.
+    for field in ("family", "mechanism", "idea", "note", "parent", "op", "legs", "batch"):
         if not entry.get(field) and previous.get(field) is not None:
             entry[field] = previous[field]
     # An automatic verdict may not overwrite a verdict a human set; ``relabel``
@@ -474,7 +479,8 @@ def _inherit_judgement(entry, previous, pinned_verdict=False):
 
 
 def record_simulation(records, settings, idea=None, mechanism=None, family=None,
-                       note=None, verdict=None, registry_path=None, source="simulate"):
+                       note=None, verdict=None, registry_path=None, source="simulate",
+                       batch=None):
     """Append one ledger entry per finished simulation record; return a summary.
 
     ``record["mechanism"]`` and ``record["family"]`` win over the run-wide default,
@@ -489,6 +495,7 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
     """
     path = registry_path or default_registry_path()
     stored = {entry.get("key"): entry for entry in load_entries(path)}
+    producer_batch = batch
     entries = []
     written = 0
     for record in records:
@@ -524,6 +531,7 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
             verdict=chosen_verdict,
             note=note,
             source=source,
+            batch=producer_batch or record.get("batch"),
         )
         if previous:
             entry = _inherit_judgement(entry, previous, pinned_verdict=verdict is not None)
