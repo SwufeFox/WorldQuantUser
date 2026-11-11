@@ -18,6 +18,7 @@ import research_paths
 from tools import guarded_sim
 
 from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, with_session
+from . import stats
 from .validation import _preflight_lint, cached_field_types as _cached_field_types
 
 
@@ -49,12 +50,7 @@ def half_split_sharpes(pnl, test_start=None):
     middle = len(days) // 2
 
     def sharpe(subset):
-        values = [pnl[day] for day in subset]
-        mean = sum(values) / len(values)
-        variance = sum((value - mean) ** 2 for value in values) / len(values)
-        if variance <= 0:
-            return None
-        return mean / (variance ** 0.5) * (252 ** 0.5)
+        return stats.sharpe([pnl[day] for day in subset], min_points=2)
 
     return sharpe(days[:middle]), sharpe(days[middle:])
 

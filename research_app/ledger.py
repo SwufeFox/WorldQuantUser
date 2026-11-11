@@ -7,6 +7,8 @@ import math
 from pathlib import Path
 
 import alpha_registry
+
+from . import stats
 import correlation
 import machine_lib as ml
 import research_paths
@@ -412,9 +414,7 @@ def _book_marginals(entries, window_end="2023-01-01"):
             return None
 
     def sharpe(values):
-        mean = sum(values) / len(values)
-        var = sum((v - mean) ** 2 for v in values) / len(values)
-        return None if var <= 0 else mean / (var ** 0.5) * (252 ** 0.5)
+        return stats.sharpe(values, min_points=2)
 
     series, book_ids = {}, []
     for entry in entries:

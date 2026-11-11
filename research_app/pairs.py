@@ -25,7 +25,7 @@ import numpy as np
 import alpha_registry
 import research_paths
 
-from . import legs
+from . import legs, stats
 
 
 def _ledger(registry_path=None):
@@ -47,11 +47,12 @@ def _load(directory, alpha_ids):
 
 
 def _sharpe(matrix):
-    """Sharpe per row of a (n, days) array."""
-    mean = matrix.mean(axis=1)
-    std = matrix.std(axis=1, ddof=1)
-    std[std == 0] = np.nan
-    return mean / std * math.sqrt(252)
+    """Sharpe per row of a (n, days) array, using the campaign-wide convention."""
+    values = []
+    for row in matrix:
+        measured = stats.sharpe(list(row), min_points=2)
+        values.append(float("nan") if measured is None else measured)
+    return np.array(values)
 
 
 def cmd_pairs(args, _sink):
@@ -197,6 +198,8 @@ def cmd_pairs(args, _sink):
                      "min_support_ratio": args.min_support_ratio,
                      "rank": args.rank},
         "book_sharpe": None if math.isnan(book_sharpe) else round(float(book_sharpe), 3),
+        "gate_basis": ("worst single member (--max-book-rho); marginal_vs_book is the "
+                       "number that says whether the pair helps the book"),
         "note": ("Sharpe and correlations come from cached daily PnL; fitness is estimated "
                  "from the legs' ledger returns and turnover, so treat it as a hint."),
         "pairs": rows[: args.limit],

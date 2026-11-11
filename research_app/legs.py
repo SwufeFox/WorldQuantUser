@@ -24,6 +24,8 @@ import os
 import alpha_registry
 import research_paths
 
+from . import stats
+
 
 def load_pnl(alpha_id, pnl_dir=None):
     """``{date: pnl}`` for one alpha, or ``{}`` when it was never cached."""
@@ -40,27 +42,12 @@ def load_pnl(alpha_id, pnl_dir=None):
 
 
 def sharpe_of(series):
-    """Annualised Sharpe of a daily PnL series."""
-    values = [v for v in series if v is not None]
-    if len(values) < 30:
-        return None
-    mean = sum(values) / len(values)
-    variance = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
-    if variance <= 0:
-        return None
-    return mean / math.sqrt(variance) * math.sqrt(252)
+    """Annualised Sharpe of a daily PnL series (see ``stats.sharpe`` for the convention)."""
+    return stats.sharpe(series)
 
 
 def correlation(a, b):
-    if len(a) < 30 or len(b) != len(a):
-        return None
-    mean_a, mean_b = sum(a) / len(a), sum(b) / len(b)
-    cov = sum((x - mean_a) * (y - mean_b) for x, y in zip(a, b))
-    var_a = sum((x - mean_a) ** 2 for x in a)
-    var_b = sum((y - mean_b) ** 2 for y in b)
-    if var_a <= 0 or var_b <= 0:
-        return None
-    return cov / math.sqrt(var_a * var_b)
+    return stats.correlation(a, b)
 
 
 def combine(legs, pnl_dir=None):
@@ -110,9 +97,15 @@ def cmd_legs(args, _sink):
         raise ValueError("no cached PnL overlaps; simulate the legs first")
 
     per_leg = {}
+    insufficient = []
     for alpha_id, series in aligned.items():
-        per_leg[alpha_id] = {"weight": legs[alpha_id],
-                             "sharpe": sharpe_of(series)}
+        measured = sharpe_of(series)
+        per_leg[alpha_id] = {"weight": legs[alpha_id], "sharpe": measured,
+                             "points": len(series)}
+        if measured is None:
+            # A null in the table is not "no signal", it is "not measurable". Say which.
+            insufficient.append({"alpha_id": alpha_id, "points": len(series),
+                                 "needed": stats.MIN_POINTS})
     pairs = []
     ids = list(aligned)
     for i, first in enumerate(ids):
@@ -130,8 +123,12 @@ def cmd_legs(args, _sink):
     payload = {
         "window": {"start": dates[0], "end": dates[-1], "days": len(dates)},
         "legs": per_leg,
+        "insufficient": insufficient,
         "pairs": pairs,
         "predicted_sharpe": predicted,
+        "note": None if not insufficient else (
+            "some legs have fewer than %d shared days; their Sharpe is null because it "
+            "was not measurable, not because it was zero" % stats.MIN_POINTS),
     }
 
     composite = getattr(args, "composite", None)

@@ -202,10 +202,22 @@ def cmd_health(args, _sink):
         marginal = None
         if sharpe is not None and rho is not None and book_sharpe is not None:
             marginal = sharpe - rho * book_sharpe
+        # Two different numbers, deliberately side by side. `slope` is the first-order
+        # term S_i - rho*S_book; `delta` is what the book's own Sharpe does when this
+        # member is removed. They differ by roughly the member's weight - on a 60-alpha
+        # book the slope can read +1.4 while the book moves 0.03 - and calling both
+        # "marginal" is how the slope gets quoted as an outcome.
+        delta = None
+        if len(ids) > 1 and rest and book_sharpe is not None:
+            rest_sharpe = _annual_sharpe(rest)
+            if rest_sharpe is not None:
+                delta = book_sharpe - rest_sharpe
         rows.append({"alpha_id": alpha_id,
                      "family": (book.get(alpha_id) or {}).get("family"),
                      "sharpe": None if sharpe is None else round(sharpe, 2),
                      "rho_rest": None if rho is None else round(rho, 3),
+                     "slope": None if marginal is None else round(marginal, 2),
+                     "delta": None if delta is None else round(delta, 4),
                      "marginal": None if marginal is None else round(marginal, 2)})
     # Optional second pass: score the *pool* (alphas the ledger knows, PnL cached, not in
     # the book) against this same book. Ranking a finished candidate by its Fitness hid
