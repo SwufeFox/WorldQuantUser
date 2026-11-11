@@ -109,16 +109,23 @@ def _checks_summary(checks):
     SELF_CORRELATION is usually PENDING until `/alphas/{id}/check` runs. Folding it into
     "failed" made every fresh candidate look unsubmittable.
     """
-    passed, failed, pending = [], [], []
+    passed, failed, pending, warned = [], [], [], []
     for name, body in (checks or {}).items():
         result = (body or {}).get("result") if isinstance(body, dict) else body
         if result == "PASS":
             passed.append(name)
         elif result in (None, "PENDING"):
             pending.append(name)
+        elif result == "WARNING":
+            # WARNING is not a failure on the platform: the alpha still submits, and
+            # UNITS in particular is a unit-inference note, not a rejection. Folding it
+            # into "failed" blocked a passing candidate from the shelf.
+            warned.append(name)
+            passed.append(name)
         else:
             failed.append(name)
-    return {"passed": sorted(passed), "failed": sorted(failed), "pending": sorted(pending)}
+    return {"passed": sorted(passed), "failed": sorted(failed),
+            "pending": sorted(pending), "warned": sorted(warned)}
 
 
 def cmd_buffer_add(args, _sink):
