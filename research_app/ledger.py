@@ -527,6 +527,92 @@ def cmd_ledger_cards(args, _sink):
             "cards": summary[: args.limit]}
 
 
+#: Expressions that read a *change* rather than a level. This is a textual test on
+#: purpose: the point is which arms the campaign actually wrote, not a semantic parse.
+_CHANGE_MARKERS = ("ts_delta(", "ts_av_diff(", "ts_step(")
+
+
+def _form_stats(values):
+    """Count, median and directional reliability of a set of Sharpes."""
+    import statistics
+
+    if not values:
+        return {"n": 0, "median": None, "net_positive": None}
+    positive = sum(1 for value in values if value > 0.5) / len(values)
+    negative = sum(1 for value in values if value < -0.5) / len(values)
+    return {"n": len(values), "median": round(statistics.median(values), 2),
+            "net_positive": round(positive - negative, 2)}
+
+
+def cmd_ledger_form(args, _sink):
+    """Which construction reads better, a level or a change - measured per block.
+
+    The campaign has argued about this in single cases three times (dispersion: change
+    wins; labour: level steadier; deferred revenue: level only). Aggregating the whole
+    ledger answers it once: for each information block, compare the arms written as a
+    change against the arms written as a level, on median Sharpe *and* on directional
+    reliability (share above +0.5 minus share below -0.5), because a block full of
+    strongly negative arms is not a block with signal.
+
+    Book members are excluded by default: they are survivors of a selection that this
+    comparison is trying to characterise, so including them would count the winners twice.
+    """
+    from . import mechanisms
+
+    latest = {}
+    for entry in alpha_registry.load_entries(getattr(args, "registry", None)):
+        key = entry.get("alpha_id") or entry.get("key")
+        if key:
+            latest[key] = entry
+
+    excluded = set()
+    if not getattr(args, "include_book", False):
+        excluded = {key for key, entry in latest.items()
+                    if str(entry.get("status") or "").upper() in ("ACTIVE", "SUBMITTED")}
+
+    buckets = {}
+    for key, entry in latest.items():
+        if key in excluded:
+            continue
+        expression = entry.get("expression") or ""
+        sharpe = (entry.get("metrics") or {}).get("sharpe")
+        if not expression or sharpe is None:
+            continue
+        block = mechanisms.block_of(expression)
+        form = "change" if any(marker in expression for marker in _CHANGE_MARKERS) else "level"
+        bucket = buckets.setdefault(block, {"level": [], "change": []})
+        bucket[form].append(float(sharpe))
+
+    rows = []
+    for block, bucket in buckets.items():
+        if len(bucket["level"]) + len(bucket["change"]) < args.min_arms:
+            continue
+        level, change = _form_stats(bucket["level"]), _form_stats(bucket["change"])
+        verdict = "insufficient"
+        if level["n"] >= args.min_per_form and change["n"] >= args.min_per_form:
+            edge = change["net_positive"] - level["net_positive"]
+            if abs(edge) >= 0.1:
+                verdict = "change" if edge > 0 else "level"
+            else:
+                # Reliability is close, so the magnitude decides - but only by a margin
+                # big enough to be worth naming; otherwise the honest answer is a tie.
+                median_edge = (change["median"] or 0) - (level["median"] or 0)
+                verdict = ("change" if median_edge >= 0.3
+                           else "level" if median_edge <= -0.3 else "tie")
+        rows.append({"block": block, "level": level, "change": change,
+                     "verdict": verdict})
+    rows.sort(key=lambda row: -(row["level"]["n"] + row["change"]["n"]))
+    return {
+        "min_arms": args.min_arms,
+        "min_per_form": args.min_per_form,
+        "book_excluded": not getattr(args, "include_book", False),
+        "blocks": rows,
+        "note": ("net_positive = share(S>0.5) - share(S<-0.5); the verdict compares that "
+                 "reliability, not the median, because a block of strongly negative arms "
+                 "is not a block with signal."),
+    }
+
+
 def cmd_ledger_mechanisms(args, _sink):
     """How many independent mechanisms the book (or the ledger) actually holds.
 

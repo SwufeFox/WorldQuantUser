@@ -1030,6 +1030,14 @@ def build_parser():
     l_fmt.add_argument("--dry-run", action="store_true", dest="dry_run")
     l_fmt.set_defaults(func=ledger.cmd_ledger_format)
 
+    l_form = ledger_sub.add_parser(
+        "form", help="Level vs change construction, measured per information block.")
+    l_form.add_argument("--min-arms", type=int, default=20, dest="min_arms")
+    l_form.add_argument("--min-per-form", type=int, default=10, dest="min_per_form")
+    l_form.add_argument("--include-book", action="store_true", dest="include_book")
+    l_form.add_argument("--registry", default=None)
+    l_form.set_defaults(func=ledger.cmd_ledger_form)
+
     l_cards = ledger_sub.add_parser(
         "cards", help="Mechanism cards: the queue of external knowledge (offline).",
         description="A card is the only shape external knowledge may enter in: source, "
