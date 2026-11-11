@@ -7,6 +7,8 @@ import machine_lib as ml
 import os
 import research_paths
 
+from .runtime import with_session
+
 
 
 def cmd_auth_check(args, _sink):
@@ -53,6 +55,62 @@ def cmd_auth_logout(args, _sink):
         "note": ("Removed only the local cookie cache; the BRAIN session itself "
                  "stays valid until it expires server-side."),
     }
+
+
+#: Endpoints worth knowing the status of, and why. Probing them turns "the platform
+#: probably does not expose X" into a measured fact - the difference between a
+#: remembered constraint and an invented one.
+PROBE_PATHS = (
+    ("/users/self/alphas", "own alpha list"),
+    ("/alphas/{alpha}", "one alpha record (metrics, checks, grade)"),
+    ("/alphas", "global alpha enumeration (expected 405)"),
+    ("/leaderboards", "leaderboard (expected 404)"),
+    ("/users/self/competitions", "own competitions, where your rank lives"),
+    ("/alphas/{alpha}/correlations/prod", "production correlation detail (level-gated)"),
+    ("/alphas/{alpha}/recordsets/daily-pnl", "daily PnL recordset"),
+    ("/users/self/consultant", "consultant surface (level-gated)"),
+)
+
+
+def cmd_api_probe(args, _sink):
+    """Probe a fixed list of BRAIN endpoints and report their HTTP status.
+
+    The point is not to discover features but to retire assumptions: a 403 and a 404
+    mean different things (level-gated versus absent), and both get mistaken for
+    "the platform cannot do this" in a write-up.
+    """
+    import requests
+
+    alpha_id = getattr(args, "alpha", None)
+
+    def work(session):
+        rows = []
+        for path, purpose in PROBE_PATHS:
+            target = path.replace("{alpha}", alpha_id) if "{alpha}" in path else path
+            if "{alpha}" in path and not alpha_id:
+                rows.append({"path": path, "purpose": purpose, "status": None,
+                             "note": "no --alpha given"})
+                continue
+            try:
+                response = session.request(
+                    "GET", ml.BRAIN_API_URL + target, timeout=30)
+                status = response.status_code
+            except requests.RequestException as exc:
+                rows.append({"path": target, "purpose": purpose, "status": None,
+                             "note": str(exc)[:80]})
+                continue
+            note = {
+                200: "available",
+                403: "level-gated (exists, your account may not read it)",
+                404: "absent",
+                405: "exists but rejects GET",
+            }.get(status, "")
+            rows.append({"path": target, "purpose": purpose, "status": status, "note": note})
+        return {"probed": len(rows), "alpha": alpha_id, "endpoints": rows,
+                "note": ("403 and 404 are different findings: one is a level gate, the "
+                         "other is an endpoint that does not exist.")}
+
+    return with_session(args, work)
 
 
 def cmd_cache_info(args, _sink):

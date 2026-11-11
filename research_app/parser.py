@@ -295,6 +295,16 @@ def build_parser():
     prune_parser.add_argument("--registry", default=None)
     prune_parser.set_defaults(func=prune.cmd_prune)
 
+    api_parser = sub.add_parser(
+        "api", help="Probe which BRAIN endpoints this account can actually read.")
+    api_sub = api_parser.add_subparsers(dest="action", metavar="<action>",
+                                        parser_class=JsonArgumentParser)
+    api_probe = api_sub.add_parser(
+        "probe", help="GET a fixed list of endpoints and report status codes.")
+    api_probe.add_argument("--alpha", default=None,
+                           help="An alpha id for the per-alpha endpoints.")
+    api_probe.set_defaults(func=account.cmd_api_probe)
+
     cache = sub.add_parser(
         "cache", help="Inspect or clear local caches (session, catalog metadata).")
     cache_sub = cache.add_subparsers(dest="subcommand", metavar="<action>",
