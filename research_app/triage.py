@@ -44,6 +44,24 @@ def _failing(entry):
     return sorted(entry.get("failing_checks") or [])
 
 
+def _unresolved(entry):
+    """Checks the platform never resolved for this record.
+
+    A simulation response carries SELF_CORRELATION as PENDING: it is computed by the
+    check endpoint afterwards. Treating a PENDING as "not failing" made every unresolved
+    candidate look clean, which is how a 0.99 self-correlation sat on the shelf looking
+    like 0.44.
+    """
+    checks = entry.get("checks") or {}
+    names = []
+    for name in ("SELF_CORRELATION", "MATCHES_COMPETITION"):
+        body = checks.get(name)
+        result = (body or {}).get("result") if isinstance(body, dict) else body
+        if result in (None, "PENDING"):
+            names.append(name)
+    return names
+
+
 def _round(value, places=3):
     return None if value is None else round(value, places)
 
@@ -66,6 +84,7 @@ def _score(alpha_id, entry, series, dates, criteria):
         "test_sharpe": test,
         "retention": retention,
         "failing": _failing(entry),
+        "unresolved": _unresolved(entry),
         "rho_book": None,
         "slope": None,
         "delta": None,
@@ -127,6 +146,9 @@ def _verdict(row, criteria):
             "removing it %s the book by %.4f" % (direction, abs(row["delta"])))
     if row["failing"]:
         return "blocked", "fails %s" % ", ".join(row["failing"])
+    if row.get("unresolved"):
+        return "unverified", ("never resolved: %s - run `alpha check` before treating "
+                              "this as passing" % ", ".join(row["unresolved"]))
     if row["delta"] is None:
         return "unknown", "no cached PnL to measure the book against"
     if row["delta"] <= 0:

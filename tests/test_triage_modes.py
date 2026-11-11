@@ -56,3 +56,23 @@ class TriageModeTests(unittest.TestCase):
         self.assertIn("internal_fitness", row)
         self.assertLessEqual(row["internal_fitness"], row["fitness"])
         self.assertEqual(row["retention"], 0.82)
+
+
+class UnresolvedCheckTests(unittest.TestCase):
+    """A PENDING check is not a pass; it is an unverified record."""
+
+    def test_pending_self_correlation_is_reported_as_unverified(self):
+        tmp, directory, dates, rows = self._workspace()
+        rng = random.Random(31)
+        with open(os.path.join(directory, "P1.json"), "w") as handle:
+            json.dump({d: rng.gauss(2, 1) for d in dates}, handle)
+        rows.append({"alpha_id": "P1", "status": "COMPLETE",
+                     "metrics": {"sharpe": 2.0, "fitness": 2.0},
+                     "failing_checks": [],
+                     "checks": {"SELF_CORRELATION": {"result": "PENDING"}},
+                     "out_of_sample": {"train": {"sharpe": 2.0}, "test": {"sharpe": 1.0}}})
+        data = triage.triage(["P1"], registry_path=self._registry(tmp, rows),
+                             pnl_dir=directory)
+        row = data["rows"][0]
+        self.assertEqual(row["unresolved"], ["SELF_CORRELATION"])
+        self.assertEqual(row["verdict"], "unverified")
