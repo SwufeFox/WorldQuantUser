@@ -213,6 +213,11 @@ def cmd_buffer_list(args, _sink):
             # A shelf that stays quiet about that invites a mistake at submit time.
             "above_gate": (entry.get("self_correlation") is not None
                            and entry.get("self_correlation") > GATE),
+            # The recorded number was true when the alpha was shelved. Every submission
+            # since then moves it - sometimes from 0.44 to 0.99, as two IV variants did
+            # once a sibling was submitted. A shelf that prints the old number without
+            # saying so invites a decision on stale evidence.
+            "stale": bool((None if not shelved_book else current_book - shelved_book) or 0),
             "book_at_shelving": shelved_book,
             "book_now": current_book,
             # The gate is measured against a snapshot: every alpha added since shifts it.

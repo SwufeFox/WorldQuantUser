@@ -154,3 +154,30 @@ class SyncDriftTests(unittest.TestCase):
             data = cli_ledger.cmd_ledger_sync(args, mock.MagicMock())
         self.assertEqual(data["missing"], [])
         self.assertEqual(data["drifted"], ["DRIFT1"])
+
+
+class StaleShelfTests(unittest.TestCase):
+    """The recorded self-correlation is true only at shelving time."""
+
+    def test_an_entry_shelved_before_a_new_alpha_is_marked_stale(self):
+        import tempfile
+        from research_app import buffer_cmd
+
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "buffer.jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"event": "shelved", "alpha_id": "A1",
+                                     "train": {"fitness": 2.0, "sharpe": 2.0},
+                                     "turnover": 0.1, "self_correlation": 0.44,
+                                     "book_size": 55, "at": "2026-11-01T00:00:00"}) + "\n")
+
+        class Args:
+            buffer = path
+            registry = None
+            limit = 20
+
+        with mock.patch.object(buffer_cmd, "_book_size", return_value=61):
+            data = buffer_cmd.cmd_buffer_list(Args(), None)
+        row = data["rows"][0]
+        self.assertTrue(row["stale"])
+        self.assertEqual(row["new_alphas_since"], 6)
