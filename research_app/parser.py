@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, feed, independence, triage, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, benchmark, feed, independence, triage, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -294,6 +294,20 @@ def build_parser():
     prune_parser.add_argument("--limit", type=int, default=20)
     prune_parser.add_argument("--registry", default=None)
     prune_parser.set_defaults(func=prune.cmd_prune)
+
+    bench_parser = sub.add_parser(
+        "benchmark",
+        help="Internal fitness: platform Fitness discounted by what decays here.",
+        description="Platform Fitness is four-fifths training. This multiplies it by a "
+                    "train-Sharpe shrink (a hump measured on the ledger), the book delta, "
+                    "and the block's retention. Operator count is warned about, never "
+                    "scored: complexity does not predict decay in this data.")
+    bench_parser.add_argument("--batch", default=None, metavar="BATCH_JSON")
+    bench_parser.add_argument("--ids", nargs="+", default=None, metavar="ID")
+    bench_parser.add_argument("--criteria", default=None,
+                              help="Weights file (default: built-in priors).")
+    bench_parser.add_argument("--registry", default=None)
+    bench_parser.set_defaults(func=benchmark.cmd_benchmark)
 
     triage_parser = sub.add_parser(
         "triage",
