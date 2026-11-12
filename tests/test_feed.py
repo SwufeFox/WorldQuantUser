@@ -69,6 +69,27 @@ class FeedTests(unittest.TestCase):
         query = feed.query_from_question("H-070 supplier network pricing and information diffusion")
         self.assertEqual(query, "supplier network pricing information diffusion")
 
+    def test_a_bare_field_or_operator_name_is_not_a_query(self):
+        # 2026-11-12: these four went out as queries and the digest answered with a
+        # biofilm paper, a bone-biology paper, photoemission physics and bread staling.
+        for heading in ("销售离散度为什么远强于 EPS 分歧",
+                        "「必须组内 rank」是不是构造定律",
+                        "delay 0 只差 0.23",
+                        "缓冲里六条 stale 的取舍"):
+            self.assertEqual(feed.query_from_question(heading), "", heading)
+        self.assertEqual(feed.query_from_question("stale news and investor reaction"),
+                         "stale news investor reaction")
+
+    def test_a_derived_query_needs_two_content_words(self):
+        self.assertEqual(feed.query_from_question("accruals"), "")
+        self.assertEqual(feed.query_from_question("accruals quality"), "accruals quality")
+
+    def test_a_thread_can_carry_its_own_english_query(self):
+        self.assertEqual(feed.explicit_query(
+            "- [open] **销售分歧** — 证据；query: earnings forecast dispersion"), 
+            "earnings forecast dispersion")
+        self.assertIsNone(feed.explicit_query("- [open] **销售分歧** — 证据"))
+
     def test_unsearchable_questions_remain_visible_even_without_any_query(self):
         path = self.write_file("open-threads.md", "- [open] **递延收入四种读法** — evidence\n")
         with mock.patch("paper_search.search_papers") as search:

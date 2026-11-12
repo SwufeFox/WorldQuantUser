@@ -68,6 +68,22 @@ def paper_key(paper):
     return title or (paper.get("url") or "").strip().lower()
 
 
+#: An optional hand-written English query on a thread line:
+#: ``- [open] **问题** — 证据；下一步：…；query: earnings dispersion analyst coverage``
+#: The question text stays in whatever language it was written in; the query is the
+#: author's own translation, so nothing is invented on the reader's behalf.
+_EXPLICIT_QUERY = re.compile(r"(?:^|[;；]\s*)query\s*[:：]\s*(.+?)\s*$", re.IGNORECASE)
+
+
+def explicit_query(line):
+    """The hand-written ``query:`` on a thread line, or ``None``."""
+    match = _EXPLICIT_QUERY.search(line.strip())
+    if not match:
+        return None
+    text = " ".join(match.group(1).split())
+    return text or None
+
+
 def open_questions(path):
     """Read tagged bold/plain questions and legacy bullet headings."""
     questions = []
@@ -98,6 +114,21 @@ def open_questions(path):
 
 _CODE = re.compile(r"^h-?\d+[a-z]?$|^\d+$|^20\d\d$")
 
+#: Platform identifiers - operators and field-name fragments - that never appear in the
+#: finance prose a query is looking for. Ordinary words that happen to be field names
+#: (eps, news, turnover) stay searchable; they are ordinary English too.
+#: On 2026-11-12 the derived queries were ["eps", "rank", "delay", "stale"] and the
+#: digest answered with a biofilm paper, a bone-biology paper, photoemission physics and
+#: bread staling - which is why a derived query now needs two content words.
+TECHNICAL_TOKENS = frozenset("""
+backfill decay group_rank neutralization sharesout sortino subindustry
+truncation ts ts_backfill ts_delta ts_mean ts_std_dev vec_avg vec_sum winsorize
+""".split())
+
+#: A one-word query is a topic, not a question. ``inspiration/topics.md`` exists for
+#: those, written by hand and in English; a derived query has to earn two content words.
+MIN_QUERY_WORDS = 2
+
 
 def query_from_question(question, max_words=8):
     """A search string of the distinctive Latin words in a question.
@@ -106,7 +137,10 @@ def query_from_question(question, max_words=8):
     source question. The digest reports these questions for an explicit query.
     """
     words = [w for w in _TOKEN.findall(question.lower())
-             if w not in STOPWORDS and not _CODE.match(w)]
+             if w not in STOPWORDS and not _CODE.match(w)
+             and w not in TECHNICAL_TOKENS]
+    if len(words) < MIN_QUERY_WORDS:
+        return ""
     return " ".join(words[:max_words])
 
 
@@ -164,8 +198,21 @@ def cmd_feed(args, _sink):
     unresolved = []
     if args.from_threads:
         threads = research_paths.resolve("open-threads.md")
+        explicit = {}
+        if os.path.exists(threads):
+            with open(threads, encoding="utf-8") as handle:
+                for line in handle:
+                    match = re.match(r"^\s*-\s+(.*)$", line)
+                    if not match:
+                        continue
+                    heading = re.match(r"^\[(open|closed)\]\s*\*\*(.+?)\*\*", match.group(1),
+                                       re.IGNORECASE)
+                    if heading and heading.group(1).lower() == "open":
+                        stated = explicit_query(match.group(1))
+                        if stated:
+                            explicit[heading.group(2).strip()] = stated
         for question in open_questions(threads):
-            query = query_from_question(question)
+            query = explicit.get(question) or query_from_question(question)
             if query:
                 topics.append(query)
             else:
