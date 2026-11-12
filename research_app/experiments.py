@@ -689,6 +689,17 @@ def _probe_design(spec, settings):
 
 
 
+def _turnover_band(expression):
+    """``{low, high, verdict, caution}`` from the fields an expression reads."""
+    from . import mine
+
+    band = mine.expected_turnover(expression)
+    if band is None:
+        return None
+    return {**band, "verdict": mine.turnover_verdict(band),
+            "caution": mine.long_window_caution(expression)}
+
+
 def _settings_signature(settings):
     """The fields that decide what a simulation *is*, in a stable order.
 
@@ -995,6 +1006,10 @@ def cmd_probe(args, _sink):
             for record, label in zip(preview, labels):
                 record["label"] = label
                 record["settings"] = dict(group["settings"])
+                # Pre-flight cost estimate: the fields bound the turnover band, and a long
+                # window pulls it below the dataset median. An arm that cannot escape the
+                # fitness floor should be known before it spends a simulation.
+                record["turnover_band"] = _turnover_band(record.get("expression") or "")
             results.extend(preview)
             pairs.extend(group["pairs"])
         field_types = _cached_field_types()

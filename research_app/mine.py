@@ -257,3 +257,63 @@ def cmd_mine(args, _sink):
         payload["spec"] = {"path": path, "arms": len(arms)}
 
     return payload
+
+def expected_turnover(expression, catalog=None, stats=None):
+    """The turnover *band* an expression is likely to land in, from its fields.
+
+    A point estimate would be false precision. What the ledger does show is that a
+    dataset's cadence bounds what any construction on it can do: quarterly footnotes
+    (fundamental2) sit at 0.020 whatever the shape, price-volume at 0.126, options at
+    0.142, news at 0.358. The window then moves the arm *within* that band - a 252-day
+    difference of a quarterly field reorders once a year, a 5-day difference four times a
+    quarter - so the honest output is ``[min, max]`` over the datasets the arms reads,
+    plus which side of the floor it is likely to fall on.
+    """
+    catalog = catalog if catalog is not None else load_catalog()
+    stats = stats if stats is not None else dataset_turnover()
+    text = " ".join((expression or "").split())
+    datasets = set()
+    for match in _TOKEN.finditer(text):
+        if text[match.end():].lstrip().startswith("("):
+            continue
+        meta = catalog.get(match.group(0))
+        if meta:
+            datasets.add(meta["dataset"])
+    values = sorted(stats[dataset]["median"] for dataset in datasets
+                    if dataset in stats and stats[dataset].get("median") is not None)
+    if not values:
+        return None
+    return {"low": round(values[0], 3), "high": round(values[-1], 3),
+            "datasets": sorted(datasets)}
+
+
+_LONG_WINDOW = re.compile(r"ts_(?:delta|mean|std_dev|sum)\([^,]+,\s*(\d{2,})\s*\)")
+
+
+def long_window_caution(expression, threshold=126):
+    """A long window on a slow field reorders rarely, whatever the dataset median says.
+
+    The measured R&D case is the reason this exists: fundamental fields sit at a 0.118
+    median, but `ts_delta(rd_expense, 252)` came back at 0.047 because the annual
+    difference of a quarterly field only changes once a year. The median bounds the arm
+    from above; the window decides where inside the bound it lands.
+    """
+    windows = [int(value) for value in _LONG_WINDOW.findall(expression or "")]
+    if not windows or max(windows) < threshold:
+        return None
+    return ("long window (%d) on these fields: expect turnover below the dataset median"
+            % max(windows))
+
+
+def turnover_verdict(band, floor=0.125):
+    """What the band implies for Fitness, given the ``max(T, 0.125)`` floor."""
+    if band is None:
+        return None
+    if band["high"] < 0.05:
+        return "floor-taxed: every field updates rarely; F is capped near S*sqrt(ret/0.125)"
+    if band["low"] >= floor:
+        return None
+    if band["low"] < 0.05 <= band["high"]:
+        return ("mixed: the slow fields will be floor-taxed unless a fast field carries "
+                "the turnover")
+    return None

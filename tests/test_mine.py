@@ -107,3 +107,25 @@ class ShapeTests(unittest.TestCase):
     def test_an_unknown_shape_is_refused(self):
         with self.assertRaises(ValueError):
             mine.apply_shape("magic", "rank(close)")
+
+
+class TurnoverBandTests(unittest.TestCase):
+    """A field's cadence bounds the turnover any construction on it can reach."""
+
+    def test_a_single_dataset_gives_a_point_band(self):
+        import research_app.mine as mine_module
+        catalog = {"assets": {"dataset": "fundamental6", "type": "MATRIX",
+                              "coverage": 1.0, "description": ""}}
+        stats = {"fundamental6": {"n": 5, "median": 0.02}}
+        band = mine_module.expected_turnover("rank(assets)", catalog=catalog, stats=stats)
+        self.assertEqual(band["low"], 0.02)
+        self.assertEqual(band["high"], 0.02)
+
+    def test_a_long_window_on_slow_fields_is_flagged(self):
+        caution = mine.long_window_caution("rank(ts_delta(ts_backfill(x, 252), 252))")
+        self.assertIsNotNone(caution)
+        self.assertIsNone(mine.long_window_caution("rank(ts_delta(x, 5))"))
+
+    def test_a_band_that_straddles_the_floor_is_reported_as_mixed(self):
+        verdict = mine.turnover_verdict({"low": 0.02, "high": 0.12})
+        self.assertIn("mixed", verdict)
