@@ -44,6 +44,23 @@ def _failing(entry):
     return sorted(entry.get("failing_checks") or [])
 
 
+def _sub_universe(entry):
+    """How much room the sub-universe check has: value / limit.
+
+    The check compares Sharpe in the smaller half of the universe against a floor. An
+    alpha that clears it by two percent is not the same as one that clears it by fifty:
+    the first may be earning its edge in names whose execution is worse, which is the one
+    thing a daily P&L cannot show. Reported as a margin so the reader can judge.
+    """
+    body = (entry.get("checks") or {}).get("LOW_SUB_UNIVERSE_SHARPE")
+    if not isinstance(body, dict):
+        return None
+    value, limit = body.get("value"), body.get("limit")
+    if value is None or not limit:
+        return None
+    return {"value": value, "limit": limit, "margin": round(value / limit, 3)}
+
+
 def _unresolved(entry):
     """Checks the platform never resolved for this record.
 
@@ -85,6 +102,7 @@ def _score(alpha_id, entry, series, dates, criteria):
         "retention": retention,
         "failing": _failing(entry),
         "unresolved": _unresolved(entry),
+        "sub_universe": _sub_universe(entry),
         "rho_book": None,
         "slope": None,
         "delta": None,

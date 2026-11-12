@@ -76,3 +76,22 @@ class UnresolvedCheckTests(TriageModeTests):
         row = data["rows"][0]
         self.assertIn("SELF_CORRELATION", row["unresolved"])
         self.assertEqual(row["verdict"], "unverified")
+
+
+class SubUniverseMarginTests(TriageModeTests):
+    """How much room the sub-universe check has is a friction hint, not a score."""
+
+    def test_the_margin_is_value_over_limit(self):
+        tmp, directory, dates, rows = self._workspace()
+        rng = random.Random(41)
+        with open(os.path.join(directory, "S1.json"), "w") as handle:
+            json.dump({d: rng.gauss(2, 1) for d in dates}, handle)
+        rows.append({"alpha_id": "S1", "status": "COMPLETE",
+                     "metrics": {"sharpe": 2.0, "fitness": 2.0}, "failing_checks": [],
+                     "checks": {"LOW_SUB_UNIVERSE_SHARPE": {"result": "PASS",
+                                                            "value": 1.14,
+                                                            "limit": 1.08}},
+                     "out_of_sample": {"train": {"sharpe": 2.0}, "test": {"sharpe": 1.5}}})
+        data = triage.triage(["S1"], registry_path=self._registry(tmp, rows),
+                             pnl_dir=directory)
+        self.assertAlmostEqual(data["rows"][0]["sub_universe"]["margin"], 1.056, places=3)
