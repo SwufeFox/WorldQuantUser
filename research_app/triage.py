@@ -150,8 +150,22 @@ def _score(alpha_id, entry, series, dates, criteria):
             book_slice = [sum(values[day] for values in series.values()) for day in common]
             values = [candidate[day] for day in common]
             rho = legs.correlation(values, book_slice)
+            # The platform's self-correlation gate compares against the *worst single
+            # member*, not against the book aggregate. An alpha can be nearly orthogonal
+            # to the sum of 61 members and still be a 0.99 duplicate of one of them -
+            # a delay-0 sibling of a submitted alpha did exactly that (rho_book 0.39,
+            # platform self-correlation 0.9911). Both numbers are needed.
+            member_rhos = []
+            for member, member_values in series.items():
+                other = legs.correlation(values, [member_values[day] for day in common])
+                if other is not None:
+                    member_rhos.append((other, member))
             own = legs.sharpe_of(values)
             now = legs.sharpe_of(book_slice)
+            if member_rhos:
+                worst = max(member_rhos, key=lambda item: abs(item[0]))
+                row["max_member_rho"] = round(worst[0], 3)
+                row["max_member"] = worst[1]
             if rho is not None:
                 row["rho_book"] = round(rho, 3)
                 if own is not None and now is not None:
@@ -197,6 +211,9 @@ def _verdict(row, criteria):
             "removing it %s the book by %.4f" % (direction, abs(row["delta"])))
     if row["failing"]:
         return "blocked", "fails %s" % ", ".join(row["failing"])
+    if (row.get("max_member_rho") or 0) > 0.9:
+        return ("duplicate", "%.2f correlated with %s - the platform gate is per member, "
+                "not per book" % (row["max_member_rho"], row.get("max_member")))
     if row["delta"] is None:
         return "unknown", "no cached PnL to measure the book against"
     # Disqualifying facts come before "not measured yet": an alpha that already lowers

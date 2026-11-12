@@ -107,3 +107,21 @@ class CohortPercentileTests(TriageModeTests):
         self.assertAlmostEqual(triage_module._percentile(values, 0.5), 60.0)
         self.assertAlmostEqual(triage_module._percentile(values, 0.95), 100.0)
         self.assertIsNone(triage_module._percentile([], 0.5))
+
+
+class PerMemberGateTests(TriageModeTests):
+    """The platform gates on the worst single member, not on the book aggregate."""
+
+    def test_an_alpha_that_copies_one_member_is_a_duplicate(self):
+        tmp, directory, dates, rows = self._workspace()
+        source = json.load(open(os.path.join(directory, "B0.json")))
+        with open(os.path.join(directory, "COPY.json"), "w") as handle:
+            json.dump(source, handle)
+        rows.append({"alpha_id": "COPY", "status": "COMPLETE",
+                     "metrics": {"sharpe": 2.0, "fitness": 2.0},
+                     "out_of_sample": {"train": {"sharpe": 2.0}, "test": {"sharpe": 1.5}}})
+        data = triage.triage(["COPY"], registry_path=self._registry(tmp, rows),
+                             pnl_dir=directory)
+        row = data["rows"][0]
+        self.assertGreater(row["max_member_rho"], 0.99)
+        self.assertEqual(row["verdict"], "duplicate")
