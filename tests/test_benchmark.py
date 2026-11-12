@@ -27,3 +27,18 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIsNone(benchmark.ops_warning(4, [8, 16, 32]))
         self.assertIsNotNone(benchmark.ops_warning(20, [8, 16, 32]))
         self.assertIn("unauditable", benchmark.ops_warning(50, [8, 16, 32]))
+
+    def test_the_block_factor_is_opt_in_and_defaults_to_neutral(self):
+        # Off by default, so every stored score keeps its old meaning.
+        self.assertEqual(benchmark.block_factor("value_quality", {}), 1.0)
+        self.assertEqual(benchmark.block_factor("value_quality", {"block_ratio": 0}), 1.0)
+
+    def test_the_block_factor_reads_the_measured_ratios(self):
+        on = {"block_ratio": 1}
+        # value_quality median test/train is 0.21 against a 0.75 baseline -> 0.28.
+        self.assertAlmostEqual(benchmark.block_factor("value_quality", on), 0.28, places=2)
+        # analyst_dispersion is 1.74 / 0.75 = 2.32, clipped to 2.0.
+        self.assertAlmostEqual(benchmark.block_factor("analyst_dispersion", on), 2.0)
+        # A block that is absent from the table is not evidence of decay.
+        self.assertEqual(benchmark.block_factor("invented_block", on), 1.0)
+        self.assertEqual(benchmark.block_factor(None, on), 1.0)

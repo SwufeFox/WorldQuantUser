@@ -23,7 +23,7 @@ import os
 import alpha_registry
 import research_paths
 
-from . import benchmark, legs
+from . import benchmark, legs, mechanisms
 
 
 def _book_series(latest, directory):
@@ -185,10 +185,16 @@ def _score(alpha_id, entry, series, dates, criteria):
                     row["delta"] = round(after - now, 4)
 
     if criteria.get("internal"):
+        # The row carries neither field: the block has to come off the ledger entry, or
+        # be derived from its expression. Reading the row silently gave "other" for
+        # everything, which is the one block with the worst measured ratio.
+        block = (row.get("block") or entry.get("block")
+                 or mechanisms.block_of(entry.get("expression") or ""))
         factors = {
             "shrink": benchmark.shrink_factor(train),
             "contribution": benchmark.contribution_factor(
                 row["delta"], criteria["delta_full_credit"]),
+            "block": benchmark.block_factor(block, criteria),
         }
         combined = 1.0
         for value in factors.values():
@@ -253,8 +259,13 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=0.02,
                 "retention_floor": retention_floor, "internal": internal,
                 "cohort": _cohort_retentions(latest)}
     settings.update(benchmark.DEFAULTS)
+    # The weights and the block table live in a file so the internal bar can be changed
+    # without a code edit; without this the file was silently ignored on this path.
+    default_criteria = os.path.join(research_paths.ensure_dir(), "benchmark-criteria.json")
+    settings.update(benchmark.refine_criteria(default_criteria))
     if criteria:
-        settings.update(criteria)
+        settings.update(benchmark.refine_criteria(criteria)
+                        if isinstance(criteria, str) else criteria)
 
     targets = sorted(series) if whole_book else list(ids or [])
     rows = []

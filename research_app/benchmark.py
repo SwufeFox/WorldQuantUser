@@ -37,7 +37,7 @@ import os
 
 import research_paths
 
-from . import legs
+from . import legs, mechanisms
 
 #: Train-Sharpe hump, read off the ledger (retention by bucket, 1427 arms with a split).
 #: Below 1.0 the arms are noise; above 2.5 they are the overfitted tail.
@@ -51,10 +51,36 @@ SHRINK_BANDS = (
     (99.0, 0.58),
 )
 
+#: Median test/train Sharpe ratio per economic block, measured on 2026-11-12 over every
+#: ledger arm that carries a train/test split and |train S| >= 0.3 (n in the comment).
+#: The spread is large and it is *not* inversion: the train-test correlation stays
+#: positive in every block (0.10 to 0.62), so these are shrinkage differences, not
+#: sign flips. A block at 0.21 needs roughly five times the train Sharpe that a block at
+#: 1.74 needs in order to deliver the same out-of-sample signal.
+BLOCK_RATIO = {
+    "price_path": (0.84, 318),
+    "analyst_yield": (0.91, 268),
+    "value_quality": (0.21, 187),
+    "turnover_structure": (0.69, 185),
+    "other": (0.10, 178),
+    "volatility_structure": (0.67, 133),
+    "derivative_pricing": (0.46, 117),
+    "analyst_dispersion": (1.74, 97),
+    "news_sentiment": (0.03, 32),
+    "debt_structure": (0.25, 26),
+}
+
+#: The ledger-wide median ratio these block numbers are normalised against.
+BLOCK_BASELINE = 0.75
+
 DEFAULTS = {
     "weight_shrink": 1.0,
     "weight_contribution": 1.0,
     "weight_retention": 1.0,
+    "weight_block": 1.0,
+    # Off by default: the factor only exists when a caller opts in, so the score keeps
+    # its old meaning unless the criteria file says otherwise.
+    "block_ratio": 0,
     "delta_full_credit": 0.05,
     "ops_warn": [8, 16, 32],
     "note": ("Weights default to 1.0 because there is no evidence to prefer another "
@@ -99,6 +125,20 @@ def retention_factor(block_retention, baseline=0.85):
     if block_retention is None:
         return 1.0
     return max(0.5, min(1.2, block_retention / baseline))
+
+
+def block_factor(block, criteria):
+    """How much a block's train Sharpe survives into the test period, versus the norm.
+
+    Measured, not assumed: see ``BLOCK_RATIO``. Unknown blocks get 1.0 rather than a
+    penalty, because "not in the table" is not evidence of decay.
+    """
+    if not criteria.get("block_ratio"):
+        return 1.0
+    entry = BLOCK_RATIO.get(block or "")
+    if entry is None:
+        return 1.0
+    return max(0.25, min(2.0, entry[0] / BLOCK_BASELINE))
 
 
 def ops_warning(ops, thresholds):
@@ -165,16 +205,19 @@ def benchmark_rows(ids, registry_path=None, pnl_dir=None, criteria=None,
                     delta = after - now
 
         fitness = metrics.get("fitness")
+        block = entry.get("block") or mechanisms.block_of(expression)
         factors = {
             "shrink": shrink_factor(train),
             "contribution": contribution_factor(delta, criteria["delta_full_credit"]),
             "retention": retention_factor(
-                (block_retention or {}).get(entry.get("block") or "", None)),
+                (block_retention or {}).get(block or "", None)),
+            "block": block_factor(block, criteria),
         }
         weights = {
             "shrink": criteria["weight_shrink"],
             "contribution": criteria["weight_contribution"],
             "retention": criteria["weight_retention"],
+            "block": criteria["weight_block"],
         }
         combined = 1.0
         for name, value in factors.items():
@@ -198,7 +241,8 @@ def benchmark_rows(ids, registry_path=None, pnl_dir=None, criteria=None,
         "criteria": criteria,
         "book_members": n,
         "rows": rows,
-        "note": ("internal_fitness = platform_fitness * shrink * contribution * retention. "
+        "note": ("internal_fitness = platform_fitness * shrink * contribution * retention"
+                 + (" * block" if criteria.get("block_ratio") else "") + ". "
                  "The shrink factor follows the train-Sharpe hump measured on this ledger; "
                  "operator count is warned about but never scored, because it does not "
                  "predict decay here."),
