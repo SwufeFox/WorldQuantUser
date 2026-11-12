@@ -83,6 +83,38 @@ def _round(value, places=3):
     return None if value is None else round(value, places)
 
 
+def _cohort_retentions(latest, days=45):
+    """Retention distribution of recently recorded arms, for a percentile.
+
+    A fixed floor hides the drift: October's arms had a median retention of 0.82,
+    November's 0.63. A candidate at -0.33 is not "just below the line", it is at the
+    bottom of its own cohort - and that is the comparison worth showing.
+    """
+    import datetime
+
+    cutoff = (datetime.datetime.now(datetime.timezone.utc)
+              - datetime.timedelta(days=days)).isoformat()[:10]
+    values = []
+    for entry in latest.values():
+        recorded = (entry.get("recorded_at") or "")[:10]
+        if not recorded or recorded < cutoff:
+            continue
+        split = entry.get("out_of_sample") or {}
+        train = (split.get("train") or {}).get("sharpe")
+        test = (split.get("test") or {}).get("sharpe")
+        if not train or test is None or train <= 1.0:
+            continue
+        values.append(test / train)
+    return sorted(values)
+
+
+def _percentile(values, value):
+    if not values or value is None:
+        return None
+    below = sum(1 for item in values if item < value)
+    return round(100.0 * below / len(values), 0)
+
+
 def _score(alpha_id, entry, series, dates, criteria):
     """The four questions plus the internal bar, for one alpha."""
     directory = criteria["pnl_dir"]
@@ -100,6 +132,7 @@ def _score(alpha_id, entry, series, dates, criteria):
         "train_sharpe": train,
         "test_sharpe": test,
         "retention": retention,
+        "retention_percentile": _percentile(criteria.get("cohort") or [], retention),
         "failing": _failing(entry),
         "unresolved": _unresolved(entry),
         "sub_universe": _sub_universe(entry),
@@ -200,7 +233,8 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=0.02,
         raise ValueError("the book's own Sharpe is not measurable on the cached days")
 
     settings = {"pnl_dir": directory, "min_delta": min_delta,
-                "retention_floor": retention_floor, "internal": internal}
+                "retention_floor": retention_floor, "internal": internal,
+                "cohort": _cohort_retentions(latest)}
     settings.update(benchmark.DEFAULTS)
     if criteria:
         settings.update(criteria)

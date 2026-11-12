@@ -95,3 +95,15 @@ class SubUniverseMarginTests(TriageModeTests):
         data = triage.triage(["S1"], registry_path=self._registry(tmp, rows),
                              pnl_dir=directory)
         self.assertAlmostEqual(data["rows"][0]["sub_universe"]["margin"], 1.056, places=3)
+
+
+class CohortPercentileTests(TriageModeTests):
+    """A retention number means little without its cohort."""
+
+    def test_the_percentile_places_a_candidate_inside_its_cohort(self):
+        from research_app import triage as triage_module
+        values = sorted([-0.3, 0.0, 0.2, 0.5, 0.9])
+        self.assertAlmostEqual(triage_module._percentile(values, -0.3), 0.0)
+        self.assertAlmostEqual(triage_module._percentile(values, 0.5), 60.0)
+        self.assertAlmostEqual(triage_module._percentile(values, 0.95), 100.0)
+        self.assertIsNone(triage_module._percentile([], 0.5))
