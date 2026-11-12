@@ -98,7 +98,11 @@ class CompareShapeTests(unittest.TestCase):
             paths.append(path)
         args = argparse.Namespace(files=paths, min_fitness=None, sort="sharpe",
                                   contributions=False, save=None, frozen=True)
-        return cli_experiments.cmd_compare(args, mock.MagicMock())
+        # `--frozen` writes an audit line; without this the test appends to the real
+        # research log, which is how 480 test entries ended up in views.jsonl.
+        log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
+        with mock.patch.object(research_paths, "views_log_path", lambda: log):
+            return cli_experiments.cmd_compare(args, mock.MagicMock())
 
     def test_a_bare_list_is_accepted(self):
         # Wrong behaviour this prevents: the research template writes a bare list of
@@ -150,7 +154,11 @@ class CompareSortAndContributionTests(unittest.TestCase):
                                   contributions=False, save=None, frozen=False)
         for key, value in overrides.items():
             setattr(args, key, value)
-        return cli_experiments.cmd_compare(args, mock.MagicMock())
+        # Same reason as CompareShapeTests._run: frozen writes an audit line, and the
+        # audit line belongs in a temp file during a test run.
+        log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
+        with mock.patch.object(research_paths, "views_log_path", lambda: log):
+            return cli_experiments.cmd_compare(args, mock.MagicMock())
 
     def test_every_allowed_sort_key_exists_in_the_train_view(self):
         # `--sort returns` raised KeyError: the row had train_sharpe/fitness/turnover
@@ -280,8 +288,34 @@ class CompareMinFitnessTests(unittest.TestCase):
                                   contributions=False, save=None, frozen=False)
         self.assertEqual(cli_experiments.cmd_compare(args, mock.MagicMock())["count"], 0)
         args.frozen = True
-        self.assertEqual(cli_experiments.cmd_compare(args, mock.MagicMock())["count"], 1)
+        log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
+        with mock.patch.object(research_paths, "views_log_path", lambda: log):
+            self.assertEqual(
+                cli_experiments.cmd_compare(args, mock.MagicMock())["count"], 1)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ViewLogIsolationTests(unittest.TestCase):
+    """Tests must not append to the research log.
+
+    Before this, two `compare` helpers ran with `frozen=True` and no patched path: every
+    full test run wrote audit lines into the real `views.jsonl`, which ended up holding
+    480 entries, all of them from tests and none from actual research.
+    """
+
+    def test_a_frozen_compare_writes_only_to_the_patched_path(self):
+        import tempfile
+        path = os.path.join(tempfile.mkdtemp(), "batch.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump([{"alpha_id": "Z1", "metrics": {"fitness": 1.5, "sharpe": 2.0}}], handle)
+        log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
+        args = argparse.Namespace(files=[path], min_fitness=None, sort="sharpe",
+                                  contributions=False, save=None, frozen=True)
+        with mock.patch.object(research_paths, "views_log_path", lambda: log):
+            cli_experiments.cmd_compare(args, mock.MagicMock())
+        self.assertTrue(os.path.exists(log))
+        self.assertEqual(json.loads(open(log, encoding="utf-8").read().strip())["tool"],
+                         "compare")
