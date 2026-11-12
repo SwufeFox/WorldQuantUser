@@ -34,8 +34,9 @@ TITLE_LIMIT = 62
 HEADER = """# MEMORY
 
 索引，不是正文。每条一行，正文在 `memory/<layer>/<slug>.md`。
-研究协议见 `/data/worldquant-research/protocol.md`：**训练不看 test**；**模拟不花钱**（省的是时间不是钱）。
-研究状态别从这份索引读：用 `research_cli.py brief`、`open-threads.md`、`research-index-20261104.md`。
+先用 `python research_cli.py brief` 读取研究状态和实际研究目录；空记录不代表从未探索。
+按当前问题打开相关条目，结论保留证据、适用范围和重新检验的条件。训练不看 test。
+命令用 `help COMMAND` / `schema COMMAND` 按需查询；账户限制以当前平台为准。
 """
 
 

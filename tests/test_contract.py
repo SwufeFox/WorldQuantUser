@@ -78,6 +78,34 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(parse(proc)["error"]["code"], "USAGE")
 
 
+class BriefContractTests(unittest.TestCase):
+    def test_nonpositive_limit_cannot_expand_the_startup_context(self):
+        for limit in ("0", "-1"):
+            with self.subTest(limit=limit):
+                proc = run_cli("brief", "--top", limit)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
+
+
+class TriageContractTests(unittest.TestCase):
+    def test_validation_only_options_cannot_silently_change_the_selection_view(self):
+        for extra in (["--internal"], ["--train-end", "not-a-date"],
+                      ["--show-test", "--train-end", "2020-01-01"]):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as directory:
+                proc = run_cli("triage", "--ids", "ANY", "--research-dir", directory, *extra)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
+
+
+class FeedContractTests(unittest.TestCase):
+    def test_missing_topics_is_a_local_input_error_without_creating_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = run_cli("feed", "--research-dir", directory)
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
+            self.assertFalse((Path(directory) / "inspiration").exists())
+
+
 class OptionalPandasTests(unittest.TestCase):
     fields = [
         {"id": "close", "type": "MATRIX"},

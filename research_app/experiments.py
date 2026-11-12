@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 import uuid
@@ -688,6 +689,56 @@ def _probe_design(spec, settings):
             "designs": {arm["label"]: arm["design"] for arm in arms}}
 
 
+def _finite_metric(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _has_finished_result(record):
+    status = str(record.get("status") or "").upper()
+    if status not in alpha_registry.FINISHED_STATUSES | {"ACTIVE", "SUBMITTED", "UNSUBMITTED"}:
+        return False
+    metrics = record.get("metrics") or _train_metrics(record)
+    return any(_finite_metric(metrics.get(key)) for key in ("sharpe", "fitness", "returns", "turnover"))
+
+
+def _probe_comparisons(rows, design):
+    """Describe intervention minus control using only explicit train evidence."""
+    result = {"scope": "train", "rows": []}
+    if not design or design.get("mode") != "controlled":
+        result["unavailable_reason"] = ("explore_no_attribution" if design and
+                                        design.get("mode") == "explore" else "design_unavailable")
+        return result
+    controls = [row for row in rows if row.get("label") == design.get("control")]
+    control = controls[0] if len(controls) == 1 else None
+    for row in rows:
+        if row is control:
+            continue
+        comparison = {"control": design.get("control"), "label": row.get("label"),
+                      "design": row.get("design"), "proxy_of": row.get("proxy_of"),
+                      "deltas": {}, "unavailable": {}}
+        for metric in ("sharpe", "fitness", "turnover", "returns"):
+            arm_value = row.get("train_" + metric)
+            control_value = control.get("train_" + metric) if control else None
+            reasons = []
+            if control is None:
+                reasons.append("control_unavailable")
+            elif not _finite_metric(control_value):
+                reasons.append("control_train_metric_unavailable")
+            if not _finite_metric(arm_value):
+                reasons.append("arm_train_metric_unavailable")
+            if reasons:
+                comparison["unavailable"][metric] = reasons
+            else:
+                comparison["deltas"][metric] = arm_value - control_value
+        result["rows"].append(comparison)
+    return result
+
+
+
+
+def _probe_visible_row(row, show_test):
+    validation = {"sharpe", "fitness", "turnover", "test_sharpe", "failed_checks"}
+    return {key: value for key, value in row.items() if show_test or key not in validation}
 
 def _turnover_band(expression):
     """``{low, high, verdict, caution}`` from the fields an expression reads."""
@@ -701,15 +752,8 @@ def _turnover_band(expression):
 
 
 def _settings_signature(settings):
-    """The fields that decide what a simulation *is*, in a stable order.
-
-    Two arms with the same expression under different neutralisation are different
-    experiments that happen to share a formula. Recovery has to compare on this, not on
-    the text alone.
-    """
-    keys = ("region", "universe", "delay", "neutralization", "decay", "truncation",
-            "instrumentType")
-    return "|".join("%s=%s" % (key, (settings or {}).get(key)) for key in keys)
+    """Stable identity of the complete settings, without inventing missing defaults."""
+    return json.dumps(settings or {}, sort_keys=True, separators=(",", ":"))
 
 
 def _normalized_expression(text):
@@ -756,7 +800,8 @@ def _recover_probe_rows(session, rows, limit=400, pages=3):
         if not candidates:
             still_missing.append(row["label"])
             continue
-        wanted = row.get("settings_signature") or _settings_signature(row.get("settings"))
+        wanted = (_settings_signature(row["settings"]) if "settings" in row
+                  else row.get("settings_signature") or _settings_signature(None))
         exact = [c for c in candidates if c["signature"] == wanted]
         if len(exact) > 1:
             # Same formula, same settings, several alpha ids: the platform cannot say
@@ -806,6 +851,8 @@ def _cmd_probe_recover(args):
     document["complete"] = not outcome["still_missing"]
     document["incomplete"] = outcome["still_missing"]
     document["recovered"] = outcome["matched"]
+    document["all_empty"] = len(outcome["still_missing"]) == len(rows)
+    document["comparisons"] = _probe_comparisons(rows, document.get("design"))
     path.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
     note("recovered %d arm(s) from the platform; still missing: %s"
          % (outcome["recovered"], ", ".join(outcome["still_missing"]) or "none"))
@@ -814,8 +861,14 @@ def _cmd_probe_recover(args):
              % (item["label"], ", ".join(item["candidates"])))
     note("wrote %s" % path)
     return {"name": document.get("name"), "path": str(path),
-            "recovered": outcome["recovered"],
-            "still_missing": outcome["still_missing"], "rows": rows}
+            "show_test": bool(getattr(args, "show_test", False)),
+            **{key: document[key] for key in ("idea", "mechanism", "note", "design")
+               if key in document},
+            "complete": document["complete"], "all_empty": document["all_empty"],
+            "comparisons": document["comparisons"],
+            "recovered": outcome["recovered"], "ambiguous": outcome["ambiguous"],
+            "still_missing": outcome["still_missing"],
+            "rows": [_probe_visible_row(row, getattr(args, "show_test", False)) for row in rows]}
 
 
 def _require_spec(args):
@@ -866,30 +919,21 @@ def cmd_fmt(args, _sink):
     return {"formatted": formatted}
 
 
-def _novelty_gate(expressions):
-    """Pre-simulation screen: is this arm structurally new, and is its block saturated?
+def _novelty_gate(arms, registry_path=None):
+    """Annotate resolved requests with exact-result and structural evidence.
 
-    Simulations are free in this account, so the scarce resource is attention and the
-    wall clock. The gate therefore never blocks by default - it annotates, because a
-    deliberate repeat can be the right call (a re-run after a settings change looks
-    identical by skeleton). What it refuses is the one case with no information content:
-    an expression whose canonical hash is already in the ledger.
-
-    Three signals, all offline:
-
-    * ``already_simulated`` - same canonical expression, so the result already exists;
-    * ``duplicate_skeleton_of`` - same construction as a book alpha, i.e. a new grid
-      point on an old bet;
-    * ``block`` / ``block_median_marginal`` - the economic block's median marginal
-      contribution inside the book, read from the convergence snapshot when present.
+    Missing historical settings never imply today's defaults. Structural similarity
+    is independent of an exact repeat and cannot block a simulation.
     """
     from . import mechanisms
 
-    registry = alpha_registry.default_registry_path()
+    registry = registry_path or alpha_registry.default_registry_path()
     try:
         entries = alpha_registry.load_entries(registry)
-    except Exception:  # noqa: BLE001 - the gate must not stop a run
-        return [{} for _ in expressions]
+    except OSError as exc:
+        return [{"available": False, "reason": str(exc), "already_simulated": False,
+                 "exact_repeat_keys": [], "structural_similarity_keys": []}
+                for _ in arms]
     latest = {}
     for entry in entries:
         key = entry.get("alpha_id") or entry.get("key")
@@ -902,7 +946,7 @@ def _novelty_gate(expressions):
     for entry in book:
         key = mechanisms.mechanism_key(entry.get("expression"))
         if key:
-            book_keys.setdefault(key, entry.get("alpha_id"))
+            book_keys.setdefault(key, []).append(entry.get("key") or entry.get("alpha_id"))
 
     block_marginals = {}
     snapshot = Path(research_paths.ensure_dir()) / "convergence.json"
@@ -913,18 +957,38 @@ def _novelty_gate(expressions):
         except (OSError, ValueError):
             block_marginals = {}
 
-    known_hashes = {alpha_registry.expression_hash(entry.get("expression") or "")
-                    for entry in latest.values() if entry.get("expression")}
+    exact_results = {}
+    for entry in latest.values():
+        prior_settings = entry.get("settings")
+        if not entry.get("expression") or not _has_finished_result(entry):
+            continue
+        if not isinstance(prior_settings, dict) or any(
+                prior_settings.get(key) is None for key in ml.DEFAULT_SETTINGS):
+            continue
+        try:
+            resolved = ml.resolve_settings(prior_settings)
+        except (ValueError, TypeError):
+            continue
+        identity = (alpha_registry.expression_hash(entry["expression"]),
+                    _settings_signature(resolved))
+        exact_results.setdefault(identity, []).append(entry.get("key") or entry.get("alpha_id"))
     verdicts = []
-    for text in expressions:
+    for arm in arms:
+        text = arm["expression"]
         key = mechanisms.mechanism_key(text)
         block = key[0] if key else None
         block_row = block_marginals.get(block) or {}
+        exact = exact_results.get((alpha_registry.expression_hash(text),
+                                   _settings_signature(arm["settings"])), [])
+        structural = book_keys.get(key, []) if key else []
         verdicts.append({
+            "available": True,
             "block": block,
             "block_median_marginal": block_row.get("median_marginal"),
-            "duplicate_skeleton_of": book_keys.get(key) if key else None,
-            "already_simulated": alpha_registry.expression_hash(text) in known_hashes,
+            "duplicate_skeleton_of": structural[0] if structural else None,
+            "structural_similarity_keys": structural,
+            "exact_repeat_keys": exact,
+            "already_simulated": bool(exact),
         })
     return verdicts
 
@@ -984,6 +1048,14 @@ def cmd_probe(args, _sink):
     design_arms = [{**arm, "settings": group["settings"]}
                    for group in groups.values() for arm in group["arms"]]
     design = _probe_design({**spec, "arms": design_arms}, {})
+    context = {key: spec[key] for key in ("idea", "mechanism", "note") if key in spec}
+    gate = _novelty_gate(design_arms, registry_path=getattr(args, "registry", None))
+    duplicates = [arm["label"] for arm, verdict in zip(design_arms, gate)
+                  if verdict.get("already_simulated")]
+    gate_blocking = ([{"code": "exact_repeat", "label": arm["label"],
+                       "evidence_keys": verdict["exact_repeat_keys"]}
+                      for arm, verdict in zip(design_arms, gate) if verdict.get("already_simulated")]
+                     if getattr(args, "strict_gate", False) else [])
     if design["mode"] == "explore":
         note("design: explore -- no control arm, so no arm is being attributed")
 
@@ -1003,14 +1075,17 @@ def cmd_probe(args, _sink):
             preview = ml.simulate_alphas(
                 None, group["pairs"], settings=group["settings"],
                 dry_run=True, labels=labels)
-            for record, label in zip(preview, labels):
-                record["label"] = label
+            for record, arm in zip(preview, group["arms"]):
+                record["label"] = arm["label"]
+                record["design"] = arm.get("design")
+                record["proxy_of"] = arm.get("proxy_of")
+                record["gate"] = gate[len(results)]
+                results.append(record)
                 record["settings"] = dict(group["settings"])
                 # Pre-flight cost estimate: the fields bound the turnover band, and a long
                 # window pulls it below the dataset median. An arm that cannot escape the
                 # fitness floor should be known before it spends a simulation.
                 record["turnover_band"] = _turnover_band(record.get("expression") or "")
-            results.extend(preview)
             pairs.extend(group["pairs"])
         field_types = _cached_field_types()
         report = expression_lint.lint_all(
@@ -1026,8 +1101,11 @@ def cmd_probe(args, _sink):
         if blocking:
             note("  these would stop a real run: %s"
                  % ", ".join(sorted({item.get("code") or "?" for item in blocking})))
-        return {"dry_run": True, "arms": len(arms), "groups": len(groups),
-                "blocking": blocking, "design": design,
+        return {"dry_run": True, "name": name, **context,
+                "arms": len(arms), "groups": len(groups),
+                "blocking": blocking, "gate_blocking": gate_blocking,
+                "would_block": bool(blocking or gate_blocking), "design": design,
+                "comparisons": _probe_comparisons(results, design),
                 "settings": [group["settings"] for group in groups.values()],
                 "results": results,
                 "lint": {"operator_catalog_checked": False,
@@ -1080,17 +1158,13 @@ def cmd_probe(args, _sink):
             record["half_sharpes"] = half_split_sharpes(pnl, test_start)
         return records
 
-    gate = _novelty_gate([arm["expression"] for group in groups.values() for arm in group["arms"]])
-    duplicates = [text for text, verdict in zip(
-        [arm["expression"] for group in groups.values() for arm in group["arms"]], gate)
-        if verdict.get("already_simulated")]
     if duplicates:
         note("")
-        note("novelty gate: %d arm(s) already simulated (same canonical expression): %s"
+        note("novelty gate: %d arm(s) repeat finished results under identical settings: %s"
              % (len(duplicates), ", ".join(duplicates))[:300])
         if getattr(args, "strict_gate", False):
             raise CliError("INVALID_INPUT",
-                           "%d arm(s) repeat an expression already in the ledger" % len(duplicates),
+                           "%d arm(s) repeat finished results under identical settings" % len(duplicates),
                            "drop them, or rerun without --strict-gate")
 
     # probe had no live preflight: the dry run linted offline and the real run went
@@ -1118,6 +1192,7 @@ def cmd_probe(args, _sink):
         # ranking on test - hiding one column would not have fixed that.
         row = {"label": arm["label"], "alpha_id": record.get("alpha_id"),
                "design": arm.get("design"),
+               "proxy_of": arm.get("proxy_of"),
                "expression": arm["expression"],
                "decay": record.get("decay"), "settings": dict(record["settings"]),
                "settings_signature": _settings_signature(record.get("settings")),
@@ -1132,22 +1207,21 @@ def cmd_probe(args, _sink):
                # operators has more room to fit, and the one operator-heavy candidate of
                # 2026-11-07 was also the one that failed its mechanism-transfer check.
                "ops": expression_lint.estimate_operator_count(arm["expression"]),
-               "gate": None,
-               "gate": gate[position] if position < len(gate) else None,
-               "failed_checks": failed}
+               "gate": gate[position] if position < len(gate) else None}
         line = "%-28s %7s %6s %7s %4s %7s %7s" % (
             arm["label"], row["train_sharpe"], row["train_fitness"],
             row["train_turnover"], row["ops"],
             None if row["train_sharpe_h1"] is None else round(row["train_sharpe_h1"], 2),
             None if row["train_sharpe_h2"] is None else round(row["train_sharpe_h2"], 2))
         if args.show_test:
+            row["failed_checks"] = failed
             row.update({"sharpe": metrics.get("sharpe"), "fitness": metrics.get("fitness"),
                         "turnover": metrics.get("turnover"),
                         "test_sharpe": (split.get("test") or {}).get("sharpe")})
             line += " %7s %6s %7s %7s" % (row["sharpe"], row["fitness"],
                                           row["turnover"], row["test_sharpe"])
         rows.append(row)
-        note(line + ("  fail=" + ",".join(failed) if failed else ""))
+        note(line + ("  fail=" + ",".join(failed) if args.show_test and failed else ""))
 
     dense = [row["label"] for row in rows if (row.get("ops") or 0) > SIMPLE_OPERATOR_LIMIT]
     if dense:
@@ -1166,12 +1240,13 @@ def cmd_probe(args, _sink):
         note("")
         note("INCOMPLETE: %d arm(s) produced no train metrics: %s"
              % (len(incomplete), ", ".join(incomplete)))
-        note("  the platform rate-limited or never finished them; rerun those arms "
-             "in a smaller batch (free) rather than reading this table as complete")
+        note("  inspect the submitted results with `probe --recover %s` before deciding "
+             "whether any arm needs another simulation" % target)
 
+    comparisons = _probe_comparisons(rows, design)
     Path(target).write_text(
-        json.dumps({"spec": str(args.spec), "name": name, "rows": rows,
-                    "design": design, "records": records,
+        json.dumps({"spec": str(args.spec), "name": name, **context, "rows": rows,
+                    "design": design, "comparisons": comparisons, "records": records,
                     "complete": not incomplete, "incomplete": incomplete},
                    ensure_ascii=False, indent=1), encoding="utf-8")
     if args.show_test:
@@ -1183,7 +1258,8 @@ def cmd_probe(args, _sink):
     # caller (and any script reading this JSON) should be able to tell the two apart
     # without parsing row-level metrics: an all-empty run raises, a partial one reports.
     all_empty = bool(rows) and len(incomplete) == len(rows)
-    summary = {"name": name, "path": str(target), "rows": rows,
+    summary = {"name": name, **context, "path": str(target), "rows": rows,
+               "comparisons": comparisons,
                "simulated": len(rows), "show_test": bool(args.show_test),
                "design": design, "complete": not incomplete,
                "all_empty": all_empty,

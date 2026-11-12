@@ -31,6 +31,7 @@ def entry(alpha_id, status, sharpe, source="manual", family="quality"):
         {"alpha_id": alpha_id, "expression": "rank(close)",
          "settings": {"region": "USA", "universe": "TOP3000"},
          "metrics": {"sharpe": sharpe, "fitness": sharpe / 2.0, "turnover": 0.15},
+         "out_of_sample": {"train": {"sharpe": sharpe, "fitness": sharpe / 2.0}},
          "status": status},
         idea="probe", mechanism="test", verdict="candidate", family=family,
         source=source)
@@ -83,8 +84,12 @@ class BriefTests(unittest.TestCase):
         self.assertEqual(data["documents"][0]["title"], "某次实验 · 2026-11-03")
 
     def test_the_window_is_respected(self):
+        alpha_registry.record_entry(
+            alpha_registry.relabel(entry("OLD", "COMPLETE", -0.5), verdict="rejected"),
+            self.registry)
         data = self._run(days=0)
         self.assertEqual(data["recent"]["runs"], 0)
+        self.assertEqual(data["recent"]["setbacks"], {"count": 0, "items": []})
         self.assertEqual(data["documents"], [])
 
     def test_ledger_health_counts_label_debt_and_recording_gaps(self):
@@ -105,12 +110,11 @@ class BriefTests(unittest.TestCase):
         self.assertGreaterEqual(data["ledger"]["rows_with_metrics_but_no_checks"], 1)
 
     def test_the_book_is_screened_for_same_bet_pairs(self):
-        # The platform compares a submission against a periodically refreshed snapshot,
-        # so two alphas 0.88 correlated can both be in the book. Nothing was scanning
-        # the book after the fact; `brief` now does it on monthly PnL.
+        # Highly correlated train PnL should be visible even with a stale platform snapshot.
         import math
-        days = ["2026-%02d-%02d" % (month, day) for month in range(1, 25)
-                for day in range(1, 28)]
+        from datetime import date, timedelta
+
+        days = [(date(2020, 1, 1) + timedelta(days=index)).isoformat() for index in range(648)]
         base = {day: math.sin(index * 0.4) for index, day in enumerate(days)}
         twin = {day: value * 2 + 0.001 for day, value in base.items()}
         for name, series in (("BOOK1", base), ("BOOK2", twin)):
@@ -126,6 +130,47 @@ class BriefTests(unittest.TestCase):
         pair = screen["pairs"][0]
         self.assertEqual({pair["a"], pair["b"]}, {"BOOK1", "BOOK2"})
 
+    def test_test_period_co_movement_does_not_change_startup_duplicates(self):
+        import math
+        from datetime import date, timedelta
+
+        folder = os.path.join(self.research, "pnl")
+        os.makedirs(folder, exist_ok=True)
+        train = [(date(2020, 1, 1) + timedelta(days=index)).isoformat() for index in range(300)]
+        holdout = [(date(2021, 1, 1) + timedelta(days=index)).isoformat() for index in range(300)]
+        for name, shift in (("BOOK1", 0.0), ("BOOK2", math.pi / 2)):
+            series = {day: math.sin(index * 0.4 + shift) for index, day in enumerate(train)}
+            series.update({day: 1000 * math.sin(index * 0.4) for index, day in enumerate(holdout)})
+            with open(os.path.join(folder, name + ".json"), "w", encoding="utf-8") as handle:
+                json.dump(series, handle)
+            payload = entry(name, "ACTIVE", 2.0)
+            payload["out_of_sample"]["test"] = {"startDate": "2021-01-01"}
+            alpha_registry.record_entry(payload, self.registry)
+        screen = self._run()["book"]["self_duplicates"]
+        self.assertEqual(screen["window"], "train")
+        self.assertEqual(screen["count"], 0)
+
+
+    def test_stability_ignores_the_test_year_without_a_recorded_boundary(self):
+        # An old ledger row may have PnL but no out-of-sample split. The default boundary
+        # still keeps the halves in train; otherwise a test-year tail becomes selection data.
+        import datetime
+
+        folder = os.path.join(self.research, "pnl")
+        os.makedirs(folder, exist_ok=True)
+        series = {}
+        start = datetime.date(2020, 1, 1)
+        for index in range(258):
+            day = (start + datetime.timedelta(days=index)).isoformat()
+            series[day] = 1.0 if index % 2 else 0.6
+        for index in range(59):
+            series[(datetime.date(2023, 1, 1) + datetime.timedelta(days=index)).isoformat()] = -40.0
+        with open(os.path.join(folder, "OLD1.json"), "w", encoding="utf-8") as handle:
+            json.dump(series, handle)
+        alpha_registry.record_entry(entry("OLD1", "ACTIVE", 2.0), self.registry)
+        stability = self._run()["book"]["stability"]
+        self.assertEqual(stability["measured"], 1)
+        self.assertEqual(stability["flips"], 0)
 
     def test_stability_ignores_the_test_year(self):
         # The halves must stay inside train: a violent test-year tail must not turn a
@@ -157,11 +202,100 @@ class BriefTests(unittest.TestCase):
         self.assertEqual(stability["flips"], 0)
         self.assertEqual(stability["measured"], 1)
 
-    def test_the_document_stays_small(self):
-        # The bound is the point: a digest is useful only while it is cheaper to read
-        # than the archive it replaces.
+    def test_score_leads_use_train_and_do_not_fill_gaps_from_full_window(self):
+        strong = entry("TRAIN", "COMPLETE", 0.1, source="simulate")
+        strong["out_of_sample"] = {"train": {"sharpe": 3.0, "fitness": 1.5},
+                                   "test": {"sharpe": -10.0}}
+        missing = entry("FULL_ONLY", "COMPLETE", 100.0, source="simulate")
+        missing.pop("out_of_sample")
+        for payload in (strong, missing):
+            alpha_registry.record_entry(payload, self.registry)
+        recent = self._run()["recent"]
+        self.assertEqual(recent["metrics_scope"], "train")
+        self.assertEqual([item["alpha_id"] for item in recent["best"]], ["TRAIN", "NEW1"])
+        self.assertEqual(recent["best"][0]["sharpe"], 3.0)
+        self.assertEqual(recent["missing_train_metrics"], 1)
+
+    def test_setbacks_include_relabels_and_preserve_scope_across_mechanisms(self):
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        cases = [("R1", "rejected", "revision", 1),
+                 ("R2", "rejected", "revision", 2),
+                 ("F1", "falsified", "revision", 3),
+                 ("N1", "no_go", "value", 4),
+                 ("W1", "watch", "value", 5)]
+        for alpha_id, verdict, mechanism, minutes in cases:
+            payload = alpha_registry.relabel(entry(alpha_id, "COMPLETE", -0.5),
+                                             verdict=verdict, mechanism=mechanism,
+                                             note="Control and scope for " + alpha_id)
+            payload["recorded_at"] = (now - timedelta(minutes=minutes)).isoformat()
+            alpha_registry.record_entry(payload, self.registry)
+
+        data = self._run(top=3)
+        self.assertEqual(data["recent"]["runs"], 1)
+        setbacks = data["recent"]["setbacks"]
+        self.assertEqual(setbacks["count"], 4)
+        self.assertEqual([(item["alpha_id"], item["verdict"]) for item in setbacks["items"]],
+                         [("R1", "rejected"), ("F1", "falsified"), ("N1", "no_go")])
+        self.assertEqual(setbacks["items"][1]["note"], "Control and scope for F1")
+        self.assertEqual(self._run(top=1)["recent"]["setbacks"]["items"],
+                         setbacks["items"][:1])
+
+    def test_thread_previews_are_bounded_and_full_evidence_remains_reachable(self):
+        path = os.path.join(self.research, "open-threads.md")
+        question = "一个需要保留适用条件的研究问题" * 100
+        with open(path, "w", encoding="utf-8") as handle:
+            for index in range(30):
+                handle.write("- [open] %s %s\n" % (index, question))
+            for index in range(10):
+                handle.write("- [closed] resolved %s\n" % index)
+        data = self._run(top=2)
+        threads = data["threads"]
+        self.assertEqual(threads["counts"], {"open": 30, "closed": 10})
+        self.assertEqual(threads["closed"], ["resolved 0", "resolved 1"])
+        self.assertEqual(len(threads["open"]), 2)
+        self.assertTrue(all(len(text) <= 240 and text.endswith("…")
+                            for text in threads["open"]))
+        with open(threads["path"], encoding="utf-8") as handle:
+            self.assertIn(question, handle.read())
+        self.assertTrue(threads["exists"])
+        self.assertEqual(data["research_dir"], self.research)
+
+    def test_missing_sources_are_distinct_from_present_but_empty_sources(self):
+        os.remove(self.registry)
+        path = os.path.join(self.research, "open-threads.md")
+        os.remove(path)
+        missing = self._run()
+        self.assertFalse(missing["ledger"]["exists"])
+        self.assertFalse(missing["threads"]["exists"])
+        for source in (self.registry, path):
+            with open(source, "w", encoding="utf-8"):
+                pass
+        empty = self._run()
+        self.assertTrue(empty["ledger"]["exists"])
+        self.assertTrue(empty["threads"]["exists"])
+        self.assertEqual(empty["ledger"]["rows"], 0)
+        self.assertEqual(empty["threads"]["counts"], {"open": 0, "closed": 0})
+
+    def test_setback_note_is_a_preview_with_a_recoverable_ledger_key(self):
+        note = "Control evidence with an important qualification. " * 100
+        payload = alpha_registry.relabel(entry("LONG", "COMPLETE", -0.5),
+                                         verdict="falsified", note=note)
+        alpha_registry.record_entry(payload, self.registry)
         data = self._run()
-        self.assertLess(len(json.dumps(data, ensure_ascii=False)), 2000)
+        preview = data["recent"]["setbacks"]["items"][0]
+        self.assertLessEqual(len(preview["note"]), 240)
+        self.assertTrue(preview["note"].endswith("…"))
+        rows = alpha_registry.load_entries(data["ledger"]["path"])
+        self.assertEqual(alpha_registry.resolve(rows, preview["key"])["note"], note)
+
+    def test_write_up_list_respects_the_same_requested_limit(self):
+        for index in range(6):
+            with open(os.path.join(self.research, "%s-results.md" % index), "w",
+                      encoding="utf-8") as handle:
+                handle.write("# Result %s\n" % index)
+        self.assertEqual(len(self._run(top=2)["documents"]), 2)
 
 
 if __name__ == "__main__":

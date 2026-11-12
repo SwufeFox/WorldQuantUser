@@ -107,24 +107,70 @@ class SnapshotTests(unittest.TestCase):
 
 
 class NoveltyGateTests(unittest.TestCase):
-    def test_an_expression_already_in_the_ledger_is_flagged(self):
+    def _gate(self, entries, settings=None, expression="rank( close )"):
         import tempfile
         from unittest import mock
-        import research_paths
-        from research_app import experiments as cli_experiments
-
-        tmp = tempfile.mkdtemp()
-        registry = os.path.join(tmp, "r.jsonl")
         import alpha_registry
-        alpha_registry.record_entry(
-            alpha_registry.build_entry({"alpha_id": "A1", "expression": "rank(close)",
-                                        "metrics": {}, "status": "ACTIVE"}), registry)
-        with mock.patch.object(alpha_registry, "default_registry_path",
-                               return_value=registry), \
+        import machine_lib as ml
+        import research_paths
+        from research_app import experiments
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(alpha_registry, "load_entries", return_value=entries) as load, \
                 mock.patch.object(research_paths, "ensure_dir", return_value=tmp):
-            verdicts = cli_experiments._novelty_gate(["rank( close )", "rank(volume)"])
-        self.assertTrue(verdicts[0]["already_simulated"])
-        self.assertFalse(verdicts[1]["already_simulated"])
+            result = experiments._novelty_gate(
+                [{"expression": expression, "settings": settings or dict(ml.DEFAULT_SETTINGS)}],
+                registry_path="chosen-registry.jsonl")[0]
+        load.assert_called_once_with("chosen-registry.jsonl")
+        return result
+
+    def _entry(self, **overrides):
+        import machine_lib as ml
+        return {"key": "evidence-1", "alpha_id": "A1", "expression": "rank(close)",
+                "status": "COMPLETE", "settings": dict(ml.DEFAULT_SETTINGS),
+                "metrics": {"fitness": 1.2}, **overrides}
+
+    def test_exact_repeat_exposes_finished_evidence_keys(self):
+        verdict = self._gate([self._entry()])
+        self.assertTrue(verdict["already_simulated"])
+        self.assertEqual(verdict["exact_repeat_keys"], ["evidence-1"])
+        self.assertEqual(verdict["structural_similarity_keys"], [])
+
+    def test_every_resolved_setting_is_part_of_identity(self):
+        import machine_lib as ml
+        changes = {"region": "EUR", "universe": "TOP500", "delay": 0, "decay": 3,
+                   "neutralization": "INDUSTRY", "truncation": 0.05,
+                   "pasteurization": "OFF", "nanHandling": "VERIFY", "testPeriod": "P2Y",
+                   "unitHandling": "OFF", "language": "OTHER", "visualization": True,
+                   "instrumentType": "OTHER"}
+        self.assertEqual(set(changes), set(ml.DEFAULT_SETTINGS))
+        for key, value in changes.items():
+            with self.subTest(setting=key):
+                requested = dict(ml.DEFAULT_SETTINGS, **{key: value})
+                self.assertFalse(self._gate([self._entry()], requested)["already_simulated"])
+
+    def test_partial_historical_settings_never_inherit_defaults(self):
+        import machine_lib as ml
+        for missing in ml.DEFAULT_SETTINGS:
+            with self.subTest(missing=missing):
+                partial = {key: value for key, value in ml.DEFAULT_SETTINGS.items() if key != missing}
+                self.assertFalse(self._gate([self._entry(settings=partial)])["already_simulated"])
+
+    def test_unfinished_or_empty_results_are_not_repeats(self):
+        for status in ("FAILED", "QUEUED", "PENDING", "DRY_RUN"):
+            with self.subTest(status=status):
+                self.assertFalse(self._gate([self._entry(status=status)])["already_simulated"])
+        for metrics in ({}, {"fitness": None}, {"fitness": float("nan")}, {"fitness": True}):
+            with self.subTest(metrics=metrics):
+                self.assertFalse(self._gate([self._entry(metrics=metrics)])["already_simulated"])
+        self.assertTrue(self._gate([self._entry(status="WARNING")])["already_simulated"])
+
+    def test_structural_similarity_does_not_claim_an_exact_repeat(self):
+        verdict = self._gate([self._entry(status="ACTIVE", expression="ts_rank(close, 20)")],
+                             expression="ts_rank(close, 60)")
+        self.assertFalse(verdict["already_simulated"])
+        self.assertEqual(verdict["exact_repeat_keys"], [])
+        self.assertEqual(verdict["structural_similarity_keys"], ["evidence-1"])
 
 
 class CardTests(unittest.TestCase):

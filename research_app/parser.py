@@ -312,10 +312,10 @@ def build_parser():
 
     triage_parser = sub.add_parser(
         "triage",
-        help="One table per batch: out-of-sample, correlation, book delta, verdict.",
-        description="Answers the four questions a probe row always raises, in one call: "
-                    "does the platform accept it, how correlated is it with the book, how "
-                    "much would the book actually move, and does it survive the test year.")
+        help="Train-only candidate screening; explicit test view after design freeze.",
+        description="Compare candidates or book members using train metrics and PnL. "
+                    "Use --show-test only for frozen-design validation, including "
+                    "full-window platform checks and test retention.")
     triage_parser.add_argument("--batch", default=None, metavar="BATCH_JSON",
                                help="Triage every alpha id in this batch file.")
     triage_parser.add_argument("--ids", nargs="+", default=None, metavar="ID")
@@ -323,22 +323,25 @@ def build_parser():
                                help="Score every book member instead of candidates "
                                     "(this is what `health` did).")
     triage_parser.add_argument("--internal", action="store_true",
-                               help="Also report the internal fitness, which discounts "
-                                    "the platform's by what decays here (was `benchmark`).")
+                               help="Report test-calibrated internal fitness; requires --show-test.")
+    triage_parser.add_argument("--show-test", action="store_true",
+                               help="Reveal full-window and test evidence after design freeze; logs the view.")
+    triage_parser.add_argument("--train-end", metavar="YYYY-MM-DD",
+                               help="Exclusive train end; cannot extend past recorded test starts. "
+                                    "Default: earliest recorded test start, else 2023-01-01.")
     triage_parser.add_argument("--min-delta", type=float, default=0.02, dest="min_delta")
     triage_parser.add_argument("--retention-floor", type=float, default=0.2,
                                dest="retention_floor",
-                               help="Veto a candidate whose test Sharpe is below this "
-                                    "fraction of train. A veto, never a ranking key.")
+                               help="Validation-only test/train retention floor with --show-test.")
     triage_parser.add_argument("--registry", default=None)
     triage_parser.set_defaults(func=triage.cmd_triage)
 
     feed_parser = sub.add_parser(
         "feed",
-        help="One literature digest from the open questions (deduped, closed-aware).",
-        description="Turns the live questions into searches, drops what the closed "
-                    "register already killed, skips anything already surfaced, and can "
-                    "write DRAFT mechanism cards for a deliberate pass.")
+        help="A bounded literature digest across open questions, with source and search status.",
+        description="Search the selected questions, balance results across topics, "
+                    "preserve source links and make missing evidence visible. "
+                    "Optional DRAFT cards still require deliberate research judgement.")
     feed_parser.add_argument("--topic", action="append", default=None,
                              help="Search this instead of deriving from open-threads.")
     feed_parser.add_argument("--from-threads", action="store_true", dest="from_threads",
@@ -355,13 +358,11 @@ def build_parser():
     feed_parser.add_argument("--from-year", type=int, default=2005, dest="from_year")
     feed_parser.add_argument("--min-citations", type=int, default=20,
                              dest="min_citations")
-    feed_parser.add_argument("--queue", default=None)
     feed_parser.add_argument("--seen", default=None)
     feed_parser.add_argument("--draft-cards", default=None, dest="draft_cards",
                              metavar="PATH")
     feed_parser.add_argument("--action", action="store_true", dest="action",
-                             help="Rank by unexplored neighbourhood and say what to do "
-                                  "with each hit.")
+                             help="Add declared book exposure and prior-trial context; unknown is not unexplored.")
     feed_parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                              help="Report only; do not update the seen store.")
     def _feed_dispatch(args, sink):
@@ -614,8 +615,7 @@ def build_parser():
     papers.set_defaults(func=literature.cmd_paper)
 
     sim = sub.add_parser(
-        "simulate", help="Simulate alphas (no per-simulation fee on this account; "
-                                "time is the only cost - sweep wide).")
+        "simulate", help="Simulate alphas; preview with --dry-run before using platform capacity.")
     sim.add_argument("file", nargs="?",
                      help="Research file: JSON, or one expression per line. "
                           "Omit when using --expr.")
@@ -726,15 +726,14 @@ def build_parser():
 
     brief = sub.add_parser(
         "brief",
-        help="One bounded document describing where the research stands (no quota).",
-        description="Book composition, what ran in the last N days and how it scored, "
-                    "which write-ups are new, and the standing open questions from "
-                    "open-threads.md. Built to be read at the start of a session "
-                    "instead of the ledger, the result directory and last week's note.")
+        help="One bounded document describing where the research stands (no quota; train-only scores).",
+        description="Book composition, train-only recent scores and setbacks, source "
+                    "paths, new write-ups and open questions. Start here, then read "
+                    "only the evidence needed for the current research question.")
     brief.add_argument("--days", type=float, default=7.0,
                        help="How far back 'recent' reaches (default 7).")
     brief.add_argument("--top", type=int, default=5,
-                       help="How many best runs and write-ups to list (default 5).")
+                       help="Maximum items per list: scores, setbacks, write-ups, and each thread state (at least 1).")
     brief.add_argument("--registry", default=None)
 
     brief.set_defaults(func=campaign.cmd_brief)
@@ -797,8 +796,8 @@ def build_parser():
                        help="Simulate even when the lint reports blocking findings. Not "
                             "recommended: the platform will reject the arm anyway.")
     probe.add_argument("--strict-gate", action="store_true", dest="strict_gate",
-                       help="Refuse arms whose canonical expression is already in the "
-                            "ledger. Off by default: a deliberate repeat is sometimes right.")
+                       help="Refuse a finished prior result with the same expression and "
+                            "effective settings. Dry-run previews the blocking evidence.")
     probe.add_argument("--recover", default=None, metavar="BATCH_JSON",
                        help="Fill a batch file's empty arms by matching expressions to "
                             "alphas already on the platform (no simulation). Use after a "

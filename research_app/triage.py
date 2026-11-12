@@ -1,10 +1,10 @@
 """One command that answers "what do I do with this".
 
 After a probe the same questions came up every time, and each was answered by a throwaway
-script: does the platform accept it, how correlated is it with the book, how much would the
-book actually move, and how much of it survives the test year. `triage`, `health`,
-`marginal` and `benchmark` grew out of that one need, one command per question - which is
-how a toolset starts costing more than it saves.
+script: does the platform accept it, how correlated is it with the book, and how much would
+the book actually move. Selection uses train metrics and train PnL. The frozen-design
+validation view adds test retention, full-window checks and the platform's internal bar;
+it is explicit because ranking on those would turn validation into another tuning round.
 
 This module is the consolidation: **one scorer**, applied to a candidate, a batch file, or
 the whole book, with the internal benchmark available as a flag rather than a religion.
@@ -13,8 +13,8 @@ The two numbers that matter and are easy to confuse:
 
 * ``delta`` - the book's Sharpe after adding this alpha equal-weight, minus the book now.
   Not the slope ``S_a - rho*S_B``, which on a sixty-member book is a different magnitude.
-* ``retention`` - test Sharpe over train Sharpe. It can veto, never rank: preferring a
-  better test number would be selecting on the test year.
+* ``retention`` - test Sharpe over train Sharpe, available only with ``show_test``
+  after the design is frozen. The default view uses training observations only.
 """
 
 import json
@@ -24,6 +24,7 @@ import alpha_registry
 import research_paths
 
 from . import benchmark, legs, mechanisms
+from .runtime import CliError
 
 
 def _book_series(latest, directory):
@@ -119,33 +120,37 @@ def _score(alpha_id, entry, series, dates, criteria):
     """The four questions plus the internal bar, for one alpha."""
     directory = criteria["pnl_dir"]
     n = len(series)
-    metrics = entry.get("metrics") or {}
     split = entry.get("out_of_sample") or {}
-    train = (split.get("train") or {}).get("sharpe")
-    test = (split.get("test") or {}).get("sharpe")
-    retention = None if not train or test is None else round(test / train, 2)
+    train_metrics = split.get("train") or {}
+    train = train_metrics.get("sharpe")
+    show_test = criteria["show_test"]
+    metrics = (entry.get("metrics") or {}) if show_test else train_metrics
 
     row = {
         "alpha_id": alpha_id,
         "sharpe": metrics.get("sharpe"),
         "fitness": metrics.get("fitness"),
         "train_sharpe": train,
-        "test_sharpe": test,
-        "retention": retention,
-        "retention_percentile": _percentile(criteria.get("cohort") or [], retention),
-        "failing": _failing(entry),
-        "unresolved": _unresolved(entry),
-        "sub_universe": _sub_universe(entry),
+        "metrics_scope": "full" if show_test else "train",
+        "overlap_days": 0,
         "rho_book": None,
         "slope": None,
         "delta": None,
         "ops": (entry.get("expression") or "").count("("),
     }
+    if show_test:
+        test = (split.get("test") or {}).get("sharpe")
+        retention = None if not train or test is None else round(test / train, 2)
+        row.update({"test_sharpe": test, "retention": retention,
+                    "retention_percentile": _percentile(criteria.get("cohort") or [], retention),
+                    "failing": _failing(entry), "unresolved": _unresolved(entry),
+                    "sub_universe": _sub_universe(entry)})
 
     in_book = alpha_id in series
     candidate = legs.load_pnl(alpha_id, directory)
     if candidate and dates:
         common = [day for day in dates if day in candidate]
+        row["overlap_days"] = len(common)
         if len(common) >= 120:
             book_slice = [sum(values[day] for values in series.values()) for day in common]
             values = [candidate[day] for day in common]
@@ -215,31 +220,46 @@ def _verdict(row, criteria):
         direction = "raises" if row["delta"] < 0 else "lowers"
         return ("drag" if row["delta"] < 0 else "carries"), (
             "removing it %s the book by %.4f" % (direction, abs(row["delta"])))
-    if row["failing"]:
+    if row.get("failing"):
         return "blocked", "fails %s" % ", ".join(row["failing"])
     if (row.get("max_member_rho") or 0) > 0.9:
         return ("duplicate", "%.2f correlated with %s - the platform gate is per member, "
                 "not per book" % (row["max_member_rho"], row.get("max_member")))
     if row["delta"] is None:
-        return "unknown", "no cached PnL to measure the book against"
+        return "unknown", "insufficient overlapping PnL in this view (%d days; need 120)" % row["overlap_days"]
     # Disqualifying facts come before "not measured yet": an alpha that already lowers
     # the book does not become interesting once its checks resolve.
     if row["delta"] <= 0:
         return "dilutive", "adding it lowers the book"
     floor = criteria["retention_floor"]
-    if row["retention"] is not None and row["retention"] < floor:
+    if row.get("retention") is not None and row["retention"] < floor:
         return "overfit-risk", "test keeps %.0f%% of train" % (row["retention"] * 100)
     if row.get("unresolved"):
         return "unverified", ("never resolved: %s - run `alpha check` before treating "
                               "this as passing" % ", ".join(row["unresolved"]))
     if row["delta"] < criteria["min_delta"]:
         return "weak", "adds %.3f, under the %.2f bar" % (row["delta"], criteria["min_delta"])
+    if not criteria["show_test"]:
+        return "validate", "train contribution clears the bar; platform and test checks not inspected"
     return "shelve", "passes checks and moves the book +%.3f" % row["delta"]
 
 
 def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=0.02,
-           retention_floor=0.2, internal=False, whole_book=False, criteria=None):
-    """Score candidates, a batch, or the book itself with one scorer."""
+           retention_floor=0.2, internal=False, whole_book=False, criteria=None,
+           show_test=False, train_end=None):
+    """Select on train; expose full-window validation only when explicitly requested."""
+    from datetime import date
+
+    if internal and not show_test:
+        raise ValueError("--internal uses test-calibrated factors; freeze the design and pass --show-test")
+    if train_end is not None:
+        try:
+            if date.fromisoformat(train_end).isoformat() != train_end:
+                raise ValueError
+        except (ValueError, TypeError):
+            raise ValueError("--train-end must be an ISO date (YYYY-MM-DD)") from None
+    if show_test and train_end is not None:
+        raise ValueError("--train-end applies to the train view; omit --show-test")
     latest = {}
     for entry in alpha_registry.load_entries(registry_path):
         key = entry.get("alpha_id") or entry.get("key")
@@ -250,6 +270,27 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=0.02,
     series, dates = _book_series(latest, directory)
     if not dates:
         raise ValueError("no cached book PnL; the book cannot be scored")
+    targets = sorted(series) if whole_book else list(dict.fromkeys(ids or []))
+    window = {"mode": "full" if show_test else "train", "end": None, "source": None}
+    if not show_test:
+        boundaries = []
+        for alpha_id in set(series) | set(targets):
+            split = (latest.get(alpha_id) or {}).get("out_of_sample") or {}
+            start = (split.get("test") or {}).get("startDate")
+            if start:
+                try:
+                    boundaries.append(date.fromisoformat(str(start)[:10]).isoformat())
+                except ValueError:
+                    raise ValueError("invalid recorded test boundary for %s" % alpha_id) from None
+        cutoff = min(boundaries) if boundaries else "2023-01-01"
+        source = "recorded_test_start" if boundaries else "default_train_end"
+        if train_end is not None:
+            cutoff = min(cutoff, train_end) if boundaries else train_end
+            source = "explicit_and_recorded" if boundaries else "explicit"
+        window.update({"end": cutoff, "source": source})
+        dates = [day for day in dates if day < cutoff]
+        if not dates:
+            raise ValueError("no cached book PnL before train end %s" % cutoff)
     book_sharpe = legs.sharpe_of([sum(values[day] for values in series.values())
                                   for day in dates])
     if book_sharpe is None:
@@ -257,7 +298,8 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=0.02,
 
     settings = {"pnl_dir": directory, "min_delta": min_delta,
                 "retention_floor": retention_floor, "internal": internal,
-                "cohort": _cohort_retentions(latest)}
+                "show_test": bool(show_test),
+                "cohort": _cohort_retentions(latest) if show_test else []}
     settings.update(benchmark.DEFAULTS)
     # The weights and the block table live in a file so the internal bar can be changed
     # without a code edit; without this the file was silently ignored on this path.
@@ -266,8 +308,10 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=0.02,
     if criteria:
         settings.update(benchmark.refine_criteria(criteria)
                         if isinstance(criteria, str) else criteria)
+    # A criteria dictionary cannot opt a caller into looking at test evidence.
+    settings["show_test"] = bool(show_test)
+    settings["internal"] = bool(internal)
 
-    targets = sorted(series) if whole_book else list(ids or [])
     rows = []
     for alpha_id in targets:
         entry = latest.get(alpha_id)
@@ -283,16 +327,26 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=0.02,
         "book_members": len(series),
         "mode": "book" if whole_book else "candidates",
         "internal": bool(internal),
-        "criteria": {"min_delta": min_delta, "retention_floor": retention_floor},
+        "window": window,
+        "criteria": {"min_delta": min_delta,
+                     **({"retention_floor": retention_floor} if show_test else {})},
         "rows": rows,
-        "note": ("delta is the book's Sharpe change from adding this alpha; retention is "
-                 "test/train and can only veto, never rank. `shelve` means the checks pass "
-                 "and the book moves up - a decision, not a permission."),
+        "note": ("Validation view: full-window PnL, platform checks and test retention; "
+                 "use after freezing the design." if show_test else
+                 "Selection view: train metrics and PnL only. Missing train metrics stay "
+                 "unknown. A validate verdict calls for platform/test checks after design freeze."),
     }
 
 
 def cmd_triage(args, _sink):
     """Triage a batch file, explicit ids, or the whole book."""
+    try:
+        return _cmd_triage(args)
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc)) from exc
+
+
+def _cmd_triage(args):
     ids = list(getattr(args, "ids", None) or [])
     if getattr(args, "batch", None):
         path = os.path.expanduser(args.batch)
@@ -306,7 +360,12 @@ def cmd_triage(args, _sink):
     ids = [alpha_id for alpha_id in dict.fromkeys(ids) if alpha_id and alpha_id != "None"]
     if not ids and not getattr(args, "book", False):
         raise ValueError("nothing to triage: pass a batch file, ids, or --book")
-    return triage(ids, getattr(args, "registry", None),
-                  min_delta=args.min_delta, retention_floor=args.retention_floor,
-                  internal=getattr(args, "internal", False),
-                  whole_book=getattr(args, "book", False))
+    show_test = bool(getattr(args, "show_test", False))
+    result = triage(ids, getattr(args, "registry", None),
+                    min_delta=args.min_delta, retention_floor=args.retention_floor,
+                    internal=getattr(args, "internal", False),
+                    whole_book=getattr(args, "book", False), show_test=show_test,
+                    train_end=getattr(args, "train_end", None))
+    if show_test:
+        research_paths.log_view("triage", "test", [row["alpha_id"] for row in result["rows"]])
+    return result

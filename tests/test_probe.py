@@ -85,6 +85,9 @@ class ProbeTests(unittest.TestCase):
         session_patch = mock.patch.object(ml, "load_session", return_value=self.session)
         self.load_session = session_patch.start()
         self.addCleanup(session_patch.stop)
+        registry_patch = mock.patch.object(alpha_registry, "load_entries", return_value=[])
+        registry_patch.start()
+        self.addCleanup(registry_patch.stop)
 
     def _write(self, payload):
         with open(self.spec_path, "w", encoding="utf-8") as handle:
@@ -437,11 +440,53 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(entries[0]["view"], "test")
         self.assertEqual(sorted(entries[0]["alpha_ids"]), ["A1", "B1"])
 
-    def test_rows_carry_the_failed_checks(self):
+    def test_failed_checks_require_explicit_validation_view(self):
         self.fake.records = [record("A1", 1.2, 0.7, fails=("LOW_SHARPE",)),
                              record("B1", 2.0, 1.5)]
-        data = self._run()
+        with mock.patch.object(cli_experiments, "note") as notes:
+            data = self._run()
+        self.assertNotIn("failed_checks", data["rows"][0])
+        self.assertFalse(any("LOW_SHARPE" in call.args[0] for call in notes.call_args_list))
+        data = self._run(force=True, show_test=True)
         self.assertEqual(data["rows"][0]["failed_checks"], ["LOW_SHARPE"])
+
+    def test_strict_repeat_is_previewed_offline_then_blocks_before_authentication(self):
+        prior = {"key": "prior", "expression": "rank(close)", "status": "WARNING",
+                 "settings": {**ml.DEFAULT_SETTINGS, "decay": 4}, "metrics": {"fitness": 1.2}}
+        with mock.patch.object(alpha_registry, "load_entries", return_value=[prior]) as load:
+            data = self._run(dry_run=True, strict_gate=True, registry="custom.jsonl")
+            self.assertTrue(data["would_block"])
+            self.assertEqual(data["gate_blocking"], [
+                {"code": "exact_repeat", "label": "a", "evidence_keys": ["prior"]}])
+            self.assertEqual(data["results"][0]["gate"]["exact_repeat_keys"], ["prior"])
+            # The gate must use the explicit registry; turnover estimation separately
+            # reads the default ledger for its field distribution.
+            self.assertEqual(load.call_args_list[0], mock.call("custom.jsonl"))
+            with self.assertRaises(cli_runtime.CliError):
+                self._run(strict_gate=True, registry="custom.jsonl")
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_non_strict_repeat_remains_visible_without_blocking(self):
+        prior = {"key": "prior", "expression": "rank(close)", "status": "COMPLETE",
+                 "settings": {**ml.DEFAULT_SETTINGS, "decay": 4}, "metrics": {"fitness": 1.2}}
+        with mock.patch.object(alpha_registry, "load_entries", return_value=[prior]):
+            data = self._run(dry_run=True)
+        self.assertEqual(data["gate_blocking"], [])
+        self.assertTrue(data["results"][0]["gate"]["already_simulated"])
+
+    def test_explore_preserves_context_but_never_attributes_arms(self):
+        self.spec["note"] = "why this scan matters"
+        self._write(self.spec)
+        preview = self._run(dry_run=True)
+        data = self._run()
+        with open(data["path"], encoding="utf-8") as handle:
+            artifact = json.load(handle)
+        for document in (preview, data, artifact):
+            for key in ("idea", "mechanism", "note"):
+                self.assertEqual(document[key], self.spec[key])
+            self.assertEqual(document["comparisons"], {
+                "scope": "train", "rows": [], "unavailable_reason": "explore_no_attribution"})
 
 
 class DesignTests(unittest.TestCase):
@@ -629,6 +674,52 @@ class DesignTests(unittest.TestCase):
         self.assertEqual(data["design"]["designs"], {"ctrl": "control", "rescue": "rescue"})
         self.assertFalse(any("unknown" in str(call) for call in alpha_note.call_args_list))
         self.assertFalse(any("unknown key" in str(call) for call in spec_note.call_args_list))
+
+    def test_controlled_deltas_use_train_and_keep_rescue_context(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "proxy", "expression": "rank(volume)", "design": "rescue", "proxy_of": "close"},
+        ])
+        self.spec["note"] = "proxy tests the same economic quantity"
+        self._write(self.spec)
+        self.fake.records[0]["out_of_sample"]["train"] = {
+            "sharpe": 1.0, "fitness": 0.8, "turnover": 0.2, "returns": 0.05}
+        self.fake.records[1]["out_of_sample"]["train"] = {
+            "sharpe": 1.5, "fitness": 1.0, "turnover": 0.1, "returns": 0.08}
+        preview = self._run(dry_run=True)
+        self.assertEqual(preview["results"][1]["proxy_of"], "close")
+        self.assertEqual(preview["results"][1]["design"], "rescue")
+        self.assertEqual(preview["comparisons"]["rows"][0]["deltas"], {})
+        data = self._run()
+        comparison = data["comparisons"]["rows"][0]
+        self.assertEqual((comparison["control"], comparison["label"], comparison["proxy_of"]),
+                         ("ctrl", "proxy", "close"))
+        for metric, expected in {"sharpe": 0.5, "fitness": 0.2, "turnover": -0.1, "returns": 0.03}.items():
+            self.assertAlmostEqual(comparison["deltas"][metric], expected)
+        self.assertEqual(comparison["unavailable"], {})
+        with open(data["path"], encoding="utf-8") as handle:
+            artifact = json.load(handle)
+        self.assertEqual(artifact["comparisons"], data["comparisons"])
+        self.assertEqual(artifact["rows"][1]["proxy_of"], "close")
+        for document in (preview, data, artifact):
+            self.assertEqual(document["note"], self.spec["note"])
+            self.assertEqual(document["mechanism"], self.spec["mechanism"])
+
+    def test_missing_train_never_borrows_headline_or_test_metrics(self):
+        self._controlled([
+            {"label": "ctrl", "expression": "rank(close)", "design": "control"},
+            {"label": "plus", "expression": "rank(close)+rank(volume)", "design": "add"},
+        ])
+        self.fake.records[0]["out_of_sample"]["train"] = {"sharpe": 1.0, "fitness": 0.5}
+        self.fake.records[1]["out_of_sample"].pop("train")
+        with mock.patch.object(cli_experiments, "note") as notes:
+            data = self._run(show_test=True)
+        comparison = data["comparisons"]["rows"][0]
+        self.assertEqual(comparison["deltas"], {})
+        self.assertIn("arm_train_metric_unavailable", comparison["unavailable"]["sharpe"])
+        self.assertIn("control_train_metric_unavailable", comparison["unavailable"]["returns"])
+        self.assertTrue(any("probe --recover" in call.args[0] for call in notes.call_args_list))
+        self.assertEqual(data["incomplete"], ["plus"])
 
 
 if __name__ == "__main__":

@@ -1,224 +1,100 @@
 # AGENTS.md
 
-Working notes for an AI agent operating this repository. Read this first; it
-should save you from reading the source.
-
-## 0. Start here
+## Start with the current question
 
 ```bash
-python research_cli.py brief     # one bounded document: book, last runs, open questions
-python research_cli.py schema
+python research_cli.py brief
 ```
 
-`brief` is the cheapest way to learn where the work stands. Read it before the
-ledger, before the result directory, and before any note written last week: it is
-built to be smaller than the archive it summarises. Its open-question list comes from
-`open-threads.md` in the research directory - keep that file honest, one
-`- [open] …` or `- [closed] …` line per question, because it is what survives a
-context reset.
+Read `research_dir`, source existence, open questions and recent evidence before
+choosing a direction. Missing or empty local records do not mean a direction is
+untested. Check the workspace before drawing conclusions from an empty brief.
 
-`schema` prints the complete contract as JSON: every command, every argument with
-its type and choices, the research-file format, the error codes and the exit
-codes. It is generated from the live argument parser, so it cannot drift from
-the implementation. **Do not read `research_cli.py` to learn the interface.**
-
-## 1. The output contract
-
-* `stdout` is **exactly one JSON document** per invocation, success or failure.
-  `json.loads(stdout)` always works. Never scrape `stderr`.
-* `stderr` carries progress and, with `--stream`, JSON Lines events
-  (`submitted`, `completed`, `rate_limited`, and per-poll `polling` with
-  `--verbose`).
-* Failure shape:
-
-  ```json
-  {"ok": false, "command": "simulate",
-   "error": {"code": "INVALID_INPUT", "message": "...", "hint": "..."}}
-  ```
-
-  Branch on `error.code`, not on the message text.
-* Exit codes: `0` ok, `2` usage/invalid input, `3` auth, `4` rate limit or
-  service, `5` not found, `6` every simulation failed, `130` interrupted.
-
-## 2. Rules of engagement
-
-1. **Always `--dry-run` before a real run.** It validates the file, resolves
-   settings and prints the exact request payloads, with no credentials and no
-   quota spent.
-   `python research_cli.py simulate research.json --dry-run`
-   `python research_cli.py probe batch.spec.json --dry-run`
-2. **Simulations cost quota.** `catalog ...` and `alpha ...` are free. Do not
-   re-simulate something you can read with `alpha get` / `alpha list`.
-3. **Check access before designing around data.** `auth check` reports the
-   regions that actually return datasets. A `TUTORIAL` account sees `USA` only,
-   so expressions built on other regions will fail.
-4. **Prefer `catalog fields --expressions`** over hand-writing
-   `winsorize(ts_backfill(...))` wrappers; it emits the expected idiom.
-5. **Ask the unit layer before spending a simulation on a "new" data family.**
-   `python3 tools/unit_report.py --dataset model51` prints the shapes that family
-   has already been run in, how many points each has, and the best Fitness seen.
-   A dataset being absent from the *book* says nothing about the *ledger*: on
-   2026-11-03 six probes were simulated for model51 shapes the ledger already held,
-   one of them byte-identical, and the one command above would have said so.
-6. **Never re-authenticate needlessly.** The session is cached in
-   `.brain_session.json`. BRAIN challenges rapid logins with a captcha
-   (`AUTH_CAPTCHA`). Use `--relogin` only when the cache is actually stale.
-7. **Loop on structured feedback**, not on guesses: `simulate --sort sharpe`
-   returns `summary.ranking` and `summary.best`; mutate from there.
-8. **A new tool has to earn its place.** `tools/` holds 18 entry points over 22k
-   lines (2026-11-01), and the cost is the surface, not the logic. Before adding a
-   file, answer three questions in the commit message -- which existing tool is
-   closest, why it cannot take another flag or subcommand, and what question this
-   answers that nothing else does. "Cleaner as its own file" is not an answer; put it
-   in the closest tool. The most common real answer is the fourth: *this question
-   gets asked once*, in which case write a throwaway script in the research
-   directory and put the conclusion in a report -- do not make a tool.
-   `docs/tooling.md` is the map; update it when a tool is removed, which matters
-   more than updating it when one is added.
-9. **Keep credentials out of chat, commits and logs.** `.env` and
-   `.brain_session.json` are git-ignored; `tests/test_contract.py` guards that
-   they stay that way. Never echo a credential, never write one into a file you
-   intend to commit.
-
-## 3. Recipes
-
-Validate, then run a batch and keep the winners:
+Discover only the interface needed next:
 
 ```bash
-python research_cli.py simulate research.json --dry-run
-python research_cli.py simulate research.json --sort sharpe --top 5 --stream
+python research_cli.py help                 # command map, only when needed
+python research_cli.py help catalog fields  # one task's options and examples
+python research_cli.py schema probe         # one command's machine contract
 ```
 
-Explore a dataset without spending quota:
+The full `schema` is for tooling integrations, not routine session startup.
+Do not read `research_cli.py` to learn the interface. The question-to-command map
+and research workflow live in [docs/tooling.md](docs/tooling.md); open the relevant
+section when needed, rather than loading every recipe.
 
-```bash
-python research_cli.py catalog categories
-python research_cli.py catalog fields --dataset fundamental6 --type MATRIX \
-    --search liability --limit 50 --expressions --save /tmp/fnd6.json
-```
+## Research loop
 
-Check a mechanism against the literature before spending quota on it:
+- Establish the question, known evidence and the next uncertainty to resolve.
+  For open exploration, consider a few distinct economic explanations before
+  selecting fields or tuning a winning expression. A targeted fix does not need
+  a brainstorming ceremony.
+- Separate observations, interpretations and untested hypotheses. A high score
+  is a lead, not a mechanism. Read the supporting record before treating a
+  shortened brief preview as a conclusion.
+- Use `tools/unit_report.py --dataset DATASET` and `ledger list` before calling a
+  family new. Read failures as well as winners: `rejected` rejects an expression;
+  `falsified` records a controlled test of a hypothesis; `no_go` records a block
+  before a fair test. Preserve settings, evidence and conditions for reopening.
+- Choose an experiment that distinguishes explanations. A scan declares
+  `design: explore`; a controlled `probe` declares its control and arm designs,
+  and reports arm-minus-control train deltas. `triage` screens on train metrics
+  and train PnL; `--show-test` is the explicit validation view after freezing.
+  Missing evidence stays unknown rather than being filled from the full window.
+- Carry forward decisions, not the conversation. Keep `open-threads.md` in the
+  research directory: one `- [open] **question** — evidence; next discriminating
+  check` or `- [closed] **question** — conclusion; evidence; reopening condition`
+  per line. Put active questions first; details belong in linked reports or the
+  ledger. Update the relevant line when evidence changes, not a second summary.
 
-```bash
-python research_cli.py search "post-earnings announcement drift accruals" --min-authority 3
-python research_cli.py search --fetch https://example.org/paper.pdf
-```
+## Execution invariants
 
-Requires `DEEPSEEK_API_KEY` in `.env`. Results carry `rerank_score` (1.5+ is high
-quality) and `authority` (3+ is authoritative), so prefer the paper over a post
-about it. Cached for a week; `--no-cache` bypasses. Queries are limited to 128
-characters, rejected locally.
+1. Always `simulate FILE --dry-run` / `probe FILE --dry-run` before a real run.
+   Simulations consume time and platform capacity; account limits are live facts.
+   Reuse stored results through `alpha get` / `alpha list` instead of rerunning.
+2. Check `auth check` before designing around an unfamiliar account or region.
+   Reuse the session cache; use `--relogin` only when it is actually stale.
+3. Prefer `catalog fields --expressions` for field wrappers. Inspect structured
+   checks and comparisons when deciding what an experiment demonstrated.
+4. Train data supports design and selection; view test data after freezing the
+   design. Keep validation distinct from another tuning round.
+5. Keep credentials out of chat, logs and commits. `.env` and session caches are
+   private; the current cache path comes from the CLI, not a remembered filename.
+6. stdout is exactly one JSON document, success or failure; stderr is progress
+   (and JSONL events with `--stream`). Branch on `error.code`, not message text.
+   Exit codes: 0 success, 2 input, 3 auth, 4 service/rate limit, 5 missing,
+   6 all simulations failed, 7 submission disabled, 130 interrupted.
+7. Code lives in the repo; results, evidence, caches and throwaway scripts live
+   in the research directory. Do not add a new tool when an existing command can
+   answer the question. Before a new entry point, explain the closest tool, why
+   it cannot be extended and the otherwise unanswered recurring question.
 
-Relate alphas to each other (offline):
+## Changing the code
 
-```bash
-python research_cli.py ledger coverage              # label debt: family column
-python research_cli.py ledger label ID --family quality --verdict candidate
-python research_cli.py ledger impact ID             # shared leg bodies
-python research_cli.py ledger lineage ID            # parent chain
-```
-
-`ledger impact` compares leg bodies, not names: a shared `a` means nothing.
-
-Ask whether a composite leg earns its place, without hand-writing variants:
-
-```bash
-python research_cli.py ablate --expr "a = ...; b = ...; a + b" --out /tmp/abl.json
-python research_cli.py simulate /tmp/abl.json --sort fitness --stream
-python research_cli.py compare <results> --contributions
-```
-
-A negative contribution means the composite is stronger without that leg. The
-combination must be a plain sum of named legs; products and gated legs are
-refused rather than guessed.
-
-Test whether two alphas are really two bets:
-
-```bash
-python research_cli.py alpha corr A B C --vs-book
-python research_cli.py alpha corr A B --control CDE
-```
-
-The platform's `SELF_CORRELATION` is one number against an unnamed pool; this
-reads the daily PnL instead. Report every pair, not just each maximum.
-
-Diagnose a single alpha:
-
-```bash
-python research_cli.py alpha get P0Mq0wEM      # metrics + per-check PASS/FAIL/limit/value
-```
-
-Ask whether a submission would be refused, and by whom - the platform names the
-counterparts, so the "Sharpe above every correlated alpha" route becomes arithmetic
-instead of a guess:
-
-```bash
-python research_cli.py alpha self-corr ID      # platform list + the Sharpe bar
-python research_cli.py alpha self-check ID     # local daily-Pearson reproduction
-```
-
-Read BRAIN's own out-of-sample split before believing an in-sample number. It is
-already in the payload, so this costs one call and no simulation:
-
-```bash
-python research_cli.py alpha get ID            # see data.out_of_sample.{train,test}
-```
-
-Run an experiment as **one command**, not a copied script. A spec file holds the
-arms, the settings and the labels; `probe` lints, simulates, prints a train-only table
-on stderr, writes one JSON document on stdout and records every arm to the ledger:
-
-```bash
-python research_cli.py probe batch.spec.json --dry-run     # lint, spend nothing
-python research_cli.py probe batch.spec.json               # simulate + record
-python research_cli.py probe batch.spec.json --show-test   # only after the design is frozen
-```
-
-```json
-{"name": "vrp-20261104", "idea": "...", "mechanism": "...",
- "settings": {"region": "USA", "universe": "TOP3000", "neutralization": "SUBINDUSTRY"},
- "arms": [{"label": "vrp_diff", "expression": "rank(close)"},
-          {"label": "vrp_ind", "expression": "rank(close)", "settings": {"neutralization": "INDUSTRY"}}]}
-```
-
-Per-arm `settings` become separate simulation groups, so a neutralisation sweep is one
-spec. The output file is `<name>-<date>.json` and refuses to overwrite an existing
-batch - that is how a six-arm result disappeared once.
-
-For the other shape - a proven parent with one token swapped N times - build the arms
-with `research_app.substitution.expand()`, which substitutes whole identifiers only.
-
-## 4. Where things live
-
-| Path | Contents |
+| Concern | Owner |
 | --- | --- |
-| `research_cli.py` | Executable entry point only. |
-| `research_app/app.py` | Invocation boundary: workspace, JSON envelope, saving and exit codes. |
-| `research_app/parser.py` | Arguments, help and the schema generated from the live parser. |
-| `research_app/runtime.py` | Shared CLI errors/constants, output, input settings and session handling. |
-| `research_app/experiments.py` | Simulate/resume/probe/ablate/compare orchestration. |
-| `research_app/catalog.py`, `research_app/validation.py` | Catalog commands, lint and preflight. |
-| `research_app/alphas.py`, `research_app/ledger.py` | Platform alpha operations and local ledger commands. |
-| `research_app/account.py`, `research_app/campaign.py`, `research_app/literature.py` | Account/cache commands, briefs/view history and literature search. |
-| `research_config.py` | Research-file parsing and validation (`build_config`). |
-| `machine_lib.py` | BRAIN API client, typed errors, FASTEXPR factories. |
-| `tests/test_contract.py` | Offline contract tests — run these after any change. |
+| Invocation, workspace, JSON envelope, saving, exit codes | `research_app/app.py` |
+| Arguments, help, generated schema | `research_app/parser.py` |
+| Shared errors, output, settings, sessions | `research_app/runtime.py` |
+| Simulation, probe, resume, ablation, comparisons | `research_app/experiments.py` |
+| Catalog and validation | `research_app/catalog.py`, `research_app/validation.py` |
+| Platform alphas and local ledger | `research_app/alphas.py`, `research_app/ledger.py` |
+| Briefs, account, literature | `research_app/campaign.py`, `research_app/account.py`, `research_app/literature.py` |
+| Research-file contract and BRAIN client | `research_config.py`, `machine_lib.py` |
 
-## 5. Changing the code
+Put behavior in its owning module and bind it explicitly in `parser.py`. Tests
+import that module; `research_cli.py` is executable only. Core libraries must not
+import `research_app`. `machine_lib` raises `BrainError` subclasses; never `print()`
+on CLI paths or call `input()`. Defaults and allowed settings live in
+`machine_lib` and are exposed through schema, with no second copy.
 
-* Keep the contract: new commands must emit the standard envelope and map
-  their failures to a documented `error.code` / exit code.
-* Put command behavior in its owning `research_app` module and bind it explicitly
-  in `research_app/parser.py`. Tests import that module; the executable entry point
-  exposes no internal helpers. Core research libraries must not import `research_app`.
-* Add or update a test in `tests/test_contract.py`; the suite must run offline
-  and pass without credentials:
+Preserve the JSON envelope and documented error/exit codes. Update meaningful
+behavioral coverage in `tests/test_contract.py` for contract changes, and run the
+offline suite without credentials:
 
-  ```bash
-  python -m unittest discover -s tests -v
-  ```
-* `machine_lib` must never `print()` on a code path the CLI can reach, and must
-  never call `input()`. Report failures by raising a `BrainError` subclass.
-* Settings defaults and allowed values live in `machine_lib` (`DEFAULT_SETTINGS`,
-  `REGIONS`, `NEUTRALIZATIONS`, `UNIVERSES`) and are re-exported through
-  `research_cli.py schema`; keep a single source of truth.
+```bash
+python -m unittest discover -s tests -v
+```
+
+Update the relevant usage documentation; keep [docs/tooling.md](docs/tooling.md)
+accurate when a tool is added, moved or removed.

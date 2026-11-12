@@ -82,6 +82,66 @@ class RecoverTests(unittest.TestCase):
         self.assertNotEqual(experiments._settings_signature(SETTINGS_A),
                             experiments._settings_signature(SETTINGS_B))
 
+    def test_recovery_does_not_cross_other_resolved_setting_boundaries(self):
+        for key, value in {"pasteurization": "OFF", "nanHandling": "VERIFY",
+                           "testPeriod": "P1Y", "unitHandling": "OFF"}.items():
+            with self.subTest(setting=key):
+                rows = self._rows(SETTINGS_A)
+                outcome = self._recover([_Alpha("A1", "rank(close)", dict(SETTINGS_A, **{key: value}))], rows)
+                self.assertEqual(outcome["recovered"], 0)
+                self.assertIsNone(rows[0]["train_fitness"])
+
+    def test_recovery_recomputes_train_comparison_and_preserves_context(self):
+        import argparse
+        import json
+        import tempfile
+        from pathlib import Path
+
+        control = {"label": "control", "design": "control", "status": "COMPLETE",
+                   "train_fitness": 1.0, "train_sharpe": 1.0, "train_turnover": 0.2,
+                   "train_returns": 0.02, "failed_checks": ["LOW_SHARPE"],
+                   "sharpe": 100, "test_sharpe": 200}
+        rescued = {**self._rows(SETTINGS_A)[0], "design": "rescue", "proxy_of": "close"}
+        document = {"name": "recover-context", "idea": "idea", "mechanism": "economic quantity",
+                    "note": "why the proxy matters", "design": {"mode": "controlled", "control": "control"},
+                    "rows": [control, rescued], "comparisons": {"stale": True}}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batch.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            args = argparse.Namespace(recover=str(path), show_test=False)
+            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn: fn(object())), \
+                    mock.patch.object(ml, "list_alphas", return_value=[_Alpha("A1", "rank(close)", SETTINGS_A)]), \
+                    mock.patch.object(ml, "regular_expression", side_effect=lambda a: (a.expression, "", 1)), \
+                    mock.patch.object(ml, "fetch_alpha_metrics", return_value=_payload(2.0)):
+                result = experiments._cmd_probe_recover(args)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["all_empty"])
+        self.assertEqual(result["comparisons"], saved["comparisons"])
+        comparison = result["comparisons"]["rows"][0]
+        self.assertEqual(comparison["deltas"]["fitness"], 1.0)
+        self.assertEqual(comparison["deltas"]["sharpe"], 0.5)
+        self.assertEqual(comparison["proxy_of"], "close")
+        self.assertEqual(comparison["unavailable"], {})
+        for key in ("idea", "mechanism", "note", "design"):
+            self.assertEqual(result[key], document[key])
+            self.assertEqual(saved[key], document[key])
+        self.assertNotIn("failed_checks", result["rows"][0])
+        self.assertNotIn("sharpe", result["rows"][0])
+        self.assertNotIn("test_sharpe", result["rows"][0])
+
+    def test_ambiguous_recovery_cannot_create_a_comparison(self):
+        rows = self._rows(SETTINGS_A)
+        rows[0].update(design="add", status="QUEUED")
+        control = {"label": "control", "design": "control", "status": "COMPLETE", "train_fitness": 1.0}
+        outcome = self._recover([_Alpha("A1", "rank(close)", SETTINGS_A),
+                                 _Alpha("A2", "rank(close)", SETTINGS_A)], rows)
+        comparison = experiments._probe_comparisons(
+            [control, *rows], {"mode": "controlled", "control": "control"})["rows"][0]
+        self.assertEqual(outcome["recovered"], 0)
+        self.assertEqual(comparison["deltas"], {})
+        self.assertIn("arm_train_metric_unavailable", comparison["unavailable"]["fitness"])
+
 
 class BatchProvenanceTests(unittest.TestCase):
     """The ledger must say which batch produced a row, not leave it to recollection."""

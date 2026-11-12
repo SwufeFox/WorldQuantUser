@@ -9,7 +9,9 @@ whole loop without reading the source.** Every capability is reachable from
 `research_cli.py`, whose contract is documented by the tool itself.
 
 ```
-research_cli.py schema      # the whole contract, as JSON
+python research_cli.py brief                # current evidence and source paths
+python research_cli.py help                 # concise command map, when needed
+python research_cli.py schema catalog fields # one command's machine contract
 ```
 
 ## Layout
@@ -222,7 +224,7 @@ python research_cli.py                         # concise guide
 python research_cli.py help catalog fields     # examples and options for one task
 python research_cli.py catalog                 # commands available in this group
 python research_cli.py catalog fields --help   # terminal help, including defaults
-python research_cli.py schema                  # full machine-readable contract
+python research_cli.py schema                  # full contract for tooling integrations
 python research_cli.py schema alpha get        # just one command's contract
 ```
 
@@ -245,16 +247,34 @@ In CLI 3.0, local records live under `ledger`: `ledger list` combines the former
 ### Start a session with one bounded document
 
 ```bash
-python research_cli.py brief             # book, last 7 days, new write-ups, open questions
+python research_cli.py brief             # book, recent scores/setbacks, questions and source paths
 python research_cli.py brief --days 30 --top 10
 ```
 
 It answers "where does the research stand" from the ledger, the result directory and
-`open-threads.md`, and stays small on purpose: reading the ledger, every write-up and
-last week's note is the expensive part of resuming work, and it grows every week while
-the answer does not. The open-question list is a hand-maintained file (`- [open] …` /
-`- [closed] …`, one line each) because what is still undecided is a judgement, not a
-derived number.
+`open-threads.md`. `research_dir`, `ledger.path` and `threads.path` identify the sources;
+the `exists` flags distinguish missing files from empty ones. An empty local workspace
+does not establish that a direction has never been tried.
+
+`recent.best` contains score leads with family/mechanism labels, measured inside the
+train window; records without train metrics stay out of `best` and appear in
+`missing_train_metrics`. `recent.setbacks` adds recorded `rejected`, `falsified` and
+`no_go` decisions, including later relabels.
+Its `count` covers all such records in the window; `items` takes the newest representative
+per family/mechanism/verdict, using the record key when a mechanism is missing. These
+are examples to investigate, not an estimate of failure rates or independent bets.
+
+`--top` must be at least 1 and bounds each score, setback, write-up and thread list.
+Threads retain file order and report their full `counts`; put current questions first.
+Long question, idea, mechanism and note previews are capped at 240 characters, with `…`
+marking truncation. Use the source path and ledger key to recover complete evidence
+before interpreting a clipped conclusion.
+
+Maintain one `- [open] **question** — evidence; next discriminating check` or
+`- [closed] **question** — conclusion; evidence; reopening condition` per line in
+`open-threads.md`. Keep detailed evidence in the linked ledger records and reports.
+For the explore → select → experiment → review workflow, see
+[the information flow guide](docs/tooling.md#给-ai-的信息按阶段进入).
 
 ### Check the account
 
@@ -387,8 +407,16 @@ anything, then runs the existing catalog guard for each simulation group. Arms
 with equivalent resolved settings and decay share a group. Results and ledger
 entries retain each arm's actual settings and decay. The table and `rows` show
 train-period metrics by default; `--show-test` also reveals the full-window and
-test metrics and records that view. Existing batch files are protected before
-simulation; choose another `--name` or pass `--force` to overwrite deliberately.
+test metrics, failing checks, and records that view. `comparisons` reports each
+arm minus its control on train metrics, with missing evidence listed under
+`unavailable`; explore batches report no attribution. Spec `idea`, `mechanism`
+and `note` travel with the preview, batch file and summary. Existing batch files
+are protected before simulation; choose another `--name` or pass `--force`.
+
+`--strict-gate` refuses only an arm whose canonical expression and complete
+effective settings already have a finished result in the registry. A dry run
+shows `gate_blocking` / `would_block` and the prior evidence keys; structural
+similarity is reported separately and never blocks.
 
 `probe` accepts the same settings and session flags as `simulate`. Explicit settings
 override the spec and each arm's settings; an arm's top-level `decay` remains its

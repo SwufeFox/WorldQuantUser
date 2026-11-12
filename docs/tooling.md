@@ -9,7 +9,8 @@
 ## 先从统一 CLI 进入
 
 ```bash
-python3 research_cli.py                       # 简短入口指南
+python3 research_cli.py brief                 # 当前状态、证据摘要和来源路径
+python3 research_cli.py help                  # 不熟悉命令时才读导航
 python3 research_cli.py help catalog fields   # 具体任务的参数和例子
 python3 research_cli.py schema alpha get      # 单个命令的机器契约
 ```
@@ -39,6 +40,78 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 模拟预检从一次查询同时生成字段名、类型及市场/披露分类，避免两条路径给出
 不同诊断；`tools.guarded_sim` 复用同一枚举。基础安装只需 `requests`，
 `pandas` 在调用 `fields_to_df()` 时按需加载，DataFrame 用户再单独安装。
+
+
+## 给 AI 的信息按阶段进入
+
+常驻入口是 `AGENTS.md`；它只保留启动方法、研究原则和执行约束。
+`brief` 给出当前状态；本页负责按问题导航；台账和报告保存完整证据。
+全量 `schema` 留给接口集成，不作为每次启动的必读项。
+
+| 阶段 | 现在需要的信息 | 留下什么 |
+| --- | --- | --- |
+| 恢复 | 当前问题、`brief` 的来源路径和记录是否存在、相关未决事项 | 这一轮要消除的一个不确定性 |
+| 发散 | 与问题有关的成功、受挫和未知；必要时查机制文献 | 少量不同经济解释及各自可观察的预测 |
+| 收敛 | 各解释的支持证据、反例、数据可得性和最便宜的区分办法 | 要检验的假设、对照、停止或改向条件 |
+| 执行 | 所选命令的 `help` / `schema`、字段与设置、dry-run 请求 | spec、结果和台账记录 |
+| 复盘 | 实际结果与原预测的差异；未解决的替代解释 | 更新对应问题及证据链接，保留下一步 |
+
+这张表是信息路由，不是每轮必须填写的表单。定位明确的修复直接进入对应阶段。
+研究范围开放时，可以先保留两到四个机制不同的解释，再查实现所需字段。
+同一表达式换窗口或权重属于局部变体，不能单凭数量算作发散。
+比较方向时同时考虑能学到什么、可行性和已有证据，不仅看历史最高分。
+没有记录的方向只能叫“本地证据未知”；“已测过的形状”也不等于经济假设被否定。
+
+### 摘要怎样保持小而可追溯
+
+`brief` 的 `research_dir` 是当前研究目录，`ledger.path` 和 `threads.path`
+指向来源，`exists` 区分文件缺失与文件存在但没有记录。换机器后先核对这些字段，
+避免把一个新目录当成全部研究历史。
+
+`recent.best` 保留分数线索，带 `family` / `mechanism`；指标限训练期，缺乏 train 的
+记录列入 `missing_train_metrics`，不用全窗口数字补齐。`book.sharpe_median` 同样按训练期。
+`recent.setbacks` 补充近期 `rejected`、`falsified`、`no_go` 的原始判断与 note，也包含模拟之后的
+人工重标。按记录时间倒序，对相同 family、mechanism、verdict 只展示最新代表；
+缺少机制标签时按记录 key 区分。这个去重只是减少重复阅读，不证明机制独立。
+`setbacks.count` 是窗口内相关记录数，展示项只是样本，不能用它代替失败率分析。
+
+`--top` 至少为 1，分别限制高分项、受挫项、报告、open 问题和 closed 问题的数量。
+`book.self_duplicates.window` 为 `train`；测试期共同波动不会改变启动诊断。
+`threads.counts` 给出完整问题数，问题按文件顺序展示，优先级通过移动原文件的行维护。
+问题和证据 note 等长文本只预览至 240 字符，以 `…` 标记裁剪；需要使用结论时，
+从路径和记录 key 回读完整条件。摘要只呈现已记录事实和判断，不生成机会或自动关闭方向。
+
+### 发散需要的边界
+
+| 记录 | 能支持的结论 | 下一步可能是什么 |
+| --- | --- | --- |
+| `rejected` | 这个表达式在这些设置下表现不合格 | 检查实现或替代代理，机制仍可能成立 |
+| `falsified` | 有对照的检验否定了具体假设 | 保留决定性对照；仅在适用条件或新证据变化时重开 |
+| `no_go` | 数据或执行条件阻止了公平检验 | 寻找可用代理，或等阻碍条件变化 |
+| 缺记录 / 缺标签 | 当前本地信息不足 | 查工作目录与台账，不推断“没人试过” |
+
+复盘时分别写清观察、解释和待检验假设。文献是候选机制的来源，不能替代本地检验。
+`triage` 默认只用训练期指标和收益；`--show-test` 才展开全窗口平台检查与测试期留存，
+并把这次查看记入 `views.jsonl`。`--internal` 依赖测试期校准，必须显式搭配 `--show-test`。
+`--train-end` 不能越过记录中的测试起点。训练证据缺失时保持 unknown，不用全窗口数字补齐。
+
+### 用现有问题文件交接
+
+`<research>/open-threads.md` 是跨会话的当前问题清单，不另建一份状态摘要。
+保留现有 `- [open]` / `- [closed]` 格式；问题标题加粗也便于 `feed --from-threads`
+抽取查询。下面只是写法示例，不是研究结论：
+
+```markdown
+- [open] **修订效应还是价格动量？** — 证据：批次文件 / alpha key；下一步：保持设置，加入能区分两者的对照。
+- [closed] **某代理能否检验该机制？** — 结论及适用范围；证据：报告路径；重开条件：覆盖率或代理变化。
+```
+
+只更新本轮受证据影响的问题。完整推导、负例和参数放在所链接的记录里；
+交接保留决策理由、未解决分歧和下一步，不复制工具输出或整段对话。
+`feed --action` 在原始结果上补本地书暴露和既往试验证据；缺失台账或未知领域保持 unknown，
+零命中不等于未被探索。检索失败、空结果和已读重复分列在 `searches`，论文保留 DOI/URL。
+记忆索引仍由 `memory_index` 生成，按当前问题取相关条目；路径与账户限制从当前 CLI
+和平台读取，索引不写死旧机器路径、日期报告或费用假设。
 
 ## 我要回答……
 
@@ -72,15 +145,16 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 
 | 问题 | 命令 |
 | --- | --- |
-| 我要跑一批臂（常态） | 写一个 spec.json，然后 `python3 research_cli.py probe spec.json`——lint、模拟、train-only 表格、JSON、台账一次做完 |
-| 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe spec.json --dry-run`；逐组验证配置并输出完整 payload，实时目录检查在正式模拟前执行 |
+| 我要跑一批臂（常态） | 写一个 spec.json，然后 `python3 research_cli.py probe spec.json`——lint、模拟、train-only 表格、对照差值、JSON、台账一次做完 |
+| 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe spec.json --dry-run`；输出完整 payload、设计上下文和精确重复证据，正式模拟前再做实时目录检查 |
 | 我要开一个单次实验 | 直接写一个两三条臂的 spec，`python3 research_cli.py probe spec.json`（没有模板文件了） |
+| 这批臂相对对照变了多少 | 看 `comparisons.rows`：arm 减 control 的训练期差值；缺失项列在 `unavailable`，explore 批次不计算归因 |
 | 换字段 / 换窗口 / 换权重的批量实验 | `research_app/substitution.py` 的 `expand()` 生成 `(label, expression)` 对，再落成 spec |
 | 我想跑一批，但怕名字写错 | `tools/guarded_sim.py`（库，不是 CLI） |
 | 这个池子够不够厚 | `python3 research_cli.py health --pool` |
 | 这个字段到底什么量纲 | `python3 tools/probe_units.py` |
 
-日常实验只维护 spec 文件：先离线预览，再正式运行。所有配置组在登录和模拟前完成本地校验；等效设置合并，同一批复用缓存会话。`simulate` 的研究文件和 `probe` 的 spec 文件都按 UTF-8 读取，兼容 BOM。
+日常实验只维护 spec 文件：先离线预览，再正式运行。`idea` / `mechanism` / `note` 会随输出和批次文件保存；`--strict-gate` 只拒绝表达式和完整生效设置都相同的已完成结果。所有配置组在登录和模拟前完成本地校验；等效设置合并，同一批复用缓存会话。`simulate` 的研究文件和 `probe` 的 spec 文件都按 UTF-8 读取，兼容 BOM。
 
 ### 备份与重放
 

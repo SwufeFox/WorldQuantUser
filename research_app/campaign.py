@@ -9,6 +9,7 @@ import json
 import research_paths
 
 from . import experiments
+from .runtime import CliError
 
 
 
@@ -352,6 +353,9 @@ def _book_stability(book, min_move=0.3, limit=3):
         # and splitting the whole series would quietly make it so.
         entry = (book.get(alpha_id) if isinstance(book, dict) else None) or {}
         test_start = ((entry.get("out_of_sample") or {}).get("test") or {}).get("startDate")
+        # Same conservative default as the duplicate screen: an entry that predates the
+        # recorded split must not silently split the whole series and read test data.
+        test_start = test_start or "2023-01-01"
         first, second = experiments.half_split_sharpes(pnl, test_start)
         if first is None or second is None:
             continue
@@ -368,18 +372,10 @@ def _book_stability(book, min_move=0.3, limit=3):
 
 
 def _book_duplicates(book, gate=0.70, prefilter=0.75, limit=8):
-    """Book pairs that break the platform's own correlation gate.
+    """Book pairs above the correlation gate, measured inside their train windows.
 
-    Why this belongs in `brief`: the platform compares a submission against a
-    *periodically refreshed snapshot*, so two alphas 0.88 correlated can both sit in
-    the book when the second was submitted before the snapshot refreshed. Measured on
-    2026-11-05, the book holds **eight** pairs above the 0.70 gate - `O0J6Aeag` and
-    `gJWre33J` at 0.975 among them - and nothing was scanning the book after the fact.
-
-    Two stages, because 1275 pairs on 1236 daily points is too slow for a session
-    start: a stride prefilter on every fifth day at 0.75, then the survivors are
-    confirmed on full daily PnL at the real gate. The summary therefore reports the
-    gate the platform would have applied, not the prefilter.
+    A stride prefilter keeps startup work bounded; surviving pairs are checked on
+    daily train PnL. Test-period returns must not change the session-start signal.
     """
     pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
     series = {}
@@ -388,7 +384,10 @@ def _book_duplicates(book, gate=0.70, prefilter=0.75, limit=8):
         if not path.exists():
             continue
         try:
-            series[alpha_id] = json.loads(path.read_text())
+            pnl = json.loads(path.read_text())
+            test = ((book[alpha_id].get("out_of_sample") or {}).get("test") or {})
+            train_end = test.get("startDate") or "2023-01-01"
+            series[alpha_id] = {day: value for day, value in pnl.items() if day < train_end}
         except (OSError, ValueError):
             continue
     # Prefilter on every fifth day rather than on monthly buckets: monthly averaging
@@ -419,7 +418,7 @@ def _book_duplicates(book, gate=0.70, prefilter=0.75, limit=8):
         hits.append({"a": left, "b": right, "r": round(value, 4),
                      "strided_r": round(strided_r, 3), "days": len(dates)})
     hits.sort(key=lambda row: abs(row["r"]), reverse=True)
-    return {"gate": gate, "prefilter": prefilter, "frequency": "daily",
+    return {"gate": gate, "prefilter": prefilter, "frequency": "daily", "window": "train",
             "count": len(hits), "pairs": hits[:limit]}
 
 
@@ -432,9 +431,8 @@ def cmd_brief(args, _sink):
     session remembered. Reading all of it is the expensive part of the work, and it
     grows every week while the answer stays the same size.
 
-    So this emits the small part that moves - what the book is, what ran lately and
-    how it scored, which write-ups are new, and the standing open questions - and
-    nothing else. It is deliberately not a report; it is the input to one.
+    Emit scores alongside recent setbacks, source paths and bounded open questions.
+    Labels and notes are recorded judgements, not inferred research conclusions.
 
     The open-question list is read from ``open-threads.md`` in the research
     directory, one ``- [open] ...`` or ``- [closed] ...`` line each. That file is
@@ -443,6 +441,14 @@ def cmd_brief(args, _sink):
     rather than a list of what is still undecided.
     """
     from datetime import datetime, timedelta, timezone
+
+    if args.top < 1:
+        raise CliError("INVALID_INPUT", "--top must be at least 1")
+
+    def excerpt(text):
+        if isinstance(text, str) and len(text) > 240:
+            return text[:239] + "…"
+        return text
 
     def moment(entry):
         raw = entry.get("recorded_at") or ""
@@ -457,7 +463,7 @@ def cmd_brief(args, _sink):
     entries = alpha_registry.load_entries(registry_path)
 
     def metric(entry, name):
-        return (entry.get("metrics") or {}).get(name)
+        return experiments._train_metrics(entry).get(name)
 
     book = {}
     for entry in entries:
@@ -496,9 +502,29 @@ def cmd_brief(args, _sink):
     scored.sort(key=lambda entry: -metric(entry, "sharpe"))
     best = [{"alpha_id": entry.get("alpha_id"), "sharpe": metric(entry, "sharpe"),
              "fitness": metric(entry, "fitness"),
-             "verdict": entry.get("verdict"), "idea": entry.get("idea"),
+             "verdict": entry.get("verdict"), "idea": excerpt(entry.get("idea")),
+             "family": entry.get("family"), "mechanism": excerpt(entry.get("mechanism")),
              "when": entry.get("recorded_at")}
             for entry in scored[:args.top]]
+
+    # Include relabelled decisions: a conclusion often arrives after the simulation.
+    setbacks = [entry for entry in recent
+                if entry.get("verdict") in {"rejected", "falsified", "no_go"}]
+    setbacks.sort(key=moment, reverse=True)
+    seen, lessons = set(), []
+    for entry in setbacks:
+        group = (entry.get("family"), entry.get("mechanism") or entry.get("key"),
+                 entry.get("verdict"))
+        if group in seen:
+            continue
+        seen.add(group)
+        lessons.append({"key": entry.get("key"), "alpha_id": entry.get("alpha_id"),
+                        "family": entry.get("family"),
+                        "mechanism": excerpt(entry.get("mechanism")),
+                        "verdict": entry.get("verdict"), "note": excerpt(entry.get("note")),
+                        "when": entry.get("recorded_at")})
+        if len(lessons) >= args.top:
+            break
 
     research_dir = Path(research_paths.ensure_dir())
     documents = []
@@ -510,19 +536,22 @@ def cmd_brief(args, _sink):
         documents.append({"file": path.name,
                           "when": written.isoformat(timespec="minutes"),
                           "title": _first_heading(path)})
-        if len(documents) >= args.top * 2:
+        if len(documents) >= args.top:
             break
 
-    threads = {"open": [], "closed": []}
     thread_file = research_dir / "open-threads.md"
-    if thread_file.exists():
+    threads = {"path": str(thread_file), "exists": thread_file.exists(),
+               "counts": {"open": 0, "closed": 0}, "open": [], "closed": []}
+    if threads["exists"]:
         for line in thread_file.read_text(encoding="utf-8").splitlines():
             text = line.strip()
             for tag, key in (("[open]", "open"), ("[closed]", "closed")):
                 if text.startswith("- " + tag):
                     body = text[len(tag) + 2:].strip()
                     if body:
-                        threads[key].append(body)
+                        threads["counts"][key] += 1
+                        if len(threads[key]) < args.top:
+                            threads[key].append(excerpt(body))
 
     # Label debt and recording gaps: both were invisible until someone counted by
     # hand, and both make the ledger look complete while it is not.
@@ -533,21 +562,26 @@ def cmd_brief(args, _sink):
     data = {
         "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "window_days": days,
+        "research_dir": str(research_dir),
         "ledger": {"rows": len(entries), "path": registry_path,
+                   "exists": Path(registry_path).exists(),
                    "book_rows_missing_labels": unlabeled,
                    "rows_with_metrics_but_no_checks": no_checks},
         "book": {
             "count": len(book),
+            "metrics_scope": "train",
             "sharpe_median": (round(sorted(sharpes)[len(sharpes) // 2], 3)
                               if sharpes else None),
             "by_family": dict(sorted(families.items(), key=lambda item: -item[1])),
             "by_universe": dict(sorted(universes.items(), key=lambda item: -item[1])),
             # Same-bet pairs the submission gate could have missed (snapshot lag).
-            "self_duplicates": _book_duplicates(sorted(book)),
+            "self_duplicates": _book_duplicates(book),
             # A train Sharpe can hide a single-regime edge; the halves stay in train.
             "stability": _book_stability(book),
         },
-        "recent": {"runs": len(runs), "by_verdict": by_verdict, "best": best},
+        "recent": {"runs": len(runs), "by_verdict": by_verdict, "best": best,
+                   "metrics_scope": "train", "missing_train_metrics": len(runs) - len(scored),
+                   "setbacks": {"count": len(setbacks), "items": lessons}},
         "documents": documents,
         # The divergence trigger: how many of the last batches produced anything additive.
         "convergence": _convergence_snapshot(),
