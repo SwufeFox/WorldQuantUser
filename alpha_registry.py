@@ -495,6 +495,7 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
     producer_batch = batch
     entries = []
     written = 0
+    skipped = []
     for record in records:
         key = record.get("alpha_id")
         previous = stored.get(key) if key else None
@@ -531,13 +532,23 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
         )
         if previous:
             entry = _inherit_judgement(entry, previous, pinned_verdict=verdict is not None)
-        _, did_write = record_entry(entry, path)
+        try:
+            _, did_write = record_entry(entry, path)
+        except ValueError as exc:
+            # `record_entry` refuses to let a metrics-less row erase a metrics-bearing
+            # one, which is right. Abandoning the rest of the batch is not: on
+            # 2026-11-13 a grid died after its third arm because that arm (a known
+            # expression under a new setting) came back without metrics. Keep the
+            # stored row, say which arm was skipped, and finish the run.
+            skipped.append({"alpha_id": key, "reason": str(exc)})
+            continue
         written += 1 if did_write else 0
         entries.append(entry)
     return {
         "registry": path,
         "recorded": len(entries),
         "appended": written,
+        "skipped": skipped,
         "by_verdict": {
             name: sum(1 for entry in entries if entry["verdict"] == name)
             for name in VERDICTS

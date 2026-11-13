@@ -1767,3 +1767,35 @@ class UndefinedVariableTests(unittest.TestCase):
 
     def test_short_field_names_are_not_mistaken_for_locals(self):
         self.assertTrue(self.lint("rank(cap) - 0.5")["ok"])
+
+
+class MetricsLossDoesNotAbortTheBatchTests(unittest.TestCase):
+    """One unrecordable arm must not throw away the arms behind it."""
+
+    def test_a_metrics_less_repeat_is_skipped_and_the_run_continues(self):
+        import json
+        import tempfile
+        import alpha_registry
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "ledger.jsonl")
+            stored = {"key": "AAA", "alpha_id": "AAA", "metrics": {"fitness": 1.5},
+                      "expression": "rank(close)", "settings": {}}
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(stored, sort_keys=True) + "\n")
+            records = [
+                {"alpha_id": "AAA", "expression": "rank(close)", "settings": {},
+                 "metrics": None, "status": "COMPLETE"},
+                {"alpha_id": "BBB", "expression": "rank(volume)", "settings": {},
+                 "metrics": {"fitness": 1.2}, "status": "COMPLETE"},
+            ]
+            summary = alpha_registry.record_simulation(records, {}, registry_path=path)
+            self.assertEqual(summary["recorded"], 1)
+            self.assertEqual(len(summary["skipped"]), 1)
+            self.assertEqual(summary["skipped"][0]["alpha_id"], "AAA")
+            with open(path, encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle]
+            keys = [row["key"] for row in rows]
+            self.assertIn("BBB", keys)
+            # The stored metrics survive: the refusal kept the old row.
+            self.assertEqual(rows[0]["metrics"], {"fitness": 1.5})
