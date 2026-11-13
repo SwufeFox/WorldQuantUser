@@ -568,3 +568,25 @@ class FeedTests(unittest.TestCase):
         self.assertNotIn("SECRET", str(progress.call_args_list))
         self.assertFalse(os.path.exists(result["seen"]))
         self.assertFalse(os.path.exists(args.draft_cards))
+
+
+class DataFitTests(unittest.TestCase):
+    """A paper that needs data this account lacks must say so before a probe is written."""
+
+    def test_a_missing_input_outranks_a_present_one(self):
+        fit = feed.data_fit({"title": "Short interest and the cross-section of stock returns",
+                             "abstract": "We study momentum and short interest."})
+        self.assertEqual(fit["verdict"], "blocked")
+        needs = {item["need"] for item in fit["needs"]}
+        self.assertIn("lending and short interest", needs)
+
+    def test_a_buildable_mechanism_is_reported_as_supported(self):
+        fit = feed.data_fit({"title": "Analyst forecast dispersion and returns",
+                             "abstract": "Using consensus estimates we study revision."})
+        self.assertEqual(fit["verdict"], "supported")
+
+    def test_an_unmatched_paper_stays_unknown_instead_of_guessing(self):
+        fit = feed.data_fit({"title": "A history of double-entry bookkeeping",
+                             "abstract": "Accounting practice in Renaissance Italy."})
+        self.assertEqual(fit["verdict"], "unknown")
+        self.assertEqual(fit["needs"], [])

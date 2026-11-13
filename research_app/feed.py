@@ -361,6 +361,51 @@ def _feed_argv(args, topics, seen_path):
     return argv
 
 
+#: What a mechanism would need from *this* account, and whether it exists.
+#: Curated on 2026-11-13 from the catalogue: 14 datasets, 66 operators, USA delay 0/1
+#: only. Two of twelve papers that day were worth a simulation; the rest needed data
+#: this account does not have (call transcripts, patents, lending, bonds, supply-chain
+#: links) or a field type that cannot be a signal (`univ1` is UNIVERSE, not MATRIX).
+#: The point is to say so before a probe is written, not after.
+DATA_NEEDS = (
+    (("conference call", "transcript", "managerial tone", "tone of"), "call transcripts", "blocked"),
+    (("patent", "innovation and productivity", "citation-weighted"), "patent data", "blocked"),
+    (("short interest", "securities lending", "lending market", "borrow fee"), "lending and short interest", "blocked"),
+    (("corporate bond", "credit spread", "bond return"), "bond prices", "blocked"),
+    (("supply chain", "supplier", "bullwhip", "customer-supplier"), "supply-chain links", "blocked"),
+    (("index reconstitution", "index addition", "index deletion", "indexing"), "index membership history", "blocked"),
+    (("monetary policy", "macro variable", "macroeconomic"), "macro series", "blocked"),
+    (("earnings announcement", "announcement date", "post-earnings"), "announcement dates", "partial"),
+    (("analyst forecast", "forecast dispersion", "estimate dispersion", "revision"), "analyst4 estimates", "supported"),
+    (("accrual", "inventory", "deferred revenue", "earnings quality", "fundamental",
+      "r&d", "research and development", "capex", "dividend", "payout"), "fundamental2/fundamental6", "supported"),
+    (("implied volatility", "option", "skew", "open interest"), "option8/option9", "supported"),
+    (("news", "sentiment", "social media", "attention", "tweet"), "news12/news18, socialmedia", "supported"),
+    (("turnover", "volume", "momentum", "reversal", "liquidity", "price"), "pv1/pv13", "supported"),
+)
+
+
+def data_fit(paper):
+    """Whether this account has the data a paper's mechanism would need.
+
+    A keyword screen over title and abstract, stated as such: it is a reading aid, not
+    a measurement. ``blocked`` outranks ``partial`` outranks ``supported``, so a paper
+    that needs one missing input is not advertised as buildable just because it also
+    mentions prices.
+    """
+    text = ("%s %s" % (paper.get("title") or "", paper.get("abstract") or "")).lower()
+    needs = []
+    for phrases, need, verdict in DATA_NEEDS:
+        if any(phrase in text for phrase in phrases):
+            needs.append({"need": need, "verdict": verdict})
+    if not needs:
+        return {"verdict": "unknown", "needs": [], "why": "no data term matched"}
+    order = {"blocked": 0, "partial": 1, "supported": 2}
+    worst = min(needs, key=lambda item: order[item["verdict"]])
+    return {"verdict": worst["verdict"], "needs": needs,
+            "why": "; ".join("%s (%s)" % (item["need"], item["verdict"]) for item in needs)}
+
+
 def _next_actions(args, reports, unresolved, deferred, papers, seen_path):
     """At most eleven evidence-based actions; the action view may add one ledger contrast."""
     actions = []
@@ -464,9 +509,10 @@ def cmd_feed(args, _sink):
         "closed_register": {"path": register["path"],
                             "available": "error" not in register,
                             "match_basis": "exact declared family only"},
-        "papers": [{k: paper.get(k) for k in
-                    ("title", "year", "journal", "doi", "url", "landing_page_url", "pdf_url",
-                     "abstract", "family", "citations", "query", "queries", "rank", "closure_cautions")}
+        "papers": [{**{k: paper.get(k) for k in
+                     ("title", "year", "journal", "doi", "url", "landing_page_url", "pdf_url",
+                      "abstract", "family", "citations", "query", "queries", "rank", "closure_cautions")},
+                    "data_fit": data_fit(paper)}
                    for paper in picked],
         "next_actions": _next_actions(args, reports, unresolved, deferred, picked, seen_path),
         "note": ("Picks take turns across queries, ranked within each query. Closure "
