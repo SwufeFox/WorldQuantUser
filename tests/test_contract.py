@@ -12,6 +12,7 @@ Run with::
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -164,6 +165,62 @@ class CheckpointConcurrencyTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "SERVICE_ERROR")
             login.assert_not_called()
             simulate.assert_not_called()
+
+
+class ResearchLookupContractTests(unittest.TestCase):
+    def test_latest_probe_snapshot_exposes_labels_and_train_halves_without_inline_parsing(self):
+        # Synthetic rows exercise input order and different train-half profiles.
+        samples = [
+            ("control", "ALPHA_A", 1.5, 1.2, 0.1, 1.0, 2.0),
+            ("variant", "ALPHA_B", 2.0, 1.6, 0.2, 2.5, 1.5),
+        ]
+        fields = ("label", "alpha_id", "train_sharpe", "train_fitness", "train_turnover",
+                  "train_sharpe_h1", "train_sharpe_h2")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            older = root / "sample-batch-z-old.json"
+            latest = root / "sample-batch-a-new.json"
+            older.write_text(json.dumps({"name": "old", "rows": [{"label": "OLD", "train_sharpe": 9}]}), encoding="utf-8")
+            latest.write_text(json.dumps({"name": "sample-batch",
+                                          "rows": [dict(zip(fields, row)) for row in samples]}), encoding="utf-8")
+            os.utime(older, (100, 100))
+            os.utime(latest, (200, 200))
+            proc = run_cli("compare", "--research-dir", directory,
+                           "--match", "sample-batch*.json", "--latest", "--sort", "none")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            data = parse(proc)["data"]
+        self.assertEqual(data["view"], "train")
+        self.assertEqual([tuple(row.get(field) for field in fields) for row in data["rows"]], samples)
+        self.assertTrue(all(row.get("failed_checks") is None for row in data["rows"]))
+        self.assertEqual([Path(path).name for path in data["files"]], [latest.name])
+
+    def test_unmatched_batch_pattern_is_missing_evidence_not_a_service_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            proc = run_cli("compare", "--research-dir", directory,
+                           "--match", "not-here*.json", "--latest")
+        self.assertEqual(proc.returncode, 5, proc.stdout + proc.stderr)
+        self.assertEqual(parse(proc)["error"]["code"], "NOT_FOUND")
+
+    def test_batch_alpha_checks_keep_pending_evidence_next_to_a_success(self):
+        outcomes = {
+            "ALPHA_A": {"alpha_id": "ALPHA_A", "complete": True,
+                        "checks": {"LOW_SHARPE": {"result": "PASS", "value": 1.8},
+                                   "SELF_CORRELATION": {"result": "PASS", "value": 0.4}}},
+            "ALPHA_B": {"alpha_id": "ALPHA_B", "complete": False,
+                        "checks": {"SELF_CORRELATION": {"result": "PENDING", "value": None}}},
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ml, "load_session", return_value=ml.requests.Session()), \
+                mock.patch.object(ml, "fetch_alpha_checks", side_effect=lambda session, alpha_id, **kw: outcomes[alpha_id]), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = cli_app.main(["alpha", "check", "ALPHA_A", "ALPHA_B", "--research-dir", directory])
+            data = json.loads(stdout.getvalue())["data"]
+        self.assertEqual(code, 0)
+        self.assertFalse(data["complete"])
+        self.assertEqual([item["alpha_id"] for item in data["results"]], ["ALPHA_A", "ALPHA_B"])
+        self.assertEqual(data["results"][0]["checks"]["SELF_CORRELATION"]["value"], 0.4)
+        self.assertEqual(data["results"][1]["checks"]["SELF_CORRELATION"]["result"], "PENDING")
 
 
 class OptionalPandasTests(unittest.TestCase):

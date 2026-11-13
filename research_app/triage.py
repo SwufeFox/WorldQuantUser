@@ -87,9 +87,8 @@ def _round(value, places=3):
 def _cohort_retentions(latest, days=45):
     """Retention distribution of recently recorded arms, for a percentile.
 
-    A fixed floor hides the drift: October's arms had a median retention of 0.82,
-    November's 0.63. A candidate at -0.33 is not "just below the line", it is at the
-    bottom of its own cohort - and that is the comparison worth showing.
+    A fixed floor can hide cohort drift. Compare a candidate with its recent peers
+    to distinguish a weak cohort from an unusually weak member of that cohort.
     """
     import datetime
 
@@ -155,11 +154,9 @@ def _score(alpha_id, entry, series, dates, criteria):
             book_slice = [sum(values[day] for values in series.values()) for day in common]
             values = [candidate[day] for day in common]
             rho = legs.correlation(values, book_slice)
-            # The platform's self-correlation gate compares against the *worst single
-            # member*, not against the book aggregate. An alpha can be nearly orthogonal
-            # to the sum of 61 members and still be a 0.99 duplicate of one of them -
-            # a delay-0 sibling of a submitted alpha did exactly that (rho_book 0.39,
-            # platform self-correlation 0.9911). Both numbers are needed.
+            # The platform gate uses the worst single-member correlation. A candidate
+            # can duplicate one member while appearing independent of the portfolio
+            # aggregate, so both numbers are needed.
             member_rhos = []
             for member, member_values in series.items():
                 other = legs.correlation(values, [member_values[day] for day in common])

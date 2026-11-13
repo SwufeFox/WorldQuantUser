@@ -274,9 +274,8 @@ def cmd_ledger_sync(args, _sink):
             latest[alpha_id] = entry
     known = set(latest)
     missing = [alpha_id for alpha_id in platform if alpha_id not in known]
-    # Status drift is the more dangerous half of a sync: `P0o5QGZK` was submitted on the
-    # platform while the ledger still said COMPLETE, so every local book count was one
-    # short and the alpha looked like a candidate that had never been spent.
+    # A submitted alpha can still say COMPLETE locally until its status is refreshed.
+    # Sync status drift so book counts and candidate lists reflect the platform.
     drifted = [alpha_id for alpha_id in platform
                if alpha_id in latest
                and str((latest[alpha_id] or {}).get("status") or "").upper()
@@ -398,9 +397,9 @@ def _book_marginals(entries, window_end="2023-01-01"):
       the "portfolio" was hundreds of unrelated alphas;
     * leave-one-out over the book only cannot score a candidate that is not in the book.
 
-    So the book is the fixed reference: ``S_own - rho(own, book) * S_book``. For a book
-    member this is the usual marginal (its own weight is 1/56 of the reference, which is
-    negligible), and for an outside candidate it is exactly the entry test.
+    The book is the fixed reference: ``S_own - rho(own, book) * S_book``. A book
+    member contributes its own weight to the reference; an outside candidate does
+    not. Both are scored against the same portfolio.
     """
     pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
 
@@ -547,11 +546,10 @@ def _form_stats(values):
 def cmd_ledger_decay(args, _sink):
     """How much of the train-period Sharpe survives to the full window.
 
-    Three veins in a row (mid-shape volume persistence, deferred-revenue variants,
-    turnover acceleration) looked stable inside the training window and then failed the
-    platform's full-window fitness floor. The selection rule reads train-only Sharpe; the
-    submit gate reads the full window, which contains the test year. The ratio between the
-    two is therefore a property of the *construction* that the campaign never measured.
+    Stability inside training does not guarantee clearing the platform's full-window
+    fitness floor. The selection rule reads train-only Sharpe; the submit gate reads
+    the full window, which contains the test year. The ratio describes how the
+    construction's measured performance changes across those windows.
 
     ``train`` comes from the ledger's ``out_of_sample.train`` block, ``full`` from
     ``metrics.sharpe``; both are what the platform reported, so this needs no simulation.
@@ -610,9 +608,7 @@ def cmd_ledger_decay(args, _sink):
 def cmd_ledger_form(args, _sink):
     """Which construction reads better, a level or a change - measured per block.
 
-    The campaign has argued about this in single cases three times (dispersion: change
-    wins; labour: level steadier; deferred revenue: level only). Aggregating the whole
-    ledger answers it once: for each information block, compare the arms written as a
+    Aggregate the ledger by information block to compare arms written as a
     change against the arms written as a level, on median Sharpe *and* on directional
     reliability (share above +0.5 minus share below -0.5), because a block full of
     strongly negative arms is not a block with signal.
@@ -620,10 +616,8 @@ def cmd_ledger_form(args, _sink):
     Book members are excluded by default: they are survivors of a selection that this
     comparison is trying to characterise, so including them would count the winners twice.
 
-    Caveat measured 2026-11-11: splitting the ledger by record date, no block ever
-    reversed to "level", but several were neutral early and only became "change" later.
-    Part of the edge is therefore about how the arms are written now, not only about the
-    information - read the verdict as a prior, not a law.
+    Results can change with the record-date split and with how the arms are written,
+    as well as with the information itself. Read the verdict as a prior, not a law.
     """
     from . import mechanisms
 
@@ -707,9 +701,8 @@ def cmd_ledger_mechanisms(args, _sink):
 def cmd_ledger_convergence(args, _sink):
     """Per-batch signals for "is this line of work exhausted".
 
-    Structural novelty is not a usable trigger: the last hundred arms were 93% new
-    skeletons and almost none of them were additive. This reports the outcome number next
-    to the structural one so the difference stays visible.
+    Structural novelty alone does not establish additive performance. Report the
+    outcome number next to the structural one so the difference stays visible.
     """
     _path, entries = _ledger(args)
     marginals = _book_marginals(entries) if not args.no_marginal else {}
@@ -733,11 +726,10 @@ def cmd_ledger_convergence(args, _sink):
 def cmd_ledger_stability(args, _sink):
     """Which book alphas earn their train Sharpe in only one half of train.
 
-    `omEaaMl2` made the case: a 2.11 train Sharpe whose following year went negative.
-    A single aggregate number cannot show that, and the test year may not be used to
-    select. Splitting train in half keeps the evidence inside the period selection is
-    allowed to see, and a sign flip between halves is the cheapest warning that an
-    edge is regime-bound rather than structural.
+    A single aggregate train Sharpe can hide opposing regimes, and the test year may
+    not be used to select. Splitting train in half keeps the evidence inside the
+    period selection is allowed to see. A sign flip between halves warns that an
+    edge may be regime-bound; stability within train does not rule out future decay.
     """
     _path, entries = _ledger(args)
     selected = [entry for entry in entries if _ask_passes(entry, _ask_filters(args.where))]
@@ -790,10 +782,10 @@ def cmd_ledger_stability(args, _sink):
 def cmd_ledger_styles(args, _sink):
     """What each alpha compares against: other stocks, its own history, or nothing.
 
-    The screen exists because one batch measured a 2.3x Fitness gap between the same
-    variable read cross-sectionally (0.87) and against its own history (2.05). Where a
-    book alpha never reads a field against its own past, that re-read is cheap and has
-    a prior; where it already does, the question is answered.
+    The same variable can behave differently when compared across stocks or against
+    its own history. Where a book alpha never reads a field against its own past,
+    that comparison is an untested construction choice; where it already does,
+    the ledger can report the existing evidence.
     """
     _path, entries = _ledger(args)
     selected = [entry for entry in entries
@@ -1007,8 +999,7 @@ def _ask_matrix(entries, within, min_overlap):
     absolute = [abs(pair["r"]) for pair in pairs]
     # Every measured id belongs to one group; the spectrum is computed per group and
     # once over the whole matched set. `median_abs_r` says how tight the typical pair
-    # is, the effective bet count says how many bets the set actually is - 24 clusters
-    # can still be 7 bets.
+    # is; the effective bet count says how many independent bets the set represents.
     members = {}
     for key, pnls in groups.items():
         if len(pnls) >= 2:
@@ -1143,8 +1134,8 @@ def cmd_ask(args, _sink):
     factor_ids = None
     if getattr(args, "factor_where", None):
         # Build the factor from a query instead of a pasted id list: "correlate every
-        # candidate against the book" is `--factor-where status=ACTIVE`, and typing 51
-        # ids by hand is how a probe becomes stale the moment the book changes.
+        # candidate against the book" is `--factor-where status=ACTIVE`. A pasted list
+        # of ids becomes stale as the book changes.
         factor_ids = [entry.get("alpha_id") for entry in entries
                       if _ask_passes(entry, _ask_filters(args.factor_where))
                       and entry.get("alpha_id")]

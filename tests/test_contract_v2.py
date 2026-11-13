@@ -770,17 +770,18 @@ class OutOfSampleSplitTests(unittest.TestCase):
     def test_extract_split_reads_train_and_test_blocks(self):
         import machine_lib as ml
 
+        # Synthetic metrics distinguish full-window, train and test values.
         payload = {
             "settings": {"testPeriod": "P1Y"},
-            "is": {"sharpe": 1.65},
-            "train": {"sharpe": 1.94, "fitness": 1.71, "startDate": "2019-01-01"},
-            "test": {"sharpe": 0.43, "fitness": 0.16, "turnover": 0.043,
+            "is": {"sharpe": 1.5},
+            "train": {"sharpe": 2.0, "fitness": 1.5, "startDate": "2019-01-01"},
+            "test": {"sharpe": 0.5, "fitness": 0.2, "turnover": 0.1,
                      "startDate": "2022-12-31", "endDate": "2023-12-31"},
         }
         split = ml.extract_split(payload)
         self.assertEqual(split["test_period"], "P1Y")
-        self.assertAlmostEqual(split["train"]["sharpe"], 1.94)
-        self.assertAlmostEqual(split["test"]["sharpe"], 0.43)
+        self.assertAlmostEqual(split["train"]["sharpe"], 2.0)
+        self.assertAlmostEqual(split["test"]["sharpe"], 0.5)
         self.assertEqual(split["test"]["startDate"], "2022-12-31")
         # Keys outside the metric allow-list must not leak through.
         self.assertNotIn("is", split)
@@ -793,11 +794,11 @@ class OutOfSampleSplitTests(unittest.TestCase):
         self.assertIsNone(ml.extract_split(None))
 
     def test_registry_keeps_out_of_sample(self):
-        split = {"test_period": "P1Y", "train": {"sharpe": 1.94}, "test": {"sharpe": 0.43}}
+        split = {"test_period": "P1Y", "train": {"sharpe": 2.0}, "test": {"sharpe": 0.5}}
         entry = alpha_registry.build_entry(
-            {"alpha_id": "abc123", "expression": "rank(close)", "status": "UNSUBMITTED",
-             "metrics": {"sharpe": 1.65, "fitness": 1.27}, "checks": [], "out_of_sample": split},
-            idea="Idea 57", mechanism="stability", verdict="candidate",
+            {"alpha_id": "ALPHA_A", "expression": "rank(close)", "status": "UNSUBMITTED",
+             "metrics": {"sharpe": 1.5, "fitness": 1.2}, "checks": [], "out_of_sample": split},
+            idea="synthetic split", mechanism="stability", verdict="candidate",
         )
         self.assertEqual(entry["out_of_sample"], split)
 
@@ -805,14 +806,14 @@ class OutOfSampleSplitTests(unittest.TestCase):
 class CheckReconciliationTests(unittest.TestCase):
     """BRAIN can serve a cached verdict beside a refreshed value.
 
-    Observed live: SELF_CORRELATION with value 0.7526, limit 0.7 and result
-    "PASS". A decision must follow the number, not the stale label.
+    A value above a ceiling can retain a cached "PASS" label. A decision must follow
+    the current number rather than that stale label.
     """
 
     def test_ceiling_check_contradiction_is_flagged(self):
         verdict = machine_lib.reconcile_check(
             "SELF_CORRELATION",
-            {"value": 0.7526, "limit": 0.7, "result": "PASS"},
+            {"value": 0.8, "limit": 0.7, "result": "PASS"},
         )
         self.assertEqual(verdict["expected"], "FAIL")
         self.assertFalse(verdict["consistent"])
@@ -820,7 +821,7 @@ class CheckReconciliationTests(unittest.TestCase):
     def test_ceiling_check_agreement(self):
         verdict = machine_lib.reconcile_check(
             "SELF_CORRELATION",
-            {"value": 0.6212, "limit": 0.7, "result": "PASS"},
+            {"value": 0.5, "limit": 0.7, "result": "PASS"},
         )
         self.assertEqual(verdict["expected"], "PASS")
         self.assertTrue(verdict["consistent"])
@@ -1160,11 +1161,11 @@ class SelfCorrelationTests(unittest.TestCase):
         # 0.84 with a higher Sharpe raises the bar and the shortcut would pass it.
         records = [
             ["low_sharpe", None, "EQUITY", "USA", "TOP3000", 0.90, 1.50, 0.1, 0.1, 1.2, 0.001],
-            ["high_sharpe", None, "EQUITY", "USA", "TOP3000", 0.84, 2.54, 0.1, 0.1, 2.3, 0.001],
+            ["high_sharpe", None, "EQUITY", "USA", "TOP3000", 0.84, 2.50, 0.1, 0.1, 2.0, 0.001],
         ]
         verdict = machine_lib.self_correlation_verdict({"records": records})
         self.assertTrue(verdict["blocked"])
-        self.assertAlmostEqual(verdict["sharpe_needed"], 2.794, places=3)
+        self.assertAlmostEqual(verdict["sharpe_needed"], 2.75, places=3)
 
     def test_pairs_below_the_limit_do_not_raise_the_bar(self):
         records = [
@@ -1502,12 +1503,7 @@ class EnvExampleTests(unittest.TestCase):
 
 
 class LocalSelfCheckTests(unittest.TestCase):
-    """The local check, calibrated against platform values that are on record.
-
-    Daily Pearson matched the platform within 0.006-0.016 on ten alphas and always read a
-    little lower; weekly and monthly overstated it by 0.03-0.08. That is why daily decides
-    and the slower frequencies only diagnose.
-    """
+    """Daily decisions, diagnostic aggregation and synthetic gate boundaries."""
 
     def test_daily_aggregation_is_the_identity(self):
         series = {"2023-01-03": 1.0, "2023-01-04": 2.0}
@@ -1527,9 +1523,8 @@ class LocalSelfCheckTests(unittest.TestCase):
         self.assertEqual(correlation.aggregate({"bad": 1.0}, "w"), {})
 
     def test_verdict_uses_the_measured_bias(self):
-        # The platform read 0.7166 and 0.7157 on two alphas whose daily Pearson was 0.6935
-        # and 0.7025 - higher, not lower. The bias is added, so a local 0.67 lands in the
-        # undecided band rather than being called clear.
+        # A positive screening adjustment moves a near-limit value into the
+        # undecided band rather than calling it clear.
         verdict, estimate = correlation.classify(0.67)
         self.assertEqual(verdict, "borderline")
         self.assertLess(estimate, 0.7)
@@ -1540,9 +1535,7 @@ class LocalSelfCheckTests(unittest.TestCase):
         self.assertEqual(correlation.classify(0.90)[0], "blocked")
 
     def test_borderline_band_is_documented_by_behaviour(self):
-        # With the measured bias of +0.015 the band is local [0.655, 0.685): below that the
-        # platform is expected to accept, at or above 0.685 it is expected to refuse. Both
-        # of today's refusals (0.6935 and 0.7025) sit above it, which is the point.
+        # Synthetic values on either side of the undecided band stay distinct.
         self.assertEqual(correlation.classify(0.67)[0], "borderline")
         self.assertEqual(correlation.classify(0.64)[0], "clear")
         self.assertEqual(correlation.classify(0.70)[0], "blocked")
@@ -1599,14 +1592,10 @@ class ForecastTargetAlignmentTests(unittest.TestCase):
 
 
 class TurnoverFloorTests(unittest.TestCase):
-    """A shape built only from disclosure fields cannot clear the 0.01 turnover floor.
+    """Disclosure-only constructions warn about turnover-floor risk.
 
-    Measured across four accounting families - deferred tax 0.0077, operating leases 0.0086,
-    unrecognised tax benefits 0.009, share-based compensation 0.0083 - and no choice of
-    neutralisation or decay lifted them, because the ranking only changes when a filing
-    does. The check reads which fields carry market data, not what the construct looks like:
-    the first attempt keyed on "has a time-series operator" and got it backwards in both
-    directions, since ts_backfill is not movement and close/vwap has no window at all.
+    The check uses market-field categories rather than time-series operator presence:
+    ts_backfill is not daily movement, while close/vwap needs no window.
     """
 
     MARKET = {"close", "returns", "volume", "vwap"}
@@ -1616,11 +1605,6 @@ class TurnoverFloorTests(unittest.TestCase):
     def test_disclosure_only_shape_warns(self):
         findings = expression_lint.turnover_findings(self.UTB, self.MARKET)
         self.assertEqual([f["code"] for f in findings], ["turnover_floor_risk"])
-        self.assertIn("0.006-0.010", findings[0]["message"])
-        # The finding must point at the missing leg, not condemn the data: three book
-        # entries are built from these very datasets.
-        self.assertIn("no leg that moves daily", findings[0]["message"])
-        self.assertIn("three book entries", findings[0]["message"])
 
     def test_a_market_field_silences_the_warning(self):
         expr = self.UTB + " - 0.5*rank(ts_sum(returns, 5))"

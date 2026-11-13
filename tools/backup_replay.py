@@ -31,7 +31,7 @@ Usage:
     python3 tools/backup_replay.py restore backups/x.tar.gz --to /tmp/restore
     python3 tools/backup_replay.py asof --at 2026-10-25T00:00:00Z
     python3 tools/backup_replay.py replay --status ACTIVE --limit 3          # dry run
-    python3 tools/backup_replay.py replay --ids akVznkO2,qMEWm7L2 --run      # costs sims
+    python3 tools/backup_replay.py replay --ids ALPHA_A,ALPHA_B --run      # costs sims
 """
 
 from __future__ import annotations
@@ -179,9 +179,8 @@ def ledger_stats(path):
             key = row.get("key") or row.get("alpha_id") or ""
             keys.add(key)
             # Row level and key level are different questions and used to be
-            # conflated here: 117 rows say ACTIVE because the same alpha was filed
-            # at several universes, while the book is 48. A manifest that reports
-            # 117 is a manifest that will be quoted as 117.
+            # conflated here: one alpha can have several recorded rows, while the
+            # book count describes the latest status per key. Report both explicitly.
             last_status[key] = (row.get("status") or "").upper()
             last_verdict[key] = row.get("verdict") or "-"
             stamp = row.get("recorded_at")
@@ -461,7 +460,7 @@ def summarize(rows):
 
     ``keys`` is the number of records after deduplication and ``book`` is how many of
     those end ACTIVE. Both are key-level on purpose: the row-level version of the
-    same number is roughly twice as large and answers a question nobody asked.
+    same number can include repeated observations and answers a different question.
     """
     verdicts = collections.Counter(row.get("verdict") or "-" for row in rows)
     statuses = collections.Counter((row.get("status") or "-").upper() for row in rows)

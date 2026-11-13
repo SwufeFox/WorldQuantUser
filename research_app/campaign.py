@@ -147,8 +147,8 @@ def _annual_sharpe(values):
 def cmd_health(args, _sink):
     """The book's own accounting: who contributes, who is dead weight, what is duplicated.
 
-    A book of 55 alphas is not 55 bets, and equal weighting means every member is paid
-    the same regardless of what it adds. The one number that decides whether a member
+    A book's alpha count is not its independent bet count, and equal weighting pays
+    every member the same regardless of what it adds. The number that decides whether a member
     earns its slot is its marginal contribution, `S_i - rho_i * S_book`, and it needs
     two things this workspace already has: each alpha's daily PnL and its correlation
     against the rest of the book.
@@ -205,9 +205,8 @@ def cmd_health(args, _sink):
             marginal = sharpe - rho * book_sharpe
         # Two different numbers, deliberately side by side. `slope` is the first-order
         # term S_i - rho*S_book; `delta` is what the book's own Sharpe does when this
-        # member is removed. They differ by roughly the member's weight - on a 60-alpha
-        # book the slope can read +1.4 while the book moves 0.03 - and calling both
-        # "marginal" is how the slope gets quoted as an outcome.
+        # member is removed. They differ by roughly the member's weight, so calling
+        # both "marginal" can misrepresent the slope as a realised book-level change.
         delta = None
         if len(ids) > 1 and rest and book_sharpe is not None:
             rest_sharpe = _annual_sharpe(rest)
@@ -257,13 +256,12 @@ def cmd_health(args, _sink):
                          "marginal": round(sharpe - rho * book_sharpe, 2)})
         pool.sort(key=lambda row: -(row["marginal"] or 0))
         # Marginal is measured against the *portfolio*, but the platform's gate is the
-        # max against any single member - and they disagree in practice: `LL58p8ee`
-        # scored rho_book 0.18 yet 0.972 against `rKd0g0bj`, i.e. a duplicate of one
-        # member that looks diversified against the average. Report both for the rows we
-        # show, otherwise the marginal alone would wave duplicates through.
+        # max against any single member. A duplicate of one member may still look
+        # diversified against the average. Report both for the rows we show, otherwise
+        # the marginal alone could wave duplicates through.
         # Screen every pool row, not just the visible ones: the point of the pool pass is
         # to answer "what is left after the two quantitative legs of the gate", and that
-        # answer is a count. The strided series keeps 433 x 55 correlations cheap.
+        # answer is a count. The strided series keeps the correlation pass bounded.
         stride = max(1, len(dates) // 250)
         strided_dates = dates[::stride]
         book_strided = {a: [series[a][d] for d in strided_dates] for a in ids}
@@ -335,9 +333,8 @@ def _book_stability(book, min_move=0.3, limit=3):
     the window selection is allowed to read, so a flip is visible at session start
     instead of after a submission disappoints.
 
-    Honest limit, worth keeping in the code: this catches *train-internal* regime
-    dependence, not future decay. `omEaaMl2` is stable by this measure (2.50 -> 1.81)
-    and still turned negative the following year.
+    This catches *train-internal* regime dependence, not future decay. Stability
+    within the training window does not guarantee positive returns in a later period.
     """
     pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
     gaps, flips, late = [], [], []
@@ -390,10 +387,9 @@ def _book_duplicates(book, gate=0.70, prefilter=0.75, limit=8):
             series[alpha_id] = {day: value for day, value in pnl.items() if day < train_end}
         except (OSError, ValueError):
             continue
-    # Prefilter on every fifth day rather than on monthly buckets: monthly averaging
-    # lost two of the eight violations (a 0.77 daily pair can read 0.80 monthly), and a
-    # screen that under-reports is worse than no screen. A stride keeps ~250 points per
-    # pair, which is cheap and tracks daily closely enough to be conservative at 0.80.
+    # Monthly averaging can distort daily pair correlations. Sample every fifth
+    # day for the prefilter, then confirm each surviving pair on daily train PnL.
+    # The prefilter is an approximation and does not guarantee an exhaustive scan.
     sampled = {name: {day: values[day] for day in sorted(values)[::5]}
                for name, values in series.items()}
     names = sorted(sampled)

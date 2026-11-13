@@ -1,10 +1,8 @@
 """What each alpha compares against: other stocks, its own history, or nothing.
 
-The distinction showed up as a 2.3x difference in Fitness inside one batch: the
-forward earnings yield read cross-sectionally (`rank(eps/close)`) scored 0.87, the
-same variable read against its own 252-day history (`ts_rank(eps/close, 252)`) scored
-2.05, and its 63-day change scored 2.04. The variable never changed - only the
-comparison set did.
+A cross-sectional rank, a rank against a value's own history, and a historical
+change ask different questions of the same input. The comparison set can change
+the resulting signal even when the underlying variable stays the same.
 
 That makes "which comparison does this expression use" a property of the whole book,
 worth measuring once instead of rediscovering per batch. This module classifies an
@@ -14,8 +12,7 @@ expression by the outermost comparison it performs:
             ``ts_zscore``, ``ts_argmax``, ``ts_av_diff``, ``ts_returns``).
 ``window``  it uses history as a window (``ts_mean``, ``ts_sum``, ``ts_std_dev``)
             without comparing against it.
-``static``  only cross-sectional comparisons and cleaning: the quantity is a fixed
-            ratio. This is the group the E/P level fell into at 0.87.
+``static``  only cross-sectional comparisons and cleaning, such as a fixed ratio.
 ``level``   no comparison at all: pure arithmetic.
 
 Known blind spots, stated rather than hidden: a windowed aggregate of a *flow*

@@ -1,20 +1,17 @@
 """Read the closed-direction list as data, so tools stop recommending dead ends.
 
-The atlas records twenty closed directions with their reasons, and every one of them
-cost at least one simulation to learn. That knowledge lived only in a markdown table,
-which meant a tool could rank a seed from the option-IV family first (it does -- F3.38
-and F3.89 are the top two by best-ever fitness) and a reader had to remember why that
-was wrong. Anything a tool can get wrong twice should be machine-readable.
+Closed directions and their reasons belong in machine-readable research data.
+A high historical fitness alone can rank a seed from a closed family first;
+tools should surface the recorded reason alongside that recommendation.
 
 The file lives in the research directory, not the repository: it is a judgement about
 markets, revised when evidence changes, while the repository versions the tool. It is
 loaded the same way as ``field-units.json`` and degrades to "nothing is closed" when
 absent, because a missing research file must not break a tool.
 
-Only entries carrying a ``match`` can be applied mechanically -- today that is the
-option family. The rest describe a technique ("take the difference of two accounting
-series", "slow the leg down") and cannot be detected from an expression; they are
-kept here so a reader gets the whole list from one place rather than a filtered one.
+Only entries carrying a ``match`` can be applied mechanically. Other entries may
+describe a technique that cannot be detected from an expression; they remain
+available so a reader gets the whole list from one place rather than a filtered one.
 """
 
 from __future__ import annotations
@@ -63,9 +60,8 @@ def closed_families(explicit=None):
     """Mechanism families that are closed, e.g. ``{"option"}``.
 
     Only entries with a ``match.family`` count. A family closed for one construction
-    is *not* closed in general -- the option verdict is about IV-driven constructions
-    -- so this is a warning to show next to a recommendation, not a filter that
-    silently deletes rows.
+    is *not* closed in general, so this is a warning to show next to a recommendation,
+    not a filter that silently deletes rows.
     """
     out = set()
     for entry in entries(explicit):

@@ -6,10 +6,10 @@ every time an alpha was judged, and each time they were rewritten by hand. That
 is where mistakes come from. Two in particular were made repeatedly and are now
 encoded once, with the trap named:
 
-1. **Two alphas that both look independent of the existing pool can still be
-   ~0.6 correlated with each other.** Judging a pair only against the book hides
-   the fact that the pair is one bet. :func:`matrix` therefore reports every pair,
-   not just each candidate's maximum.
+1. **Two alphas that each look independent of the existing pool can still be
+   correlated with each other.** Judging a pair only against the book hides
+   shared exposures. :func:`matrix` therefore reports every pair, not just
+   each candidate's maximum.
 
 2. **A shared factor makes unrelated signals look alike.** If two alphas load on
    the same leg, their raw correlation is mostly that leg.
@@ -156,11 +156,9 @@ def max_against(target, refs, min_overlap=200):
 def aggregate(series, frequency="d"):
     """Aggregate a daily PnL series to weekly or monthly buckets.
 
-    The platform's SELF_CORRELATION was calibrated against daily Pearson: over ten alphas
-    with a known platform value, daily came within 0.006 to 0.016 and always slightly
-    below, while weekly and monthly overstated it by 0.03 to 0.08. Daily is therefore the
-    default; the slower frequencies are diagnostic, useful for telling a shared signal
-    that drifts apart from a mechanically identical one.
+    Daily values are used for correlation decisions. Weekly and monthly aggregates
+    are diagnostics for distinguishing slower shared exposure from identical daily
+    behavior; aggregation changes the statistic being compared.
 
     Buckets are keyed by calendar period, so two series only line up when they share the
     bucket - which is what ``align`` needs.
@@ -183,17 +181,8 @@ def aggregate(series, frequency="d"):
     return out
 
 
-#: Typical gap between daily Pearson and the platform's SELF_CORRELATION, same book, same
-#: moment: measured +0.013, +0.023 and +0.126 on three alphas.
-#:
-#: That spread is the point. The gap is not a constant, so this number orders candidates and
-#: does not gate them: an alpha at 0.62 locally was refused at 0.745, which no correction of
-#: this size would have predicted. Local correlation is a screen; the platform is the only
-#: test that counts, and a refused submission costs nothing but a call.
-#:
-#: The +0.126 case also rules out the first explanation tried here - that the platform's
-#: reference set is the ACTIVE book. It is not, or not only: that alpha's book-only local
-#: maximum was 0.6195 against an ACTIVE counterpart, and the platform still measured 0.745.
+#: Screening adjustment for local daily Pearson. Differences in peer sets and
+#: timestamps can exceed this adjustment, so it cannot replace the platform check.
 PLATFORM_BIAS = 0.015
 
 #: How close to the limit counts as undecided rather than clear. A candidate sitting just
@@ -232,10 +221,9 @@ def spectrum(ids, pairs):
     ``pc1_share`` is the largest eigenvalue over the trace, found by power iteration
     so this module stays free of numpy.
 
-    The cluster count answers a different question. Twenty-five alphas can sit in
-    twenty-four clusters at ``|r| >= 0.7`` and still behave like seven bets, because
-    the correlation is diffuse rather than blocked; the quality family measured
-    exactly that (24 clusters, 7.12 effective bets).
+    The cluster count answers a different question. Diffuse correlation can leave
+    most pairs below a clustering threshold while substantially reducing the
+    number of effective bets.
     """
     n = len(ids)
     if n < 2:

@@ -5,11 +5,10 @@ Three measured facts decide whether a field is worth a probe, and none of them i
 
 * **is it untouched** - a field already in the ledger has been paid for; new work starts
   from the ones that have not;
-* **will its cadence land in the useful turnover band** - a dataset whose alphas have
-  always come back at 0.02 turnover is paying the ``max(T, 0.125)`` floor tax, and one at
-  0.4 has information lasting days. Both were measured the hard way this month: the
-  relationship graph came back at 0.41, inventory composition at 0.02, and neither could
-  be rescued by shape;
+* **will its cadence land in the useful turnover band** - slow-changing signals pay
+  the ``max(T, 0.125)`` floor tax, while rapid turnover can indicate short-lived
+  information. Use stored measurements to assess whether a different construction
+  is likely to help;
 * **what type is it** - VECTOR and EVENT fields are rejected by arithmetic operators, so
   an arm built on one needs `vec_avg` or `vec_sum` before anything else touches it. Five
   arms once went to the simulator to learn this.
@@ -113,10 +112,8 @@ def dataset_turnover(entries=None):
             for dataset, values in buckets.items()}
 
 
-#: Shapes the campaign has measured. Applying one to a field is a different experiment
-#: from applying another, and the same field can go from noise to a live signal across
-#: the set: the mid shape took a volume-autocorrelation leg from F -0.70 to +0.90 while
-#: leaving volatility clustering worse than its plain group_rank.
+#: Applying a different shape is a separate experiment: a transformation can change
+#: both signal strength and turnover. Compare each against its plain rank control.
 SHAPES = {
     "raw": "rank({x})",
     "centre": "-(group_rank({x}, subindustry) - 0.5)",
@@ -293,10 +290,9 @@ _LONG_WINDOW = re.compile(r"ts_(?:delta|mean|std_dev|sum)\([^,]+,\s*(\d{2,})\s*\
 def long_window_caution(expression, threshold=126):
     """A long window on a slow field reorders rarely, whatever the dataset median says.
 
-    The measured R&D case is the reason this exists: fundamental fields sit at a 0.118
-    median, but `ts_delta(rd_expense, 252)` came back at 0.047 because the annual
-    difference of a quarterly field only changes once a year. The median bounds the arm
-    from above; the window decides where inside the bound it lands.
+    Dataset medians do not determine a specific construction's turnover. Long-window
+    transformations can make an already slow field reorder less often, so assess the
+    expression's window as well as its dataset.
     """
     windows = [int(value) for value in _LONG_WINDOW.findall(expression or "")]
     if not windows or max(windows) < threshold:

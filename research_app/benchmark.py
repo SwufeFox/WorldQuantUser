@@ -1,35 +1,9 @@
-"""An internal bar: the platform's Fitness, discounted by what our own data says decays.
+"""Discount platform Fitness using scoring priors and portfolio contribution.
 
-The platform's Fitness is a *train-heavy* number: the full window is four-fifths training,
-so an arm can clear the floor while its out-of-sample behaviour is poor. The campaign
-needs a bar of its own - one that is strictly harder to clear - and the question is what
-belongs in it.
-
-Two candidates were proposed and both failed their own test on this ledger:
-
-* **operator count**. The intuition is that a 40-operator expression is overfitted. It is
-  not, here: median retention is 0.45 for 1-4 operators, 0.75 for 5-8, 0.73 for 9-16,
-  0.81 for 17-32 and 1.83 above 32. Complexity does *not* predict decay, and a penalty
-  would push work toward the arms that decay most.
-* **field crowding** (the "cold field" bonus). Also backwards: the least-crowded third of
-  the ledger retains 0.52, the middle 0.74, the most-crowded 0.94. Crowded fields are
-  crowded because they keep working.
-
-What the ledger does support is a **hump in train Sharpe**: retention is 0.41 below 1.0,
-0.77 in 1.0-1.5, **0.85 in 1.5-2.0**, 0.64 in 2.0-2.5 and 0.49 at 2.5 and above. Weak arms
-are noise; very strong arms are the overfitted ones. That is the shape a benchmark should
-encode, and it is the opposite of rewarding raw Fitness.
-
-So this module keeps three factors, each with a stated basis:
-
-* ``shrink`` - train-Sharpe hump (the table above);
-* ``contribution`` - the book delta, because an alpha that does not move the book is not a
-  finding however good its own Sharpe;
-* ``retention`` - the block's median test/train ratio, as a family-level prior.
-
-Operator count is *reported* and warned about (a 32-operator arm cannot be reasoned about
-by a reader) but it does not multiply the score: a warning is honest, a penalty would be
-a superstition with a number attached.
+The train-Sharpe bands and optional economic-block factors are scoring coefficients.
+Raw calibration observations, sample sizes and individual alpha outcomes belong in
+the research directory. Operator count warns about auditability without multiplying
+the score. Treat this benchmark as a ranking aid, not evidence of future performance.
 """
 
 import json
@@ -39,10 +13,7 @@ import research_paths
 
 from . import legs, mechanisms
 
-#: Train-Sharpe hump, read off the ledger (retention by bucket, 1427 arms with a split).
-#: Below 1.0 the arms are noise; above 2.5 they are the overfitted tail.
-#: Measured retention / best retention, so the factor is a *ratio* rather than a guess:
-#: 0.41/0.85 = 0.48, 0.77/0.85 = 0.91, 1.00, 0.64/0.85 = 0.75, 0.49/0.85 = 0.58.
+#: Piecewise scoring coefficients: strongest confidence in the middle Sharpe band.
 SHRINK_BANDS = (
     (1.0, 0.48),
     (1.5, 0.91),
@@ -51,27 +22,19 @@ SHRINK_BANDS = (
     (99.0, 0.58),
 )
 
-#: Median test/train Sharpe ratio per economic block, measured on 2026-11-12 over every
-#: ledger arm that carries a train/test split and |train S| >= 0.3 (n in the comment).
-#: The spread is large and it is *not* inversion: the train-test correlation stays
-#: positive in every block (0.10 to 0.62), so these are shrinkage differences, not
-#: sign flips. A block at 0.21 needs roughly five times the train Sharpe that a block at
-#: 1.74 needs in order to deliver the same out-of-sample signal.
-BLOCK_RATIO = {
-    "price_path": (0.84, 318),
-    "analyst_yield": (0.91, 268),
-    "value_quality": (0.21, 187),
-    "turnover_structure": (0.69, 185),
-    "other": (0.10, 178),
-    "volatility_structure": (0.67, 133),
-    "derivative_pricing": (0.46, 117),
-    "analyst_dispersion": (1.74, 97),
-    "news_sentiment": (0.03, 32),
-    "debt_structure": (0.25, 26),
+#: Normalised scoring priors; raw performance measurements are not shipped.
+BLOCK_PRIORS = {
+    'price_path': 1.1199999999999999,
+    'analyst_yield': 1.2133333333333334,
+    'value_quality': 0.27999999999999997,
+    'turnover_structure': 0.9199999999999999,
+    'other': 0.25,
+    'volatility_structure': 0.8933333333333334,
+    'derivative_pricing': 0.6133333333333334,
+    'analyst_dispersion': 2.0,
+    'news_sentiment': 0.25,
+    'debt_structure': 0.3333333333333333,
 }
-
-#: The ledger-wide median ratio these block numbers are normalised against.
-BLOCK_BASELINE = 0.75
 
 DEFAULTS = {
     "weight_shrink": 1.0,
@@ -128,24 +91,16 @@ def retention_factor(block_retention, baseline=0.85):
 
 
 def block_factor(block, criteria):
-    """How much a block's train Sharpe survives into the test period, versus the norm.
-
-    Measured, not assumed: see ``BLOCK_RATIO``. Unknown blocks get 1.0 rather than a
-    penalty, because "not in the table" is not evidence of decay.
-    """
+    """Apply an optional block prior; an unknown block receives no penalty."""
     if not criteria.get("block_ratio"):
         return 1.0
-    entry = BLOCK_RATIO.get(block or "")
-    if entry is None:
-        return 1.0
-    return max(0.25, min(2.0, entry[0] / BLOCK_BASELINE))
+    return BLOCK_PRIORS.get(block or "", 1.0)
 
 
 def ops_warning(ops, thresholds):
     """A warning string when the expression is long, or ``None``.
 
-    Long expressions are hard to audit, which is a real cost to the reader - but the
-    ledger says they are not more likely to decay, so this never changes the score.
+    Long expressions cost more to audit; complexity alone does not justify a penalty.
     """
     if ops is None:
         return None
@@ -153,7 +108,7 @@ def ops_warning(ops, thresholds):
         if ops <= limit:
             if limit == thresholds[0]:
                 return None
-            return "ops<=%d (no penalty; complexity does not predict decay here)" % limit
+            return "ops<=%d (no score penalty; audit expression complexity)" % limit
     return "ops>%d: long expression, consider splitting before it becomes unauditable" % thresholds[-1]
 
 
@@ -243,9 +198,8 @@ def benchmark_rows(ids, registry_path=None, pnl_dir=None, criteria=None,
         "rows": rows,
         "note": ("internal_fitness = platform_fitness * shrink * contribution * retention"
                  + (" * block" if criteria.get("block_ratio") else "") + ". "
-                 "The shrink factor follows the train-Sharpe hump measured on this ledger; "
-                 "operator count is warned about but never scored, because it does not "
-                 "predict decay here."),
+                 "Shrink and optional block factors are scoring priors; "
+                 "operator count produces auditability warnings without a score penalty."),
     }
 
 

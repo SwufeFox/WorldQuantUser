@@ -4,21 +4,19 @@ The ledger stores expressions. That is the wrong granularity to think in: after 
 hundred simulations there are hundreds of strings, most of them one small step away
 from a dozen others, and no way to ask *what has this construction not tried yet*.
 
-This document records the decomposition, the measured hierarchy, and — the part that
-matters most — **where compression stops and why**. All numbers were recomputed on
-2026-11-01 by `python3 tools/unit_report.py`; do not trust a number quoted here after
-the ledger has moved, re-run it. The absolute counts move on every filing -- the
-ratios are what has stayed put across measurements -- so read a count as "about this
-many" and the ratio as the claim.
+This document records the decomposition, the hierarchy, and **where compression
+stops and why**. Run `python3 tools/unit_report.py` against the current research
+directory for counts and coverage; private corpus measurements stay with that
+research evidence.
 
 ## Why not sugar, and not parts
 
-Both were measured first, and both fail at the same place.
+Sugar and parts answer different questions from unit compression:
 
-| Attempt | Result | Why it fails |
+| Attempt | What it captures | Why it is insufficient |
 | --- | --- | --- |
-| Sugar forms (`sugar_rewrite`, since removed) | 951 expressions → **932** distinct sugar spellings (−2%) | Sugar works on shape. The variation is not in the shape. |
-| Parts catalogue (`parts_catalogue`) | 951 → **424** parts | A vocabulary, not a compression: it says which ingredients exist, not how many dishes there are. |
+| Sugar forms (`sugar_rewrite`, since removed) | Alternative spellings of a shape | Does not capture variation in fields and constants. |
+| Parts catalogue (`parts_catalogue`) | Reusable ingredients | Does not identify which complete constructions or grid points have been tried. |
 
 The variation lives one level down, in **which data** and **which constants** a fixed
 shape is given, and one level up, in **how many legs** are combined. Compressing on
@@ -28,13 +26,13 @@ those two axes is what `alpha_unit` does.
 
 An expression becomes five things:
 
-| Piece | What it is | Size on the corpus |
-| --- | --- | --- |
-| **assembly** | How the legs are mixed, as a string over `G` (leg) and `L` (offset): `G -L -G` is "leg, minus a constant, minus another leg" | **40** |
-| **legs** | The additive terms, coefficients factored out | 1–8 per expression, 1625 in total |
-| **role** | A leg with its fields removed and its cleaning operators folded: `rank(ratio(F,F))` is "a ranked ratio" | **273** |
-| **data class** | Dataset family of each field, from the field catalogue (4417 fields, 14 datasets, all 373 used fields covered) | 7 families |
-| **fillings** | Which field in each field slot, which constant in each number slot, and the settings | the grid |
+| Piece | What it is |
+| --- | --- |
+| **assembly** | How the legs are mixed, as a string over `G` (leg) and `L` (offset): `G -L -G` is "leg, minus a constant, minus another leg" |
+| **legs** | The additive terms, coefficients factored out |
+| **role** | A leg with its fields removed and its cleaning operators folded: `rank(ratio(F,F))` is "a ranked ratio" |
+| **data class** | Dataset family of each field, from the field catalogue |
+| **fillings** | Which field in each field slot, which constant in each number slot, and the settings |
 
 Three decisions in there were paid for by a failure:
 
@@ -51,63 +49,43 @@ to the hand-written original and be reported as novel. Four rewrites, none algeb
 ``a + -x -> a - x``, ``1 * x -> x``, ``-1 * x -> -x``, ``x + 0 -> x``. Nothing is
 commuted, factored or folded.
 
-**A scale factor on the whole signal is divided out.** Measured on 2026-11-01:
-`akVznkO2` and `2 * akVznkO2` (ids `akKAxMl1` and the parent) return sharpe 2.56,
-fitness 1.76, turnover 0.1793 and returns 0.084 *to three decimals*. The platform
-normalises the book, so a scalar multiple is the same alpha — which means the two
-must be one unit. They were not: wrapping the sum in a product turned three terms
-into one, so the scaled copy landed in a template of its own. Weights *inside* the
-sum are still the grid and are never stripped.
+**A scale factor on the whole signal is divided out.** Under portfolio
+normalisation, multiplying the whole signal by a positive scalar does not create
+a new construction. Factoring it out before decomposing the sum prevents a scaled
+copy from landing in its own template. Weights *inside* the sum remain grid values
+and are never stripped.
 
-## The hierarchy, measured
+## The hierarchy
 
-Counts are a snapshot (2026-11-01); they move with every filing, the ratios do not.
+| Level | What question it answers |
+| --- | --- |
+| Ledger rows | What was filed, including repeated records per key |
+| Expressions (after inlining) | What was run: variable names are not content |
+| Assemblies | How legs are mixed |
+| Kinds (assembly × data family) | What combinations of shape and data families exist |
+| Units (exact template) | Which constructions and grid points are represented |
+| One-step moves | What can be tried next using values already observed |
 
-| Level | Count | What question it answers |
-| --- | --- | --- |
-| Ledger rows | 2134 | what was filed (1274 distinct keys) |
-| Expressions (after inlining) | **927** | what was run: variables are not content |
-| Assemblies | **41** | how are legs mixed |
-| Kinds (assembly × data family) | **130** | what kinds of alpha exist here |
-| Units (exact template) | **558**, 437 of them singletons | the construction, plus its grid |
-| One-step moves | **483** | what can be tried next without inventing a value |
-
-So the compression is **1.66x at template level, 7.1x at kind level, 22x at assembly
-level** — and the level that compresses best is the level that says least about any
-single alpha. That is not a defect of the method, it is a fact about the corpus:
-
-> 437 of 558 templates contain exactly one expression. The exploration was
-> breadth-first: one expression per idea, then move on. 53% of expressions sit in a
-> shared template, and only 483 single-slot moves are available across the whole
-> corpus with values it already uses.
+Coarser levels compress more but say less about an individual alpha. Singleton
+templates and sparse grids indicate limited coverage of a construction; they do
+not establish that its economic hypothesis has been exhausted.
 
 ### The alternative that looked better and was rejected
 
-Grouping by *leg set* instead of by template does compress further: 531 signatures
-collapse to **403** maximal ones (2.27x), because an expression that is "another one
-minus a leg" merges into the larger one. Measured, then rejected:
+Grouping by *leg set* instead of template merges an expression into any larger
+expression containing it. This can compress further, but containment can chain
+unrelated constructions through a shared leg.
 
-```
-largest maximal unit: 8 legs, absorbs 23 signatures / 48 expressions
-smallest absorbed:    group_rank(anl4_..._eps_median / close, subindustry) - 0.5
-```
-
-A single-leg expression is a subset of an eight-leg one, so containment merges
-unrelated constructions. This is the same failure the old family graph hit when it merged on
-`extends` edges and produced a 467-member "family"; the fix there — merge only on
-siblings — is the fix here — do not merge on containment at all. Subset derivation
-stays available as a *rule* (`drop:lN`), where it is one leg and it is labelled.
+The same issue arises when family graphs merge on `extends` edges. Keep sibling
+identity separate from containment: subset derivation remains available as the
+labelled rule `drop:lN`, without treating parent and child as one template.
 
 ## What each level is for
 
-* **Assembly** is the cheapest reading of the corpus and the most surprising: five
-  patterns cover two thirds of everything. `G` (one leg) is 280 expressions,
-  `G -L` (one leg, centred) 118, `G -L -G` (carrier minus an offset minus a
-  stabiliser) 93. The corpus is overwhelmingly "one ranked ratio, occasionally
-  centred, occasionally with one price-based stabiliser subtracted".
-* **Kind** is for reading. `fundamental` + `G` is 113 expressions; `fundamental,price`
-  + `-G -L G` is 89 and holds the best single-leg-plus-stabiliser template in the
-  corpus (F 1.76).
+* **Assembly** describes mixing patterns, such as `G` (one leg), `G -L` (one leg,
+  centred), or `G -L -G` (a carrier minus an offset and a stabiliser).
+* **Kind** combines assembly with data families, allowing a reader to distinguish
+  shapes that use different kinds of inputs without asserting a performance rank.
 * **Unit** is for deriving. It carries the exact template and the grid; everything in
   the next section operates on it.
 * **One-step moves** is for choosing what to run next.
@@ -131,27 +109,19 @@ the one already in `annotations.py`, including its renormalisation. `annotations
 passes on every rendered unit, which is what makes the annotation layer and the unit
 layer the same vocabulary rather than two.
 
-That decision paid for itself immediately. Wiring the two together exposed that
-`drop_term` split only `+`, so **every composite written with subtraction was
-silently undroppable** — and most composites are written that way — while every
-net-short composite (`-l0 - l1 - 0.5*l2`) failed the renormalisation guard, which
-required a positive sum. Both are fixed; the book's open ablations went from 75 to
-90. The row was simply missing, and the table looked complete.
+Ablation needs to handle subtraction as well as addition. A composite written
+`-l0 - l1 - 0.5*l2` must not disappear from derivation merely because its coefficient
+sum is negative. The shared annotation layer keeps subtraction and renormalisation
+rules consistent with rendered units.
 
-`port` is the derivation the parts catalogue could not express: a part is not
-attached to a position, so "put this proven leg where that one sits" had no way to
-be stated. Measured on the corpus: **114 candidate ports, 72 never run**. The guards
-are what make the number small — a port has to be able to say *why* the two legs are
-interchangeable, and "both are ranked ratios over fundamentals" is a reason while
-"both are subexpressions" is not. The guard binds on the data *family*; tightening it
-to the dataset id moves the yield from 70 novel to 68, so the corpus limits it, not
-the guard.
+`port` attaches a replacement leg to a specific position. Its guards require the
+same role, the same data families and another shared leg, so a proposed substitution
+has an explicit structural reason. A generic parts catalogue cannot establish
+that positional compatibility.
 
-**Measured on the book (2026-11-01):** 43 constructions, **416 derivations never run**
-— 231 data moves, 99 `zero_leg`, 86 `drop_term`. The ablations dominate because the
-composites were never taken apart: the balance-sheet family — 13 alphas but only
-**8 distinct constructions**, since five of them are the same construction refiled at
-another universe — shares one template and nobody removed its price-position leg.
+Use the report's derivation counts to find untried data moves and ablations.
+Repeated settings for one construction do not constitute additional constructions,
+and an untried move is a coverage gap rather than evidence of likely success.
 
 Caveat worth keeping: many `data` moves are cosmetic — `x / atq` against
 `x / ltq` is a different grid cell and barely a different bet. The count says "open",
@@ -160,30 +130,28 @@ not "promising".
 ## The round-trip gate
 
 `verify` refills every template from its own filling and demands canonical equality
-with the expression it came from: **927/927, 0 failures**. This is the property that
-separates a compression from a summary. A template that cannot be re-instantiated
-makes the coverage number say 100% while nothing was checked.
+with the source expression. A template that cannot be re-instantiated cannot support
+a trustworthy coverage claim. The current report supplies any failures.
 
 ## How to recompute
 
 ```
 python3 tools/unit_report.py                 # the hierarchy and the top of each level
 python3 tools/unit_report.py --gaps          # book derivations never run
-python3 tools/unit_report.py --unit 3f2a     # one unit in full
-python3 tools/unit_report.py --derive 3f2a   # what that unit has not tried
+python3 tools/unit_report.py --unit UNIT_KEY   # one unit in full
+python3 tools/unit_report.py --derive UNIT_KEY # what that unit has not tried
 python3 tools/unit_report.py --cross         # templates assembled from two existing ones
 python3 tools/unit_report.py --json units.json
 ```
 
 ## Known limitations
 
-* **The role string fragments.** 273 distinct roles for 1625 leg instances, because an
-  unfamiliar operator keeps its own name in the string instead of being folded into
-  `other`. That is the right trade for honesty and the wrong trade for counting; the
-  top six roles cover 47% of instances, the tail is where the count goes.
-* **`kind` on a single-leg assembly is coarse.** The 113-expression `fundamental` + `G`
-  kind is one bucket for "rank of something fundamental", which is several different
-  ideas. The kind answers *what data, how mixed*, not *which hypothesis*.
+* **The role string fragments.** An unfamiliar operator keeps its own name instead
+  of being folded into `other`. This preserves distinctions but makes coarse role
+  counts less compact.
+* **`kind` on a single-leg assembly is coarse.** A `fundamental` + `G` bucket can
+  contain several economic ideas. The kind answers *what data, how mixed*, not
+  *which hypothesis*.
 * **`expand_domain` can pick a normaliser.** If the carrier slot mixes families it is
   not eligible, and the next most-varied slot may be a denominator
   (`atq`/`ltq`/`saleq`). Pass `slot=` explicitly when that matters.

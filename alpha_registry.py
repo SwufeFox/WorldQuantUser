@@ -60,14 +60,13 @@ VERDICTS = ("candidate", "watch", "rejected", "falsified", "no_go")
 #: Statuses that mean the platform finished the run and every number is final.
 #: ``WARNING`` belongs here: BRAIN uses it when a check warns without failing
 #: (``UNITS`` is the usual one), and the metrics are as final as ``COMPLETE``.
-#: Treating it as unfinished made a Sharpe 2.37 / Fitness 1.68 alpha look like a
-#: failed simulation in every summary and in the ledger.
+#: Treating it as unfinished would misclassify a completed simulation in summaries
+#: and in the ledger.
 FINISHED_STATUSES = frozenset({"COMPLETE", "WARNING"})
 
 # Second-level grouping: which return source an alpha draws on. ``mechanism``
 # is deliberately specific (one label per construction), so counting labels
-# overstates diversity -- thirteen book alphas carry eleven labels but only
-# four families, and six of the labels are the same overnight/intraday bet.
+# overstates diversity when several constructions draw on the same return source.
 # ``family`` is the number to quote when the question is "how many independent
 # bets do I have".
 #
@@ -427,10 +426,8 @@ def auto_verdict(record):
     """
     # WARNING is a finished run: the platform marks a simulation WARNING when a check
     # warns without failing (UNITS is the common one), and every metric is final. It
-    # used to fall into the "not finished" branch, so `RREmgObg` - all checks PASS,
-    # Sharpe 2.37, Fitness 1.68, only a UNITS warning - was filed as `rejected` with
-    # reason `unrecorded_check`, which reads as "this alpha failed" to every later
-    # search over the ledger.
+    # must not fall into the "not finished" branch and be filed as `rejected` merely
+    # because a non-failing check emitted a warning.
     if (record.get("status") or "").upper() not in FINISHED_STATUSES:
         return "rejected"
     checks = record.get("checks") or {}
@@ -506,9 +503,8 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
         if previous and (previous.get("status") or "").upper() == "ACTIVE":
             # A simulation cannot un-submit a book alpha. BRAIN hands back the
             # existing id when an identical expression is re-run, so a re-run of a
-            # book member arrives here looking like an ordinary new record - and on
-            # 2026-11-02 a 20-field batch demoted `E5VzE550` from ACTIVE to COMPLETE
-            # and relabelled it `rejected`, which quietly shrank the book by one.
+            # book member arrives here looking like an ordinary new record. Preserve
+            # its ACTIVE status and existing verdict rather than demoting it.
             if (status or "").upper() != "ACTIVE":
                 status = previous.get("status")
             if not verdict:
@@ -696,11 +692,9 @@ def relabel(entry, family=None, verdict=None, mechanism=None, idea=None,
             note=None):
     """Return a copy of ``entry`` with labels replaced.
 
-    Labels are the only part of a record that is judgement rather than
-    measurement, and they are the part that had to be filled in by editing the
-    JSONL by hand: 318 of 481 keys carried no ``family``, which made "how many
-    independent mechanisms" unanswerable from the ledger. Changing a label
-    appends a new record under the same key, so history is preserved and the
+    Labels are the part of a record that is judgement rather than measurement.
+    Missing family labels make independent mechanisms hard to count. Changing a
+    label appends a new record under the same key, so history is preserved and the
     newest record wins.
     """
     updated = dict(entry)
@@ -870,10 +864,9 @@ def mark_duplicate(entry, canonical):
 
     Two ids can carry the same PnL: submitting the same expression twice yields a
     new id, and an algebraically zero term added to force a fresh simulation does
-    the same. Those are not two findings, and leaving them uncounted inflates every
-    total that matters — 494 pairs at |r| >= 0.90 were reported before this was
-    noticed. The mark is a field rather than a verdict: being a duplicate says
-    nothing about whether the alpha is any good.
+    the same. Those are not two findings, and leaving them uncounted inflates totals.
+    The mark is a field rather than a verdict: being a duplicate says nothing about
+    whether the alpha is any good.
     """
     updated = dict(entry)
     updated["duplicate_of"] = canonical

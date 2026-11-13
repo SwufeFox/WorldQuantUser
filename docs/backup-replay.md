@@ -15,16 +15,16 @@ python3 tools/backup_replay.py backup --profile ledger    # the ledger alone
 python3 tools/backup_replay.py verify backups/x.tar.gz
 python3 tools/backup_replay.py restore backups/x.tar.gz --to /tmp/restore --dry-run
 python3 tools/backup_replay.py asof --at 2026-10-25T00:00:00Z
-python3 tools/backup_replay.py replay --ids akVznkO2 --run
+python3 tools/backup_replay.py replay --ids ALPHA_ID --run
 ```
 
 ## Profiles
 
-| Profile | Contents | Measured 2026-11-01 |
-| --- | --- | --- |
-| `ledger` | `alpha-registry.jsonl`, `field-units.json` | 2 files, 4.9 MB → 0.4 MB |
-| `state` | everything except `cache/` — results, PnL series, checkpoints, notes | 1855 files, 41.5 MB → 5.4 MB, 6 s |
-| `full` | `state` plus the metadata cache, for a machine that has to work offline | +11 MB |
+| Profile | Contents |
+| --- | --- |
+| `ledger` | `alpha-registry.jsonl`, `field-units.json` |
+| `state` | everything except `cache/` — results, PnL series, checkpoints, notes |
+| `full` | `state` plus the metadata cache, for a machine that has to work offline |
 
 The default is `state`: the cache is fetched again on demand, the PnL series and the
 ledger are not.
@@ -50,11 +50,10 @@ Member paths in the manifest and archive use `/` on every platform. Windows
 backups therefore verify against the same names that tar stores, and nested
 results restore with the same layout on Windows and POSIX.
 
-Two counts in there are deliberately different. On 2026-11-01 the ledger held
-**2134 rows over 1267 keys**, and **117 rows carry an `ACTIVE` status while the book
-is 48 keys** — the same alpha filed at several universes. A manifest that reports
-117 is a manifest that will be quoted as 117, so both numbers are printed with their
-units spelled out.
+Rows and distinct keys are deliberately different counts. An alpha can be filed
+under several settings or recorded repeatedly as its status changes. The manifest
+therefore labels both units explicitly and counts the book per key, so a row count
+cannot be mistaken for the number of distinct alphas.
 
 ## Verification is inside the write
 
@@ -81,15 +80,6 @@ timestamp and keep the newest record per key. **Filter first, deduplicate second
 that order is the whole feature, because a key rewritten after the cutoff has to
 keep the value it had before it.
 
-Measured, which is also a sanity check on the ledger itself:
-
-| As of | Keys | Book |
-| --- | --- | --- |
-| 2026-10-19 | 245 | 5 |
-| 2026-10-22 | 866 | 32 |
-| 2026-10-26 | 1241 | 48 |
-| 2026-10-31 | 1267 | 48 |
-
 `asof --json` writes the reconstructed rows, so a report can be checked against the
 state it was written from instead of against today's ledger.
 
@@ -108,13 +98,14 @@ against what was recorded, field by field, with a tolerance.
   that is an identity change, not a numeric drift.
 * One failure does not stop the batch.
 
-First run, 2026-11-01: `akVznkO2` and `qMEWm7L2`, **2 replayed, 2 identical, 0
-drifted, 0 failed** — 3m37s for two simulations.
+Replay reports distinguish identical results, numeric drift, missing metrics,
+identity changes and failed simulations. Keep those reports in the research
+directory so they remain tied to the selected records and observation time.
 
 ## Limitations
 
-* No incremental or deduplicated archives: every backup is a full copy. At 5 MB that
-  is not worth the complexity, and a simpler format is one you can open with `tar`.
+* No incremental or deduplicated archives: every backup is a full copy in a format
+  that can be opened with `tar`.
 * No encryption. The exclusion list is the security boundary, so treat an archive as
   a copy of the research directory minus credentials.
 * `restore` extracts a whole archive; there is no single-file restore.

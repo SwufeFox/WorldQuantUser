@@ -35,10 +35,9 @@ def half_split_sharpes(pnl, test_start=None):
     """Sharpe of the first and second half of the train window.
 
     Selection uses the train period, and a train Sharpe can be the average of two very
-    different halves. `omEaaMl2` read as 2.11 in train while the following year turned
-    negative - a fact only visible afterwards, because that year is test data and may
-    not drive selection. The halves stay inside train, so this is legal to look at
-    *before* choosing, and it says whether the edge is stable or lives in one regime.
+    different halves. Future test performance cannot drive selection. The halves stay
+    inside train, so they can reveal whether an edge depends on one train regime
+    before choosing a candidate.
 
     PnL rather than returns: only the PnL series is exposed, and Sharpe is
     scale-invariant, so a within-alpha comparison is unaffected.
@@ -426,6 +425,175 @@ def cmd_ablate(args, _sink):
     return data
 
 
+def _compare_inputs(args):
+    """Select files before loading JSON, retaining where each selection came from."""
+    import glob
+
+    explicit = [str(path) for path in args.files]
+    patterns = list(getattr(args, "match", None) or [])
+    latest = getattr(args, "latest", None)
+    if not explicit and not patterns:
+        raise CliError("USAGE", "compare needs files or --match")
+    if explicit.count("-") > 1:
+        raise CliError("INVALID_INPUT", "stdin (-) may be read only once")
+    if latest is not None and (not isinstance(latest, int) or latest < 1):
+        raise CliError("USAGE", "--latest must be a positive integer")
+    if latest is not None and "-" in explicit:
+        raise CliError("USAGE", "--latest cannot select from stdin")
+    root = Path(research_paths.research_dir()).resolve()
+    candidates = {}
+
+    def add(path, source):
+        resolved = "-" if str(path) == "-" else str(Path(path).resolve())
+        if resolved not in candidates:
+            if resolved == "-":
+                modified = None
+            else:
+                try:
+                    if not Path(resolved).is_file():
+                        raise OSError("not a file")
+                    modified = Path(resolved).stat().st_mtime_ns
+                except OSError as exc:
+                    raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc)) from exc
+            candidates[resolved] = {"path": resolved, "sources": [], "mtime_ns": modified}
+        if source not in candidates[resolved]["sources"]:
+            candidates[resolved]["sources"].append(source)
+
+    for path in explicit:
+        add(path, "explicit")
+    for pattern in patterns:
+        matches = [path for path in glob.iglob(str(root / pattern), recursive=True)
+                   if Path(path).is_file()]
+        if not matches:
+            raise CliError("NOT_FOUND", "no files match %s" % pattern,
+                           "patterns are resolved under %s" % root)
+        for path in matches:
+            add(path, pattern)
+    selected = list(candidates.values())
+    if patterns or latest is not None:
+        selected.sort(key=lambda item: (item["mtime_ns"] is None,
+                                       -(item["mtime_ns"] or 0), item["path"]))
+    if latest is not None:
+        selected = selected[:latest]
+    paths = [item["path"] for item in selected]
+    return paths, {"research_root": str(root), "patterns": patterns,
+                   "explicit_files": explicit, "latest": latest,
+                   "matched_count": len(candidates), "selected_paths": paths,
+                   "provenance": selected}
+
+
+def _compare_document(path, payload):
+    """Keep raw records for ablation; normalize only explicit probe display fields."""
+    while isinstance(payload, dict) and "data" in payload:
+        payload = payload["data"]
+    display = []
+    probe = False
+    ordered_probe = False
+    if isinstance(payload, list):
+        records = [item for item in payload if isinstance(item, dict)]
+    elif isinstance(payload, dict) and isinstance(payload.get("results"), list):
+        records = [item for item in payload["results"] if isinstance(item, dict)]
+    elif isinstance(payload, dict):
+        display = payload.get("rows")
+        # A labelled row with explicit train fields is safe to normalize even in
+        # an older snapshot without probe metadata. Headline-only tables are not.
+        ordered_probe = "spec" in payload or ("name" in payload and any(
+            key in payload for key in ("simulated", "incomplete", "design")))
+        probe = isinstance(display, list) and (ordered_probe or bool(display) and all(
+            isinstance(row, dict) and row.get("label")
+            and any(key.startswith("train_") for key in row) for row in display))
+        if isinstance(payload.get("records"), list):
+            records = [item for item in payload["records"] if isinstance(item, dict)]
+        elif probe:
+            records = []
+        else:
+            raise CliError("INVALID_INPUT", "%s is not a simulate or probe result document" % path,
+                           "expected results, raw records, or labelled probe rows with train fields")
+    else:
+        raise CliError("INVALID_INPUT", "%s is not a simulate or probe result document" % path)
+
+    if not probe:
+        if any(any(key in record for key in ("sharpe", "fitness", "train_sharpe", "train_fitness"))
+               and not any(key in record for key in ("metrics", "out_of_sample")) for record in records):
+            raise CliError("INVALID_INPUT", "%s contains flattened rows without probe metadata" % path,
+                           "use raw simulation records or labelled probe rows with explicit train fields")
+        return records, [(record, None) for record in records]
+
+    display = [row for row in display if isinstance(row, dict)]
+    used = set()
+    aligned = []
+
+    def label(record):
+        return record.get("label") or record.get("mechanism")
+
+    def compatible(row, record):
+        return not (row.get("alpha_id") and record.get("alpha_id")
+                    and row["alpha_id"] != record["alpha_id"]) and not (
+                        row.get("label") and label(record) and row["label"] != label(record))
+
+    for position, row in enumerate(display):
+        matches = [index for index, record in enumerate(records) if index not in used
+                   and compatible(row, record) and
+                   ((row.get("alpha_id") and row["alpha_id"] == record.get("alpha_id"))
+                    or (row.get("label") and row["label"] == label(record)))]
+        index = matches[0] if len(matches) == 1 else None
+        # Probe checkpoints save parallel arrays; order is evidence only when no
+        # identity conflicts and no ambiguous identity match exist.
+        if index is None and not matches and ordered_probe and len(display) == len(records) and position not in used:
+            candidate = records[position]
+            claimed_elsewhere = any(other is not row and (
+                candidate.get("alpha_id") and candidate["alpha_id"] == other.get("alpha_id")
+                or label(candidate) and label(candidate) == other.get("label")) for other in display)
+            if compatible(row, candidate) and not claimed_elsewhere:
+                index = position
+        if index is not None:
+            used.add(index)
+            aligned.append((records[index], row))
+        else:
+            aligned.append(({}, row))
+    aligned.extend((record, None) for index, record in enumerate(records) if index not in used)
+    if not records:
+        # Row-only snapshots still provide explicit train evidence for ablation.
+        records = [{"candidate_id": row.get("candidate_id"), "alpha_id": row.get("alpha_id"),
+                    "metrics": {key: row.get(key) for key in ("sharpe", "fitness", "turnover", "returns")},
+                    "out_of_sample": {"train": {key: row.get("train_" + key)
+                                                for key in ("sharpe", "fitness", "turnover", "returns")}}}
+                   for row in display]
+    return records, aligned
+
+
+def _compare_row(record, display, path, frozen):
+    display = display or {}
+    train = _train_metrics(record)
+    halves = record.get("half_sharpes") or (None, None)
+    row = {key: record[key] if record.get(key) is not None else display.get(key)
+           for key in ("candidate_id", "alpha_id", "decay", "status")}
+    row.update({"label": display.get("label") or record.get("label") or record.get("mechanism"),
+                "source_file": path,
+                "train_sharpe_h1": halves[0] if len(halves) > 0 and halves[0] is not None
+                else display.get("train_sharpe_h1"),
+                "train_sharpe_h2": halves[1] if len(halves) > 1 and halves[1] is not None
+                else display.get("train_sharpe_h2"),
+                "failed_checks": None, "checks_state": "hidden"})
+    for key in ("sharpe", "fitness", "turnover", "returns"):
+        row["train_" + key] = train.get(key, display.get("train_" + key))
+    if frozen:
+        metrics = record.get("metrics") or {}
+        row.update({key: metrics.get(key, display.get(key))
+                    for key in ("sharpe", "fitness", "turnover", "returns")})
+        test = (record.get("out_of_sample") or {}).get("test") or {}
+        row["test_sharpe"] = test.get("sharpe", display.get("test_sharpe"))
+        checks = record.get("checks")
+        if isinstance(checks, dict):
+            row["failed_checks"] = sorted(name for name, value in checks.items()
+                                          if isinstance(value, dict)
+                                          and value.get("result") in ("FAIL", "ERROR"))
+        elif isinstance(display.get("failed_checks"), list):
+            row["failed_checks"] = display["failed_checks"]
+        row["checks_state"] = "available" if row["failed_checks"] is not None else "unavailable"
+    return row
+
+
 def cmd_compare(args, _sink):
     """Merge result documents into one table.
 
@@ -437,76 +605,24 @@ def cmd_compare(args, _sink):
     them for a design that is already fixed.
     """
     frozen = bool(getattr(args, "frozen", False))
-    def records_from(path, payload):
-        """Records from the two shapes this repository writes.
-
-        `simulate` writes ``{"data": {"results": [...]}}`` and the research template
-        writes a bare list, so a batch produced by the template could not be compared
-        at all - the file was there, the command refused it, and the reason had
-        nothing to do with the batch. Rows already flattened by `compare` are not
-        accepted on purpose: they carry ``sharpe`` at the top level, and re-reading
-        them as records would fill the table with nulls instead of saying so.
-        """
-        if isinstance(payload, dict) and "data" in payload:
-            return records_from(path, payload.get("data"))
-        if isinstance(payload, list):
-            return [item for item in payload if isinstance(item, dict)]
-        if isinstance(payload, dict) and isinstance(payload.get("results"), list):
-            return [item for item in payload["results"] if isinstance(item, dict)]
-        if isinstance(payload, dict) and isinstance(payload.get("records"), list):
-            # `probe` writes the raw simulation records next to its display rows, so a
-            # batch can be re-read under --frozen without re-running anything.
-            return [item for item in payload["records"] if isinstance(item, dict)]
-        raise CliError("INVALID_INPUT",
-                       "%s is not a simulate result document" % path,
-                       "expected {\"results\": [...]} or a bare list of records; "
-                       "`ledger list --format json` rows are not records")
-
-    if sum(str(path) == "-" for path in args.files) > 1:
-        raise CliError("INVALID_INPUT", "stdin (-) may be read only once")
+    paths, selection = _compare_inputs(args)
     records = []
     inputs = []
-    for path in args.files:
+    rows = []
+    for path in paths:
         try:
             payload = json.loads(config_io.read_input_text(path))
         except (config_io.ResearchError, ValueError) as exc:
             raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc),
-                           "point at a file written by `simulate`") from exc
-        file_records = records_from(path, payload)
+                           "point at a file written by `simulate` or `probe`") from exc
+        file_records, aligned = _compare_document(path, payload)
         records.extend(file_records)
         inputs.append((path, payload, file_records))
+        rows.extend(_compare_row(record, display, path, frozen) for record, display in aligned)
 
-    if not records:
+    if not rows:
         raise CliError("NOT_FOUND", "no result records in the given files",
-                       "the file must come from `simulate`")
-
-    rows = []
-    for record in records:
-        metrics = record.get("metrics") or {}
-        checks = record.get("checks") or {}
-        failed = sorted(name for name, value in checks.items()
-                        if isinstance(value, dict)
-                        and value.get("result") in ("FAIL", "ERROR"))
-        oos = record.get("out_of_sample") or {}
-        train = oos.get("train") or {}
-        row = {
-            "candidate_id": record.get("candidate_id"),
-            "alpha_id": record.get("alpha_id"),
-            "decay": record.get("decay"),
-            # The exploration columns. `sharpe`/`fitness` below are the full window,
-            # which contains the test year, so they are only filled in the frozen view.
-            "train_sharpe": train.get("sharpe"),
-            "train_fitness": train.get("fitness"),
-            "train_turnover": train.get("turnover"),
-            "train_returns": train.get("returns"),
-            "failed_checks": failed,
-        }
-        if frozen:
-            row.update({"sharpe": metrics.get("sharpe"), "fitness": metrics.get("fitness"),
-                        "turnover": metrics.get("turnover"),
-                        "returns": metrics.get("returns"),
-                        "test_sharpe": (oos.get("test") or {}).get("sharpe")})
-        rows.append(row)
+                       "the file must come from `simulate` or `probe`")
 
     fitness_key = "fitness" if frozen else "train_fitness"
     if args.min_fitness is not None:
@@ -514,18 +630,19 @@ def cmd_compare(args, _sink):
                 if isinstance(row.get(fitness_key), (int, float))
                 and row[fitness_key] >= args.min_fitness]
 
-    key = "alpha_id" if args.sort == "id" else args.sort
-    if not frozen and key in {"sharpe", "fitness", "turnover", "returns"}:
-        key = "train_" + key
-    rows.sort(key=lambda row: (row[key] is None, -(row[key] or 0)
-                               if isinstance(row[key], (int, float))
-                               else str(row[key])))
+    if args.sort != "none":
+        key = "alpha_id" if args.sort == "id" else args.sort
+        if not frozen and key in {"sharpe", "fitness", "turnover", "returns"}:
+            key = "train_" + key
+        rows.sort(key=lambda row: (row[key] is None, -(row[key] or 0)
+                                   if isinstance(row[key], (int, float))
+                                   else str(row[key])))
 
-    data = {"files": args.files, "count": len(rows), "view": "frozen" if frozen else "train",
-            "rows": rows}
+    data = {"files": paths, "selection": selection, "count": len(rows),
+            "view": "frozen" if frozen else "train", "rows": rows}
     if frozen:
         research_paths.log_view("compare", "frozen", [row.get("alpha_id") for row in rows],
-                                note=", ".join(str(path) for path in args.files))
+                                note=", ".join(paths))
     if getattr(args, "per_file", False):
         # Variant ids repeat across files, so keep their contributions separate.
         rules = alpha_unit.load_rules() or {}

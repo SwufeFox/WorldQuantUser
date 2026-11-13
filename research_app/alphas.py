@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 import json
+import math
 from pathlib import Path
+
+import requests
 
 import alpha_registry
 import correlation
@@ -130,32 +135,102 @@ def cmd_alpha_near(args, _sink):
             "same_skeleton": same[:10], "near": limited}
 
 
+def _check_error(exc):
+    if isinstance(exc, requests.RequestException):
+        return {"code": "SERVICE_ERROR", "message": "check request failed (%s)" % type(exc).__name__,
+                "hint": "Retry this alpha when the platform is reachable."}
+    return {"code": exc.code, "message": str(exc), "hint": getattr(exc, "hint", None)}
+
+
+def _check_result(alpha_id, payload=None, error=None):
+    payload = payload or {}
+    checks = payload.get("checks") or {}
+    verdicts = [check.get("result") for check in checks.values()]
+    resolved = bool(verdicts) and all(value in {"PASS", "FAIL", "WARNING"}
+                                      for value in verdicts)
+    complete = error is None and bool(payload.get("complete")) and resolved
+    status = "error" if error else "complete" if complete else "pending"
+    outcome = ("error" if error else "failed" if "FAIL" in verdicts else
+               "pending" if not complete else "warning" if "WARNING" in verdicts else "passed")
+    return {"alpha_id": alpha_id, "status": status, "outcome": outcome,
+            "complete": complete, "payload_received": bool(payload.get("payload_received", checks)),
+            "checks_resolved": resolved, "checks": checks,
+            "self_correlation": payload.get("self_correlation"), "error": error}
+
+
+def _isolated_check_session(source):
+    """Copy authenticated state without sharing mutable cookies or connection pools."""
+    session = requests.Session()
+    for name in ("auth", "headers", "cookies", "params", "proxies", "hooks",
+                 "verify", "cert", "trust_env", "max_redirects", "stream"):
+        setattr(session, name, deepcopy(getattr(source, name)))
+    return session
+
+
 def cmd_alpha_check(args, _sink):
-    """Force the platform to compute checks and return the real values.
-
-    ``alpha get`` reads the cached snapshot embedded in the alpha body, where
-    SELF_CORRELATION is usually PENDING or absent. This command hits
-    ``/alphas/{id}/check``, which runs the job (answering with Retry-After) and
-    then returns the computed correlation.
-    """
-    if args.max_wait is not None and args.max_wait < 0:
-        raise CliError("USAGE", "--max-wait must be non-negative",
+    """Compute live checks for ordered unique IDs, preserving every partial outcome."""
+    if args.max_wait is not None and (not math.isfinite(args.max_wait) or args.max_wait < 0):
+        raise CliError("USAGE", "--max-wait must be finite and non-negative",
                        "pass a number of seconds, or omit the flag for the default")
-    result = with_session(args, lambda s: ml.fetch_alpha_checks(
-        s, args.alpha_id, max_wait_seconds=args.max_wait))
-    if not result.get("complete"):
-        raise CliError(
-            "SERVICE_ERROR",
-            "platform did not finish computing checks within %.0fs" % (args.max_wait or 0),
-            hint="Retry, or raise --max-wait; the job keeps running server-side.",
-        )
-    document = {
-        "alpha_id": result["alpha_id"],
-        "self_correlation": result.get("self_correlation"),
-        "checks": result.get("checks"),
-    }
+    if args.workers not in (1, 2, 3):
+        raise CliError("USAGE", "--workers must be 1, 2 or 3")
+    alpha_ids = list(dict.fromkeys(args.alpha_ids))
+    results, auth_failed = {}, set()
+    attempts = 0
 
-    return document
+    def work(session):
+        nonlocal attempts
+        attempts += 1
+        remaining = [alpha_id for alpha_id in alpha_ids
+                     if alpha_id not in results or alpha_id in auth_failed]
+        auth_failed.clear()
+
+        def fetch(alpha_id):
+            try:
+                if args.workers == 1:
+                    payload = ml.fetch_alpha_checks(session, alpha_id, max_wait_seconds=args.max_wait)
+                else:
+                    with _isolated_check_session(session) as isolated:
+                        payload = ml.fetch_alpha_checks(isolated, alpha_id, max_wait_seconds=args.max_wait)
+                return _check_result(alpha_id, payload), None
+            except (ml.BrainError, requests.RequestException) as exc:
+                return _check_result(alpha_id, error=_check_error(exc)), exc
+
+        def collect(outcomes):
+            first_auth_error = None
+            for alpha_id, (result, exc) in zip(remaining, outcomes):
+                results[alpha_id] = result
+                if isinstance(exc, ml.AuthError):
+                    auth_failed.add(alpha_id)
+                    first_auth_error = first_auth_error or exc
+            return first_auth_error
+
+        if args.workers == 1 or not remaining:
+            auth_error = collect(map(fetch, remaining))
+        else:
+            with ThreadPoolExecutor(max_workers=min(args.workers, len(remaining))) as executor:
+                auth_error = collect(executor.map(fetch, remaining))
+        if auth_error is not None and attempts == 1:
+            # with_session owns the single refresh. Its second call only retries
+            # rejected authentication work; successful and pending peers stay put.
+            raise auth_error
+
+    try:
+        with_session(args, work)
+    except (ml.BrainError, requests.RequestException) as exc:
+        if not results:
+            raise
+        # A failed refresh must not erase the first pass's successful evidence.
+        for alpha_id in auth_failed:
+            results[alpha_id] = _check_result(alpha_id, error=_check_error(exc))
+    ordered = [results[alpha_id] for alpha_id in alpha_ids]
+    summary = {status: sum(row["status"] == status for row in ordered)
+               for status in ("complete", "pending", "error")}
+    summary.update({outcome: sum(row["outcome"] == outcome for row in ordered)
+                    for outcome in ("passed", "failed", "warning")})
+    research_paths.log_view("alpha check", "validation", alpha_ids)
+    return {"count": len(ordered), "complete": all(row["complete"] for row in ordered),
+            "results": ordered, "summary": summary}
 
 
 def cmd_alpha_submit(args, _sink):
@@ -361,9 +436,8 @@ def cmd_alpha_explain(args, _sink):
 def _local_book_gate(alpha_id, entries):
     """Daily-correlation of one alpha against the book, computed from cached PnL.
 
-    Measured against the platform on 2026-11-01: median difference 0.003, maximum
-    0.023. That is close enough to screen and not close enough to submit -- anything
-    above 0.67 needs the platform's own answer.
+    Local correlations screen candidates; the platform makes the submission decision.
+    Values near the gate require the platform's own check.
     """
     from pathlib import Path
 
@@ -532,19 +606,15 @@ def cmd_alpha_self_check(args, sink):
 
     Three measured facts shape this command.
 
-    Daily Pearson matches the platform's SELF_CORRELATION within 0.006 to 0.016 and always
-    slightly below it; weekly and monthly overstate it by 0.03 to 0.08. Daily is therefore
-    the number that decides, and the others are kept as diagnostics.
+    Daily Pearson is the decision measure; weekly and monthly aggregates remain
+    diagnostics because aggregation changes the comparison.
 
-    The platform compares against a periodically refreshed snapshot of the book, not a live
-    one. Two alphas submitted minutes apart were each accepted while correlating 0.975 with
-    the other. A local check that looks only at ACTIVE alphas repeats that blind spot, so
-    recent submissions - including ones not submitted yet - are included by default.
+    The platform compares against a periodically refreshed snapshot of the book.
+    A local check using only ACTIVE alphas can miss in-flight submissions, so recent
+    submissions, including ones not submitted yet, are included by default.
 
-    A published platform value is historical. To compare against it, the peer set has to be
-    the book as it was, which is what ``--as-of`` does. Without it, an alpha rejected last
-    night appears to correlate 0.99 with something that entered afterwards, and the apparent
-    disagreement is only a difference in what the platform could see.
+    A published platform value is historical. ``--as-of`` restricts peers to the book
+    at that timestamp; peers submitted later can otherwise change the comparison.
 
     Every peer that yields no number is named with a reason - no PnL, too little overlap,
     or an undefined Pearson because one series is flat. A flat series is the sharp case:

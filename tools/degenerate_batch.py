@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """Flag a batch whose different expressions produced the same result.
 
-Measured 2026-10-23: six alphas built on six different S&P Core Earnings adjustment fields all
-returned Sharpe 2.09-2.11, turnover 0.81, returns 0.138 - identical to two decimals. The
-fields are in the catalogue with coverage 0.5, but carry no values in this universe, so the
-disclosure leg was null and each expression had quietly collapsed to the fast leg with a
-flipped sign.
+An unpopulated disclosure field can leave several different expressions dependent
+on the same fast leg. Identical metrics across different inputs flag this possibility;
+field-only and fast-leg-only controls can establish which part survived.
 
-Two diagnostic runs confirmed it: the field alone returned Sharpe 0.0 and turnover 0.0, and
-the fast leg alone returned -2.09 / 0.8111.
-
-The tell is that identical numbers from different inputs are not a coincidence; they mean the
-differing part was discarded. This checks for it after the fact, because the platform has no
-way to ask a field whether it is populated.
+This checks stored results because catalog coverage alone cannot prove that a field
+has usable values in the simulated universe.
 
 Usage:
     python tools/degenerate_batch.py results.json

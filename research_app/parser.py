@@ -299,10 +299,9 @@ def build_parser():
     bench_parser = sub.add_parser(
         "benchmark",
         help="[superseded by `triage --internal`] Internal fitness vs the platform's.",
-        description="Platform Fitness is four-fifths training. This multiplies it by a "
-                    "train-Sharpe shrink (a hump measured on the ledger), the book delta, "
-                    "and the block's retention. Operator count is warned about, never "
-                    "scored: complexity does not predict decay in this data.")
+        description="Discount platform Fitness using train-Sharpe priors, the book "
+                    "delta and block retention. Operator count produces auditability "
+                    "warnings without changing the score.")
     bench_parser.add_argument("--batch", default=None, metavar="BATCH_JSON")
     bench_parser.add_argument("--ids", nargs="+", default=None, metavar="ID")
     bench_parser.add_argument("--criteria", default=None,
@@ -709,14 +708,18 @@ def build_parser():
 
     cmp_ = sub.add_parser(
         "compare",
-        help="Compare simulation results side by side (no quota).",
-        description="Read one or more simulate result documents and print a "
-                    "single table, so variants from different batches stop being "
-                    "aligned by hand.")
-    cmp_.add_argument("files", nargs="+", help="Result JSON files from simulate.")
+        help="Find and compare saved research batches using training evidence.",
+        description="Read explicit result files or discover matching batches in the research "
+                    "directory. Select the latest files and inspect labelled train metrics "
+                    "without globbing or parsing JSON in a separate script.")
+    cmp_.add_argument("files", nargs="*", help="Explicit result JSON paths, or - for stdin.")
+    cmp_.add_argument("--match", action="append", default=[], metavar="GLOB",
+                      help="Find result files under the research directory; quote the glob. Repeatable.")
+    cmp_.add_argument("--latest", nargs="?", type=int, const=1, default=None, metavar="N",
+                      help="Read only the newest N matching files by modification time (1 when omitted).")
     cmp_.add_argument("--min-fitness", type=float, default=None)
     cmp_.add_argument("--sort", default="fitness",
-                      choices=["fitness", "sharpe", "turnover", "returns", "id"])
+                      choices=["none", "fitness", "sharpe", "turnover", "returns", "id"])
     cmp_.add_argument("--frozen", action="store_true",
                       help="Show full-window and test-period columns. Only for a "
                            "design that is already frozen: the full window contains "
@@ -865,10 +868,12 @@ def build_parser():
 
     a_chk = alpha_sub.add_parser(
         "check",
-        help="Compute live checks (incl. SELF_CORRELATION). 'get' only shows cached values.")
-    a_chk.add_argument("alpha_id")
-    a_chk.add_argument("--max-wait", type=float, default=180.0,
-                       help="Seconds to wait for the async check job (default 180).")
+        help="Compute live checks for one or more alphas, preserving pending/error evidence.")
+    a_chk.add_argument("alpha_ids", nargs="+", metavar="ALPHA_ID")
+    a_chk.add_argument("--workers", type=int, choices=[1, 2, 3], default=1,
+                       help="Concurrent alpha checks; each worker uses isolated authenticated session state.")
+    a_chk.add_argument("--max-wait", type=_non_negative_seconds, default=180.0,
+                       help="Seconds to wait for each alpha's async check job (default 180).")
     _add_session_args(a_chk)
 
     a_chk.set_defaults(func=alphas.cmd_alpha_check)
@@ -1154,10 +1159,9 @@ def build_parser():
     l_sty = ledger_sub.add_parser(
         "styles",
         help="Classify what each alpha compares against: history, peers, or nothing (offline).",
-        description="One batch measured 0.87 for a value read cross-sectionally against "
-                    "2.05 for the same value read against its own history. This reports "
-                    "which book alphas have never been re-read that way, so the cheap "
-                    "re-estimation can be aimed instead of guessed.")
+        description="Report each alpha's comparison set and identify variables that "
+                    "have not been compared with their own history. This helps target "
+                    "controlled re-estimation of the same input.")
     l_sty.add_argument("--registry", default=None)
     l_sty.add_argument("--where", default=None,
                        help="Ledger filter, e.g. status=ACTIVE or family=quality.")
@@ -1266,8 +1270,8 @@ def build_parser():
     a_self.add_argument("--threshold", type=float, default=0.7,
                         help="The platform's limit (default 0.7).")
     a_self.add_argument("--platform-bias", type=float, default=0.015,
-                        help="How far above daily Pearson the platform reads on the same "
-                             "book (default 0.015, from two same-moment comparisons).")
+                        help="Screening adjustment added to absolute daily Pearson "
+                             "(default 0.015); does not replace a platform check.")
     a_self.add_argument("--top", type=int, default=3,
                         help="How many counterparts to list (default 3).")
     a_self.add_argument("--min-overlap", type=int, default=200,
@@ -1350,7 +1354,8 @@ _COMMAND_EXAMPLES = {
                  "simulate research.json --sort fitness --save results.json"],
     "resume": ["resume CHECKPOINT.json --save results.json"],
     "ablate": ['ablate --expr "a = rank(close); b = rank(volume); a + b" --out variants.json'],
-    "compare": ["compare results.json --sort fitness"],
+    "compare": ["compare results.json --sort fitness",
+                'compare --match "sample-batch*.json" --latest --sort none'],
     "brief": ["brief", "brief --days 7 --top 5"],
     "ask": ["ask --by neutralization --stat n,median:sharpe,floor_share",
             "ask --where status=ACTIVE --list"],
@@ -1359,7 +1364,7 @@ _COMMAND_EXAMPLES = {
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],
     "alpha get": ["alpha get ALPHA_ID"],
-    "alpha check": ["alpha check ALPHA_ID"],
+    "alpha check": ["alpha check ALPHA_ID", "alpha check ALPHA_A ALPHA_B --workers 2"],
     "alpha self-corr": ["alpha self-corr ALPHA_ID"],
     "alpha describe": ['alpha describe ALPHA_ID --name "quality signal" --category FUNDAMENTAL'],
     "alpha submit": ["alpha submit ALPHA_ID"],

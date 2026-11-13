@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 """Compress the ledger into units: one construction, many grid points.
 
-The ledger stores expressions. That is the wrong granularity to *think* in: 900+
-strings, most of them one knight's move away from a dozen others, and no way to ask
-"what has this construction not tried yet". Sugar did not fix it -- measured on the
-2026-10-31 corpus, 951 expressions reduce to 932 distinct sugar forms, i.e. the
-compression is 2%, because sugar works at the shape level and the variation lives
-one level down, in *which data* and *which constants* a fixed shape is given.
+The ledger stores expressions, but many strings can describe nearby variants of
+the same construction. Shape-level sugar alone does not capture variation in
+which data and constants a fixed shape is given, or show what that construction
+has not tried yet.
 
 So this module compresses on the axis that actually varies. An expression is split
 into
 
 * an **assembly** -- how the legs are combined: ``G -L -G`` is "leg, minus a constant,
-  minus another leg". Only 40 of these exist in the whole corpus, and five of them
-  cover two thirds of it;
+  minus another leg";
 * a tuple of **legs** -- the subexpressions being combined, each classified by a
   *role* (``rank(ratio(F,F))``, ``delta(F)``, ``disp(gate(...))``), which is what the
   leg *does* independent of which field it reads;
@@ -26,12 +23,9 @@ one template plus a grid. The template is a real tree with :class:`Slot` leaves,
 unit can be re-instantiated at any grid point -- that is the "derivable" half. The
 grid is what has actually been run -- that is the "compressible" half.
 
-The measured hierarchy is reported by ``python3 tools/unit_report.py``. What has
-stayed put across measurements is the *shape* of it -- roughly 22x fewer assemblies
-than expressions, 7x fewer kinds, 1.7x fewer templates -- while the absolute counts
-move every time an alpha is filed, so they are not repeated here. See
-``docs/unit-compression.md`` for the table, for what does *not* compress, and for the
-grouping that measured better and was rejected.
+The measured hierarchy is reported by ``python3 tools/unit_report.py``. Counts and
+compression ratios depend on the current ledger. See ``docs/unit-compression.md``
+for the grouping design and its limitations.
 
 Design rules, each one paid for:
 
@@ -185,11 +179,9 @@ def _positive_form(node):
 def _strip_scale(node):
     """Divide out a scale factor applied to the whole signal.
 
-    Measured 2026-11-01 (`akVznkO2` against `2 * akVznkO2`, ids `akKAxMl1` and its
-    parent): the platform normalises the book, so sharpe, fitness, turnover and
-    returns are identical to three decimals. A scalar multiple is the same alpha --
-    which means `2 * (a + b)` and `a + b` must land in the same unit, and without
-    this they did not, because the product turned a sum into a single term.
+    The platform normalises the book, so a positive scalar multiple of the whole
+    signal represents the same alpha. Thus ``2 * (a + b)`` and ``a + b`` must land
+    in the same unit; otherwise the product turns a sum into a single term.
 
     Only a factor applied to the *whole* signal is removed. Weights inside a sum are
     the grid and stay where they are.

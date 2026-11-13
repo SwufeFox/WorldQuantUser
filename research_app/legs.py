@@ -1,10 +1,8 @@
 """Did the composite behave like the sum of its legs?
 
-The question keeps coming up the same way: two legs each look fine, their daily PnL
-correlation is near zero, the arithmetic says the equal-weight combination should have
-Sharpe 1.7 - and the composite comes back at 0.07. The composite is re-neutralised and
-re-decayed as one expression, so the legs do not enter the portfolio the way the two
-separate alphas did.
+Strong standalone legs with low correlation can still produce a weak composite.
+The composite is re-neutralised and re-decayed as one expression, so the legs do
+not enter the portfolio the way the separate alphas did.
 
 Once both legs *and* the composite are simulated, that gap is measurable rather than
 arguable: sum the cached daily PnL of the legs with the chosen weights and compare its

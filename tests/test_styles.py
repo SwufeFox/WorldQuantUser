@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Tests for `ledger styles`: what an alpha compares against.
 
-The screen exists because one batch measured the same variable at 0.87 read
-cross-sectionally and 2.05 read against its own history. The risk is a classifier that
-silently labels everything alike, so each bucket is pinned with a real expression.
+Comparison sets must remain distinct even when they use the same input. Each bucket
+is exercised with a representative expression.
 """
 
 import os

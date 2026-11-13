@@ -6,9 +6,8 @@ submitting it is irreversible. Two things make "hold it" the right default:
 * the platform's self-correlation is measured against a snapshot, so a candidate that
   is independent today may collide after a few more submissions - the value of a held
   alpha decays as the book grows;
-* a book wants timing. `2rAeZaY5` passed every check on 2026-11-07 and its appeal was
-  a 2019-2020 profile that the rest of the book lacks; holding it until the book needs
-  that profile costs nothing.
+* a book wants timing. A candidate may offer a return profile the book could need
+  later; holding it preserves the choice of when to submit.
 
 So each entry stores the evidence *as it was when the alpha was shelved*, including
 the book size at that moment. `buffer list` reports both the stored value and how
@@ -214,9 +213,9 @@ def cmd_buffer_list(args, _sink):
             "above_gate": (entry.get("self_correlation") is not None
                            and entry.get("self_correlation") > GATE),
             # The recorded number was true when the alpha was shelved. Every submission
-            # since then moves it - sometimes from 0.44 to 0.99, as two IV variants did
-            # once a sibling was submitted. A shelf that prints the old number without
-            # saying so invites a decision on stale evidence.
+            # since then can change it, especially when a similar alpha is submitted.
+            # A shelf that prints the old number without saying so invites a decision
+            # on stale evidence.
             "stale": bool((None if not shelved_book else current_book - shelved_book) or 0),
             "book_at_shelving": shelved_book,
             "book_now": current_book,

@@ -7,13 +7,13 @@ so the same ground is not re-covered.
 
 ## Why a parser
 
-Three failures, all of which cost real simulations:
+Three failure modes motivate structural parsing:
 
 | Failure | What the string view did |
 | --- | --- |
-| `historical_volatility_252` does not exist (the catalogue stops at 180) | Nothing could check a name it had never seen. One batch died on it. |
-| `hv = ...; band = ...` — locals looked like fields | Regex reported the locals as unknown datafields, so readable composites were rejected by the linter. |
-| `//leverage = liabilities / assets` written as a comment | Regex read the comment as code and reported `liabilities` as a field. A `/* HYPOTHESIS */` block produced 47 phantom fields in one expression. |
+| An unknown field name | A parser can extract identifiers reliably; the catalog then decides whether each exists. |
+| `hv = ...; band = ...` — locals look like fields | Regex can report bound locals as unknown datafields. |
+| `//leverage = liabilities / assets` written as a comment | Regex can read comments as code and invent field references. |
 
 The tree fixes all three structurally, and it makes the next questions askable at
 all: *are these two alphas the same construction*, *what does this annotation point
@@ -29,8 +29,7 @@ nodes: `Number`, `String`, `Field`, `Call`, `BinOp`, `UnaryOp`, `Ternary`,
   preserved so error messages still point at the original text.
 * Precedence: `|| < && < comparisons < + - < * / < unary < ^`, with rendering that
   re-inserts parentheses only where the tree requires them.
-* Round-trip: `parse(render(parse(x))) == parse(x)` for every expression in the
-  ledger (1112 distinct, all parse as of 2026-10-30).
+* Round-trip property: `parse(render(parse(x))) == parse(x)`.
 
 Two properties are load-bearing and are pinned by tests:
 
@@ -73,15 +72,14 @@ them. The split is therefore explicit:
 Parameter names in constraints are read from the catalog's own `definition` string,
 so a renamed parameter makes a rule skip rather than misfire.
 
-Cross-check against FastPlus (Rust, MIT), which hardcodes 108 operators for an
-Expert account: this account has 66, a strict subset. Its positional typing accepts
-`group_rank(close, banana)` and `pasteurize(...)`; the linter here rejects both. The
-two invariant families above were the only real gap, and they are now covered.
+Operator availability is account-scoped. Another tool's hardcoded list does not
+establish what this account can run. The live catalog supplies availability;
+curated invariants cover constraints that signatures alone do not express.
 
 ## Annotations
 
 ```
-@mechanism("distress carrier + news impact + shape stabiliser")
+@mechanism("sample carrier and stabiliser")
 @leg(name="a", role="carrier")
 @ablate(leg="sy")
 a = ...;
@@ -123,18 +121,12 @@ Three guards, each from a specific failure mode:
 
 The rewrite is *offered with a reason*, never applied silently.
 
-**Measured coverage, stated honestly: zero.** Of 3023 rank-family calls in the
-ledger's 1102 distinct expressions, 177 take a genuinely bare field (locals excluded)
-and none of those is a level — they are `cap`, `volume`, `close/open/low/high/vwap`,
-`historical_volatility_*`, `adv15`, i.e. size and market series ranked bare on
-purpose. The pattern this rewrite targets does not occur in what has already been
-written, so it is a preventive check for new expressions rather than a repair pass.
+This is a preventive check for new expressions. Market series may be ranked bare
+intentionally, so the number of bare-field rank calls is not the number of mistakes.
 
-A second measurement shaped the design: most accounting amounts in this catalogue are
-stored as dimensionless (`assets`, `atq`, `revenue`, `cogs` all measure that way), so
-`Unit[TSPrice:1]` does not identify "amountness". Levels cannot be derived from units
-alone; `intent.derive_levels` adds candidates and is disjoint from the curated list by
-construction, and the curated list stays the primary signal.
+Accounting amounts may be stored as dimensionless, so units alone do not identify
+levels. `intent.derive_levels` adds candidates disjoint from the curated list;
+the curated list remains the primary signal for this rewrite.
 
 ## The family graph
 
@@ -146,26 +138,19 @@ construction, and the curated list stays the primary signal.
 | `extends` | leg set is a proper subset | "that alpha plus a leg" |
 | `shares` | one common leg, no containment | weak relation, excluded from components |
 
-Measured on the live book (2026-10-30): **48 alphas, 183 edges — 83 sibling, 36
-extends, 64 shares — collapsing to 32 construction families**, largest 13, 28
-singletons.
-
 Families are connected components over `sibling` edges only. `extends` is recorded as
 lineage and deliberately excluded from the merge: containment is transitive through a
 shared ancestor, so single linkage chains unrelated constructions together — A with one
 leg, B = A + leg1, C = A + leg2 puts B and C in one "family" although they share no
-construction. On the full ledger that inflated a single family to 467 of 951
-expressions; on the book it read as 22 families instead of 32. The same counts now come out of `ledger mechanisms`, grouped by economic block rather
-than by connected component.
+construction. Current mechanism reporting groups by economic block and skeleton;
+containment remains lineage evidence rather than proof of one construction.
 
-**Structure is not independence.** The same 48 alphas correlate at ~0.85 pairwise
-while occupying 32 families, and candidates rebuilt from those families are blocked
-by self-correlation at 0.84–0.87. The graph finds copies cheaply; only daily PnL
-finds shared bets.
+**Structure is not independence.** Distinct constructions can share the same
+underlying bet. Structural grouping finds copies cheaply; daily PnL comparison
+is needed to assess shared exposure.
 
-`--api-book` reads the book from the platform rather than from the ledger's `status`
-column, because that column is written at submission time and never reconciled: it
-marked 33 ACTIVE against 48 live.
+A platform book query supplies current membership; a local ledger's status reflects
+the last recorded observation and may be stale until reconciled with `ledger sync`.
 
 ## One entry point for simulation
 
@@ -176,53 +161,42 @@ not a rule.
 
 ## Measured, then not done
 
-Two migrations were prepared and then declined, because the measurement said they
-were no-ops. Recorded here so they are not retried on principle:
+Not every string-based operation needs migration. Operator extraction and arity
+checking can remain on their existing paths when structural parsing adds no
+correctness benefit. Compare behavior before expanding the change surface.
 
-| Migration | Measurement | Decision |
-| --- | --- | --- |
-| Operator extraction → tree | 1103/1103 identical to regex | not worth the change surface |
-| Arity check → tree | zero false warnings on nested calls, kwargs, deep nesting; zero findings across 1112 ledger expressions | same |
+Field extraction did need the tree: comments must not invent fields, and locals
+must remain locals regardless of whitespace or line-ending style.
 
-Field extraction **was** migrated: 1097/1103 identical, and all 6 differences were
-the regex inventing fields out of comments or missing a CRLF-separated local.
-
-The macro backend **was** migrated. Text substitution is correct only while every
-argument is atomic; over 2728 sampled combinations the text backend leaked a nested
-macro 1262 times (its call regex cannot match parentheses in an argument) and changed
-meaning 101 times. Every difference is attributable to a compound argument in a
-non-atomic position, and **zero** differences appear where the text output was
-already correct. The whole macro system was later removed (2026-11-01) because
-`alpha_unit` templates do the same job and also report untried grid points.
+The former macro backend needed structural substitution because compound arguments
+can contain nested calls and operators. A call regex cannot reliably substitute
+them without leaking macros or changing precedence. That macro system was later
+removed because `alpha_unit` templates also report untried grid points.
 
 ## Ledger hygiene
 
-The ledger is written at submission and reconciled by nothing, so it drifts in ways
-that quietly change every count derived from it. These closed those gaps (the
-one-off repair is removed now that it has run; git history keeps it):
+Submission-time records can drift from platform state. The tools separate ongoing
+reconciliation from one-off repairs:
 
 | Tool | Defect it removes |
 | --- | --- |
-| `repair_ledger` (ran once, removed) | 9 expressions with a variant index glued to the tail (repaired, annotated); 191 rows with no alpha id at all (marked `abandoned`, not deleted) |
-| `ledger sync` (was `tools/reconcile_status.py`) | the `status` column lagging the platform — measured 33 ACTIVE against 48 live, i.e. 15 rows that had been submitted but still said COMPLETE or UNSUBMITTED |
+| `repair_ledger` (one-off, removed) | Malformed expression suffixes and records without alpha IDs required explicit repair or an `abandoned` label. |
+| `ledger sync` (was `tools/reconcile_status.py`) | Refreshes local status against the platform. |
 | `probe` spec files (were `tools/research_template.py`) | a new script having to remember the guard, the sugar, the annotation check and where results go |
 
-Consequences worth remembering: **191 of 2118 rows are shells**, so "how many alphas
-do I have" needs that subtracted first; and **rows outnumber alphas**, because one
-alpha can appear several times, so a line like "51 rows promoted" is not a claim
-about 51 alphas.
+Rows without usable identities must be distinguished from alpha records. Rows can
+also outnumber alphas because one alpha may appear repeatedly; report both counts
+with their units rather than treating a row update count as a book size.
 
-Two audits that are now free: with 63 fields' units measured, the 48 ACTIVE
-expressions contain **zero** dimensional inconsistencies (expected — the simulator
-rejects those at submission — but the check costs nothing now), and the same unit
-table gates the intent rewrite.
+The measured field-unit table supports dimensional audits as well as intent
+rewrites. An unmeasured field remains unknown; absence of a finding is not proof
+that its dimensions are compatible.
 
 ## Known limits
 
-* **Unit coverage.** Intent rewriting wants dimensional analysis, but units can only
-  be measured one simulation at a time. 48 fields are measured; the catalogue has
-  thousands. Outside the curated list the rewrite stays silent, which is correct and
-  also means coverage is the binding constraint on scaling it.
+* **Unit coverage.** Intent rewriting wants dimensional analysis, but units are
+  measured through simulation. Outside the curated list the rewrite stays silent;
+  incomplete measurement coverage limits what it can establish.
 * **`returns` carries `Unit[TSPrice:1]`** as measured, i.e. it behaves like a price
   change rather than a ratio. Anything computing a dispersion of `returns` should be
   read with that in mind.

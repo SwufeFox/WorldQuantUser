@@ -97,8 +97,7 @@ def build(entries):
                 # The number that decides whether a part is worth porting has to come
                 # from an alpha that is actually in the book. `best_fitness` is a max
                 # over every expression containing the shape -- including rejected and
-                # never-submitted ones -- so 18 of 34 seeds were ranked by a score no
-                # book member ever achieved.
+                # never-submitted ones -- and may exceed every book member's score.
                 if entry.get("family"):
                     slot["book_families"].add(entry["family"])
                 if fitness is not None and (slot["book_fitness"] is None
@@ -145,11 +144,9 @@ def screen(catalogue, min_fitness=1.5, max_expressions=3):
 def portable_seeds(catalogue, min_fitness=1.2, max_book=1, spec=None):
     """Proven parts that appear in few book alphas: ingredients never ported.
 
-    The co-occurrence version of this question was degenerate -- most book alphas are a
-    single expression with no named leg, so "partners" was empty, and with 61 proven
-    parts almost every pair is untried, so "never met" was always true. Counting how
-    many *families* a proven part appears in is the sharper question: an ingredient
-    that carries one family at F 1.8 and appears nowhere else has been tested once.
+    Co-occurrence can be uninformative when expressions lack named legs and most
+    pairs have never been combined. Count how many *families* a proven part appears
+    in to identify ingredients whose use is concentrated in one family.
     """
     rows = [slot for slot in catalogue.values()
             if slot["n_book"] > 0 and slot["n_book"] <= max_book

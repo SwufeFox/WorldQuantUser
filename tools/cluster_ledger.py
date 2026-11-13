@@ -19,12 +19,9 @@ Two numbers are reported on purpose, because neither alone is honest:
 The gap between them is the honest uncertainty, so both are printed with the
 members of the component and of the independent set.
 
-``--mode fields`` answers a different question on the same pool: not "do these move
-together" but "are these built from the same information". Two alphas can be
-uncorrelated in PnL and still read the same fields — the option pair scored 0.88
-field overlap while sitting below the 0.7 PnL bar — so PnL independence alone
-overstates how many mechanisms a pool really holds. This mode needs no PnL and no
-network.
+``--mode fields`` asks whether alphas use the same information. Low PnL correlation
+does not imply different inputs, so field overlap adds a separate view of shared
+mechanisms. This mode needs no PnL and no network.
 """
 
 from __future__ import annotations

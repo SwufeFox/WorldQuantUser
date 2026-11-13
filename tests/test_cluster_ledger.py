@@ -97,10 +97,8 @@ class IndependentSetTests(unittest.TestCase):
 
 class SpectralSummaryTests(unittest.TestCase):
     def test_an_equicorrelated_pool_is_fewer_bets_than_names(self):
-        # Wrong behaviour this prevents: counting clusters at |r|>=0.7 and concluding
-        # "25 alphas = 24 bets" while the pool behaves like a handful, because the
-        # correlation is diffuse rather than blocked. The quality family measured
-        # exactly that: 24 clusters, 7.1 effective bets.
+        # Diffuse correlation can reduce effective bets even when no pair crosses
+        # the clustering threshold.
         ids = ["A", "B", "C", "D"]
         pairs = [pair(a, b, 0.3) for a, b in
                  ("AB", "AC", "AD", "BC", "BD", "CD")]

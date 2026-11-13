@@ -3,17 +3,15 @@
 The campaign counts candidates by *independent economic mechanism*, not by expression
 count. Two things were missing to make that countable offline:
 
-* a mechanism key. Family labels are too coarse (11 buckets, one of which holds half the
-  book) and PnL correlation is too late (it needs a simulation). The key used here is
+* a mechanism key. Family labels can be too coarse, and PnL correlation needs a
+  simulation. The key used here is
   ``(economic block, AST skeleton)``: the block says what information is being read, the
   skeleton says how. Fields and literals are blanked, so a window change or a field swap
   stays inside the same mechanism - which is exactly the rule "100 parameter variants
   count as one".
-* a convergence signal. On 2026-11-08 the book held 56 alphas but only 38 distinct
-  skeletons, and the last 100 simulated arms were 93% structurally novel while only one
-  of the last seven batches produced anything additive. Structural novelty is therefore
-  a weak trigger; the monitor keys on outcomes, and this module reports both so the gap
-  stays visible.
+* a convergence signal. Structurally novel arms need not contribute independent
+  returns. The monitor keys on outcomes, and this module reports both structural
+  novelty and measured contributions so the gap stays visible.
 """
 
 from __future__ import annotations
@@ -27,12 +25,10 @@ import fastexpr_ast
 #: Which information the expression reads, in the order that decides ties: the first rule
 #: that matches wins, so the list runs from most specific to most generic.
 #:
-#: Two kinds of needle, because matching raw text was wrong in a way that took a while to
-#: notice: `_std` was meant to catch `eps_std`-style analyst columns but also matched the
-#: *operator* `ts_std_dev`, so eight book alphas built on realised volatility were counted
-#: as analyst dispersion. Token needles are therefore matched only against identifiers that
-#: are **not** followed by `(` - i.e. fields, never operators. Text needles match the raw
-#: expression and are used for shapes (`open / ts_delay(close`), not for names.
+#: Token needles are matched only against identifiers that are **not** followed by
+#: `(`, so a field fragment cannot accidentally classify an operator such as
+#: `ts_std_dev`. Text needles match the raw expression and are used for shapes
+#: (`open / ts_delay(close`), not for names.
 BLOCK_RULES = (
     ("derivative_pricing", ("implied_volatility", "option", "straddle", "pcr_"), ()),
     ("analyst_dispersion", ("eps_high", "eps_low", "sales_high", "sales_low", "dts_spe"),
@@ -166,8 +162,8 @@ def convergence(entries, marginals=None, recent_batches=8):
     A batch is the ledger's ``idea`` label, ordered by first record. For each batch:
     how many arms, how many distinct mechanisms, how many mechanisms the book did not
     already hold, and how many members turned out additive (marginal >= threshold).
-    The third number is the one worth triggering on - structural novelty sat at 93% even
-    across the run of batches that produced nothing.
+    Structural novelty alone does not establish that a batch produced additive arms.
+    Report the outcome counts alongside it when deciding whether to widen the search.
     """
     marginals = marginals or {}
     batches = defaultdict(list)

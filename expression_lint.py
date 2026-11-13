@@ -454,9 +454,6 @@ def trailing_token_findings(expression):
 #: The platform's turnover floor.
 TURNOVER_FLOOR = 0.01
 
-#: The band measured for a construct with no leg that moves daily, used in the message.
-MEASURED_BAND = (0.006, 0.010)
-
 
 #: `name = expression;` at the start of a statement. FASTEXPR variables are assignments
 #: separated by semicolons; the final statement is the returned expression.
@@ -495,16 +492,10 @@ def unused_variable_findings(expression):
 def turnover_findings(expression, market_fields=None):
     """Warn when the expression has no leg that moves daily.
 
-    The subject is the construct, not the fields. Disclosure datasets are among the most
-    productive in this account: three book entries are built entirely from them - inventory
-    stages 2.11 Sharpe, receivables-payables 1.56, raw materials 1.53 - because each pairs
-    the disclosure leg with one that reprices daily. Remove that leg and the same data
-    measures 0.006-0.010 turnover against a 0.01 floor: deferred tax 0.0077, operating
-    leases 0.0086, unrecognised tax benefits 0.009, share-based compensation 0.0083. No
-    neutralisation or decay lifted them, because the ranking only changes when a filing
-    does.
-
-    So the finding is "add the daily leg", never "this data is weak".
+    The subject is the construct, not the fields. A ranking based only on disclosure
+    fields may change only when filings change, putting turnover below the platform
+    floor. Pairing it with a leg that reprices daily can change that behaviour.
+    This warning identifies a construction risk; it does not reject the dataset.
 
     ``market_fields`` is the set of field ids whose catalogue category carries market data,
     supplied by the caller from the catalogue. Deriving it here would mean encoding which
@@ -522,14 +513,11 @@ def turnover_findings(expression, market_fields=None):
     return [{
         "code": "turnover_floor_risk",
         "severity": "warning",
-        "measured_band": list(MEASURED_BAND),
-        "message": "no leg that moves daily: this construct measured %.3f-%.3f turnover "
-                   "against a %.2f floor in four accounting families, because a ranking "
-                   "of disclosure fields only reorders when a filing does. The fields are "
-                   "fine - three book entries are built from them - what is missing is the "
-                   "daily leg. Add one (a reversal, position or pressure term) rather than "
-                   "discarding the idea."
-                   % (MEASURED_BAND[0], MEASURED_BAND[1], TURNOVER_FLOOR),
+        "message": "no leg that moves daily: a ranking of disclosure fields may only "
+                   "reorder when a filing changes, creating a risk of turnover below "
+                   "the %.2f platform floor. Consider adding a daily leg (a reversal, "
+                   "position or pressure term) rather than discarding the idea."
+                   % TURNOVER_FLOOR,
     }]
 
 
@@ -661,9 +649,8 @@ def _split_statements(text):
 def _wrap_chain(statement, indent="      ", width=88):
     """Break a long ``+``/``-`` chain at operator boundaries.
 
-    The book's own expressions do this by hand (`WjbJO0vZ`: `core = rank(` then one leg
-    per line). Reproducing it mechanically keeps long composites readable without
-    touching their semantics - a line break inside a call is whitespace to the parser.
+    Placing one leg per line keeps long composites readable without touching their
+    semantics: a line break inside a call is whitespace to the parser.
     """
     if len(statement) <= width or "(" not in statement:
         return [statement]
@@ -726,8 +713,8 @@ def pretty_expression(expression, indent="      ", width=88):
     unreviewable. This is idempotent: formatting a formatted expression changes nothing.
     """
     # `#` runs to end of line: flattening the whole text would swallow the newline after a
-    # comment and comment out the statement that followed it. `Grgv90PQ` opens with
-    # `# day1`, and joining it to the first assignment changed its AST.
+    # comment and comment out the statement that followed it. Keep leading comments
+    # such as `# day1` separate from the first assignment to preserve the AST.
     raw_lines = (expression or "").replace("\r\n", "\n").split("\n")
     comments = [line.strip() for line in raw_lines if line.strip().startswith("#")]
     code_lines = [line for line in raw_lines if not line.strip().startswith("#")]

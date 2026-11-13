@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Identical results from different inputs mean the differing part was thrown away.
 
-Measured 2026-10-23: six alphas over six different Core Earnings fields returned Sharpe
-2.09-2.11 and turnover 0.81 because the fields were unpopulated and every expression collapsed
-to the fast leg. Two diagnostic runs settled it - the field alone scored 0.0 with zero
-turnover, the fast leg alone scored -2.09 with 0.8111.
+An unpopulated field can leave every expression dependent on the same fast leg.
+These synthetic rows test the resulting degeneracy without storing research results.
 """
 
 import sys
@@ -23,9 +21,9 @@ def record(candidate, expression, sharpe, turnover):
 
 class DegenerateBatchTests(unittest.TestCase):
     def test_identical_metrics_from_different_fields_are_flagged(self):
-        records = [record("A", "rank(field_a)", 2.09, 0.81),
-                   record("B", "rank(field_b)", 2.09, 0.81),
-                   record("C", "rank(field_c)", 2.09, 0.81)]
+        records = [record("A", "rank(field_a)", 1.2, 0.2),
+                   record("B", "rank(field_b)", 1.2, 0.2),
+                   record("C", "rank(field_c)", 1.2, 0.2)]
         report = degenerate_batch.report(records)
         self.assertEqual(len(report["identical_clusters"]), 1)
         self.assertIn("degenerate", report["verdict"])

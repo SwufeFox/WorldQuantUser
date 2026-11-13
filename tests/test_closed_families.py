@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Tests for the closed-direction list and the places that consume it.
 
-The list exists because a tool recommended the option family first: it ranks top by
-best-ever Fitness (F3.38, F3.89) and it is closed for concentration. Two properties
-matter, and both were got wrong by hand before:
+High Fitness does not make a family viable when concentration fails. Two properties
+matter for reporting those closed directions:
 
 * a missing or damaged file must **not** stop a tool -- it degrades to "nothing is
   closed", and the absence is visible in the returned payload;

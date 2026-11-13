@@ -176,9 +176,9 @@ seen 与草稿各自原子提交，草稿先于 seen：草稿失败不会把论�
 
 | 问题 | 命令 |
 | --- | --- |
-| 我要跑一批臂（常态） | 写一个 spec.json，然后 `python3 research_cli.py probe spec.json`——lint、模拟、train-only 表格、对照差值、JSON、台账一次做完 |
-| 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe spec.json --dry-run`；输出完整 payload、设计上下文和精确重复证据，正式模拟前再做实时目录检查 |
-| 我要开一个单次实验 | 直接写一个两三条臂的 spec，`python3 research_cli.py probe spec.json`（没有模板文件了） |
+| 我要跑一批臂（常态） | 写一个 sample-batch.spec.json，然后 `python3 research_cli.py probe sample-batch.spec.json`——lint、模拟、train-only 表格、对照差值、JSON、台账一次做完 |
+| 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe sample-batch.spec.json --dry-run`；输出完整 payload、设计上下文和精确重复证据，正式模拟前再做实时目录检查 |
+| 我要开一个单次实验 | 直接写一个两三条臂的 spec，`python3 research_cli.py probe sample-batch.spec.json`（没有模板文件了） |
 | 这批臂相对对照变了多少 | 看 `comparisons.rows`：arm 减 control 的训练期差值；缺失项列在 `unavailable`，explore 批次不计算归因 |
 | 换字段 / 换窗口 / 换权重的批量实验 | `research_app/substitution.py` 的 `expand()` 生成 `(label, expression)` 对，再落成 spec |
 | 我想跑一批，但怕名字写错 | `tools/guarded_sim.py`（库，不是 CLI） |
@@ -192,7 +192,7 @@ seen 与草稿各自原子提交，草稿先于 seen：草稿失败不会把论�
 前一配置组仍有未完成任务时，后面的配置组保持排队，不再叠加提交。
 
 ```bash
-python3 research_cli.py probe --recover <research>/batch-YYYY-MM-DD.json --max-wait-seconds 60
+python3 research_cli.py probe --recover <research>/sample-batch.json --max-wait-seconds 60
 python3 research_cli.py resume <checkpoint.json> --max-wait-seconds 60
 ```
 
@@ -200,6 +200,42 @@ python3 research_cli.py resume <checkpoint.json> --max-wait-seconds 60
 设置匹配，有多个匹配时继续保留未知。恢复本身不提交模拟；`not_submitted` 列出确定没有启动的
 实验臂，后续只为这些臂准备新 spec。每条恢复证据都会落盘，已完成批次无需重新登录。
 同一批次的运行/恢复和同一 checkpoint 的恢复互斥；`--force` 也不能覆盖正在运行的批次。
+
+
+### 合并已有结果与读取实时检查
+
+```bash
+python3 research_cli.py compare sample-batch-a.json sample-batch-b.json
+python3 research_cli.py compare --match "**/sample-batch*.json" --latest --sort none
+python3 research_cli.py compare --match "sample-batch-a.json" --match "**/sample-batch-b*.json" --latest 2
+python3 research_cli.py compare sample-batch.json --sort fitness --frozen
+python3 research_cli.py alpha check ALPHA_A ALPHA_B --workers 2 --max-wait 300
+```
+
+`compare` 可以省略 FILE，改用可重复的 `--match NAME_OR_GLOB`。模式相对研究目录解析：
+裸文件名只匹配根目录，`**/sample-batch*.json` 才包含递归子目录。`--latest [N]` 先按
+文件 mtime 选取再解析 JSON，不传 N 时取最新一个；不能与 stdin 一起使用。
+`selection.selected_paths` 列出文件，`selection.provenance` 保留路径、匹配来源和 mtime。
+显式文件与匹配结果按路径去重；匹配或 latest 选择按文件从新到旧排列，只有显式文件时保持参数顺序。
+
+默认 `--sort fitness` 按训练期 fitness 排序，传 `--frozen` 才改用全窗口指标。
+`--sort none` 明确保留所选文件顺序及文件内的行顺序。支持模拟原始结果和保存的 probe
+`rows` 摘要，并保留 `label`、`train_sharpe_h1`、`train_sharpe_h2`；缺失训练指标不能用
+全窗口数值补齐。
+
+默认视图为 `train`；只有冻结设计后传 `--frozen` 才显示全窗口、测试期和检查证据。
+`checks_state` 的枚举为 `hidden`（训练视图隐藏）、`available`（冻结视图有保存的检查证据）、
+`unavailable`（没有检查证据）。`failed_checks: null` 代表未知；即使保存的失败列表为空，
+也不能据此认定所有平台检查已完成或通过。
+
+`alpha check` 接受一个或多个 ID，按首次出现顺序去重，`--workers` 为 1–3（默认 1），
+并发完成先后不改变结果顺序。单个和多个 ID 都返回 `count`、`results`、`complete`、`summary`。
+每项的 `status` 为 `complete` / `pending` / `error`，`outcome` 为
+`passed` / `failed` / `warning` / `pending` / `error`：已判 FAIL 是完整的失败证据，
+但该项若仍有未决检查则 `complete` 仍为 false，可能同时是 `pending` 状态和 `failed` 结果。
+全部项证据完整时顶层 `complete` 才为 true；缺失检查不能称为通过。
+`summary` 统计三种状态及 passed/failed/warning 结果，单项错误保留在该项而不抹掉其他结果。
+`--max-wait` 是每个 alpha 异步检查的等待预算，默认 180 秒，不是整批共享预算。
 
 
 ### 备份与重放
@@ -233,7 +269,7 @@ python3 tools/unit_report.py                    # 不传就是人读的报告
 ## 看一条 alpha 在算什么
 
 ```bash
-python3 research_cli.py alpha explain akVznkO2
+python3 research_cli.py alpha explain ALPHA_ID
 ```
 
 三层，故意分开：
@@ -249,29 +285,29 @@ python3 research_cli.py alpha explain akVznkO2
 ## 提交是唯一会写平台的动作
 
 ```bash
-python3 research_cli.py alpha submit ID            # 预检：跑 live checks，什么都不发
-python3 research_cli.py alpha submit ID --yes --record   # 真提交 + 回读 + 记账
+python3 research_cli.py alpha submit ALPHA_ID            # 预检：跑 live checks，什么都不发
+python3 research_cli.py alpha submit ALPHA_ID --yes --record   # 真提交 + 回读 + 记账
 ```
 
 三条硬规矩：
 
 * **没有 `--yes` 就不发**——平台没有"试提交"，预检就是 check 流程；
-* **`name` / `category` 必须先设**，否则拒绝（`alpha describe ID --name ... --category ...`）。没有标签的 alpha 事后无法归属；
-* **`--record` 用 `regular_expression()` 和 `is` 段**取数，不直接摸平台原始 payload——`regular` 有时是字符串、有时是对象，摸错一次就记了一行没有 metrics 的账（2026-11-01 真实发生过）。
-* **`--record` 顺带把这条 alpha 的日频 PnL 缓存到 `<research>/pnl/`**。本地相关扫描读的就是那个目录，不缓存的话新提交在下次扫描里是隐形的——而扫描正是看清"这次提交挤掉了什么"的便宜办法（2026-11-01：提交 `leMnKWol` 一条，同族 10 条从 0.35 跳到 0.95）。
+* **`name` / `category` 必须先设**，否则拒绝（`alpha describe ALPHA_ID --name ... --category ...`）。没有标签的 alpha 事后无法归属；
+* **`--record` 用 `regular_expression()` 和 `is` 段**取数，兼容 `regular` 为字符串或对象，避免丢失表达式或 metrics；
+* **`--record` 顺带把这条 alpha 的日频 PnL 缓存到 `<research>/pnl/`**。本地相关扫描读的就是那个目录；缺少缓存会让新提交缺席后续扫描，不能把缺失证据解读为独立。
 
 台账那边现在也会拦：`record_entry` 拒绝用没有 metrics 的行覆盖有 metrics 的行，除非显式 `allow_metrics_loss=True`。
 
 ## 工具会读的封闭清单
 
-`<research>/closed-families.json` 是机制地图第二节的机器可读版：20 条已关闭的方向，带 id、类型（`blocked-by-check` / `falsified` / `structurally-impossible`）、理由、证据。
+`<research>/closed-families.json` 保存已关闭方向的 id、类型（`blocked-by-check` / `falsified` / `structurally-impossible`）、理由和证据。
 
-只有带 `match` 的条目能机械匹配（今天是 `family: option`），其余是技术方向（"把腿放慢"、"跨族移植"），表达式里看不出来，留给人和 agent 读。
+只有带 `match` 的条目能机械匹配；其余技术方向需要结合研究上下文判断，留给人和 agent 读。
 
 读它的地方：
 
 * `parts_catalogue --seeds` —— 来自封闭族的种子会标 `[CLOSED: 理由]` 并排到最后，**不删**（藏起来正是它上次被推荐的原因）。
-* `unit_report` —— kind 表里标封闭族，另外单独列一节"封闭族里分数很高的"，因为那种行最容易看成机会（`fundamental,option` 那个 kind best F **3.89**）。
+* `unit_report` —— kind 表里标封闭族，另外单独列出封闭族中的高分项，防止把局部得分误当成重新开放方向的证据。
 
 文件缺失或损坏时两个工具都照常运行，只是什么都不标——研究文件不见了不该让工具停摆。
 
@@ -301,7 +337,7 @@ python3 research_cli.py alpha submit ID --yes --record   # 真提交 + 回读 + 
 
 不带对照的批次必须把 `"design": "explore"` 写在 spec 顶层。这不是逃生门，是**记录**：扫描和实验在台账里长得一样，唯一区别是扫描自己承认了。
 
-理由不是洁癖。2026-11-03 那批四个臂，参照是一个本来就不过门的 base（S 1.23 / F 0.68）；两个臂"更差"，但差在哪里无法归因——**没有合格的对照，减法实验就没有解释力**。
+对照必须与要回答的问题相符。若基准本身不满足设计条件，实验臂变差也无法说明是哪项改动造成；对照、设置和变化轴需要随批次一起保存，才能解释差值。
 
 ## 边界
 

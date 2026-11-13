@@ -83,6 +83,10 @@ all live in a results directory outside the working tree, resolved by
 `research/` directory inside the repo is git-ignored as a guard rail, so a stray
 run cannot quietly add data to the history.
 
+Examples use placeholder alpha IDs and synthetic or qualitative case data. BRAIN's
+metric definitions, platform thresholds, field/operator names and general concepts
+remain literal; private account observations belong in the research directory.
+
 ## Application boundaries
 
 ```mermaid
@@ -116,10 +120,10 @@ search path to locate it.
 
 ## The expression tree
 
-`docs/ast-pipeline.md` explains what parsing FASTEXPR into a tree bought, which
-measurements justified each step, and which two migrations were measured and then
-deliberately declined. Read it before changing anything that extracts information
-from an expression by pattern-matching the string.
+`docs/ast-pipeline.md` explains why FASTEXPR is parsed into a tree, which operations
+need structural parsing, and which can keep their existing implementation. Read
+it before changing anything that extracts information from an expression by
+pattern-matching the string.
 
 ## Documentation
 
@@ -236,7 +240,7 @@ failures; `--save -` uses stdout only. The destination is checked before executi
 
 ```bash
 python research_cli.py --research-dir ./research ledger list --family quality
-python research_cli.py simulate batch.json --dry-run --compact --save preview.json
+python research_cli.py simulate sample-batch.json --dry-run --compact --save preview.json
 ```
 
 In CLI 3.0, local records live under `ledger`: `ledger list` combines the former
@@ -374,7 +378,7 @@ BRAIN, so it needs no credentials.
 Then run for real:
 
 ```bash
-python research_cli.py simulate research.json --sort sharpe --top 5 --stream
+python research_cli.py simulate sample-batch.json --sort sharpe --top 5 --stream
 ```
 
 `--stream` emits JSON Lines progress events on stderr (`submitted`, `completed`,
@@ -406,15 +410,15 @@ names `proxy_of`. Validation uses resolved settings, including CLI overrides and
 explicit arm decay. A scan declares `"design": "explore"` at the spec's top level:
 
 ```json
-{"name": "neutralization-sweep", "design": "explore", "settings": {"decay": 4},
+{"name": "sample-batch", "design": "explore", "settings": {"decay": 4},
  "arms": [{"label": "subindustry", "expression": "rank(close)"},
           {"label": "industry-fast", "expression": "rank(close)", "decay": 2,
            "settings": {"neutralization": "INDUSTRY"}}]}
 ```
 
 ```bash
-python research_cli.py probe batch.spec.json --dry-run
-python research_cli.py probe batch.spec.json
+python research_cli.py probe sample-batch.spec.json --dry-run
+python research_cli.py probe sample-batch.spec.json
 ```
 
 `probe --dry-run` is a fully offline preview: it loads no session or credentials,
@@ -449,7 +453,7 @@ Use `probe - --dry-run` to read a spec from stdin.
 Probe batches are saved before submitting and after each progress/result event, including
 accepted progress URLs. `--max-wait-seconds` bounds simulation waiting across groups
 (default 300); unfinished jobs stop later settings groups from submitting. Use
-`probe --recover BATCH_JSON` to read known IDs/progress URLs without resubmitting, and
+`probe --recover sample-batch.json` to read known IDs/progress URLs without resubmitting, and
 `resume CHECKPOINT` for simulation checkpoints. Recovery persists each result and reports
 `not_submitted` arms separately. Same-batch writers and same-checkpoint resumes are locked;
 Windows and POSIX release ownership when the process exits. A complete batch recovers offline.
@@ -458,7 +462,7 @@ Windows and POSIX release ownership when the process exits. A complete batch rec
 ### Inspect results
 
 ```bash
-python research_cli.py alpha get P0Mq0wEM
+python research_cli.py alpha get ALPHA_ID
 python research_cli.py alpha list --min-sharpe 1.5 --limit 20
 ```
 
@@ -476,7 +480,7 @@ mechanism label, and can report how a candidate would sit against it:
 
 ```bash
 python research_cli.py alpha book
-python research_cli.py alpha book --check P0M7171K
+python research_cli.py alpha book --check ALPHA_ID
 ```
 
 ### Check the ledger before spending a simulation
@@ -508,10 +512,9 @@ in the note.
 
 ### Mechanism labels overstate diversity — read the family count
 
-`mechanism` is specific on purpose: one label per construction. That makes it a
-bad diversity metric. The current book has **13 alphas, 11 mechanism labels,
-but only 4 families**, because six labels are variations of the same
-overnight/intraday bet.
+`mechanism` is specific on purpose: one label per construction. Multiple labels can
+describe variants of the same underlying exposure, so label counts alone do not
+establish diversity.
 
 `family` is the declared second level (`oi`, `quality`, `leverage`, `option`,
 `analyst`, `event`, `reversal`, `momentum`, `attention`, `other`) and it is
@@ -523,8 +526,8 @@ python research_cli.py alpha book           # book_size / mechanism_count / fami
 python research_cli.py ledger list --family quality
 ```
 
-Quote `family_count` when the question is "how many independent bets do I
-have"; quote `mechanism` only when you need to tell two constructions apart.
+Use `family_count` to group declared research families and `mechanism` to distinguish
+constructions. Neither count proves independence; inspect daily PnL as well.
 
 ### Read the checks that matter (including self-correlation)
 
@@ -534,45 +537,49 @@ artefact, not a permission limit: `GET /alphas/{id}/check` triggers the
 computation and replies with `Retry-After` until the job finishes.
 
 ```bash
-python research_cli.py alpha check d5K0Pod2          # compute and print live checks
-python research_cli.py alpha check d5K0Pod2 --max-wait 300
+python research_cli.py alpha check ALPHA_ID          # compute and print live checks
+python research_cli.py alpha check ALPHA_A ALPHA_B --workers 2 --max-wait 300
 ```
+
+One or several IDs use the same response shape: `count`, `results`, `complete` and
+`summary`. IDs are deduplicated in first-seen order; results retain that order even
+with concurrent workers (`--workers` accepts 1–3, default 1). Each row separates
+`status` (`complete`, `pending`, `error`) from `outcome` (`passed`, `failed`,
+`warning`, `pending`, `error`). A resolved `FAIL` is complete evidence of failure;
+missing or unresolved checks keep the row incomplete. A row can therefore have
+`outcome: failed` while another check still leaves `status: pending`.
+
+Top-level `complete` requires every row to be complete. `summary` counts status
+values and the `passed` / `failed` / `warning` outcomes; it is not a pass count
+disguised as completion. An individual request error stays in that row's `error`
+and does not discard other results. `--max-wait` is the async-check wait budget
+for each alpha (default 180 seconds), not a shared budget for the batch.
 
 ### Check self-correlation locally, and correctly
 
 ```bash
-python research_cli.py alpha self-check O0J6Aeag
-python research_cli.py alpha self-check gJWre33J --as-of 2026-10-22T09:15:30-04:00
+python research_cli.py alpha self-check ALPHA_ID
+python research_cli.py alpha self-check ALPHA_ID --as-of 2026-01-01T00:00:00Z
 ```
 
-Daily Pearson is the measure that decides. Weekly and monthly overstated the platform number
-by 0.03 to 0.08, so those are diagnostics rather than verdicts.
+Daily Pearson provides the local correlation estimate. Weekly and monthly
+aggregation are diagnostics because changing the sampling window changes the
+quantity being compared.
 
-The platform reads **about 0.015 higher** than daily Pearson on the same book: LIFO measured
-0.6935 locally and was refused at 0.7166; restructuring measured 0.7025 and was refused at
-0.7157. An earlier calibration concluded the opposite — that the platform read lower by
-0.012 — from values recorded days before against a smaller book. It was measuring book
-growth, not a measurement gap, and with the sign inverted every borderline case was called
-optimistically, which spends submissions on alphas that were always going to be refused.
+Local/platform calibration must use the same peer set and observation time.
+Otherwise book growth can look like measurement bias. `classify()` applies its
+configured bias and margin when producing a local verdict; calibration parameters
+are model assumptions, not platform thresholds or a guarantee of submission.
 
-So `classify()` **adds** the bias, and the undecided band is local 0.655–0.685. Below it,
-submit; above it, expect a refusal.
+The peer set and timing are part of the evidence:
 
-Two behaviours matter more than the arithmetic, both found by disagreeing with the
-platform and then explaining why:
-
-* **The peer set must include in-flight submissions.** `O0J6Aeag` entered the book **20
-  seconds** after `gJWre33J`, and the two correlate **0.975**. Both were accepted, because
-  the platform compares against a periodically refreshed snapshot rather than a live book.
-  A local check that looks only at ACTIVE alphas repeats that blind spot, so recent
-  submissions — including ones not yet submitted — are included by default
-  (`--include-unsent-hours`, default 24).
-* **A published platform value is historical.** `0mjGjJ36` was refused at 0.7005 and now
-  measures 0.9991 against today's book, which is not a contradiction: the counterpart
-  entered afterwards. `--as-of` restricts the peers to those submitted at or before a
-  timestamp, which reproduces the original check. Timezone matters here and got it wrong
-  first: `dateSubmitted` is `-04:00`, so comparing it as a string against a Beijing
-  timestamp silently treats every alpha as older than it is.
+* **Include in-flight submissions.** Recent candidates can share exposure even
+  when they are absent from the platform's current ACTIVE snapshot. Local checks
+  include recent candidates by default (`--include-unsent-hours`, default 24).
+* **A published platform value is historical.** A later book can contain new
+  counterparts. `--as-of` restricts peers to the submission cutoff so the comparison
+  uses the intended historical set. Parse timestamps with their timezones instead
+  of comparing timestamp strings.
 * **A peer with no number is a gap, not a zero.** A flat PnL series has no Pearson
   correlation with anything, and a peer whose PnL has not been written yet has no series
   at all. Both are listed in `peers_unmeasured` with a reason (`undefined`, `no_pnl`,
@@ -618,8 +625,8 @@ reports the correlation that would decide the submission, and only writes with
 `--yes`:
 
 ```bash
-python research_cli.py alpha submit RRA1jdmb          # dry-run, nothing written
-python research_cli.py alpha submit RRA1jdmb --yes    # irreversible
+python research_cli.py alpha submit ALPHA_ID          # dry-run, nothing written
+python research_cli.py alpha submit ALPHA_ID --yes    # irreversible
 ```
 
 An alpha also carries metadata, and a submission is unattributable without it. `name`,
@@ -630,8 +637,8 @@ it was the shape that was wrong. `alpha submit` refuses an alpha with no name or
 and prints the exact command to fix it.
 
 ```bash
-python research_cli.py alpha describe ABC12345 \
-    --name "Inventory stage growth with intraday position" --category FUNDAMENTAL
+python research_cli.py alpha describe ALPHA_ID \
+    --name "Sample research candidate" --category FUNDAMENTAL
 ```
 
 Categories are an enum discovered by probing, because an invalid value returns 400 without
@@ -647,10 +654,9 @@ Three outcomes look similar and are not:
 | `201` with an empty body | accepted for asynchronous evaluation; **not** a submission |
 | `dateSubmitted` set | the only trustworthy evidence that it went in |
 
-A first `POST` does not return the self-correlation value at all. It comes back on a
-**second** attempt once the evaluation has cached: an alpha can answer `201` and then
-`403 selfCorr=0.8488` minutes later. Always confirm with `dateSubmitted`, never with the
-status code.
+A first `POST` may return before asynchronous evaluation finishes. A later check
+can still refuse the candidate. Always confirm with `dateSubmitted`, never with
+the initial status code alone.
 
 `alpha submit` therefore reports a four-state `submission` field instead of a boolean:
 
@@ -662,21 +668,19 @@ status code.
 | `UNCERTAIN` | accepted, but the read-back failed; the outcome is unknown |
 | `NOT_SENT` | dry run, nothing was written |
 
-`submitted` stays in the document and is true only for `CONFIRMED`. An earlier version set
-it whenever the HTTP status was below 400, which contradicted this very table and produced
-a false report of twenty submissions, all of which were still UNSUBMITTED.
+`submitted` is true only for `CONFIRMED`. An HTTP status below 400 alone does not
+establish that the alpha entered the book.
 
 The platform's own view names the counterpart, which is what makes the substitute route
 decidable:
 
 ```bash
-python research_cli.py alpha self-corr ABC12345
+python research_cli.py alpha self-corr ALPHA_ID
 ```
 
-```
-sharpe 2.35   max_correlation 0.8593   sharpe_needed 2.475   verdict blocked
-counterparts: qMEWm7L2 (0.8593, Sharpe 2.25), XgRWJAQX (0.7896, Sharpe 2.00)
-```
+The report includes the candidate's Sharpe, maximum correlation, required Sharpe,
+verdict and counterpart details. These are live evidence for the selected alpha;
+private result snapshots belong in `research_dir`.
 
 The margin applies to **every** counterpart above the limit, not to the most-correlated
 one — taking the counterpart of the maximum understates the bar exactly when a second,
@@ -690,8 +694,7 @@ the documented requirement to difference a cumulative series does not apply here
 
 `cap + abs(liabilities)` is refused by the simulator: market capitalisation carries
 `Unit[CSPrice:1,CSShare:1]` — price times shares — while total liabilities is dimensionless
-in this catalogue. The error cost a submission, and the same shape was in three
-expressions of the same batch.
+in this catalogue. Check the measured units before combining these quantities.
 
 `lint` now says so first:
 
@@ -718,24 +721,13 @@ mismatch.
 
 ### The turnover floor, checked mechanically
 
-**Disclosure data is not low-value.** Three of the book's entries are built entirely from
-`fundamental6` and `analyst4` fields — inventory stages at Sharpe 2.11, receivables-payables
-at 1.56, raw materials at 1.53 — because each pairs the disclosure leg with one that
-reprices daily.
+Disclosure fields can express useful mechanisms, but a construction driven only by
+infrequent filings may not clear the platform's 0.01 turnover floor. A leg that
+reprices daily can change that behavior; it still needs simulation and validation.
 
-What cannot clear the 0.01 turnover floor is a construct with **no such leg**. Remove it and
-the same data measures deferred tax **0.0077**, operating leases **0.0086**, unrecognised
-tax benefits **0.009**, share-based compensation **0.0083**. No neutralisation, decay or
-truncation lifted any of them, because the ranking only reorders when a filing does.
-
-`lint` now says so before a simulation is spent:
-
-```
-turnover_floor_risk: no leg that moves daily: this construct measured 0.006-0.010 turnover
-against a 0.01 floor in four accounting families ... The fields are fine - three book
-entries are built from them - what is missing is the daily leg. Add one (a reversal,
-position or pressure term) rather than discarding the idea.
-```
+`lint` reports `turnover_floor_risk` when a disclosure-only construction lacks a
+market-driven leg. This is a structural warning about update cadence, not a stored
+performance result or a reason to discard an entire data family.
 
 The check reads **which fields carry market data**, taking that from the catalogue's
 dataset rather than from a list of names. Its subject is the expression, not the field: the
@@ -790,7 +782,7 @@ expression is not mistaken for a type error.
 
 ```bash
 python research_cli.py lint 'rank(ts_delta(close, 5))'
-python research_cli.py lint --file my_batch.json --dataset fundamental6
+python research_cli.py lint --file sample-batch.json --dataset fundamental6
 python research_cli.py lint --offline 'rank(close)'      # no account needed
 ```
 
@@ -863,8 +855,7 @@ only once. Two details are easy to get wrong and both are pinned by tests:
   inspected before the status.
 
 This distinction is worth acting on: `unknown` is a prompt to measure, `absent` is a
-reason to stop. An audit that records a block on a measurable unknown leaves a mechanism
-unexamined for no reason, which is how four inventory fields sat untested for days.
+reason to stop. A measurable unknown needs evidence before a mechanism can be judged.
 
 ## Templates: use units, not macros
 
@@ -872,29 +863,19 @@ A template with slots is `alpha_unit`'s job: every expression in the ledger alre
 decomposes into a template plus a filling, and the unit also knows which grid points
 were never run. `python3 tools/unit_report.py --derive <key>` lists them. The old
 text/tree macro system that did the same thing by hand-written `def` blocks was
-removed on 2026-11-01 (git history has it); its plans in `<research>/macros/` were
-all simulated and are in the ledger.
+removed because unit templates also track derivations and coverage. Keep private
+experiment plans and their outcomes in the research directory.
 
 ### Report the pool as a distribution
 
 A best-alpha report hides what a pool is: two pools can share a top result and differ
 completely in spread, one narrow and correlated, one broad and independent.
 
-```bash
-```
-
-```
-measure                           min       q1   median     mean       q3      max
-Sharpe                         1.4100   1.7225   1.9050   1.9025   2.0700   2.5800
-turnover                       0.0125   0.0934   0.1229   0.1233   0.1580   0.3793
-holding days (1/turnover)      2.6364   6.3291   8.1400  13.0821  10.7131  80.0000
-pairwise correlation          -0.1843   0.2731   0.4213   0.4475   0.6142   1.0000
-```
-
-The correlation row is the one that matters. A pool whose median pairwise correlation is
-0.42 is one bet wearing many names, whatever its best alpha looks like. Percent-of-capital
-volatility is deliberately absent: the recordset is cumulative dollar PnL and capital is
-not exposed, so that figure cannot be computed here and is not faked.
+Use `python research_cli.py health --pool` to inspect the current pool. Compare the
+distribution of Sharpe, turnover, holding days and pairwise correlations, rather
+than quoting only the best alpha. Shared PnL can reveal concentrated exposure
+despite distinct names or expressions. Percent-of-capital volatility requires
+capital data; an unavailable denominator must not be replaced by an invented one.
 
 #### Forecast fields: frequency is not target period
 
@@ -920,9 +901,9 @@ trade one mistake for a worse one.
 ### Remember what you found
 
 ```bash
-python research_cli.py simulate batch.json --record --idea "Idea 50" \
-    --mechanism "external financing gap"
-python research_cli.py ledger record P0Mq0wEM --idea "leverage, size-bucketed" \
+python research_cli.py simulate sample-batch.json --record --idea "Sample hypothesis" \
+    --mechanism "sample mechanism"
+python research_cli.py ledger record ALPHA_ID --idea "Sample hypothesis" \
     --verdict candidate --note "why it mattered"
 python research_cli.py ledger list --format markdown --min-sharpe 1.25
 ```
@@ -945,9 +926,9 @@ other half — how they relate — and all of them work offline.
 
 ```bash
 python research_cli.py ledger coverage                 # how much lacks a family label
-python research_cli.py ledger label ABC12345 --family quality --verdict candidate
-python research_cli.py ledger impact ABC12345          # who else stands on these legs
-python research_cli.py ledger lineage ABC12345         # where a variant came from
+python research_cli.py ledger label ALPHA_ID --family quality --verdict candidate
+python research_cli.py ledger impact ALPHA_ID          # who else stands on these legs
+python research_cli.py ledger lineage ALPHA_ID         # where a variant came from
 ```
 
 `ledger impact` matches on the **leg body**, not the leg name: leg names are
@@ -972,14 +953,13 @@ reports each scheme's count, median Sharpe and share below the turnover floor.
 
 ## Ask whether a leg earns its place
 
-Adding a leg felt productive and was often a loss: a five-leg version scored below
-its four-leg parent. Seeing that required two batches and reading two files.
-`ablate` writes every variant at once:
+An added leg may reduce a composite's performance. `ablate` writes the controlled
+variants together so their contributions can be compared directly:
 
 ```bash
-python research_cli.py ablate --expr "a = ...; n = ...; c = ...; a + n + c" --out /tmp/abl.json
-python research_cli.py simulate /tmp/abl.json --sort fitness --stream
-python research_cli.py compare <results.json> --contributions
+python research_cli.py ablate --expr "a = ...; n = ...; c = ...; a + n + c" --out sample-batch-ablation.json
+python research_cli.py simulate sample-batch-ablation.json --sort fitness --stream --save sample-batch-results.json
+python research_cli.py compare sample-batch-results.json --contributions
 ```
 
 The last command reports `contribution = fitness(full) - fitness(full without
@@ -995,11 +975,40 @@ structural drop-term variants and writes a legend describing each leg's fields.
 `simulate` carries `legs`, `legend` and `note` metadata into results and checkpoints,
 including stdin inputs and resumed runs. Later files override earlier metadata keys.
 
-`compare` also merges batches: several result files become one table sorted by
-fitness, with failing checks and the train/test split side by side.
-Use `compare A-results.json B-results.json --per-file` to compute each batch's leg
-contributions separately. It adds fields and data families from the embedded leg
-legend or a neighbouring `<id>-ablation.json`, keeping identically named arms apart.
+`compare` merges saved simulation results and saved probe `rows` summaries. It
+defaults to the train view; full-window metrics, test metrics and check evidence
+are shown only with `--frozen`, after the design is fixed. Explicit train fields
+remain train evidence; missing values are not filled from full-window scores.
+
+```bash
+python research_cli.py compare sample-batch-a.json sample-batch-b.json
+python research_cli.py compare --match "**/sample-batch*.json" --latest --sort none
+python research_cli.py compare --match "sample-batch-a.json" --match "**/sample-batch-b*.json" --latest 2
+python research_cli.py compare sample-batch-results.json --sort fitness --frozen
+```
+
+`FILE` is optional when at least one repeatable `--match NAME_OR_GLOB` is supplied.
+Patterns are resolved relative to the research directory: a bare name matches at
+its root, while `**/sample-batch*.json` also searches subdirectories. `--latest [N]`
+selects files by modification time before parsing JSON; omitting N means 1.
+`selection.selected_paths` lists the files, and `selection.provenance` records
+each path, matching sources and modification time. Explicit files are deduplicated
+with matches. Matching or `--latest` orders files newest first; with explicit files
+alone their argument order is preserved. `--latest` cannot be used with stdin.
+
+The default `--sort fitness` sorts by train fitness unless `--frozen` is set.
+Pass `--sort none` to preserve row order within the selected file order.
+
+Rows retain `label`, `train_sharpe_h1` and `train_sharpe_h2` when present.
+`checks_state` distinguishes `hidden` in the train view, `available` when a frozen
+view has stored check evidence, and `unavailable` when it does not. Missing checks
+are not passed checks; `failed_checks: null` is unknown, and a stored empty failure
+list alone does not prove that all platform checks resolved.
+
+Use `compare sample-batch-a.json sample-batch-b.json --per-file` to compute each
+batch's leg contributions separately. It adds fields and data families from the
+embedded leg legend or a neighbouring `<id>-ablation.json`, keeping identically
+named arms apart.
 
 ## Test an independence claim
 
@@ -1008,14 +1017,14 @@ it cannot tell you whether two candidates are two bets or one. `alpha corr` work
 on the daily PnL series instead:
 
 ```bash
-python research_cli.py alpha corr A B C                 # pairwise matrix
-python research_cli.py alpha corr A --vs-book           # max against ACTIVE
-python research_cli.py alpha corr A B --control CDE     # residual correlation
+python research_cli.py alpha corr ALPHA_A ALPHA_B                 # pairwise matrix
+python research_cli.py alpha corr ALPHA_ID --vs-book              # max against ACTIVE
+python research_cli.py alpha corr ALPHA_A ALPHA_B --control ALPHA_CONTROL
 ```
 
-Every pair is reported, not just each candidate's maximum: two alphas that each
-look independent of the book can still be 0.6 with each other, and that is the
-pair that decides whether you have two bets. Pairs that overlap for fewer than
+Every pair is reported, not just each candidate's maximum: candidates that each
+look independent of the book can still share exposure with each other. Pairs
+that overlap for fewer than
 `--min-overlap` trading days are listed as skipped rather than dropped, because a
 missing correlation and a zero correlation mean different things.
 
@@ -1030,10 +1039,9 @@ correlation tables missing exactly the rows fetched fastest.
 
 ## Find the paper, not the blog post
 
-`search` is a web search with reranking. Measured over three mechanism queries it
-returned zero to one academic domain in ten; the rest were research-blog posts,
-accounting explainers and brokerage pages. That is fine for looking up a definition and
-useless for finding where an anomaly comes from.
+`search` is a web search with reranking and can return academic papers, research
+blogs, explainers and brokerage pages. Use source type and primary evidence to
+decide whether a result supports the economic claim.
 
 `paper` asks OpenAlex instead, which is free and needs no key:
 
@@ -1101,8 +1109,8 @@ that does not start with `{` or `[` is plain text: one expression per line,
 blank lines and `#` comments skipped. Inputs are UTF-8, with or without a BOM.
 
 ```bash
-python research_cli.py lint --file base.json --file additions.json --expr "rank(close)" --offline
-python research_cli.py simulate base.json --file additions.json --expr "rank(close)" --dry-run
+python research_cli.py lint --file sample-batch-base.json --file sample-batch-additions.json --expr "rank(close)" --offline
+python research_cli.py simulate sample-batch-base.json --file sample-batch-additions.json --expr "rank(close)" --dry-run
 ```
 
 Use `-` for stdin in `lint --file -`, `simulate -`, `ablate -`, `probe -` or

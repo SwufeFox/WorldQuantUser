@@ -138,10 +138,8 @@ def cmd_pairs(args, _sink):
                 marginal = float(sharpe) - rho_book * float(book_sharpe)
             if args.min_marginal is not None and (marginal is None or marginal < args.min_marginal):
                 continue
-            # `--plain-legs` keeps only pairs whose leg sum is exact. A centred leg makes
-            # the offline prediction an overestimate (measured: 2.60 predicted, 1.53
-            # delivered), and a screen that ranks on a number it cannot deliver is worse
-            # than no screen.
+            # `--plain-legs` keeps only pairs whose leg sum is exact. Centred legs can
+            # make the offline prediction overstate what the composite delivers.
             if getattr(args, "plain_legs", False) and centred_legs:
                 continue
             if args.min_composite_sharpe is not None and sharpe < args.min_composite_sharpe:

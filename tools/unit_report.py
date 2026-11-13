@@ -9,13 +9,12 @@ reason.
 What the report is for is *reading a corpus*, not scoring it. Three questions, in the
 order they get asked:
 
-1. **How many constructions are there really?** The answer is a hierarchy, not a
-   number, and the shape of the hierarchy is the finding: assemblies collapse by 20x,
-   templates barely collapse at all. See ``docs/unit-compression.md``.
+1. **How many constructions are there really?** Report the hierarchy of assemblies,
+   kinds and templates. See ``docs/unit-compression.md`` for their definitions.
 2. **What has a construction already tried, and what has it not?** The grid per unit;
    ``--gaps`` lists the derivations the book never ran.
 3. **Which constructions are worth attention?** Size and best Fitness together, since
-   a template with 42 field variants and one with 42 settings are different things.
+   field variants and settings variants answer different questions.
 
 Usage:
     python3 tools/unit_report.py                 # the report
@@ -45,8 +44,7 @@ import alpha_unit as au  # noqa: E402
 import closed_families  # noqa: E402
 import fastexpr_ast as fa  # noqa: E402
 
-#: How an assembly token reads in prose. The vocabulary is small on purpose: there
-#: are 40 assemblies in the corpus and they are all combinations of these two.
+#: How an assembly token reads in prose. Assemblies combine legs and offsets.
 _TOKENS = {"G": "leg", "-G": "−leg", "L": "offset", "-L": "−offset"}
 
 
@@ -89,9 +87,8 @@ def load(entries=None):
 def report(corpus, counts, stream=None):
     """The hierarchy plus the top of each level, in the order the questions are asked.
 
-    Every line is printed with the unit it counts: "117 rows say ACTIVE" and "48
-    ACTIVE keys" are different numbers about different things, and the report has to
-    say which is which or the reader supplies their own.
+    Every line names its counting unit: rows carrying ACTIVE and distinct ACTIVE
+    keys describe different things, so the report must distinguish them.
     """
     stream = sys.stdout if stream is None else stream
     print("corpus", file=stream)
@@ -135,8 +132,8 @@ def report(corpus, counts, stream=None):
         flag = ""
         hit = sorted(closed.intersection(kind.families))
         if hit:
-            # The option family proves F3.38 is possible and useless: concentration
-            # kills it. A size column that does not say so reads as an opportunity.
+            # High fitness does not override a recorded closure reason. Show the
+            # warning so a closed family does not read as an unexplored opportunity.
             flag = "  [CLOSED: %s]" % ",".join(hit)
         print("  %4d  %-14s %-22s  units=%d  best F=%s%s"
               % (kind.size, ",".join(kind.families) or "-", kind.assembly,
@@ -176,9 +173,8 @@ def report(corpus, counts, stream=None):
 def gaps(corpus, known, stream=None, top=12):
     """Derivations of book constructions that the ledger has never run.
 
-    The book is where the money is, so "which questions about it were never asked" is
-    the cheapest question in the corpus. Ablations dominate: 43 of the 48 book alphas
-    are composites whose legs were never individually removed.
+    Book constructions can contain legs that have never been individually removed.
+    Reporting those ablations exposes untested questions about existing holdings.
     """
     stream = sys.stdout if stream is None else stream
     book = [point for point in corpus.points
@@ -220,10 +216,8 @@ def dataset_view(corpus, dataset, stream=None, top=8):
     they score". Each unit is one exact template and each kind is assembly x family,
     so the answer is a short list, not a grep.
 
-    This exists because on 2026-11-03 six model51 probes were hand-written for shapes
-    the ledger already held 42 expressions of, best Fitness 0.26: the dataset looked
-    empty because the *book* had none of it, and nobody asked the unit layer. One
-    command would have said so.
+    A dataset absent from the book may still have many measured expressions in the
+    ledger. Inspecting the unit layer before writing probes avoids repeating them.
     """
     stream = sys.stdout if stream is None else stream
     # The unit layer groups by *family* (price / fundamental / analyst / news /

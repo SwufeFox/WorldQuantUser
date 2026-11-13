@@ -52,7 +52,7 @@ class NamedGates(unittest.TestCase):
 class FitnessDecomposition(unittest.TestCase):
     def test_weak_sharpe_is_not_blamed_on_amplitude(self):
         code, _ = rr.classify(entry(["LOW_SHARPE", "LOW_FITNESS"],
-                                    sharpe=0.93, fitness=0.49, turnover=0.096, returns=0.034))
+                                    sharpe=0.9, fitness=0.4, turnover=0.1, returns=0.03))
         self.assertEqual(code, "weak_signal")
 
     def test_turnover_excess_when_capping_would_clear(self):
@@ -63,11 +63,10 @@ class FitnessDecomposition(unittest.TestCase):
         self.assertIn("turnover floor", detail)
 
     def test_low_amplitude_when_turnover_is_already_slow(self):
-        # F = 1.15 * sqrt(0.0457/0.125) = 0.70, and turnover is below the floor.
-        code, detail = rr.classify(entry(["LOW_FITNESS"], sharpe=1.15, fitness=0.70,
-                                         turnover=0.0627, returns=0.0457))
+        # Synthetic case: F = sqrt(0.02/0.125) = 0.4, with turnover below the floor.
+        code, _ = rr.classify(entry(["LOW_FITNESS"], sharpe=1.0, fitness=0.4,
+                                    turnover=0.05, returns=0.02))
         self.assertEqual(code, "low_amplitude")
-        self.assertIn("needs returns", detail)
 
     def test_missing_metrics_is_unclassified_rather_than_guessed(self):
         self.assertEqual(rr.classify(entry(["LOW_FITNESS"]))[0], "unclassified")

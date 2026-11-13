@@ -1669,8 +1669,8 @@ def note_operator_rejection(expression, message, context=None):
 
 # Checks whose limit is a ceiling: PASS when value <= limit. Every other check
 # in the catalog uses a floor (value >= limit). BRAIN sometimes serves a cached
-# ``result`` beside a refreshed ``value``, so the two can contradict each other
-# -- observed values 0.7526 and 0.7911 both labelled PASS against limit 0.7.
+# ``result`` beside a refreshed ``value``, so a cached PASS can contradict a value
+# above the ceiling.
 # ``reconcile_check`` recomputes the verdict from the number so a decision is
 # never made on a stale label.
 _CEILING_CHECKS = frozenset({
@@ -1728,20 +1728,29 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
     with ``Retry-After`` until the job finishes, so it is the only way to read
     the real correlation value. This polls it within a bounded budget.
 
-    Returns ``{"alpha_id", "checks", "self_correlation", "complete"}``.
-    ``complete`` is False when the budget expired before a finished payload.
+    ``complete`` indicates a nonempty check payload was received, not that every
+    check resolved. ``payload_received`` also records successful empty payloads.
+    The CLI reports check resolution separately from transport completion.
     """
-    if max_wait_seconds is not None and max_wait_seconds < 0:
-        raise ValueError("max_wait_seconds must be non-negative")
+    if max_wait_seconds is not None and (not math.isfinite(max_wait_seconds) or max_wait_seconds < 0):
+        raise ValueError("max_wait_seconds must be finite and non-negative")
     deadline = time.monotonic() + (max_wait_seconds or 0)
     url = BRAIN_API_URL + "/alphas/" + alpha_id + "/check"
     payload = None
     while True:
         response = s.get(url, timeout=_request_timeout(deadline))
+        if response.status_code in (401, 403):
+            raise AuthError("BRAIN rejected the session (HTTP %s) for alpha %s checks"
+                            % (response.status_code, alpha_id))
         if response.status_code == 404:
             raise NotFound("alpha %s not found" % alpha_id)
+        if response.status_code == 429:
+            raise RateLimited("checks for alpha %s are rate limited" % alpha_id)
+        if not 200 <= response.status_code < 300:
+            raise ServiceError("HTTP %s fetching checks for alpha %s"
+                               % (response.status_code, alpha_id))
         retry_after = _retry_after_seconds(response, cap_error_wait=False)
-        if response.status_code in (429, 503) or retry_after:
+        if retry_after:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -1767,6 +1776,7 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
         "checks": checks,
         "self_correlation": (checks or {}).get("SELF_CORRELATION"),
         "complete": bool(checks),
+        "payload_received": payload is not None,
     }
 
 
@@ -2257,9 +2267,8 @@ def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None,
 def fetch_self_correlation(s, alpha_id, tries=6, max_wait=5.0):
     """Return the platform's own self-correlation view for one alpha.
 
-    The useful part is that it names the counterpart: a bare maximum tells you a
-    submission will be refused, while knowing it collides with a Sharpe 2.54 alpha
-    tells you whether the substitute route is even arithmetically available.
+    The counterpart's Sharpe determines whether the substitute route clears its
+    required margin; a bare maximum correlation cannot answer that question.
 
     The endpoint frequently answers HTTP 200 with an *empty body* plus a Retry-After
     header. That means "not now", not "no data": reading it as absence silently

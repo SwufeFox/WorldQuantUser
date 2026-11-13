@@ -40,10 +40,10 @@ class WarningStatusTests(unittest.TestCase):
         # Wrong behaviour this prevents: a batch of WARNING records (a UNITS warning
         # is enough) summarised as completed=0, so `simulate` raised
         # SIMULATION_FAILED on a run that had every number it needed.
-        summary = cli_experiments.summarize([record(status="WARNING", sharpe=2.37, fitness=1.68)])
+        summary = cli_experiments.summarize([record(status="WARNING", sharpe=2.0, fitness=1.5)])
         self.assertEqual(summary["completed"], 1)
         self.assertEqual(summary["failed"], 0)
-        self.assertEqual(summary["best"]["sharpe"], 2.37)
+        self.assertEqual(summary["best"]["sharpe"], 2.0)
 
     def test_only_an_unfinished_status_is_rejected(self):
         self.assertEqual(alpha_registry.auto_verdict(record(status="WARNING")), "candidate")

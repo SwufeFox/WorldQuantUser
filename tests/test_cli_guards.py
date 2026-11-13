@@ -66,7 +66,7 @@ class DiagnosticLifecycleTests(unittest.TestCase):
 
 class NegativeMaxWaitTests(unittest.TestCase):
     def test_alpha_check_refuses_negative_wait_with_a_code(self):
-        args = argparse.Namespace(max_wait=-1, alpha_id="X", save=None)
+        args = argparse.Namespace(max_wait=-1, alpha_ids=["X"], save=None)
         with self.assertRaises(cli_runtime.CliError) as caught:
             cli_alphas.cmd_alpha_check(args, mock.MagicMock())
         self.assertEqual(caught.exception.code, "USAGE")
@@ -124,7 +124,88 @@ class CompareShapeTests(unittest.TestCase):
         with self.assertRaises(cli_runtime.CliError) as caught:
             self._run(rows)
         self.assertEqual(caught.exception.code, "INVALID_INPUT")
-        self.assertIn("not a simulate result document", str(caught.exception))
+        with self.assertRaises(cli_runtime.CliError) as caught:
+            self._run(rows["rows"])
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+
+
+class CompareDiscoveryTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = directory.name
+        patch = mock.patch.object(research_paths, "research_dir", return_value=self.directory)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def _write(self, name, alpha_id, modified):
+        path = os.path.join(self.directory, name)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump([result_record(alpha_id)], handle)
+        os.utime(path, (modified, modified))
+        return os.path.realpath(path)
+
+    def _run(self, files=(), **overrides):
+        options = dict(files=list(files), match=[], latest=None, sort="none",
+                       min_fitness=None, frozen=False, contributions=False)
+        options.update(overrides)
+        return cli_experiments.cmd_compare(argparse.Namespace(**options), mock.MagicMock())
+
+    def test_latest_uses_mtime_across_explicit_and_discovered_inputs_before_loading(self):
+        older = self._write("z-2026-11-13.json", "OLD", 100)
+        newest = self._write("a-2026-11-13.json", "NEW", 300)
+        explicit = self._write("explicit.json", "EXPLICIT", 200)
+        with open(older, "w", encoding="utf-8") as handle:
+            handle.write("older artifact must not be parsed")
+        os.utime(older, (100, 100))
+        data = self._run([explicit], match=["*-2026-11-13.json"], latest=2)
+        self.assertEqual([row["alpha_id"] for row in data["rows"]], ["NEW", "EXPLICIT"])
+        self.assertEqual(data["selection"]["selected_paths"], [newest, explicit])
+        self.assertEqual(data["selection"]["matched_count"], 3)
+        self.assertEqual(data["selection"]["research_root"], os.path.realpath(self.directory))
+
+    def test_globs_dedupe_explicit_paths_and_ignore_directories(self):
+        first = self._write("a.json", "A", 200)
+        second = self._write("b.json", "B", 200)
+        os.mkdir(os.path.join(self.directory, "directory.json"))
+        data = self._run([first, os.path.join(self.directory, ".", "a.json")],
+                         match=["*.json", "a.*"])
+        self.assertEqual(data["files"], [first, second])
+        self.assertEqual([row["alpha_id"] for row in data["rows"]], ["A", "B"])
+        self.assertEqual(data["selection"]["matched_count"], 2)
+        self.assertEqual(data["selection"]["provenance"][0]["sources"],
+                         ["explicit", "*.json", "a.*"])
+
+    def test_missing_inputs_and_unmatched_discovery_are_distinct(self):
+        for options, code in (({}, "USAGE"), ({"match": ["missing*.json"]}, "NOT_FOUND")):
+            with self.subTest(options=options), self.assertRaises(cli_runtime.CliError) as caught:
+                self._run(**options)
+            self.assertEqual(caught.exception.code, code)
+
+    def test_stdin_is_preserved_but_cannot_be_used_for_latest_or_twice(self):
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps([result_record("STDIN")]))):
+            data = self._run(["-"])
+        self.assertEqual(data["rows"][0]["alpha_id"], "STDIN")
+        self.assertEqual(data["rows"][0]["source_file"], "-")
+        for files, options, code in ((["-"], {"latest": 1}, "USAGE"),
+                                     (["-", "-"], {}, "INVALID_INPUT")):
+            with self.subTest(files=files, options=options), self.assertRaises(cli_runtime.CliError) as caught:
+                self._run(files, **options)
+            self.assertEqual(caught.exception.code, code)
+
+    def test_latest_rejects_nonpositive_counts(self):
+        path = self._write("batch.json", "A", 100)
+        for latest in (0, -1):
+            with self.subTest(latest=latest), self.assertRaises(cli_runtime.CliError) as caught:
+                self._run([path], latest=latest)
+            self.assertEqual(caught.exception.code, "USAGE")
+
+    def test_explicit_inputs_retain_their_order_without_latest(self):
+        first = self._write("z.json", "FIRST", 100)
+        second = self._write("a.json", "SECOND", 300)
+        data = self._run([first, second])
+        self.assertEqual([row["alpha_id"] for row in data["rows"]], ["FIRST", "SECOND"])
+
 
 
 class AlphaGetMetadataTests(unittest.TestCase):
@@ -182,6 +263,109 @@ class CompareSortAndContributionTests(unittest.TestCase):
         frozen = self._run(records, contributions=True, frozen=True)
         self.assertEqual(frozen["contributions"]["view"], "frozen")
         self.assertEqual(frozen["contributions"]["legs"][0]["verdict"], "adds")
+
+    def test_row_only_probe_preserves_ten_arm_order_and_explicit_train_metrics(self):
+        labels = ["control", "decay-4", "decay-8", "decay-16", "industry",
+                  "subindustry", "truncate-001", "truncate-005", "neutral-sector", "neutral-market"]
+        rows = [{"label": label, "alpha_id": "A%d" % index, "status": "COMPLETE",
+                 "train_sharpe": 2.3 - index / 10, "train_fitness": 1.2 + index / 10,
+                 "train_turnover": 0.04 + index / 100, "train_sharpe_h1": 1.8 + index / 10,
+                 "train_sharpe_h2": 2.7 - index / 10, "failed_checks": []}
+                for index, label in enumerate(labels)]
+        data = self._run({"name": "sample-batch", "complete": True, "rows": rows},
+                         sort="none", frozen=True)
+        self.assertEqual([row["label"] for row in data["rows"]], labels)
+        for source, actual in zip(rows, data["rows"]):
+            for key, value in source.items():
+                self.assertEqual(actual[key], value, key)
+            self.assertTrue(actual["source_file"].endswith("batch.json"))
+            self.assertEqual(actual["checks_state"], "available")
+
+    def test_missing_train_and_checks_stay_unknown_in_both_views(self):
+        record = {"alpha_id": "A", "metrics": {"sharpe": 9, "fitness": 8},
+                  "out_of_sample": {"test": {"sharpe": 7}}}
+        for frozen in (False, True):
+            row = self._run([record], frozen=frozen)["rows"][0]
+            self.assertIsNone(row["train_sharpe"])
+            self.assertIsNone(row["train_fitness"])
+            self.assertIsNone(row["failed_checks"])
+            self.assertEqual(row["checks_state"], "unavailable" if frozen else "hidden")
+        row_only = {"name": "probe", "incomplete": ["missing"], "rows": [
+            {"label": "missing", "status": "PENDING", "sharpe": 9, "test_sharpe": 7}]}
+        row = self._run(row_only, frozen=True)["rows"][0]
+        self.assertIsNone(row["train_sharpe"])
+        self.assertIsNone(row["failed_checks"])
+        self.assertEqual(row["status"], "PENDING")
+
+    def test_cached_check_failures_are_frozen_only_and_empty_is_known(self):
+        failed = result_record("FAIL")
+        failed["checks"] = {"LOW_SHARPE": {"result": "FAIL"}, "BROKEN": {"result": "ERROR"}}
+        passed = result_record("PASS")
+        hidden = self._run([failed, passed], sort="none")["rows"]
+        self.assertTrue(all(row["failed_checks"] is None and row["checks_state"] == "hidden"
+                            for row in hidden))
+        shown = self._run([failed, passed], sort="none", frozen=True)["rows"]
+        self.assertEqual(shown[0]["failed_checks"], ["BROKEN", "LOW_SHARPE"])
+        self.assertEqual(shown[1]["failed_checks"], [])
+        self.assertTrue(all(row["checks_state"] == "available" for row in shown))
+
+    def test_probe_alignment_uses_identity_and_retains_raw_contribution_evidence(self):
+        records = [
+            {"candidate_id": "full", "alpha_id": "F", "metrics": {"fitness": 2.0},
+             "out_of_sample": {"train": {"fitness": 1.0}}, "half_sharpes": [1.1, 1.2]},
+            {"candidate_id": "loo:a", "alpha_id": "A", "metrics": {"fitness": 1.9},
+             "out_of_sample": {"train": {"fitness": 1.4}}, "half_sharpes": [2.1, 2.2]},
+        ]
+        payload = {"spec": "probe.json", "rows": [
+            {"label": "loo:a", "alpha_id": "A", "train_fitness": 9},
+            {"label": "full", "alpha_id": "F", "train_fitness": 8}], "records": records}
+        data = self._run(payload, sort="none", contributions=True)
+        self.assertEqual([row["alpha_id"] for row in data["rows"]], ["A", "F"])
+        self.assertEqual([row["train_sharpe_h1"] for row in data["rows"]], [2.1, 1.1])
+        self.assertEqual(data["contributions"]["legs"][0]["verdict"], "hurts")
+        frozen = self._run(payload, sort="none", contributions=True, frozen=True)
+        self.assertEqual(frozen["contributions"]["legs"][0]["verdict"], "adds")
+
+    def test_probe_alignment_uses_order_only_without_conflicting_identity(self):
+        payload = {"spec": "probe.json", "rows": [
+            {"label": "first", "train_sharpe": 1}, {"label": "second", "train_sharpe": 2}],
+            "records": [{"alpha_id": "A", "half_sharpes": [1.1, 1.2]},
+                        {"alpha_id": "B", "half_sharpes": [2.1, 2.2]}]}
+        rows = self._run(payload, sort="none")["rows"]
+        self.assertEqual([(row["label"], row["alpha_id"], row["train_sharpe_h1"])
+                          for row in rows], [("first", "A", 1.1), ("second", "B", 2.1)])
+        payload = {"spec": "probe.json", "rows": [
+            {"label": "first", "alpha_id": "A", "train_sharpe": 1}],
+            "records": [{"alpha_id": "UNRELATED", "half_sharpes": [99, 98],
+                         "checks": {"LOW_SHARPE": {"result": "FAIL"}}}]}
+        rows = self._run(payload, sort="none", frozen=True)["rows"]
+        self.assertEqual(rows[0]["alpha_id"], "A")
+        self.assertIsNone(rows[0]["train_sharpe_h1"])
+        self.assertIsNone(rows[0]["failed_checks"])
+        self.assertEqual(rows[1]["alpha_id"], "UNRELATED")
+
+    def test_probe_position_does_not_take_another_rows_identified_record(self):
+        payload = {"spec": "probe.json", "rows": [
+            {"label": "missing", "train_sharpe": None},
+            {"label": "known", "alpha_id": "B", "train_sharpe": 2}],
+            "records": [{"alpha_id": "B", "half_sharpes": [2.1, 2.2]},
+                        {"alpha_id": "UNRELATED", "half_sharpes": [99, 98]}]}
+        rows = self._run(payload, sort="none")["rows"]
+        self.assertIsNone(rows[0]["alpha_id"])
+        self.assertIsNone(rows[0]["train_sharpe_h1"])
+        self.assertEqual(rows[1]["alpha_id"], "B")
+        self.assertEqual(rows[1]["train_sharpe_h1"], 2.1)
+
+    def test_probe_labels_align_records_without_alpha_ids(self):
+        payload = {"spec": "probe.json", "rows": [
+            {"label": "first", "train_sharpe": 1, "failed_checks": []},
+            {"label": "second", "train_sharpe": 2, "failed_checks": ["LOW_FITNESS"]}],
+            "records": [{"mechanism": "second", "half_sharpes": [2.1, 2.2]},
+                        {"mechanism": "first", "half_sharpes": [1.1, 1.2]}]}
+        rows = self._run(payload, sort="none", frozen=True)["rows"]
+        self.assertEqual([row["train_sharpe_h1"] for row in rows], [1.1, 2.1])
+        self.assertEqual([row["failed_checks"] for row in rows], [[], ["LOW_FITNESS"]])
+
 
 
 class ComparePerFileTests(unittest.TestCase):
