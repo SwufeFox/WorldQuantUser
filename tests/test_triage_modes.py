@@ -125,3 +125,32 @@ class PerMemberGateTests(TriageModeTests):
         row = data["rows"][0]
         self.assertGreater(row["max_member_rho"], 0.99)
         self.assertEqual(row["verdict"], "duplicate")
+
+
+class MemberCorrelationSignTests(unittest.TestCase):
+    """max_member_rho is a magnitude: a -0.75 member is not a safe neighbour."""
+
+    def test_a_negatively_correlated_member_still_reads_as_a_duplicate(self):
+        import numpy as np
+        from research_app import triage
+        days = ["2020-%03d" % (i + 1) for i in range(300)]
+        rng = np.random.default_rng(7)
+        base = rng.normal(size=300)
+        book = {days[i]: base[i] for i in range(300)}
+        # Mirror image of the book member: strongly related, opposite sign.
+        mirror = {days[i]: -base[i] * 10 for i in range(300)}
+        from research_app import legs
+        original_load = legs.load_pnl
+        legs.load_pnl = lambda alpha_id, directory: (mirror if alpha_id == "cand" else book)
+        try:
+            series = {"member": book}
+            row = {"alpha_id": "cand"}
+            row = triage._score("cand", {"expression": "rank(close)", "metrics": {"fitness": 1.0}},
+                                series, days, {"pnl_dir": ".", "cohort": [], "min_delta": 0.02,
+                                               "retention_floor": 0.2, "internal": False,
+                                               "show_test": False})
+        finally:
+            legs.load_pnl = original_load
+        self.assertAlmostEqual(row["max_member_rho"], 1.0, places=2)
+        self.assertLess(row["max_member_rho_signed"], 0.0)
+        self.assertEqual(row["verdict"], "duplicate")

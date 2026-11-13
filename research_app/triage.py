@@ -166,7 +166,12 @@ def _score(alpha_id, entry, series, dates, criteria):
             now = legs.sharpe_of(book_slice)
             if member_rhos:
                 worst = max(member_rhos, key=lambda item: abs(item[0]))
-                row["max_member_rho"] = round(worst[0], 3)
+                # The platform counts a duplicate whichever way it is signed, so the
+                # headline number is the magnitude. A member at -0.75 is a stronger
+                # relationship than one at +0.60, and reporting the signed value let a
+                # -0.75 row read as "safe" in a `max_member_rho < 0.8` screen.
+                row["max_member_rho"] = round(abs(worst[0]), 3)
+                row["max_member_rho_signed"] = round(worst[0], 3)
                 row["max_member"] = worst[1]
             if rho is not None:
                 row["rho_book"] = round(rho, 3)
