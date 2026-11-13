@@ -7,9 +7,15 @@ each status code has to become a distinct exception so the CLI can report a
 useful next step instead of one opaque failure.
 """
 
+import contextlib
+import json
 import os
 import sys
+import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -155,6 +161,116 @@ class QualityFilterTests(unittest.TestCase):
 
     def test_missing_score_is_treated_as_low(self):
         self.assertEqual(ds.high_quality([{"title": "x"}]), [])
+
+
+class SearchCacheTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = temporary.name
+        self.rows = [{"title": "Research", "url": "https://example.org/paper"}]
+        transport = mock.patch.object(ds, "_post", return_value={"results": self.rows})
+        self.post = transport.start()
+        self.addCleanup(transport.stop)
+
+    def test_reuses_effective_request_and_reports_cache_truthfully(self):
+        first = ds.search_cached(self.directory, "  alpha decay  ", count=999,
+                                 need_content=1, ori_question="x" * 130)
+        second = ds.search_cached(self.directory, "alpha decay", count=50,
+                                  need_content=True, ori_question="x" * 128)
+        self.assertEqual(first, (self.rows, False))
+        self.assertEqual(second, (self.rows, True))
+        self.post.assert_called_once()
+        self.assertEqual(self.post.call_args.args[1], {
+            "query": "alpha decay", "count": 50, "need_content": True,
+            "ori_question": "x" * 128})
+
+    def test_every_effective_option_gets_its_own_cache(self):
+        options = [{}, {"count": 3}, {"need_content": True},
+                   {"ori_question": "mechanism"}, {"ori_question": "evidence"}]
+        for option in options:
+            self.assertFalse(ds.search_cached(self.directory, "alpha", **option)[1])
+        self.assertFalse(ds.search_cached(self.directory, "beta")[1])
+        for option in options:
+            self.assertTrue(ds.search_cached(self.directory, "alpha", **option)[1])
+        self.assertEqual(self.post.call_count, 6)
+
+    def test_empty_results_are_reusable(self):
+        self.post.return_value = {"results": []}
+        self.assertEqual(ds.search_cached(self.directory, "empty"), ([], False))
+        self.assertEqual(ds.search_cached(self.directory, "empty"), ([], True))
+        self.post.assert_called_once()
+
+    def test_expiry_and_stricter_caller_age_refetch(self):
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with mock.patch.object(ds.cache_store, "utc_now", return_value=start) as clock:
+            ds.search_cached(self.directory, "alpha", max_age_hours=10)
+            clock.return_value = start + timedelta(hours=2)
+            self.assertTrue(ds.search_cached(self.directory, "alpha", max_age_hours=10)[1])
+            self.assertFalse(ds.search_cached(self.directory, "alpha", max_age_hours=1)[1])
+            clock.return_value = start + timedelta(hours=3)
+            self.assertFalse(ds.search_cached(self.directory, "alpha", max_age_hours=10)[1])
+        self.assertEqual(self.post.call_count, 3)
+
+    def test_corruption_and_legacy_entries_are_refetched(self):
+        path = ds.cache_path(self.directory, "alpha")
+        path.parent.mkdir(parents=True)
+        invalid = ["{broken", "[]", json.dumps({"query": "alpha", "count": 10,
+                                                "results": self.rows}),
+                   json.dumps({"_cache": ["bad"], "payload": {}}),
+                   json.dumps(ds.cache_store.build_entry("deepseek-search", [], ttl=60)),
+                   json.dumps(ds.cache_store.build_entry("deepseek-search", {
+                       "request": ds._search_payload("alpha", 10, False, None),
+                       "results": [None]}, ttl=60))]
+        for content in invalid:
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                self.assertEqual(ds.search_cached(self.directory, "alpha"), (self.rows, False))
+                self.assertTrue(ds.search_cached(self.directory, "alpha")[1])
+        self.assertEqual(self.post.call_count, len(invalid))
+
+    def test_concurrent_identical_requests_fetch_and_write_once(self):
+        barrier = threading.Barrier(4)
+        original_lock = ds.cache_store.file_lock
+
+        @contextlib.contextmanager
+        def coordinated_lock(path):
+            barrier.wait(timeout=10)
+            with original_lock(path):
+                yield
+
+        with mock.patch.object(ds.cache_store, "file_lock", coordinated_lock), \
+                mock.patch.object(ds.cache_store, "write_json_atomic",
+                                  wraps=ds.cache_store.write_json_atomic) as write:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda _: ds.search_cached(self.directory, "alpha"),
+                                        range(4)))
+        self.assertEqual(sum(cached for _, cached in results), 3)
+        self.assertTrue(all(rows == self.rows for rows, _ in results))
+        self.post.assert_called_once()
+        write.assert_called_once()
+
+    def test_cache_write_failure_preserves_one_successful_request(self):
+        with mock.patch.object(ds.cache_store, "write_json_atomic",
+                               side_effect=PermissionError("read only")):
+            self.assertEqual(ds.search_cached(self.directory, "alpha"), (self.rows, False))
+        self.post.assert_called_once()
+        self.assertFalse(ds.cache_path(self.directory, "alpha").exists())
+
+    def test_unwritable_cache_directory_preserves_one_successful_request(self):
+        directory = Path(self.directory) / "file"
+        directory.write_text("not a directory", encoding="utf-8")
+        self.assertEqual(ds.search_cached(directory, "alpha"), (self.rows, False))
+        self.post.assert_called_once()
+
+    def test_transport_failure_is_not_cached_or_retried(self):
+        self.post.side_effect = ds.SearchServiceError("unavailable")
+        with self.assertRaises(ds.SearchServiceError):
+            ds.search_cached(self.directory, "alpha")
+        self.post.assert_called_once()
+        self.assertFalse(ds.cache_path(self.directory, "alpha").exists())
+        self.post.side_effect = None
+        self.assertEqual(ds.search_cached(self.directory, "alpha"), (self.rows, False))
 
 
 if __name__ == "__main__":

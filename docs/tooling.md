@@ -102,7 +102,7 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 抽取查询。下面只是写法示例，不是研究结论：
 
 ```markdown
-- [open] **修订效应还是价格动量？** — 证据：批次文件 / alpha key；下一步：保持设置，加入能区分两者的对照。
+- [open] **修订效应还是价格动量？** — 证据：批次文件 / alpha key；下一步：保持设置，加入区分两者的对照；query: analyst revisions price momentum
 - [closed] **某代理能否检验该机制？** — 结论及适用范围；证据：报告路径；重开条件：覆盖率或代理变化。
 ```
 
@@ -112,6 +112,37 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 零命中不等于未被探索。检索失败、空结果和已读重复分列在 `searches`，论文保留 DOI/URL。
 记忆索引仍由 `memory_index` 生成，按当前问题取相关条目；路径与账户限制从当前 CLI
 和平台读取，索引不写死旧机器路径、日期报告或费用假设。
+
+### 有界并发、缓存与主动下一步
+
+```bash
+python3 research_cli.py feed --from-threads --workers 4 --timeout 30 --dry-run
+python3 research_cli.py feed --topic "analyst forecast dispersion" --topic "earnings quality" --action
+```
+
+`--workers` 为 1–8，默认 4；它限制同时请求的主题数，`--timeout` 是单次网络请求的
+超时秒数。检索完成后仍按原主题顺序均衡选取，完成先后不会改变排序。网络调用在锁外；
+多个 feed 提交结果前会锁住状态并重新读取已读集合，避免按旧快照重复选中论文。
+
+OpenAlex 使用 `<research>/cache/papers/`；网页搜索使用 `<research>/search-cache/`。
+缓存键包含实际请求选项，全文开关、原问题和结果数量不同会分别保存。相同请求并发未命中时
+只由持锁者抓取；有效缓存直接复用，过期或损坏才重新读取。缓存写入失败仍保留成功获取的结果。
+论文输出包括可用的出版页、DOI 与 PDF 链接；来源未提供的全文保持未知。
+
+`next_actions` 是有上限的建议：失败查询附 CLI 参数数组 `argv`，未搜主题给下一批参数，
+无法推导查询的问题给原文件位置，已获得的论文给来源阅读和反例对照任务。
+`argv` 是传给 `research_cli.py` 的参数列表，不是可以直接拼接进 shell 的字符串。
+中文问题可以保留中文标题，并显式写 `; query: ...`；系统不自动编造翻译。
+
+在用户授权的研究范围内，AI 应主动完成可获取的前置事实、比较不同解释、准备下一项实验并
+先 dry-run。存在反证时先解释分歧，避免反复微调同一个高分表达式。工具的下一步建议提供证据
+入口；模拟、验证和提交仍遵循各自边界。
+
+seen 与草稿各自原子提交，草稿先于 seen：草稿失败不会把论文标成已读。它们不是跨文件事务，
+两次提交之间中断可能留下重复草稿；seen 已提交但 stdout 未送达时，也可能已消费本次选中的论文。
+`--dry-run` 不写 seen/草稿，检索缓存仍可写入。Windows 使用系统字节锁，POSIX 使用 flock；
+进程退出后系统释放锁，旧 `.pid` 文件不会阻塞新任务。
+
 
 ## 我要回答……
 
@@ -155,6 +186,21 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 | 这个字段到底什么量纲 | `python3 tools/probe_units.py` |
 
 日常实验只维护 spec 文件：先离线预览，再正式运行。`idea` / `mechanism` / `note` 会随输出和批次文件保存；`--strict-gate` 只拒绝表达式和完整生效设置都相同的已完成结果。所有配置组在登录和模拟前完成本地校验；等效设置合并，同一批复用缓存会话。`simulate` 的研究文件和 `probe` 的 spec 文件都按 UTF-8 读取，兼容 BOM。
+
+`probe` 在第一次提交前建立批次文件，之后在提交、等待、完成和失败事件上原子保存，
+并保留原始结果、训练视图与进度 URL。`--max-wait-seconds` 默认 300，限制模拟阶段的等待；
+前一配置组仍有未完成任务时，后面的配置组保持排队，不再叠加提交。
+
+```bash
+python3 research_cli.py probe --recover <research>/batch-YYYY-MM-DD.json --max-wait-seconds 60
+python3 research_cli.py resume <checkpoint.json> --max-wait-seconds 60
+```
+
+`probe --recover` 优先用已知 alpha ID 或进度 URL 读取；旧文件中没有任务身份的行才按表达式与
+设置匹配，有多个匹配时继续保留未知。恢复本身不提交模拟；`not_submitted` 列出确定没有启动的
+实验臂，后续只为这些臂准备新 spec。每条恢复证据都会落盘，已完成批次无需重新登录。
+同一批次的运行/恢复和同一 checkpoint 的恢复互斥；`--force` 也不能覆盖正在运行的批次。
+
 
 ### 备份与重放
 

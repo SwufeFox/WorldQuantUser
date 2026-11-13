@@ -276,6 +276,29 @@ Maintain one `- [open] **question** — evidence; next discriminating check` or
 For the explore → select → experiment → review workflow, see
 [the information flow guide](docs/tooling.md#给-ai-的信息按阶段进入).
 
+### Retrieve independent questions concurrently
+
+```bash
+python research_cli.py feed --from-threads --workers 4 --timeout 30 --dry-run
+python research_cli.py feed --topic "analyst revisions" --topic "earnings quality" --action
+```
+
+`--workers` bounds concurrent queries (1–8, default 4); `--timeout` bounds each network
+request. Output retains topic order and balanced picks regardless of completion order.
+`next_actions` supplies bounded, evidence-linked retries, deferred searches, source reviews
+and contrasts. Its `argv` lists are arguments for `research_cli.py`, not shell strings.
+Threads may state an authored query with `; query: ...`, including after a Chinese heading.
+
+Paper caches use the effective request under `<research>/cache/papers/`; web-search caches
+also distinguish content and original-question options. Identical concurrent misses share
+one fetch; writes are atomic, expired/corrupt entries refetch, and failed cache writes do
+not discard successful retrievals. Paper records preserve available landing-page/PDF links.
+
+Concurrent feeds reread seen state under a lock after retrieval. Drafts commit before seen;
+each file is atomic, but a crash between commits can repeat drafts, and a crash after seen
+commits can consume picks before delivery. Dry-run leaves seen/drafts alone; caches may write.
+
+
 ### Check the account
 
 ```bash
@@ -422,6 +445,15 @@ similarity is reported separately and never blocks.
 override the spec and each arm's settings; an arm's top-level `decay` remains its
 per-expression override. One real batch shares a session across all groups.
 Use `probe - --dry-run` to read a spec from stdin.
+
+Probe batches are saved before submitting and after each progress/result event, including
+accepted progress URLs. `--max-wait-seconds` bounds simulation waiting across groups
+(default 300); unfinished jobs stop later settings groups from submitting. Use
+`probe --recover BATCH_JSON` to read known IDs/progress URLs without resubmitting, and
+`resume CHECKPOINT` for simulation checkpoints. Recovery persists each result and reports
+`not_submitted` arms separately. Same-batch writers and same-checkpoint resumes are locked;
+Windows and POSIX release ownership when the process exits. A complete batch recovers offline.
+
 
 ### Inspect results
 

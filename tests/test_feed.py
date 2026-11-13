@@ -3,7 +3,9 @@
 import json
 import os
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest import mock
 
@@ -24,7 +26,7 @@ class FeedTests(unittest.TestCase):
         values = dict(topic=["receivables"], from_threads=False, topics=False,
                       topics_file=None, limit=5, total=3, max_topics=4,
                       from_year=2005, min_citations=0, seen=None,
-                      draft_cards=None, dry_run=False, registry=None)
+                      draft_cards=None, dry_run=False, registry=None, workers=4, timeout=30)
         values.update(overrides)
         return SimpleNamespace(**values)
 
@@ -113,12 +115,16 @@ class FeedTests(unittest.TestCase):
     def test_failures_empty_and_success_are_reported_and_all_topics_searched(self):
         args = self.args(topic=["first", " FIRST ", "broken", "empty", "last", "deferred"],
                          max_topics=4, total=1)
-        with mock.patch("paper_search.search_papers", side_effect=[
-                {"papers": [self.paper()]}, RuntimeError("token=SECRET https://private"),
-                {"papers": []}, {"papers": [self.paper("Later")]}]) as search:
+        outcomes = {"first": {"papers": [self.paper()]},
+                    "empty": {"papers": []}, "last": {"papers": [self.paper("Later")]}}
+        def search_topic(topic, **_options):
+            if topic == "broken":
+                raise RuntimeError("token=SECRET https://private")
+            return outcomes[topic]
+        with mock.patch("paper_search.search_papers", side_effect=search_topic) as search:
             result = feed.cmd_feed(args, None)
-        self.assertEqual([call.args[0] for call in search.call_args_list],
-                         ["first", "broken", "empty", "last"])
+        self.assertCountEqual([call.args[0] for call in search.call_args_list],
+                              ["first", "broken", "empty", "last"])
         self.assertEqual([row["status"] for row in result["searches"]],
                          ["success", "failure", "empty", "success"])
         self.assertEqual(result["searches"][1]["error"],
@@ -127,8 +133,8 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(result["unsearched_topics"], ["deferred"])
 
     def test_malformed_response_is_distinct_from_empty_success(self):
-        with mock.patch("paper_search.search_papers", side_effect=[
-                {"unexpected": []}, {"papers": [None, {}, self.paper()]}]):
+        outcomes = {"bad": {"unexpected": []}, "usable": {"papers": [None, {}, self.paper()]}}
+        with mock.patch("paper_search.search_papers", side_effect=lambda topic, **_: outcomes[topic]):
             result = feed.cmd_feed(self.args(topic=["bad", "usable"]), None)
         self.assertEqual(result["searches"][0]["status"], "failure")
         self.assertEqual(result["searches"][0]["error"]["code"], "INVALID_RESPONSE")
@@ -139,8 +145,8 @@ class FeedTests(unittest.TestCase):
         first = self.paper("First", citations=1000)
         second = self.paper("Second", citations=900)
         later = self.paper("Later", citations=1)
-        with mock.patch("paper_search.search_papers", side_effect=[
-                {"papers": [second, first]}, {"papers": [first, later]}]):
+        outcomes = {"alpha": {"papers": [second, first]}, "beta": {"papers": [first, later]}}
+        with mock.patch("paper_search.search_papers", side_effect=lambda topic, **_: outcomes[topic]):
             result = feed.cmd_feed(self.args(topic=["alpha", "beta"], total=2), None)
         self.assertEqual([row["title"] for row in result["papers"]], ["First", "Later"])
         self.assertEqual(result["papers"][0]["queries"], ["alpha", "beta"])
@@ -204,15 +210,21 @@ class FeedTests(unittest.TestCase):
 
     def test_feed_and_draft_retain_source_links_and_bounded_abstract(self):
         draft = os.path.join(self.root, "drafts.jsonl")
-        paper = self.paper(abstract="evidence " * 200)
+        paper = self.paper(abstract="evidence " * 200,
+                           landing_page_url="https://publisher.example/article",
+                           pdf_url="https://publisher.example/article.pdf")
         result = self.run_feed([paper], self.args(draft_cards=draft))
         row = result["papers"][0]
         self.assertEqual(row["doi"], paper["doi"])
         self.assertEqual(row["url"], paper["url"])
+        self.assertEqual(row["landing_page_url"], paper["landing_page_url"])
+        self.assertEqual(row["pdf_url"], paper["pdf_url"])
         self.assertEqual(row["abstract"], paper["abstract"][:600])
         with open(draft, encoding="utf-8") as handle:
             card = json.loads(handle.read())
         self.assertEqual(card["source"]["url"], paper["url"])
+        self.assertEqual(card["source"]["landing_page_url"], paper["landing_page_url"])
+        self.assertEqual(card["source"]["pdf_url"], paper["pdf_url"])
         self.assertEqual(card["abstract"], row["abstract"])
         self.assertIsNone(card["hypothesis"]["falsification"])
         self.assertIsNone(card["novelty"]["closest_existing_family"])
@@ -248,6 +260,14 @@ class FeedTests(unittest.TestCase):
             self.assertEqual(row["doi"], source["doi"])
             self.assertEqual(row["url"], source["url"])
             self.assertEqual(row["abstract"], source["abstract"])
+        contrasts = [action for action in result["next_actions"]
+                     if action["kind"] == "contrast_prior_evidence"]
+        self.assertEqual(len(contrasts), 1)
+        self.assertEqual(contrasts[0]["paper_index"], 0)
+        self.assertEqual(contrasts[0]["source"], registry)
+        self.assertEqual(contrasts[0]["evidence_keys"], ["active"])
+        self.assertIn("not a joint transaction", result["note"])
+        self.assertNotIn("abstract", json.dumps(result["next_actions"]))
 
     def test_action_missing_registry_keeps_exposure_and_trials_unknown(self):
         result = self.run_feed([self.paper("Analyst forecast dispersion")], action=True)
@@ -282,3 +302,269 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(prior["evidence"][0]["key"], "trial-3")
         self.assertLessEqual(len(prior["evidence"][0]["note"]), 240)
         self.assertLessEqual(len(prior["evidence"][0]["mechanism"]), 160)
+
+    def test_explicit_queries_apply_to_plain_and_bold_threads_in_one_read(self):
+        path = self.write_file("open-threads.md", """- [open] **销售分歧** — 证据；query: earnings forecast dispersion
+- [open] 递延收入；query： deferred revenue quality
+- **旧标题**：证据; query: supplier network pricing
+- [open] **销售分歧**；query: analyst coverage information
+- [closed] 旧问题; query: must never search
+- [open] **无英文问题** — 证据
+""")
+        original_open = open
+        with mock.patch("builtins.open", wraps=original_open) as opened, \
+                mock.patch("paper_search.search_papers", return_value={"papers": []}) as search:
+            result = feed.cmd_feed(self.args(topic=None, from_threads=True), None)
+        self.assertEqual(result["topics"], ["earnings forecast dispersion", "deferred revenue quality",
+                                             "supplier network pricing", "analyst coverage information"])
+        self.assertCountEqual([call.args[0] for call in search.call_args_list], result["topics"])
+        reads = [call for call in opened.call_args_list if os.fspath(call.args[0]) == path]
+        self.assertEqual(len(reads), 1)
+        self.assertEqual([row["question"] for row in result["questions_without_query"]], ["无英文问题"])
+
+    def test_workers_overlap_provider_calls_and_enforce_the_bound(self):
+        entered = threading.Event()
+        release = threading.Event()
+        guard = threading.Lock()
+        active = 0
+        peak = 0
+        topics = ["topic-%d" % index for index in range(6)]
+
+        def search(topic, **options):
+            nonlocal active, peak
+            self.assertEqual(options["timeout"], 7.5)
+            with guard:
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    entered.set()
+            try:
+                if not release.wait(5):
+                    raise RuntimeError("test did not release provider calls")
+                return {"papers": [self.paper(topic)]}
+            finally:
+                with guard:
+                    active -= 1
+
+        with mock.patch("paper_search.search_papers", side_effect=search) as provider, \
+                mock.patch.object(feed.runtime, "note") as progress, \
+                ThreadPoolExecutor(max_workers=1) as runner:
+            future = runner.submit(feed.cmd_feed, self.args(
+                topic=topics, max_topics=6, workers=2, timeout=7.5, total=6, dry_run=True), None)
+            try:
+                self.assertTrue(entered.wait(5), "two provider calls must overlap")
+                with guard:
+                    self.assertEqual(active, 2)
+            finally:
+                release.set()
+            result = future.result(timeout=5)
+        self.assertEqual(peak, 2)
+        self.assertEqual(provider.call_count, 6)
+        self.assertEqual(progress.call_count, 6)
+        self.assertEqual(result["count"], 6)
+
+    def test_reverse_completion_keeps_reports_picks_and_provenance_in_topic_order(self):
+        topics = ["alpha", "beta", "gamma"]
+        started = threading.Barrier(4, timeout=5)
+        release = {topic: threading.Event() for topic in topics}
+        finished = [threading.Event() for _ in topics]
+        completion_order = []
+        shared = self.paper("Shared", citations=1000)
+        outcomes = {"alpha": [shared, self.paper("Alpha")],
+                    "beta": [shared, self.paper("Beta")], "gamma": [self.paper("Gamma")]}
+
+        def search(topic, **_options):
+            started.wait()
+            if not release[topic].wait(5):
+                raise RuntimeError("test did not release provider call")
+            return {"papers": outcomes[topic]}
+
+        def note(message):
+            index = int(message.split()[2].split("/")[0]) - 1
+            completion_order.append(index)
+            finished[index].set()
+
+        with mock.patch("paper_search.search_papers", side_effect=search), \
+                mock.patch.object(feed.runtime, "note", side_effect=note), \
+                ThreadPoolExecutor(max_workers=1) as runner:
+            future = runner.submit(feed.cmd_feed, self.args(topic=topics, workers=3, dry_run=True), None)
+            try:
+                started.wait()
+                for index in (2, 1, 0):
+                    release[topics[index]].set()
+                    self.assertTrue(finished[index].wait(5))
+                result = future.result(timeout=5)
+            finally:
+                for event in release.values():
+                    event.set()
+        self.assertEqual(completion_order, [2, 1, 0])
+        self.assertEqual([row["query"] for row in result["searches"]], topics)
+        self.assertEqual([row["title"] for row in result["papers"]], ["Shared", "Beta", "Gamma"])
+        self.assertEqual(result["papers"][0]["query"], "alpha")
+        self.assertEqual(result["papers"][0]["queries"], ["alpha", "beta"])
+        self.assertEqual([row["picked"] for row in result["searches"]], [1, 1, 1])
+
+    def test_concurrent_feeds_select_unique_picks_after_network_finishes(self):
+        providers = threading.Barrier(2, timeout=5)
+        papers = [self.paper("Paper-%d" % index) for index in range(4)]
+        draft = os.path.join(self.root, "drafts.jsonl")
+
+        def search(_topic, **_options):
+            # Holding the seen lock during provider I/O would deadlock this barrier.
+            providers.wait()
+            return {"papers": papers}
+
+        with mock.patch("paper_search.search_papers", side_effect=search), \
+                ThreadPoolExecutor(max_workers=2) as runner:
+            futures = [runner.submit(feed.cmd_feed, self.args(total=2, draft_cards=draft), None)
+                       for _ in range(2)]
+            results = [future.result(timeout=10) for future in futures]
+        picks = [{row["doi"] for row in result["papers"]} for result in results]
+        self.assertEqual([len(keys) for keys in picks], [2, 2])
+        self.assertFalse(picks[0] & picks[1])
+        self.assertEqual(picks[0] | picks[1], {row["doi"] for row in papers})
+        self.assertEqual(sorted(result["seen_before"] for result in results), [0, 2])
+        self.assertEqual(len(feed.load_seen(results[0]["seen"])), 4)
+        with open(draft, encoding="utf-8") as handle:
+            cards = [json.loads(line) for line in handle]
+        self.assertEqual(len(cards), 4)
+        self.assertEqual({card["source"]["doi"] for card in cards}, picks[0] | picks[1])
+
+    def test_invalid_provider_rows_do_not_discard_other_evidence(self):
+        rows = [None, [], {}, self.paper("Bad DOI", doi=[]),
+                self.paper("Bad rank", citations="unknown"),
+                self.paper("Bad abstract", abstract={"text": "invalid"}),
+                self.paper("Not finite", citations=float("nan")), self.paper("Usable")]
+        # A nonempty, non-string DOI cannot become a stable key.
+        rows[3]["doi"] = ["10.1/invalid"]
+        result = self.run_feed(rows)
+        self.assertEqual(result["searches"][0]["invalid"], 7)
+        self.assertEqual([row["title"] for row in result["papers"]], ["Usable"])
+
+    def test_seen_commit_preserves_prior_bytes_and_flushes_before_replace(self):
+        seen = os.path.join(self.root, "seen.jsonl")
+        previous = b'{"key":"older","note":"keep"}\r\nnull\nnot-json\n{"key":"last"}'
+        with open(seen, "wb") as handle:
+            handle.write(previous)
+        calls = []
+        fsync, replace = os.fsync, os.replace
+
+        def flush(descriptor):
+            calls.append("fsync")
+            return fsync(descriptor)
+
+        def commit(source, destination):
+            self.assertTrue(calls)
+            self.assertEqual(calls[-1], "fsync")
+            calls.append("replace")
+            return replace(source, destination)
+
+        with mock.patch.object(feed.os, "fsync", side_effect=flush), \
+                mock.patch.object(feed.os, "replace", side_effect=commit):
+            result = self.run_feed([self.paper()], self.args(seen=seen))
+        with open(seen, "rb") as handle:
+            content = handle.read()
+        self.assertTrue(content.startswith(previous + b"\n"))
+        self.assertEqual(feed.load_seen(seen), {"older", "last", feed.paper_key(self.paper())})
+        self.assertEqual(json.loads(content[len(previous) + 1:])["title"], "Receivables")
+        self.assertEqual(result["count"], 1)
+        self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(self.root)))
+
+    def test_draft_replace_failure_does_not_consume_picks_or_change_prior_files(self):
+        seen = self.write_file("seen.jsonl", '{"key":"older"}\n')
+        draft = self.write_file("drafts.jsonl", '{"status":"DRAFT","note":"older"}\n')
+        replace = os.replace
+
+        def commit(source, destination):
+            if destination == os.path.realpath(draft):
+                raise PermissionError("private filesystem detail")
+            return replace(source, destination)
+
+        with mock.patch.object(feed.os, "replace", side_effect=commit):
+            with self.assertRaises(feed.CliError) as failure:
+                self.run_feed([self.paper()], self.args(seen=seen, draft_cards=draft))
+        self.assertEqual(failure.exception.code, "INVALID_INPUT")
+        self.assertNotIn("private", failure.exception.message)
+        self.assertEqual(feed.load_seen(seen), {"older"})
+        with open(draft, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), '{"status":"DRAFT","note":"older"}\n')
+        self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(self.root)))
+        retried = self.run_feed([self.paper()], self.args(seen=seen, draft_cards=draft))
+        self.assertEqual(retried["count"], 1)
+
+    def test_seen_replace_failure_preserves_state_and_explains_repeatable_drafts(self):
+        seen = self.write_file("seen.jsonl", '{"key":"older"}\n')
+        draft = os.path.join(self.root, "drafts.jsonl")
+        replace = os.replace
+
+        def commit(source, destination):
+            if destination == os.path.realpath(seen):
+                raise PermissionError("write failed")
+            return replace(source, destination)
+
+        with mock.patch.object(feed.os, "replace", side_effect=commit):
+            with self.assertRaises(feed.CliError) as failure:
+                self.run_feed([self.paper()], self.args(seen=seen, draft_cards=draft))
+        self.assertEqual(feed.load_seen(seen), {"older"})
+        self.assertIn("repeat draft cards", failure.exception.hint)
+        with open(draft, encoding="utf-8") as handle:
+            self.assertEqual(json.loads(handle.read())["source"]["doi"], self.paper()["doi"])
+        self.assertFalse(any(name.endswith(".tmp") for name in os.listdir(self.root)))
+        result = self.run_feed([self.paper()], self.args(seen=seen, draft_cards=draft))
+        self.assertEqual(result["count"], 1)
+        self.assertIn("not a joint transaction", result["note"])
+        with open(draft, encoding="utf-8") as handle:
+            self.assertEqual(len(handle.readlines()), 2)
+
+    def test_unreadable_seen_state_fails_closed(self):
+        with mock.patch.object(feed, "_read_jsonl", side_effect=PermissionError("private")), \
+                mock.patch.object(feed, "_append_jsonl_atomic") as commit:
+            with self.assertRaises(feed.CliError):
+                self.run_feed([self.paper()])
+        commit.assert_not_called()
+
+    def test_next_actions_are_bounded_attributable_and_retries_keep_exact_options(self):
+        self.write_file("open-threads.md", "\n".join(
+            "- [open] **问题%d** — 证据" % index for index in range(8)))
+        failed = ["failed-%d" % index for index in range(8)]
+        deferred = ["deferred-%d" % index for index in range(8)]
+        papers = [self.paper("Source-%d" % index,
+                             landing_page_url="https://publisher.example/%d" % index,
+                             pdf_url="https://publisher.example/%d.pdf" % index) for index in range(3)]
+        args = self.args(topic=failed + ["usable"] + deferred, from_threads=True,
+                         max_topics=9, limit=7, from_year=2011, min_citations=9,
+                         workers=2, timeout=7.5, total=3, dry_run=True, action=True,
+                         draft_cards=os.path.join(self.root, "drafts.jsonl"))
+
+        def search(topic, **_options):
+            if topic in failed:
+                raise RuntimeError("SECRET provider detail")
+            return {"papers": papers}
+
+        with mock.patch("paper_search.search_papers", side_effect=search), \
+                mock.patch.object(feed.runtime, "note") as progress:
+            result = feed.cmd_feed(args, None)
+        actions = result["next_actions"]
+        self.assertEqual(len(actions), 11)
+        retries = [row for row in actions if row["kind"] == "retry_search"]
+        self.assertEqual([row["query"] for row in retries], failed[:3])
+        self.assertEqual(retries[0]["argv"], [
+            "--research-dir", self.root, "feed", "--topic", failed[0],
+            "--limit", "7", "--total", "3", "--max-topics", "1", "--from-year", "2011",
+            "--min-citations", "9", "--workers", "2", "--timeout", "7.5",
+            "--seen", result["seen"], "--draft-cards", args.draft_cards, "--dry-run", "--action"])
+        self.assertEqual(retries[0]["error"], result["searches"][0]["error"])
+        self.assertEqual(len([row for row in actions if row["kind"] == "supply_query"]), 3)
+        pending = next(row for row in actions if row["kind"] == "search_deferred")
+        self.assertEqual(pending["queries"], deferred[:3])
+        self.assertEqual(pending["remaining"], 5)
+        reviews = [row for row in actions if row["kind"] == "review_source"]
+        self.assertEqual([row["paper_index"] for row in reviews], [0, 1, 2])
+        self.assertEqual(reviews[0]["sources"]["pdf_url"], papers[0]["pdf_url"])
+        contrast = next(row for row in actions if row["kind"] == "contrast_sources")
+        self.assertEqual(contrast["paper_indices"], [0, 1])
+        self.assertNotIn("abstract", json.dumps(actions))
+        self.assertNotIn("SECRET", json.dumps(result))
+        self.assertNotIn("SECRET", str(progress.call_args_list))
+        self.assertFalse(os.path.exists(result["seen"]))
+        self.assertFalse(os.path.exists(args.draft_cards))

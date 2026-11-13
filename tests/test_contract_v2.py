@@ -1409,8 +1409,10 @@ class PaperSearchTests(unittest.TestCase):
         # server-side filter interacts badly with relevance ranking on narrow topics.
         payload = {"meta": {"count": 2}, "results": [
             dict(self.WORK), dict(self.WORK, title="Low cited", cited_by_count=1)]}
-        with mock.patch.object(paper_search.urllib.request, "urlopen",
-                               return_value=_FakeResponse(payload)):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": directory}), \
+                mock.patch.object(paper_search.urllib.request, "urlopen",
+                                  return_value=_FakeResponse(payload)):
             data = paper_search.search_papers("q", limit=10, min_citations=5)
         self.assertEqual([paper["title"] for paper in data["papers"]],
                          ["Information in balance sheets"])

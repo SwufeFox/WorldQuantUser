@@ -355,6 +355,10 @@ def build_parser():
     feed_parser.add_argument("--total", type=int, default=10,
                              help="Papers in the digest.")
     feed_parser.add_argument("--max-topics", type=int, default=4, dest="max_topics")
+    feed_parser.add_argument("--workers", type=int, choices=range(1, 9), default=4,
+                             help="Concurrent topic searches, bounded independently of result count.")
+    feed_parser.add_argument("--timeout", type=_positive_seconds, default=30.0,
+                             metavar="SECONDS", help="Network timeout for each topic search.")
     feed_parser.add_argument("--from-year", type=int, default=2005, dest="from_year")
     feed_parser.add_argument("--min-citations", type=int, default=20,
                              dest="min_citations")
@@ -812,6 +816,8 @@ def build_parser():
                        help="Batch name for the output file (default: the spec's name).")
     probe.add_argument("--dry-run", action="store_true",
                        help="Offline validation and exact request preview; no login or quota spent.")
+    probe.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
+                       help="Simulation wait budget across settings groups; accepted jobs remain recoverable.")
     probe.add_argument("--show-test", action="store_true",
                        help="Also print the test period. Do not pass this while "
                             "choosing between arms.")
@@ -1338,6 +1344,8 @@ _COMMAND_EXAMPLES = {
     "lint": ['lint --expr "rank(close)" --offline', "lint --file research.json"],
     "search": ['search "post earnings announcement drift" --min-authority 3'],
     "paper": ['paper "accruals stock returns" --limit 3'],
+    "feed": ["feed --from-threads --workers 4 --timeout 30 --dry-run",
+             'feed --topic "analyst revisions" --topic "earnings quality" --action'],
     "simulate": ['simulate --expr "rank(close)" --dry-run',
                  "simulate research.json --sort fitness --save results.json"],
     "resume": ["resume CHECKPOINT.json --save results.json"],
@@ -1346,7 +1354,8 @@ _COMMAND_EXAMPLES = {
     "brief": ["brief", "brief --days 7 --top 5"],
     "ask": ["ask --by neutralization --stat n,median:sharpe,floor_share",
             "ask --where status=ACTIVE --list"],
-    "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json"],
+    "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json",
+              "probe --recover BATCH.json --max-wait-seconds 60"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],
     "alpha get": ["alpha get ALPHA_ID"],

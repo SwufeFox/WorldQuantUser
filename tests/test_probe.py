@@ -489,6 +489,79 @@ class ProbeTests(unittest.TestCase):
                 "scope": "train", "rows": [], "unavailable_reason": "explore_no_attribution"})
 
 
+class ProbeDurabilityTests(unittest.TestCase):
+    setUp = ProbeTests.setUp
+    _write = ProbeTests._write
+    _args = ProbeTests._args
+    _run = ProbeTests._run
+
+    def _saved(self):
+        from pathlib import Path
+        paths = list(Path(self.output_dir).glob("*.json"))
+        self.assertEqual(len(paths), 1)
+        return paths[0], json.loads(paths[0].read_text(encoding="utf-8"))
+
+    def test_interruption_preserves_accepted_url_and_completed_evidence(self):
+        def interrupted(expressions, settings=None, **kwargs):
+            finished = record("DONE", 2.0, 1.5)
+            finished["out_of_sample"]["train"]["fitness"] = 1.2
+            kwargs["on_event"]("completed", {"index": 0, **finished})
+            kwargs["on_event"]("submitted", {"index": 1, "status": "PENDING",
+                "progress_url": "https://api.worldquantbrain.com/simulations/accepted"})
+            raise KeyboardInterrupt
+
+        with mock.patch.object(self.fake, "simulate", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self._run()
+        path, saved = self._saved()
+        self.assertEqual(saved["rows"][0]["alpha_id"], "DONE")
+        self.assertEqual(saved["rows"][0]["train_fitness"], 1.2)
+        self.assertEqual(saved["rows"][1]["progress_url"],
+                         "https://api.worldquantbrain.com/simulations/accepted")
+        self.assertEqual(saved["incomplete"], ["b"])
+        self.assertEqual(saved["idea"], self.spec["idea"])
+        with mock.patch.object(ml, "simulate_alphas") as submit, \
+                mock.patch.object(ml, "list_alphas") as scan, \
+                mock.patch.object(ml, "poll_simulation", return_value={"status": "COMPLETE", "alpha": "B1"}), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value={
+                    "status": "UNSUBMITTED", "train": {"sharpe": 1.8, "fitness": 1.4}}):
+            result = cli_experiments._cmd_probe_recover(self._args(recover=str(path)))
+        self.assertTrue(result["complete"])
+        submit.assert_not_called()
+        scan.assert_not_called()
+        restored = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(restored["records"][1]["alpha_id"], "B1")
+
+    def test_unfinished_group_does_not_submit_later_settings_groups(self):
+        self.spec["arms"][1]["settings"] = {"neutralization": "INDUSTRY"}
+        self._write(self.spec)
+        with mock.patch.object(self.fake, "simulate", return_value=[{
+                "status": "PENDING", "progress_url": "https://api.worldquantbrain.com/simulations/first"}]) as simulate:
+            result = self._run()
+        self.assertEqual(simulate.call_count, 1)
+        self.assertFalse(result["rows"][1]["submission_attempted"])
+        self.assertEqual(result["rows"][1]["status"], "QUEUED")
+        self.assertEqual(result["incomplete"], ["a", "b"])
+
+    def test_unwritable_snapshot_fails_before_simulation(self):
+        with mock.patch.object(cli_experiments.cache_store, "write_json_atomic", side_effect=OSError("disk")), \
+                mock.patch.object(self.fake, "simulate") as simulate:
+            with self.assertRaises(OSError):
+                self._run()
+        simulate.assert_not_called()
+
+    def test_same_batch_cannot_be_overwritten_while_another_owner_runs(self):
+        import cache_store
+        target = research_paths.batch_path(self.spec["name"], directory=self.output_dir)
+        with cache_store.file_lock(target + ".lock"), \
+                mock.patch.object(self.fake, "simulate") as simulate:
+            with self.assertRaises(cli_runtime.CliError) as caught:
+                self._run(force=True)
+        self.assertEqual(caught.exception.code, "SERVICE_ERROR")
+        simulate.assert_not_called()
+        self.load_session.assert_not_called()
+
+
 class DesignTests(unittest.TestCase):
     """The control-arm rules: a batch must be able to attribute what it measures."""
 

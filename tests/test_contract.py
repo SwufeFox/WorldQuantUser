@@ -105,6 +105,66 @@ class FeedContractTests(unittest.TestCase):
             self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
             self.assertFalse((Path(directory) / "inspiration").exists())
 
+    def test_concurrency_and_timeout_bounds_fail_before_network(self):
+        for option, value in (("--workers", "0"), ("--workers", "9"), ("--timeout", "0"),
+                              ("--timeout", "nan")):
+            with self.subTest(option=option, value=value), tempfile.TemporaryDirectory() as directory:
+                proc = run_cli("feed", "--topic", "asset pricing", option, value,
+                               "--research-dir", directory)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertEqual(parse(proc)["error"]["code"], "USAGE")
+
+    def test_explicit_thread_query_reaches_concurrent_feed_and_retry_guidance(self):
+        from research_app import feed
+
+        with tempfile.TemporaryDirectory() as directory:
+            threads = Path(directory) / "open-threads.md"
+            threads.write_text("- [open] **修订与惯性** — 证据；query: analyst revisions momentum\n", encoding="utf-8")
+            args = cli_parser.build_parser().parse_args(["feed", "--from-threads", "--dry-run",
+                                                        "--workers", "2", "--timeout", "1"])
+            with mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": directory}), \
+                    mock.patch("paper_search.search_papers", side_effect=TimeoutError):
+                result = feed.cmd_feed(args, None)
+        self.assertEqual(result["topics"], ["analyst revisions momentum"])
+        self.assertEqual(result["searches"][0]["status"], "failure")
+
+
+class CheckpointConcurrencyTests(unittest.TestCase):
+    def test_concurrent_completion_events_preserve_every_record(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "progress.json"
+            checkpoint = {"records": [{"status": "QUEUED"} for _ in range(8)]}
+            callback = cli_experiments._simulation_checkpoint_callback(path, checkpoint, None)
+            start = threading.Barrier(8)
+
+            def complete(index):
+                start.wait(timeout=10)
+                callback("completed", {"index": index, "status": "COMPLETE", "alpha_id": "A%d" % index})
+
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                list(pool.map(complete, range(8)))
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual([row["alpha_id"] for row in saved["records"]], ["A%d" % i for i in range(8)])
+        self.assertTrue(all(row["status"] == "COMPLETE" for row in saved["records"]))
+
+    def test_competing_resume_refuses_before_reading_or_submitting(self):
+        import cache_store
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            args = cli_parser.build_parser().parse_args(["resume", str(path)])
+            with cache_store.file_lock(str(path) + ".lock"), \
+                    mock.patch.object(ml, "load_session") as login, \
+                    mock.patch.object(ml, "simulate_alphas") as simulate:
+                with self.assertRaises(cli_runtime.CliError) as caught:
+                    cli_experiments.cmd_resume(args, None)
+            self.assertEqual(caught.exception.code, "SERVICE_ERROR")
+            login.assert_not_called()
+            simulate.assert_not_called()
+
 
 class OptionalPandasTests(unittest.TestCase):
     fields = [

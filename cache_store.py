@@ -37,6 +37,11 @@ try:  # POSIX advisory locks; absent on Windows.
 except ImportError:  # pragma: no cover - exercised only off Linux/macOS
     fcntl = None
 
+try:  # Windows byte-range locks; absent on POSIX.
+    import msvcrt
+except ImportError:  # pragma: no cover - exercised only off Windows
+    msvcrt = None
+
 __all__ = [
     "CACHE_VERSION",
     "LockTimeout",
@@ -305,43 +310,38 @@ def file_lock(path, timeout=60.0, poll=0.1):
     the session cache, everyone else blocks and then finds a valid cache instead
     of logging in again (repeat logins are what trigger BRAIN's captcha).
 
-    On POSIX this is ``flock``, which the kernel releases when the process dies,
-    so a killed run cannot leave a permanent lock. Raises :class:`LockTimeout`
-    when the deadline passes; callers decide whether that is fatal.
+    POSIX uses ``flock``; Windows locks the first byte with ``msvcrt.locking``.
+    Both locks are released by the OS when the owning process dies. The lock
+    file stays in place so every contender locks the same file. Legacy ``.pid``
+    sentinels are ignored and left untouched. Raises :class:`LockTimeout` when
+    the deadline passes, or :class:`CacheError` without a supported lock backend.
     """
+    if fcntl is None and (os.name != "nt" or msvcrt is None):
+        raise CacheError("file locking is unsupported on platform %s" % os.name)
     path = os.path.abspath(path)
     _ensure_parent(path)
     fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     deadline = time.monotonic() + float(timeout)
     acquired = False
     try:
-        if fcntl is None:  # pragma: no cover - fallback path
-            while True:
-                try:
-                    lock_fd = os.open(path + ".pid", os.O_CREAT | os.O_EXCL, 0o600)
-                    os.close(lock_fd)
-                    acquired = True
-                    break
-                except OSError as exc:
-                    if exc.errno != errno.EEXIST:
-                        raise
-                    if time.monotonic() > deadline:
-                        raise LockTimeout(
-                            "timed out after %.1fs waiting for %s" % (timeout, path))
-                    time.sleep(poll)
-        else:
-            while True:
-                try:
+        while True:
+            try:
+                if fcntl is not None:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                    break
-                except OSError as exc:
-                    if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                        raise
-                    if time.monotonic() > deadline:
-                        raise LockTimeout(
-                            "timed out after %.1fs waiting for %s" % (timeout, path))
-                    time.sleep(poll)
+                else:
+                    # Windows permits locking beyond EOF, so an empty file
+                    # needs no unprotected initialization write.
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                if time.monotonic() > deadline:
+                    raise LockTimeout(
+                        "timed out after %.1fs waiting for %s" % (timeout, path))
+                time.sleep(poll)
         try:
             os.ftruncate(fd, 0)
             os.write(fd, ("%d %s\n" % (os.getpid(), _to_iso(utc_now()))).encode())
@@ -349,12 +349,13 @@ def file_lock(path, timeout=60.0, poll=0.1):
             pass
         yield
     finally:
-        if acquired and fcntl is None:  # pragma: no cover
+        if acquired:
             with contextlib.suppress(OSError):
-                os.unlink(path + ".pid")
-        if fcntl is not None:
-            with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                if fcntl is not None:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                else:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         with contextlib.suppress(OSError):
             os.close(fd)
 

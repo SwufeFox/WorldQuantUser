@@ -23,12 +23,16 @@ with a guess.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
 import sys
-import time
 import urllib.parse
 import urllib.request
+
+import cache_store
+import research_paths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -63,30 +67,56 @@ def _authors(work):
 
 def normalise(work):
     """One paper as this project reports it."""
-    source = ((work.get("primary_location") or {}).get("source") or {})
-    return {
+    primary = work.get("primary_location") or {}
+    source = primary.get("source") or {}
+    locations = [primary, work.get("best_oa_location") or {}]
+    locations.extend(work.get("locations") or [])
+    landing_page = next((location.get("landing_page_url") for location in locations
+                         if location and location.get("landing_page_url")), None)
+    pdf = next((location.get("pdf_url") for location in locations
+                if location and location.get("pdf_url")), None)
+    paper = {
         "title": (work.get("title") or work.get("display_name") or "").strip(),
         "year": work.get("publication_year"),
         "journal": source.get("display_name"),
         "doi": work.get("doi"),
-        "url": work.get("id"),
+        "url": landing_page or work.get("doi") or work.get("id"),
         "citations": work.get("cited_by_count"),
         "authors": _authors(work)[:6],
         "abstract": reconstruct_abstract(work),
         "open_access": bool((work.get("open_access") or {}).get("is_oa")),
     }
+    if landing_page:
+        paper["landing_page_url"] = landing_page
+    if pdf:
+        paper["pdf_url"] = pdf
+    return paper
 
 
 def _cache_path(query, limit, from_year, min_citations):
+    request = {"query": query, "limit": limit, "from_year": from_year,
+               "min_citations": min_citations}
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True,
+                                       separators=(",", ":")).encode("utf-8")).hexdigest()
+    return os.path.join(research_paths.cache_root(), "papers", digest + ".json")
+
+
+def _cached_result(path, query):
     try:
-        import cache_store
-        directory = cache_store.default_dir()
-    except Exception:  # noqa: BLE001 - a missing cache just means no caching
+        entry = cache_store.read_entry(path)
+    except (OSError, ValueError, TypeError, AttributeError):
         return None
-    safe = "".join(char if char.isalnum() else "-" for char in query.lower())[:60]
-    name = "papers-%s-%s-%s-%s-%s.json" % (safe, limit, from_year or 0, min_citations or 0,
-                                           int(time.time() // CACHE_TTL_SECONDS))
-    return os.path.join(directory, name)
+    result = entry.get("payload")
+    if (not entry["fresh"] or entry["kind"] != "papers"
+            or entry["expires_in"] is None or entry["age_seconds"] is None
+            or not isinstance(result, dict) or result.get("query") != query
+            or result.get("source") != "openalex"
+            or not isinstance(result.get("papers"), list)
+            or result.get("returned") != len(result["papers"])
+            or any(not isinstance(paper, dict) or not paper.get("title")
+                   for paper in result["papers"])):
+        return None
+    return {**result, "cached": True}
 
 
 def search_papers(query, limit=10, from_year=None, min_citations=None, timeout=30):
@@ -98,46 +128,51 @@ def search_papers(query, limit=10, from_year=None, min_citations=None, timeout=3
     """
     if not (query or "").strip():
         raise ValueError("query must not be empty")
+    query = query.strip()
     limit = max(1, min(int(limit), 50))
+    from_year = (int(from_year) or None) if from_year else None
+    min_citations = (int(min_citations) or None) if min_citations else None
     cache = _cache_path(query, limit, from_year, min_citations)
-    if cache and os.path.exists(cache):
+    cached = _cached_result(cache, query)
+    if cached is not None:
+        return cached
+
+    with contextlib.ExitStack() as stack:
         try:
-            with open(cache, encoding="utf-8") as handle:
-                cached = json.load(handle)
-            cached["cached"] = True
+            stack.enter_context(cache_store.file_lock(cache + ".lock"))
+        except (OSError, cache_store.LockTimeout):
+            pass  # Retrieval still works when the cache cannot be locked.
+        cached = _cached_result(cache, query)
+        if cached is not None:
             return cached
-        except (OSError, ValueError):
-            pass
 
-    params = {"search": query.strip(), "per-page": str(min(50, limit * 3 if min_citations else limit))}
-    if from_year:
-        params["filter"] = "from_publication_date:%d-01-01" % int(from_year)
-    url = BASE + "?" + urllib.parse.urlencode(params)
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+        params = {"search": query, "per-page": str(min(50, limit * 3 if min_citations else limit))}
+        if from_year:
+            params["filter"] = "from_publication_date:%d-01-01" % from_year
+        url = BASE + "?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
 
-    papers = [normalise(work) for work in payload.get("results") or []]
-    papers = [paper for paper in papers if paper["title"]]
-    if min_citations:
-        papers = [paper for paper in papers if (paper.get("citations") or 0) >= int(min_citations)]
-    papers = papers[:limit]
-    result = {
-        "query": query.strip(),
-        "total_available": (payload.get("meta") or {}).get("count"),
-        "returned": len(papers),
-        "source": "openalex",
-        "papers": papers,
-        "cached": False,
-    }
-    if cache:
+        papers = [normalise(work) for work in payload.get("results") or []]
+        papers = [paper for paper in papers if paper["title"]]
+        if min_citations:
+            papers = [paper for paper in papers if (paper.get("citations") or 0) >= min_citations]
+        papers = papers[:limit]
+        result = {
+            "query": query,
+            "total_available": (payload.get("meta") or {}).get("count"),
+            "returned": len(papers),
+            "source": "openalex",
+            "papers": papers,
+            "cached": False,
+        }
         try:
-            os.makedirs(os.path.dirname(cache), exist_ok=True)
-            with open(cache, "w", encoding="utf-8") as handle:
-                json.dump(result, handle, ensure_ascii=False)
+            cache_store.write_json_atomic(cache, cache_store.build_entry(
+                "papers", result, ttl=CACHE_TTL_SECONDS, source=BASE))
         except OSError:
             pass
-    return result
+        return result
 
 
 def main(argv=None):

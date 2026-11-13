@@ -6,11 +6,17 @@ Draft cards still require a deliberate mechanism and falsification review.
 """
 
 import json
+import math
 import os
 import re
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import ExitStack
 
+import cache_store
 import research_paths
 
+from . import runtime
 from .runtime import CliError
 
 
@@ -31,27 +37,59 @@ def _seen_path(args=None):
     return research_paths.resolve("inspiration", "seen.jsonl")
 
 
-def load_seen(path):
-    """DOIs and titles already surfaced, so a daily run is incremental."""
-    seen = set()
-    if not os.path.exists(path):
-        return seen
+def _read_jsonl(path):
     try:
-        with open(path, encoding="utf-8") as handle:
-            for line in handle:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except ValueError:
-                    continue
-                key = record.get("key")
-                if key:
-                    seen.add(key)
-    except OSError:
-        return seen
+        with open(path, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return b""
+
+
+def _seen_keys(content):
+    seen = set()
+    for line in content.splitlines():
+        try:
+            record = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        key = record.get("key") if isinstance(record, dict) else None
+        if isinstance(key, str) and key:
+            seen.add(key)
     return seen
+
+
+def load_seen(path):
+    """Read prior picks; unreadable state must never masquerade as an empty store."""
+    return _seen_keys(_read_jsonl(path))
+
+
+def _append_jsonl_atomic(path, records, previous=None):
+    """Preserve prior bytes and commit one flushed JSONL file under the caller's lock."""
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    previous = _read_jsonl(path) if previous is None else previous
+    descriptor, temporary = tempfile.mkstemp(
+        prefix="." + os.path.basename(path) + ".", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(previous)
+            if previous and not previous.endswith(b"\n"):
+                handle.write(b"\n")
+            for record in records:
+                handle.write((json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        if hasattr(os, "O_DIRECTORY"):
+            directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def paper_key(paper):
@@ -84,8 +122,8 @@ def explicit_query(line):
     return text or None
 
 
-def open_questions(path):
-    """Read tagged bold/plain questions and legacy bullet headings."""
+def _open_threads(path):
+    """Parse a heading and its authored query together in one read."""
     questions = []
     if not os.path.exists(path):
         return questions
@@ -100,16 +138,23 @@ def open_questions(path):
                 if tag.group(1).lower() == "closed":
                     continue
                 text = text[tag.end():]
-            heading = re.match(r"^\*\*(.+?)\*\*", text)
+            stated = explicit_query(text)
+            heading_text = _EXPLICIT_QUERY.sub("", text).strip()
+            heading = re.match(r"^\*\*(.+?)\*\*", heading_text)
             if heading:
                 question = heading.group(1).strip()
-            elif tag or re.search(r"[:：]", text):
-                question = re.split(r"\s*[—–]+\s*|[:：]", text, maxsplit=1)[0].strip()
+            elif tag or re.search(r"[:：]", heading_text):
+                question = re.split(r"\s*[—–]+\s*|[:：]", heading_text, maxsplit=1)[0].strip()
             else:
                 continue
             if question:
-                questions.append(question)
+                questions.append({"question": question, "query": stated})
     return questions
+
+
+def open_questions(path):
+    """Read tagged bold/plain questions and legacy bullet headings."""
+    return [row["question"] for row in _open_threads(path)]
 
 
 _CODE = re.compile(r"^h-?\d+[a-z]?$|^\d+$|^20\d\d$")
@@ -186,33 +231,180 @@ def _closure_cautions(paper, register):
     return cautions
 
 
-def cmd_feed(args, _sink):
-    """Search every distinct selected query, then take ranked turns per topic."""
-    import closed_families
+def _search_topics(topics, args):
+    """Overlap provider I/O and keep outcomes in input order, without shared sessions."""
     import paper_search
 
-    seen_path = _seen_path(args)
-    seen = load_seen(seen_path)
+    def search(topic):
+        try:
+            found = paper_search.search_papers(
+                topic, limit=args.limit, from_year=args.from_year,
+                min_citations=args.min_citations, timeout=getattr(args, "timeout", 30))
+            rows = found.get("papers") if isinstance(found, dict) else found
+            if not isinstance(rows, list):
+                return topic, [], {"code": "INVALID_RESPONSE"}
+            return topic, rows, None
+        except Exception as error:  # noqa: BLE001 - one provider failure must not cancel peers
+            # Messages may contain request URLs, credentials or response bodies.
+            return topic, [], {"code": "SEARCH_FAILED", "type": type(error).__name__}
+
+    if not topics:
+        return []
+    outcomes = [None] * len(topics)
+    with ThreadPoolExecutor(max_workers=min(getattr(args, "workers", 4), len(topics))) as pool:
+        pending = {pool.submit(search, topic): index for index, topic in enumerate(topics)}
+        for completed, future in enumerate(as_completed(pending), 1):
+            index = pending[future]
+            outcomes[index] = future.result()
+            status = "failed" if outcomes[index][2] else "complete"
+            runtime.note("feed: search %d/%d %s (%d finished)" %
+                         (index + 1, len(topics), status, completed))
+    return outcomes
+
+
+def _select_papers(outcomes, seen, total, register):
+    candidates, buckets, reports, repeats = {}, [], [], set()
+    for topic, rows, error in outcomes:
+        report = {"query": topic, "status": "failure" if error else "success" if rows else "empty",
+                  "returned": len(rows), "eligible": 0, "seen_before": 0,
+                  "invalid": 0, "picked": 0}
+        if error:
+            report["error"] = error
+        reports.append(report)
+        bucket = []
+        buckets.append(bucket)
+        bucket_keys = set()
+        for paper in rows:
+            if not isinstance(paper, dict):
+                report["invalid"] += 1
+                continue
+            try:
+                key = paper_key(paper)
+                rank = score(paper)
+                abstract = paper.get("abstract") or ""
+                valid = bool(key) and math.isfinite(rank) and isinstance(abstract, str)
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                valid = False
+            if not valid:
+                report["invalid"] += 1
+                continue
+            if key in seen:
+                repeats.add(key)
+                report["seen_before"] += 1
+                continue
+            if key not in candidates:
+                candidates[key] = {**paper, "query": topic, "queries": [], "key": key,
+                                   "rank": rank, "abstract": abstract[:600],
+                                   "closure_cautions": _closure_cautions(paper, register)}
+            candidate = candidates[key]
+            if topic not in candidate["queries"]:
+                candidate["queries"].append(topic)
+            if key not in bucket_keys:
+                bucket_keys.add(key)
+                bucket.append(candidate)
+        bucket.sort(key=lambda row: -row["rank"])
+        report["eligible"] = len(bucket)
+
+    picked, picked_keys = [], set()
+    positions = [0] * len(buckets)
+    while len(picked) < max(0, total):
+        advanced = False
+        for index, bucket in enumerate(buckets):
+            while positions[index] < len(bucket) and bucket[positions[index]]["key"] in picked_keys:
+                positions[index] += 1
+            if positions[index] == len(bucket):
+                continue
+            paper = bucket[positions[index]]
+            positions[index] += 1
+            picked.append(paper)
+            picked_keys.add(paper["key"])
+            reports[index]["picked"] += 1
+            advanced = True
+            if len(picked) >= max(0, total):
+                break
+        if not advanced:
+            break
+    return picked, reports, len(repeats)
+
+
+def _draft_card(paper):
+    return {
+        "mechanism_id": None,
+        "status": "DRAFT",
+        "source": {**{key: paper.get(key) for key in
+                      ("title", "doi", "url", "landing_page_url", "pdf_url", "journal", "year")},
+                   "verified": False},
+        "hypothesis": {"economic_mechanism": None, "falsification": None},
+        "implementation": {"conceptual_fields": [], "verified_brain_fields": []},
+        "novelty": {"closest_existing_family": None},
+        "abstract": paper.get("abstract"),
+    }
+
+
+def _feed_argv(args, topics, seen_path):
+    """Exact CLI arguments for a bounded retry using this invocation's research context."""
+    argv = ["--research-dir", os.fspath(research_paths.research_dir()), "feed"]
+    for topic in topics:
+        argv.extend(("--topic", topic))
+    for option, value in (("--limit", args.limit), ("--total", args.total),
+                          ("--max-topics", len(topics)), ("--from-year", args.from_year),
+                          ("--min-citations", args.min_citations),
+                          ("--workers", getattr(args, "workers", 4)),
+                          ("--timeout", getattr(args, "timeout", 30)), ("--seen", seen_path)):
+        if value is not None:
+            argv.extend((option, str(value)))
+    if args.draft_cards:
+        argv.extend(("--draft-cards", os.path.abspath(args.draft_cards)))
+    for option, attribute in (("--dry-run", "dry_run"), ("--action", "action")):
+        if getattr(args, attribute, False):
+            argv.append(option)
+    return argv
+
+
+def _next_actions(args, reports, unresolved, deferred, papers, seen_path):
+    """At most eleven evidence-based actions; the action view may add one ledger contrast."""
+    actions = []
+    for report in [row for row in reports if row["status"] == "failure"][:3]:
+        actions.append({"kind": "retry_search", "query": report["query"],
+                        "error": report["error"],
+                        "argv": _feed_argv(args, [report["query"]], seen_path)})
+    for question in unresolved[:3]:
+        actions.append({"kind": "supply_query", **question,
+                        "instruction": "Add '; query:' followed by your own English search "
+                                       "terms to this open-thread line."})
+    if deferred:
+        actions.append({"kind": "search_deferred", "queries": deferred[:3],
+                        "remaining": max(0, len(deferred) - 3),
+                        "argv": _feed_argv(args, deferred[:3], seen_path)})
+    for index, paper in enumerate(papers[:3]):
+        actions.append({"kind": "review_source", "paper_index": index,
+                        "sources": {key: paper.get(key) for key in
+                                    ("doi", "url", "landing_page_url", "pdf_url")},
+                        "instruction": "Read the source; record its sample, identification "
+                                       "strategy and falsification evidence before drafting a mechanism."})
+    if len(papers) > 1:
+        actions.append({"kind": "contrast_sources", "paper_indices": [0, 1],
+                        "instruction": "Compare these sources' samples, identification and "
+                                       "falsification evidence; record agreements and conflicts."})
+    return actions
+
+
+def cmd_feed(args, _sink):
+    """Search concurrently, then select against the latest locked seen state."""
+    import closed_families
+
+    seen_path = os.path.realpath(_seen_path(args))
+    draft_path = os.path.realpath(args.draft_cards) if args.draft_cards else None
+    if draft_path and os.path.normcase(draft_path) == os.path.normcase(seen_path):
+        raise CliError("INVALID_INPUT", "Seen state and draft cards need different files.")
     register = closed_families.load()
     topics = list(args.topic or [])
     unresolved = []
     if args.from_threads:
         threads = research_paths.resolve("open-threads.md")
-        explicit = {}
-        if os.path.exists(threads):
-            with open(threads, encoding="utf-8") as handle:
-                for line in handle:
-                    match = re.match(r"^\s*-\s+(.*)$", line)
-                    if not match:
-                        continue
-                    heading = re.match(r"^\[(open|closed)\]\s*\*\*(.+?)\*\*", match.group(1),
-                                       re.IGNORECASE)
-                    if heading and heading.group(1).lower() == "open":
-                        stated = explicit_query(match.group(1))
-                        if stated:
-                            explicit[heading.group(2).strip()] = stated
-        for question in open_questions(threads):
-            query = explicit.get(question) or query_from_question(question)
+        for thread in _open_threads(threads):
+            question = thread["question"]
+            query = thread["query"] or query_from_question(question)
             if query:
                 topics.append(query)
             else:
@@ -232,118 +424,58 @@ def cmd_feed(args, _sink):
         raise CliError("INVALID_INPUT",
                        "nothing to search: pass --topic, --topics or --from-threads")
     selected = topics[:max(0, args.max_topics)]
-    candidates, buckets, reports, repeats = {}, [], [], set()
-    for topic in selected:
-        report = {"query": topic, "status": "failure", "returned": 0,
-                  "eligible": 0, "seen_before": 0, "invalid": 0, "picked": 0}
-        reports.append(report)
-        bucket = []
-        buckets.append(bucket)
-        try:
-            options = {"limit": args.limit, "from_year": args.from_year,
-                       "min_citations": args.min_citations}
-            found = paper_search.search_papers(topic, **options)
-            rows = found.get("papers") if isinstance(found, dict) else found
-            if not isinstance(rows, list):
-                report["error"] = {"code": "INVALID_RESPONSE"}
-                continue
-        except Exception as error:  # noqa: BLE001 - retain other queries on failure
-            # Exception messages may contain request URLs, credentials or response bodies.
-            report["error"] = {"code": "SEARCH_FAILED", "type": type(error).__name__}
-            continue
-        report["returned"] = len(rows)
-        report["status"] = "success" if rows else "empty"
-        bucket_keys = set()
-        for paper in rows:
-            if not isinstance(paper, dict):
-                report["invalid"] += 1
-                continue
-            key = paper_key(paper)
-            if not key:
-                report["invalid"] += 1
-                continue
-            if key in seen:
-                repeats.add(key)
-                report["seen_before"] += 1
-                continue
-            if key not in candidates:
-                candidates[key] = {**paper, "query": topic, "queries": [], "key": key,
-                                   "rank": score(paper),
-                                   "abstract": (paper.get("abstract") or "")[:600],
-                                   "closure_cautions": _closure_cautions(paper, register)}
-            candidate = candidates[key]
-            if topic not in candidate["queries"]:
-                candidate["queries"].append(topic)
-            if key not in bucket_keys:
-                bucket_keys.add(key)
-                bucket.append(candidate)
-        bucket.sort(key=lambda row: -row["rank"])
-        report["eligible"] = len(bucket)
+    outcomes = _search_topics(selected, args)
+    try:
+        if getattr(args, "dry_run", False) or not any(rows for _, rows, _ in outcomes):
+            picked, reports, repeats = _select_papers(outcomes, load_seen(seen_path), args.total, register)
+        else:
+            # All provider I/O is finished. Stable lock ordering also protects a shared
+            # draft destination used with different seen stores.
+            locks = {os.path.normcase(path) + ".lock" for path in (seen_path, draft_path) if path}
+            with ExitStack() as stack:
+                for path in sorted(locks):
+                    stack.enter_context(cache_store.file_lock(path))
+                previous = _read_jsonl(seen_path)
+                picked, reports, repeats = _select_papers(
+                    outcomes, _seen_keys(previous), args.total, register)
+                if picked:
+                    # A failed draft write must leave every unseen pick available.
+                    if draft_path:
+                        _append_jsonl_atomic(draft_path, (_draft_card(paper) for paper in picked))
+                    _append_jsonl_atomic(seen_path, (
+                        {"key": paper["key"], "title": paper.get("title"), "query": paper.get("query")}
+                        for paper in picked), previous=previous)
+    except (OSError, cache_store.LockTimeout) as error:
+        raise CliError("INVALID_INPUT", "Could not read or commit feed state.",
+                       hint="Check seen/draft paths and permissions. Drafts commit before seen; "
+                            "a retry after a seen-write failure may repeat draft cards.",
+                       details={"seen": seen_path, "draft_cards": draft_path,
+                                "type": type(error).__name__}) from error
 
-    picked, picked_keys = [], set()
-    positions = [0] * len(buckets)
-    while len(picked) < max(0, args.total):
-        advanced = False
-        for index, bucket in enumerate(buckets):
-            while positions[index] < len(bucket) and bucket[positions[index]]["key"] in picked_keys:
-                positions[index] += 1
-            if positions[index] == len(bucket):
-                continue
-            paper = bucket[positions[index]]
-            positions[index] += 1
-            picked.append(paper)
-            picked_keys.add(paper["key"])
-            reports[index]["picked"] += 1
-            advanced = True
-            if len(picked) >= max(0, args.total):
-                break
-        if not advanced:
-            break
-
-    if picked and not getattr(args, "dry_run", False):
-        os.makedirs(os.path.dirname(seen_path) or ".", exist_ok=True)
-        with open(seen_path, "a", encoding="utf-8") as handle:
-            for paper in picked:
-                handle.write(json.dumps({"key": paper["key"],
-                                         "title": paper.get("title"),
-                                         "query": paper.get("query")},
-                                        ensure_ascii=False) + "\n")
-        if args.draft_cards:
-            os.makedirs(os.path.dirname(args.draft_cards) or ".", exist_ok=True)
-            with open(args.draft_cards, "a", encoding="utf-8") as handle:
-                for paper in picked:
-                    handle.write(json.dumps({
-                        "mechanism_id": None,
-                        "status": "DRAFT",
-                        "source": {"title": paper.get("title"), "doi": paper.get("doi"),
-                                   "url": paper.get("url"), "journal": paper.get("journal"),
-                                   "year": paper.get("year"), "verified": False},
-                        "hypothesis": {"economic_mechanism": None, "falsification": None},
-                        "implementation": {"conceptual_fields": [],
-                                           "verified_brain_fields": []},
-                        "novelty": {"closest_existing_family": None},
-                        "abstract": paper.get("abstract"),
-                    }, ensure_ascii=False) + "\n")
-
+    deferred = topics[len(selected):]
     return {
         "topics": selected,
-        "unsearched_topics": topics[len(selected):],
+        "unsearched_topics": deferred,
         "questions_without_query": unresolved,
         "searches": reports,
-        "seen_before": len(repeats),
+        "seen_before": repeats,
         "count": len(picked),
         "seen": seen_path,
         "closed_register": {"path": register["path"],
                             "available": "error" not in register,
                             "match_basis": "exact declared family only"},
         "papers": [{k: paper.get(k) for k in
-                    ("title", "year", "journal", "doi", "url", "abstract", "family",
-                     "citations", "query", "queries", "rank", "closure_cautions")}
+                    ("title", "year", "journal", "doi", "url", "landing_page_url", "pdf_url",
+                     "abstract", "family", "citations", "query", "queries", "rank", "closure_cautions")}
                    for paper in picked],
+        "next_actions": _next_actions(args, reports, unresolved, deferred, picked, seen_path),
         "note": ("Picks take turns across queries, ranked within each query. Closure "
                  "cautions require a declared family; no title or relevance filter applies. "
                  "Dry-run leaves seen and draft files unchanged; search caching may write. "
-                 "Drafts require a falsification condition and closest family before promotion."),
+                 "Drafts require a falsification condition and closest family before promotion. "
+                 "Drafts commit before seen; each file is atomic, not a joint transaction. "
+                 "A crash between commits can repeat drafts; a crash after seen commits can "
+                 "consume picks before delivery. Next actions are bounded suggestions for review."),
     }
 
 #: Title/abstract keywords suggest a broad information block for ledger lookup;
@@ -418,8 +550,19 @@ def cmd_feed_action(args, _sink):
     payload["papers"] = rows
     payload["registry"] = {"path": registry_path, "exists": exists,
                            "entries": len(entries)}
-    payload["note"] = ("Digest order is preserved. Block guesses guide local ledger lookup; "
-                       "book exposure and prior trials are separate evidence. Missing sources "
-                       "or unknown blocks remain unknown. Zero local matches do not establish "
-                       "an unexplored mechanism or a marginal contribution to the book.")
+    for index, paper in enumerate(rows):
+        evidence = paper["prior_trials"]["evidence"]
+        if evidence:
+            payload["next_actions"].append({
+                "kind": "contrast_prior_evidence", "paper_index": index,
+                "source": registry_path, "evidence_keys": [entry.get("key") for entry in evidence],
+                "instruction": "Read these prior trials and compare their recorded mechanisms, "
+                               "controls and failure conditions with this source; a shared block "
+                               "does not establish the same mechanism.",
+            })
+            break
+    payload["note"] += (" Digest order is preserved. Block guesses guide local ledger lookup; "
+                        "book exposure and prior trials are separate evidence. Missing sources "
+                        "or unknown blocks remain unknown. Zero local matches do not establish "
+                        "an unexplored mechanism or a marginal contribution to the book.")
     return payload

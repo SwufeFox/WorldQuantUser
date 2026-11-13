@@ -25,12 +25,15 @@ post repeating it.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
-import time
 from pathlib import Path
 
 import requests
+
+import cache_store
 
 import machine_lib
 
@@ -147,6 +150,23 @@ def _post(url, payload, timeout=60):
     raise SearchServiceError("HTTP %d: %s" % (code, detail or "service error"))
 
 
+def _search_payload(query, count, need_content, ori_question, localization=""):
+    text = (query or "").strip()
+    if not text:
+        raise SearchServiceError("query is empty")
+    if len(text) > MAX_QUERY_CHARS:
+        raise SearchServiceError(
+            "query is %d characters; the API accepts at most %d"
+            % (len(text), MAX_QUERY_CHARS))
+    payload = {"query": text, "count": max(1, min(50, int(count))),
+               "need_content": bool(need_content)}
+    if ori_question:
+        payload["ori_question"] = str(ori_question)[:MAX_QUERY_CHARS]
+    if localization:
+        payload["localization"] = localization
+    return payload
+
+
 def search(query, count=10, need_content=False, ori_question=None,
            localization=""):
     """Run one search and return the provider's result list.
@@ -156,21 +176,7 @@ def search(query, count=10, need_content=False, ori_question=None,
     longer than the documented 128-character limit is rejected here rather than
     by the server, because the server's error does not say what to cut.
     """
-    text = (query or "").strip()
-    if not text:
-        raise SearchServiceError("query is empty")
-    if len(text) > MAX_QUERY_CHARS:
-        raise SearchServiceError(
-            "query is %d characters; the API accepts at most %d"
-            % (len(text), MAX_QUERY_CHARS))
-
-    payload = {"query": text, "count": max(1, min(50, int(count))),
-               "need_content": bool(need_content)}
-    if ori_question:
-        payload["ori_question"] = str(ori_question)[:MAX_QUERY_CHARS]
-    if localization:
-        payload["localization"] = localization
-
+    payload = _search_payload(query, count, need_content, ori_question, localization)
     body = _post(SEARCH_URL, payload)
     return body.get("results") or []
 
@@ -200,39 +206,59 @@ def high_quality(results, min_score=1.5, min_authority=None):
     return kept
 
 
-def cache_path(research_dir, query):
-    """Where a query's results may be cached inside the results tree."""
-    import hashlib
-    digest = hashlib.sha1((query or "").encode("utf-8")).hexdigest()[:16]
+def cache_path(research_dir, query, count=10, need_content=False, ori_question=None):
+    """Where the complete effective request's results are cached."""
+    request = _search_payload(query, count, need_content, ori_question)
+    digest = hashlib.sha256(json.dumps(request, sort_keys=True,
+                                       separators=(",", ":")).encode("utf-8")).hexdigest()
     return Path(research_dir) / "search-cache" / (digest + ".json")
+
+
+def _cached_results(path, request, max_age_seconds):
+    try:
+        entry = cache_store.read_entry(path)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    payload = entry.get("payload")
+    if (not entry["fresh"] or entry["kind"] != "deepseek-search"
+            or entry["expires_in"] is None or entry["age_seconds"] is None
+            or entry["age_seconds"] >= max_age_seconds
+            or not isinstance(payload, dict) or payload.get("request") != request
+            or not isinstance(payload.get("results"), list)
+            or any(not isinstance(result, dict) for result in payload["results"])):
+        return None
+    return payload["results"]
 
 
 def search_cached(research_dir, query, count=10, need_content=False,
                   ori_question=None, max_age_hours=168):
-    """Search, reusing a cached answer when it is fresh enough.
+    """Reuse fresh request-specific results, serializing identical cache misses.
 
-    A literature query's answer does not change hour to hour, so re-running the
-    same query in a later session should not cost a request. ``max_age_hours``
-    defaults to a week.
+    Answers use atomic TTL envelopes. ``max_age_hours`` defaults to one week;
+    a stricter caller age limit also applies to entries written by other callers.
+    Cache access failures leave successful retrieval available to the caller.
     """
-    path = cache_path(research_dir, query)
-    if path.is_file():
-        age = time.time() - path.stat().st_mtime
-        if age < max_age_hours * 3600:
-            try:
-                cached = json.loads(path.read_text(encoding="utf-8"))
-                if cached.get("count") == count:
-                    return cached.get("results") or [], True
-            except (OSError, ValueError):
-                pass
+    request = _search_payload(query, count, need_content, ori_question)
+    path = cache_path(research_dir, **request)
+    max_age_seconds = float(max_age_hours) * 3600
+    cached = _cached_results(path, request, max_age_seconds)
+    if cached is not None:
+        return cached, True
 
-    results = search(query, count=count, need_content=need_content,
-                     ori_question=ori_question)
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"query": query, "count": count,
-                                    "results": results}, ensure_ascii=False),
-                        encoding="utf-8")
-    except OSError:
-        pass
-    return results, False
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(cache_store.file_lock(str(path) + ".lock"))
+        except (OSError, cache_store.LockTimeout):
+            pass  # Retrieval still works when the cache cannot be locked.
+        cached = _cached_results(path, request, max_age_seconds)
+        if cached is not None:
+            return cached, True
+
+        results = search(**request)
+        try:
+            cache_store.write_json_atomic(path, cache_store.build_entry(
+                "deepseek-search", {"request": request, "results": results},
+                ttl=max_age_seconds, source=SEARCH_URL))
+        except OSError:
+            pass
+        return results, False

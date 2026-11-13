@@ -142,6 +142,63 @@ class RecoverTests(unittest.TestCase):
         self.assertEqual(comparison["deltas"], {})
         self.assertIn("arm_train_metric_unavailable", comparison["unavailable"]["fitness"])
 
+    def test_known_alpha_id_is_read_directly_instead_of_matching_an_older_run(self):
+        rows = self._rows(SETTINGS_A)
+        rows[0]["alpha_id"] = "KNOWN"
+        with mock.patch.object(ml, "list_alphas") as scan, \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=_payload(2.0)) as fetch:
+            result = experiments._recover_probe_rows(object(), rows)
+        scan.assert_not_called()
+        self.assertEqual(fetch.call_args.args[1], "KNOWN")
+        self.assertEqual(result["matched"], {"a1": "KNOWN"})
+
+    def test_never_submitted_arm_cannot_borrow_a_historical_result(self):
+        rows = self._rows(SETTINGS_A)
+        rows[0].update(status="QUEUED", submission_attempted=False)
+        with mock.patch.object(ml, "list_alphas") as scan, \
+                mock.patch.object(ml, "fetch_alpha_metrics") as fetch:
+            result = experiments._recover_probe_rows(None, rows)
+        scan.assert_not_called()
+        fetch.assert_not_called()
+        self.assertEqual(result["still_missing"], ["a1"])
+        self.assertEqual(result["not_submitted"], ["a1"])
+        self.assertEqual(result["matched"], {})
+
+    def test_recovery_saves_each_result_before_another_fetch_can_interrupt(self):
+        import argparse
+        import json
+        import tempfile
+        from pathlib import Path
+
+        rows = [{**self._rows(SETTINGS_A)[0], "label": name, "alpha_id": name}
+                for name in ("FIRST", "SECOND")]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batch.json"
+            path.write_text(json.dumps({"name": "partial", "rows": rows}), encoding="utf-8")
+            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn: fn(object())), \
+                    mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[_payload(2.0), KeyboardInterrupt]):
+                with self.assertRaises(KeyboardInterrupt):
+                    experiments._cmd_probe_recover(argparse.Namespace(recover=str(path)))
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["rows"][0]["train_fitness"], 2.0)
+        self.assertEqual(saved["incomplete"], ["SECOND"])
+        self.assertEqual(saved["records"][0]["alpha_id"], "FIRST")
+
+    def test_complete_batch_needs_no_login_to_recover(self):
+        import argparse
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batch.json"
+            path.write_text(json.dumps({"rows": [{"label": "done", "train_fitness": 1.0}]}), encoding="utf-8")
+            with mock.patch.object(experiments, "with_session") as login:
+                result = experiments._cmd_probe_recover(argparse.Namespace(recover=str(path)))
+        login.assert_not_called()
+        self.assertTrue(result["complete"])
+
+
 
 class BatchProvenanceTests(unittest.TestCase):
     """The ledger must say which batch produced a row, not leave it to recollection."""

@@ -5,13 +5,15 @@ from __future__ import annotations
 import json
 import math
 import os
-import tempfile
+import threading
+import time
 import uuid
 from pathlib import Path
 
 import ablation
 import alpha_registry
 import alpha_unit
+import cache_store
 import expression_lint
 import machine_lib as ml
 import research_config as config_io
@@ -124,35 +126,23 @@ def _compact_metrics(record):
 
 
 def _write_simulation_checkpoint(path, checkpoint):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=str(path.parent), prefix=".%s." % path.name, suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
-            json.dump(checkpoint, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
+    cache_store.write_json_atomic(path, checkpoint, indent=2)
 
 
 def _simulation_checkpoint_callback(path, checkpoint, sink):
+    lock = threading.Lock()
+
     def on_event(kind, payload):
-        if kind in {"submitted", "pending", "completed", "failed", "deferred"}:
-            index = payload.get("index")
-            if isinstance(index, int) and 0 <= index < len(checkpoint["records"]):
-                checkpoint["records"][index] = {
-                    key: value for key, value in payload.items() if key != "index"
-                }
-                _write_simulation_checkpoint(path, checkpoint)
-        if sink:
-            sink(kind, payload)
+        with lock:
+            if kind in {"submitted", "pending", "completed", "failed", "deferred"}:
+                index = payload.get("index")
+                if isinstance(index, int) and 0 <= index < len(checkpoint["records"]):
+                    checkpoint["records"][index] = {
+                        key: value for key, value in payload.items() if key != "index"
+                    }
+                    _write_simulation_checkpoint(path, checkpoint)
+            if sink:
+                sink(kind, payload)
 
     return on_event
 
@@ -761,80 +751,115 @@ def _normalized_expression(text):
     return "".join((text or "").split())
 
 
-def _recover_probe_rows(session, rows, limit=400, pages=3):
-    """Fill arms that came back empty by matching them to alphas on the platform.
-
-    A batch can lose arms two ways, both seen on 2026-11-05: the whole run stalls and
-    gets killed, or individual submissions are rate-limited after the backoff budget.
-    Either way the simulations *did* run (or are still running), so the honest repair
-    is to read the platform back rather than spend another twenty minutes re-running.
-
-    Matching is by expression, because that is the only stable key: labels live in the
-    spec, ids live in a stdout that a killed process never flushed. ``alpha get``
-    already exposes ``out_of_sample.train``, so no simulation is needed.
-    """
+def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.0,
+                        on_progress=None):
+    """Read known jobs first; use expression/settings lookup only for unidentified arms."""
     missing = [row for row in rows if row.get("train_fitness") is None]
-    if not missing:
-        return {"recovered": 0, "still_missing": [], "ambiguous": [], "matched": {}}
-    index = {}
-    for page in range(pages):
-        batch = ml.list_alphas(session, limit=limit, offset=page * limit,
-                               order="-dateCreated", status="UNSUBMITTED")
-        for alpha in batch:
-            code, _description, _ops = ml.regular_expression(alpha)
-            key = _normalized_expression(code)
-            if not key:
-                continue
-            # Several alphas can share a formula; keep them all and let the settings
-            # decide, instead of silently attaching the newest one.
-            index.setdefault(key, []).append({
-                "alpha_id": alpha.get("id"),
-                "signature": _settings_signature(alpha.get("settings")),
-            })
-        if len(batch) < limit:
-            break
     matched, still_missing, ambiguous = {}, [], []
+    not_submitted = [row["label"] for row in missing if row.get("submission_attempted") is False]
+    deadline = time.monotonic() + max_wait_seconds
+    lookup = [row for row in missing if row.get("submission_attempted") is not False
+              and not row.get("alpha_id") and not row.get("progress_url")]
+    index = {}
+    if lookup:
+        for page in range(pages):
+            if time.monotonic() >= deadline:
+                break
+            batch = ml.list_alphas(session, limit=limit, offset=page * limit,
+                                   order="-dateCreated", status="UNSUBMITTED")
+            for alpha in batch:
+                code, _description, _ops = ml.regular_expression(alpha)
+                key = _normalized_expression(code)
+                if key:
+                    index.setdefault(key, []).append({"alpha_id": alpha.get("id"),
+                        "signature": _settings_signature(alpha.get("settings"))})
+            if len(batch) < limit:
+                break
     for row in missing:
-        key = _normalized_expression(row.get("expression"))
-        candidates = index.get(key) or []
-        if not candidates:
-            still_missing.append(row["label"])
+        label = row["label"]
+        if row.get("submission_attempted") is False or time.monotonic() >= deadline:
+            still_missing.append(label)
             continue
-        wanted = (_settings_signature(row["settings"]) if "settings" in row
-                  else row.get("settings_signature") or _settings_signature(None))
-        exact = [c for c in candidates if c["signature"] == wanted]
-        if len(exact) > 1:
-            # Same formula, same settings, several alpha ids: the platform cannot say
-            # which run this arm was. Guessing would put a real number on the wrong row.
-            ambiguous.append({"label": row["label"], "candidates":
-                              [c["alpha_id"] for c in exact]})
-            still_missing.append(row["label"])
+        try:
+            alpha_id = row.get("alpha_id")
+            if not alpha_id and row.get("progress_url"):
+                if (row.get("next_poll_at") or 0) > time.time():
+                    still_missing.append(label)
+                    continue
+                progress = ml.poll_simulation(session, row["progress_url"], deadline=deadline)
+                row["status"] = progress.get("status")
+                alpha_id = progress.get("alpha")
+                if not alpha_id:
+                    wait = progress.get("next_poll_after_seconds")
+                    if wait is not None:
+                        row["next_poll_at"] = time.time() + max(0, float(wait))
+                    row["error"] = progress.get("message")
+                    still_missing.append(label)
+                    if on_progress:
+                        on_progress(row)
+                    continue
+                row["alpha_id"] = alpha_id
+                row.pop("progress_url", None)
+                row.pop("next_poll_at", None)
+                if on_progress:
+                    on_progress(row)
+            if not alpha_id:
+                wanted = (_settings_signature(row["settings"]) if "settings" in row
+                          else row.get("settings_signature") or _settings_signature(None))
+                exact = [candidate for candidate in index.get(
+                    _normalized_expression(row.get("expression")), [])
+                    if candidate["signature"] == wanted]
+                if len(exact) != 1:
+                    if len(exact) > 1:
+                        ambiguous.append({"label": label,
+                                          "candidates": [item["alpha_id"] for item in exact]})
+                    still_missing.append(label)
+                    continue
+                alpha_id = exact[0]["alpha_id"]
+                row["alpha_id"] = alpha_id
+                if on_progress:
+                    on_progress(row)
+            payload = ml.fetch_alpha_metrics(session, alpha_id, deadline=deadline)
+            split = ml.extract_split(payload) or {}
+            train = split.get("train") or {}
+            if train.get("fitness") is None:
+                still_missing.append(label)
+                continue
+            row.update({"status": payload.get("status"), "train_sharpe": train.get("sharpe"),
+                        "train_fitness": train.get("fitness"), "train_turnover": train.get("turnover"),
+                        "train_returns": train.get("returns"), "error": None,
+                        "settings_signature": _settings_signature(row.get("settings"))})
+            row.pop("metrics_pending", None)
+            raw = {"alpha_id": alpha_id, "status": row["status"],
+                   "expression": row.get("expression"), "settings": row.get("settings") or {},
+                   "metrics": payload.get("is"), "out_of_sample": split,
+                   "checks": ml._extract_checks(payload), "error": None}
+            matched[label] = alpha_id
+        except ml.AuthError:
+            raise
+        except (ml.BrainError, ml.requests.RequestException) as exc:
+            row["error"] = str(exc)
+            still_missing.append(label)
+            if on_progress:
+                on_progress(row)
             continue
-        if not exact:
-            # The expression exists, but under settings this arm did not use.
-            still_missing.append(row["label"])
-            continue
-        alpha_id = exact[0]["alpha_id"]
-        payload = ml.fetch_alpha_metrics(session, alpha_id)
-        train = (ml.extract_split(payload) or {}).get("train") or {}
-        if train.get("fitness") is None:
-            still_missing.append(row["label"])
-            continue
-        row.update({"alpha_id": alpha_id, "status": payload.get("status"),
-                    "train_sharpe": train.get("sharpe"),
-                    "train_fitness": train.get("fitness"),
-                    "train_turnover": train.get("turnover"),
-                    "train_returns": train.get("returns"),
-                    "error": None})
-        matched[row["label"]] = alpha_id
-        row["settings_signature"] = wanted
+        if on_progress:
+            on_progress(row, raw)
     return {"recovered": len(matched), "still_missing": still_missing,
-            "ambiguous": ambiguous, "matched": matched}
+            "ambiguous": ambiguous, "matched": matched, "not_submitted": not_submitted}
 
 
 def _cmd_probe_recover(args):
-    """Rebuild a batch file's empty rows from the platform, then re-record them."""
+    """Refresh saved batch evidence under the same lock as its producer."""
     path = Path(args.recover).expanduser().resolve()
+    try:
+        with cache_store.file_lock(str(path) + ".lock", timeout=0):
+            return _recover_probe_batch(args, path)
+    except cache_store.LockTimeout as exc:
+        raise CliError("SERVICE_ERROR", "this probe batch is already being updated", str(path)) from exc
+
+
+def _recover_probe_batch(args, path):
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -842,7 +867,25 @@ def _cmd_probe_recover(args):
     rows = document.get("rows") or []
     if not rows:
         raise CliError("INVALID_INPUT", "%s has no rows" % path.name)
-    outcome = with_session(args, lambda s: _recover_probe_rows(s, rows))
+    positions = {id(row): index for index, row in enumerate(rows)}
+    saved_records = document.get("records") or [{} for _ in rows]
+
+    def save_recovered(row, raw=None):
+        if raw is not None:
+            saved_records[positions[id(row)]] = raw
+            document["records"] = saved_records
+        document["incomplete"] = [item["label"] for item in rows if item.get("train_fitness") is None]
+        document["complete"] = not document["incomplete"]
+        document["comparisons"] = _probe_comparisons(rows, document.get("design"))
+        cache_store.write_json_atomic(path, document, indent=1)
+
+    def recover(session):
+        return _recover_probe_rows(session, rows, on_progress=save_recovered,
+                                   max_wait_seconds=getattr(args, "max_wait_seconds", 300.0))
+
+    needs_platform = any(row.get("train_fitness") is None
+                         and row.get("submission_attempted") is not False for row in rows)
+    outcome = with_session(args, recover) if needs_platform else recover(None)
     for row in rows:
         if row.get("train_fitness") is not None:
             note("%-28s %7s %6s %7s" % (row["label"], row.get("train_sharpe"),
@@ -853,13 +896,15 @@ def _cmd_probe_recover(args):
     document["recovered"] = outcome["matched"]
     document["all_empty"] = len(outcome["still_missing"]) == len(rows)
     document["comparisons"] = _probe_comparisons(rows, document.get("design"))
-    path.write_text(json.dumps(document, ensure_ascii=False, indent=1), encoding="utf-8")
+    cache_store.write_json_atomic(path, document, indent=1)
     note("recovered %d arm(s) from the platform; still missing: %s"
          % (outcome["recovered"], ", ".join(outcome["still_missing"]) or "none"))
     for item in outcome.get("ambiguous") or []:
         note("ambiguous: %s matches several alphas %s - left empty on purpose"
              % (item["label"], ", ".join(item["candidates"])))
     note("wrote %s" % path)
+    if getattr(args, "show_test", False):
+        research_paths.log_view("probe-recover", "test", [row.get("alpha_id") for row in rows])
     return {"name": document.get("name"), "path": str(path),
             "show_test": bool(getattr(args, "show_test", False)),
             **{key: document[key] for key in ("idea", "mechanism", "note", "design")
@@ -868,6 +913,7 @@ def _cmd_probe_recover(args):
             "comparisons": document["comparisons"],
             "recovered": outcome["recovered"], "ambiguous": outcome["ambiguous"],
             "still_missing": outcome["still_missing"],
+            "not_submitted": outcome["not_submitted"],
             "rows": [_probe_visible_row(row, getattr(args, "show_test", False)) for row in rows]}
 
 
@@ -1114,8 +1160,90 @@ def cmd_probe(args, _sink):
                                  "run `lint` for authoritative catalog checks.",
                          "ok": report["ok"], "errors": report["errors"],
                          "warnings": report["warnings"]}}
+    if duplicates:
+        note("")
+        note("novelty gate: %d arm(s) repeat finished results under identical settings: %s"
+             % (len(duplicates), ", ".join(duplicates))[:300])
+        if getattr(args, "strict_gate", False):
+            raise CliError("INVALID_INPUT",
+                           "%d arm(s) repeat finished results under identical settings" % len(duplicates),
+                           "drop them, or rerun without --strict-gate")
 
 
+
+    try:
+        with cache_store.file_lock(str(target) + ".lock", timeout=0):
+            if target.exists() and not args.force:
+                raise CliError("INVALID_INPUT", "%s already exists" % target.name,
+                               "recover the saved batch or use another --name")
+            return _run_probe(args, spec, name, groups, design, gate, target)
+    except cache_store.LockTimeout as exc:
+        raise CliError("SERVICE_ERROR", "this probe batch is already being updated",
+                       str(target)) from exc
+
+
+def _probe_row(record, arm, gate, show_test):
+    train = _train_metrics(record)
+    row = {"label": arm["label"], "alpha_id": record.get("alpha_id"),
+           "design": arm.get("design"), "proxy_of": arm.get("proxy_of"),
+           "expression": arm["expression"], "decay": record.get("decay"),
+           "settings": dict(record["settings"]),
+           "settings_signature": _settings_signature(record["settings"]),
+           "status": record.get("status"), "error": record.get("error"),
+           "train_sharpe": train.get("sharpe"), "train_fitness": train.get("fitness"),
+           "train_turnover": train.get("turnover"), "train_returns": train.get("returns"),
+           "train_sharpe_h1": (record.get("half_sharpes") or (None, None))[0],
+           "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
+           "ops": arm["ops"], "gate": gate}
+    for key in ("progress_url", "metrics_pending", "next_poll_at", "submission_attempted"):
+        if key in record:
+            row[key] = record[key]
+    if show_test:
+        metrics = record.get("metrics") or {}
+        row.update({"sharpe": metrics.get("sharpe"), "fitness": metrics.get("fitness"),
+                    "turnover": metrics.get("turnover"),
+                    "test_sharpe": ((record.get("out_of_sample") or {}).get("test") or {}).get("sharpe"),
+                    "failed_checks": sorted(key for key, body in (record.get("checks") or {}).items()
+                                            if isinstance(body, dict) and body.get("result") == "FAIL")})
+    return row
+
+
+def _run_probe(args, spec, name, groups, design, gate, target):
+    """Own a batch under its process lock; snapshot every accepted or completed arm."""
+    settings = dict(spec.get("settings") or {})
+    context = {key: spec[key] for key in ("idea", "mechanism", "note") if key in spec}
+    arms = [{**arm, "settings": group["settings"],
+             "ops": expression_lint.estimate_operator_count(arm["expression"])}
+            for group in groups.values() for arm in group["arms"]]
+    records = [{"expression": arm["expression"], "decay": arm["settings"]["decay"],
+                "settings": dict(arm["settings"]), "mechanism": arm["label"],
+                "status": "QUEUED", "alpha_id": None, "metrics": None,
+                "submission_attempted": False} for arm in arms]
+    state_lock = threading.Lock()
+
+    def save_batch():
+        rows = [_probe_row(record, arm, gate[index], args.show_test)
+                for index, (record, arm) in enumerate(zip(records, arms))]
+        incomplete = [row["label"] for row in rows if row.get("train_fitness") is None]
+        document = {"spec": str(args.spec), "name": name, **context, "rows": rows,
+                    "design": design, "comparisons": _probe_comparisons(rows, design),
+                    "records": records, "complete": not incomplete, "incomplete": incomplete}
+        cache_store.write_json_atomic(target, document, indent=1)
+
+    def update_record(index, payload):
+        records[index] = {**payload, "settings": dict(arms[index]["settings"]),
+                          "expression": arms[index]["expression"],
+                          "submission_attempted": True}
+
+    def progress(offset, kind, payload):
+        if kind in {"submitted", "pending", "completed", "failed", "deferred"}:
+            index = payload.get("index")
+            if isinstance(index, int) and 0 <= offset + index < len(records):
+                with state_lock:
+                    update_record(offset + index, {key: value for key, value in payload.items()
+                                                   if key != "index"})
+                    save_batch()
+        note("  %s" % kind)
 
     def work(session):
         # The live preflight runs inside this one session, before any arm is submitted:
@@ -1125,20 +1253,36 @@ def cmd_probe(args, _sink):
             for group in groups.values():
                 _preflight_lint(session, group["pairs"], group["settings"], args)
 
-        records = []
+        save_batch()
+        note("progress saved to %s; recover it before repeating submitted work" % target)
+        deadline = time.monotonic() + getattr(args, "max_wait_seconds", 300.0)
+        offset = 0
         for group in groups.values():
+            size = len(group["arms"])
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
             arm_settings = group["settings"]
             note("simulating %d arm(s) under %s/%s/%s"
                  % (len(group["arms"]), arm_settings.get("region"), arm_settings.get("universe"),
                     arm_settings.get("neutralization")))
+            with state_lock:
+                for record in records[offset:offset + size]:
+                    record["submission_attempted"] = True
+                save_batch()
             produced = guarded_sim.simulate(
                 [expression for expression, _decay in group["pairs"]], arm_settings,
                 labels=[arm["label"] for arm in group["arms"]], session=session,
-                on_event=lambda kind, payload: note("  %s" % kind))
-            for record in produced:
-                # The ledger must carry the complete settings this arm actually used.
-                record["settings"] = dict(arm_settings)
-            records.extend(produced)
+                initial_records=records[offset:offset + size], max_wait_seconds=remaining,
+                on_event=lambda kind, payload, start=offset: progress(start, kind, payload))
+            with state_lock:
+                for index, record in enumerate(produced):
+                    update_record(offset + index, record)
+                save_batch()
+            offset += size
+            if any(record.get("progress_url") or record.get("metrics_pending")
+                   or record.get("status") in {"PENDING", "QUEUED"} for record in produced):
+                break
         # Half-split stability, from the daily PnL the platform already exposes.
         # Inside the session because this is the only place one is open; the fetch is
         # cached, so a re-run costs nothing and no simulation is involved.
@@ -1158,14 +1302,6 @@ def cmd_probe(args, _sink):
             record["half_sharpes"] = half_split_sharpes(pnl, test_start)
         return records
 
-    if duplicates:
-        note("")
-        note("novelty gate: %d arm(s) repeat finished results under identical settings: %s"
-             % (len(duplicates), ", ".join(duplicates))[:300])
-        if getattr(args, "strict_gate", False):
-            raise CliError("INVALID_INPUT",
-                           "%d arm(s) repeat finished results under identical settings" % len(duplicates),
-                           "drop them, or rerun without --strict-gate")
 
     # probe had no live preflight: the dry run linted offline and the real run went
     # straight to the simulator, so a VECTOR field in a MATRIX slot was only discovered
@@ -1180,44 +1316,16 @@ def cmd_probe(args, _sink):
     if args.show_test:
         header += " %7s %6s %7s %7s" % ("S", "F", "T", "testS")
     note(header)
-    for position, (record, arm) in enumerate(zip(
-            records, [a for group in groups.values() for a in group["arms"]])):
-        metrics = record.get("metrics") or {}
-        split = record.get("out_of_sample") or {}
-        train = split.get("train") or {}
-        failed = sorted(name for name, body in (record.get("checks") or {}).items()
-                        if isinstance(body, dict) and body.get("result") == "FAIL")
-        # Exploration view: train period only. The platform's headline metrics use
-        # the full window, which *contains* the test year, so ranking on them is
-        # ranking on test - hiding one column would not have fixed that.
-        row = {"label": arm["label"], "alpha_id": record.get("alpha_id"),
-               "design": arm.get("design"),
-               "proxy_of": arm.get("proxy_of"),
-               "expression": arm["expression"],
-               "decay": record.get("decay"), "settings": dict(record["settings"]),
-               "settings_signature": _settings_signature(record.get("settings")),
-               "status": record.get("status"), "error": record.get("error"),
-               "train_sharpe": train.get("sharpe"),
-               "train_fitness": train.get("fitness"),
-               "train_turnover": train.get("turnover"),
-               "train_returns": train.get("returns"),
-               "train_sharpe_h1": (record.get("half_sharpes") or (None, None))[0],
-               "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
-               # Simplicity is a design rule here, not an aesthetic: a factor with many
-               # operators has more room to fit, and the one operator-heavy candidate of
-               # 2026-11-07 was also the one that failed its mechanism-transfer check.
-               "ops": expression_lint.estimate_operator_count(arm["expression"]),
-               "gate": gate[position] if position < len(gate) else None}
+    for position, (record, arm) in enumerate(zip(records, arms)):
+        row = _probe_row(record, arm, gate[position], args.show_test)
+        failed = row.get("failed_checks") or []
         line = "%-28s %7s %6s %7s %4s %7s %7s" % (
             arm["label"], row["train_sharpe"], row["train_fitness"],
             row["train_turnover"], row["ops"],
             None if row["train_sharpe_h1"] is None else round(row["train_sharpe_h1"], 2),
             None if row["train_sharpe_h2"] is None else round(row["train_sharpe_h2"], 2))
         if args.show_test:
-            row["failed_checks"] = failed
-            row.update({"sharpe": metrics.get("sharpe"), "fitness": metrics.get("fitness"),
-                        "turnover": metrics.get("turnover"),
-                        "test_sharpe": (split.get("test") or {}).get("sharpe")})
+            # Validation fields were explicitly added by _probe_row.
             line += " %7s %6s %7s %7s" % (row["sharpe"], row["fitness"],
                                           row["turnover"], row["test_sharpe"])
         rows.append(row)
@@ -1244,11 +1352,7 @@ def cmd_probe(args, _sink):
              "whether any arm needs another simulation" % target)
 
     comparisons = _probe_comparisons(rows, design)
-    Path(target).write_text(
-        json.dumps({"spec": str(args.spec), "name": name, **context, "rows": rows,
-                    "design": design, "comparisons": comparisons, "records": records,
-                    "complete": not incomplete, "incomplete": incomplete},
-                   ensure_ascii=False, indent=1), encoding="utf-8")
+    save_batch()
     if args.show_test:
         research_paths.log_view("probe", "test", [row.get("alpha_id") for row in rows],
                                 note=name)
@@ -1359,6 +1463,15 @@ def cmd_simulate(args, sink):
 def cmd_resume(args, sink):
     """Resume pending, queued or unpolled simulations from an atomic checkpoint file."""
     path = Path(args.checkpoint).expanduser().resolve()
+    try:
+        with cache_store.file_lock(str(path) + ".lock", timeout=0):
+            return _resume_simulation(args, sink, path)
+    except cache_store.LockTimeout as exc:
+        raise CliError("SERVICE_ERROR", "this simulation checkpoint is already being resumed",
+                       str(path)) from exc
+
+
+def _resume_simulation(args, sink, path):
     try:
         checkpoint = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:

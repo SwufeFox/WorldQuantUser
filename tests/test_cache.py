@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -121,28 +122,78 @@ class EnvelopeTests(TempCacheCase):
 
 
 def _hold_lock(path, ready, release):
-    with cache_store.file_lock(path, timeout=5):
+    with cache_store.file_lock(path, timeout=10, poll=0.02):
         ready.set()
-        release.wait(5)
+        release.wait()
+
+
+def _take_lock(path, attempted, acquired):
+    attempted.set()
+    with cache_store.file_lock(path, timeout=10, poll=0.02):
+        acquired.set()
+
+
+def _update_shared_json(path, lock, start, worker_id, updates):
+    start.wait(15)
+    for index in range(updates):
+        with cache_store.file_lock(lock, timeout=10, poll=0.02):
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            payload["updates"].append([worker_id, index])
+            cache_store.write_json_atomic(path, payload)
 
 
 class LockTests(TempCacheCase):
+    def setUp(self):
+        super().setUp()
+        # Spawn exercises independent descriptors on Windows and POSIX alike.
+        self.processes = multiprocessing.get_context("spawn")
+
+    def _stop_worker(self, worker):
+        if worker.is_alive():
+            worker.terminate()
+        worker.join(10)
+        if worker.is_alive():
+            worker.kill()
+            worker.join(10)
+        self.assertFalse(worker.is_alive(), "child did not stop")
+
+    def _start_worker(self, target, *args):
+        worker = self.processes.Process(target=target, args=args)
+        worker.start()
+        self.addCleanup(self._stop_worker, worker)
+        return worker
+
+    def _start_holder(self, lock):
+        ready = self.processes.Event()
+        release = self.processes.Event()
+        worker = self._start_worker(_hold_lock, lock, ready, release)
+        self.assertTrue(ready.wait(15), "child never took the lock")
+        return worker, release
+
     def test_second_holder_times_out(self):
         lock = self.path("locks", "brain-session.lock")
-        os.makedirs(os.path.dirname(lock), exist_ok=True)
-        ready = multiprocessing.Event()
-        release = multiprocessing.Event()
-        worker = multiprocessing.Process(target=_hold_lock, args=(lock, ready, release))
-        worker.start()
-        try:
-            self.assertTrue(ready.wait(10), "child never took the lock")
-            with self.assertRaises(cache_store.LockTimeout):
-                with cache_store.file_lock(lock, timeout=0.3):
-                    pass
-        finally:
-            release.set()
+        worker, release = self._start_holder(lock)
+        with self.assertRaises(cache_store.LockTimeout):
+            with cache_store.file_lock(lock, timeout=0.2, poll=0.02):
+                self.fail("entered an already held lock")
+        release.set()
+        worker.join(10)
+        self.assertEqual(worker.exitcode, 0)
+
+    def test_waiter_acquires_after_owner_releases(self):
+        lock = self.path("l.lock")
+        owner, release = self._start_holder(lock)
+        attempted = self.processes.Event()
+        acquired = self.processes.Event()
+        waiter = self._start_worker(_take_lock, lock, attempted, acquired)
+        self.assertTrue(attempted.wait(15), "waiter never attempted the lock")
+        self.assertFalse(acquired.wait(0.2), "waiter entered while owner held the lock")
+        release.set()
+        self.assertTrue(acquired.wait(10), "waiter did not acquire the released lock")
+        for worker in (owner, waiter):
             worker.join(10)
-            worker.terminate()
+            self.assertEqual(worker.exitcode, 0)
 
     def test_lock_released_after_block(self):
         lock = self.path("l.lock")
@@ -150,6 +201,69 @@ class LockTests(TempCacheCase):
             pass
         with cache_store.file_lock(lock, timeout=1):
             pass
+
+    def test_lock_released_after_exception(self):
+        lock = self.path("l.lock")
+        with self.assertRaisesRegex(RuntimeError, "interrupted work"):
+            with cache_store.file_lock(lock, timeout=1):
+                raise RuntimeError("interrupted work")
+        attempted = self.processes.Event()
+        acquired = self.processes.Event()
+        worker = self._start_worker(_take_lock, lock, attempted, acquired)
+        self.assertTrue(acquired.wait(15), "exception left the lock held")
+        worker.join(10)
+        self.assertEqual(worker.exitcode, 0)
+
+    def test_lock_reacquired_after_owner_is_killed(self):
+        lock = self.path("l.lock")
+        worker, _release = self._start_holder(lock)
+        worker.kill()
+        worker.join(10)
+        self.assertIsNotNone(worker.exitcode, "killed owner did not exit")
+        self.assertNotEqual(worker.exitcode, 0)
+        with cache_store.file_lock(lock, timeout=1, poll=0.02):
+            self.assertTrue(os.path.isfile(lock))
+
+    def test_legacy_pid_sentinel_is_ignored_and_preserved(self):
+        lock = self.path("l.lock")
+        sentinel = lock + ".pid"
+        with open(sentinel, "w", encoding="utf-8") as handle:
+            handle.write("legacy owner")
+        for _attempt in range(2):
+            with cache_store.file_lock(lock, timeout=0, poll=0.02):
+                with open(sentinel, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), "legacy owner")
+        self.assertTrue(os.path.isfile(sentinel))
+
+    def test_unsupported_lock_backend_fails_clearly(self):
+        lock = self.path("l.lock")
+        with mock.patch.object(cache_store, "fcntl", None), \
+                mock.patch.object(cache_store, "msvcrt", None):
+            with self.assertRaisesRegex(cache_store.CacheError, "file locking is unsupported"):
+                with cache_store.file_lock(lock):
+                    self.fail("entered without a supported lock backend")
+        self.assertFalse(os.path.exists(lock))
+
+    def test_processes_preserve_shared_json_updates(self):
+        path = self.path("shared.json")
+        lock = self.path("shared.lock")
+        cache_store.write_json_atomic(path, {"updates": []})
+        worker_count, updates = 4, 12
+        start = self.processes.Barrier(worker_count + 1)
+        workers = [
+            self._start_worker(_update_shared_json, path, lock, start, worker_id, updates)
+            for worker_id in range(worker_count)
+        ]
+        start.wait(15)
+        for worker in workers:
+            worker.join(20)
+            self.assertEqual(worker.exitcode, 0, "concurrent JSON update failed")
+        with open(path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertCountEqual(
+            payload["updates"],
+            [[worker_id, index] for worker_id in range(worker_count) for index in range(updates)],
+        )
 
 
 class FakeSession:

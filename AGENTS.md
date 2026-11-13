@@ -29,6 +29,11 @@ section when needed, rather than loading every recipe.
   For open exploration, consider a few distinct economic explanations before
   selecting fields or tuning a winning expression. A targeted fix does not need
   a brainstorming ceremony.
+- Within the authorized research task, resolve reachable prerequisites and prepare
+  the next discriminating check proactively. Batch independent reads; use bounded
+  concurrency for retrieval. Treat `feed.next_actions` as evidence-linked leads,
+  not automatic permission to simulate or submit. Reconcile contrary evidence
+  before spending another round on the current winner.
 - Separate observations, interpretations and untested hypotheses. A high score
   is a lead, not a mechanism. Read the supporting record before treating a
   shortened brief preview as a conclusion.
@@ -52,6 +57,9 @@ section when needed, rather than loading every recipe.
 1. Always `simulate FILE --dry-run` / `probe FILE --dry-run` before a real run.
    Simulations consume time and platform capacity; account limits are live facts.
    Reuse stored results through `alpha get` / `alpha list` instead of rerunning.
+   If a run stops, inspect its saved progress first: `resume CHECKPOINT` for
+   simulation jobs, `probe --recover BATCH` for probe evidence. Never rerun a
+   whole spec merely because its stdout was lost.
 2. Check `auth check` before designing around an unfamiliar account or region.
    Reuse the session cache; use `--relogin` only when it is actually stale.
 3. Prefer `catalog fields --expressions` for field wrappers. Inspect structured
