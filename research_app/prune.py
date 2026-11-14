@@ -24,7 +24,7 @@ from pathlib import PurePosixPath
 import alpha_registry
 import research_paths
 
-from . import mechanisms
+from . import book_state, mechanisms
 
 #: Defaults, copied from the platform's own gates plus the campaign's stricter bar for
 #: *new* work. A cache entry failing these is not wrong, it is simply no longer a
@@ -125,7 +125,7 @@ def _reasons(entry, criteria, known_fields=None):
 
 def _is_protected(entry, criteria):
     status = str(entry.get("status") or "").upper()
-    if status in ("ACTIVE", "SUBMITTED"):
+    if status in book_state.BOOK_STATUSES:
         return "in the book"
     if entry.get("alpha_id") in (criteria.get("protect") or []):
         return "listed in protect"
@@ -191,12 +191,16 @@ def cmd_prune(args, _sink):
             if os.path.exists(target):
                 os.unlink(target)
                 removed += 1
+                metadata = os.path.join(pnl_dir, ".meta", row["alpha_id"] + ".json")
+                if os.path.isfile(metadata):
+                    os.unlink(metadata)
 
     return {
         "criteria_path": path,
         "criteria_source": source,
         "criteria": criteria,
         "applied": bool(getattr(args, "apply", False)),
+        "book": book_state.describe_book(latest, registry_path=getattr(args, "registry", None)),
         "cached": len(keep) + len(drop),
         "kept": len(keep),
         "dropped": len(drop),

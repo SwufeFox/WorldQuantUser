@@ -19,7 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import machine_lib as ml
-from research_app import buffer_cmd
+from research_app import buffer_cmd, selection
 
 
 def _payload(name="cand", checks=None, self_corr=0.45):
@@ -42,7 +42,14 @@ def _checks(self_corr=0.45, result="PASS"):
 
 class BufferTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.mkdtemp()
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.tmp = temporary.name
+        patcher = mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": self.tmp})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.selection_path = os.path.join(self.tmp, "selection.json")
+        selection.freeze(self.selection_path, source="triage", rows=[{"alpha_id": "A1"}])
         self.shelf = os.path.join(self.tmp, "shelf.jsonl")
         patcher = mock.patch.object(buffer_cmd, "with_session",
                                     lambda args, work: work(object()))
@@ -50,8 +57,9 @@ class BufferTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def _args(self, **overrides):
-        base = dict(alpha_id="A1", buffer=self.shelf, note=None, registry=None,
-                    max_wait=None, yes=False, force=False)
+        base = dict(alpha_id="A1", buffer=self.shelf, note=None,
+                    registry=os.path.join(self.tmp, "ledger.jsonl"),
+                    selection=self.selection_path, max_wait=None, yes=False, force=False)
         base.update(overrides)
         return argparse.Namespace(**base)
 
@@ -88,6 +96,7 @@ class BufferTests(unittest.TestCase):
             data = buffer_cmd.cmd_buffer_add(self._args(), mock.MagicMock())
         self.assertEqual(data["entry"]["checks"]["failed"], [])
         self.assertIn("SELF_CORRELATION", data["entry"]["checks"]["pending"])
+        self.assertFalse(data["entry"]["eligible"])
 
     def _shelve(self):
         with mock.patch.object(ml, "fetch_alpha_metrics", return_value=_payload()), \
@@ -111,15 +120,21 @@ class BufferTests(unittest.TestCase):
                 mock.patch.object(ml, "fetch_alpha_checks",
                                   return_value=_checks(self_corr=0.78, result="FAIL")):
             with self.assertRaises(Exception):
-                buffer_cmd.cmd_buffer_submit(self._args(), mock.MagicMock())
+                buffer_cmd.cmd_buffer_submit(self._args(yes=True), mock.MagicMock())
 
     def test_submit_marks_the_entry_consumed(self):
         self._shelve()
-        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=_payload()), \
-                mock.patch.object(ml, "fetch_alpha_checks", return_value=_checks(0.44)), \
-                mock.patch.object(ml, "submit_alpha",
-                                  return_value={"submitted": True}):
+        payload = {**_payload(), "status": "ACTIVE", "dateSubmitted": "2026-01-02T00:00:00Z"}
+
+        def pnl(_session, _alpha_id, **kwargs):
+            kwargs["report"].update(complete=True)
+            return {"2025-01-01": 1.0}
+
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=payload), \
+                mock.patch.object(ml, "fetch_daily_pnl", side_effect=pnl), \
+                mock.patch.object(ml, "submit_alpha") as post:
             result = buffer_cmd.cmd_buffer_submit(self._args(yes=True), mock.MagicMock())
+        post.assert_not_called()
         self.assertTrue(result["submitted"])
         data = buffer_cmd.cmd_buffer_list(self._args(), mock.MagicMock())
         self.assertEqual(data["count"], 0)
@@ -148,9 +163,8 @@ class SyncDriftTests(unittest.TestCase):
                                   pages=1, order="-dateCreated", limit_record=10,
                                   dry_run=True, registry=registry)
         with mock.patch.object(cli_ledger, "with_session",
-                               lambda a, work: platform), \
-                mock.patch.object(cli_ledger, "_ledger",
-                                  lambda a: (None, alpha_registry.load_entries(registry))):
+                               lambda a, work: work(object())), \
+                mock.patch.object(ml, "list_alphas", return_value=list(platform.values())):
             data = cli_ledger.cmd_ledger_sync(args, mock.MagicMock())
         self.assertEqual(data["missing"], [])
         self.assertEqual(data["drifted"], ["DRIFT1"])

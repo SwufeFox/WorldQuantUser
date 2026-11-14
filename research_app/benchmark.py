@@ -3,7 +3,8 @@
 The train-Sharpe bands and optional economic-block factors are scoring coefficients.
 Raw calibration observations, sample sizes and individual alpha outcomes belong in
 the research directory. Operator count warns about auditability without multiplying
-the score. Treat this benchmark as a ranking aid, not evidence of future performance.
+the score. Validation requires a persisted training selection and preserves its order;
+these local scores do not establish platform eligibility or future performance.
 """
 
 import json
@@ -11,7 +12,7 @@ import os
 
 import research_paths
 
-from . import legs, mechanisms
+from . import costs, legs, mechanisms, selection
 
 #: Piecewise scoring coefficients: strongest confidence in the middle Sharpe band.
 SHRINK_BANDS = (
@@ -112,11 +113,33 @@ def ops_warning(ops, thresholds):
     return "ops>%d: long expression, consider splitting before it becomes unauditable" % thresholds[-1]
 
 
-def benchmark_rows(ids, registry_path=None, pnl_dir=None, criteria=None,
-                   block_retention=None):
+def benchmark_rows(ids=None, registry_path=None, pnl_dir=None, criteria=None,
+                   block_retention=None, selection_path=None, cost_bps=None):
+    """Annotate a frozen training choice with validation scores, never rerank it."""
     import alpha_registry
+    from .book_state import describe_book
 
-    criteria = criteria or dict(DEFAULTS)
+    if not selection_path:
+        raise ValueError("benchmark validation requires --selection from a training freeze")
+    manifest = selection.load(selection_path)
+    frozen_ids = [row["alpha_id"] for row in manifest["rows"]]
+    if ids and set(ids) != set(frozen_ids):
+        raise ValueError("candidate IDs conflict with the frozen selection")
+    for key, value in (("registry_path", registry_path), ("pnl_dir", pnl_dir)):
+        saved = manifest["inputs"].get(key)
+        if value is not None and saved is not None and os.path.abspath(os.path.expanduser(os.fspath(value))) != saved:
+            raise ValueError("%s conflicts with the frozen selection" % key)
+    registry_path = manifest["inputs"].get("registry_path") or registry_path
+    pnl_dir = manifest["inputs"].get("pnl_dir") or pnl_dir
+    frozen_criteria = {**DEFAULTS, **{key: value for key, value in manifest["criteria"].items() if key in DEFAULTS}}
+    if criteria and any(frozen_criteria.get(key) != value for key, value in criteria.items()):
+        raise ValueError("benchmark criteria conflict with the frozen selection")
+    criteria = frozen_criteria
+    saved_costs = manifest["criteria"].get("cost_bps")
+    if cost_bps is not None and saved_costs is not None and list(cost_bps) != saved_costs:
+        raise ValueError("cost scenarios conflict with the frozen selection")
+    cost_bps = saved_costs if saved_costs is not None else cost_bps
+    costs.evidence({}, "full", cost_bps)
     latest = {}
     for entry in alpha_registry.load_entries(registry_path):
         key = entry.get("alpha_id") or entry.get("key")
@@ -134,12 +157,15 @@ def benchmark_rows(ids, registry_path=None, pnl_dir=None, criteria=None,
     for values in series.values():
         dates = set(values) if dates is None else dates & set(values)
     dates = sorted(dates or [])
-    book_daily = [sum(values[day] for values in series.values()) for day in dates]
+    book_state = describe_book(latest, series=series, registry_path=registry_path, pnl_dir=directory)
     n = len(series)
 
     rows = []
-    for alpha_id in ids:
-        entry = latest.get(alpha_id) or {}
+    for frozen in manifest["rows"]:
+        alpha_id = frozen["alpha_id"]
+        entry = latest.get(alpha_id)
+        if entry is None:
+            continue
         metrics = entry.get("metrics") or {}
         split = entry.get("out_of_sample") or {}
         train = (split.get("train") or {}).get("sharpe")
@@ -180,6 +206,16 @@ def benchmark_rows(ids, registry_path=None, pnl_dir=None, criteria=None,
         internal = None if fitness is None else round(fitness * combined, 3)
         rows.append({
             "alpha_id": alpha_id,
+            **{key: frozen[key] for key in selection.IDENTITY_FIELDS if key in frozen},
+            "costs": costs.evidence(metrics, "full", cost_bps),
+            "costs_by_period": {period: costs.evidence(split.get(period) or {}, period, cost_bps)
+                                for period in ("train", "test")},
+            "source_settings": entry.get("settings") or {},
+            "source_expression": entry.get("expression"),
+            "source_changes": {key: {"frozen": frozen.get(key), "current": value}
+                               for key, value in (("source_settings", entry.get("settings") or {}),
+                                                  ("source_expression", entry.get("expression")))
+                               if key in frozen and frozen[key] != value},
             "platform_fitness": fitness,
             "internal_fitness": internal,
             "train_sharpe": train,
@@ -191,20 +227,31 @@ def benchmark_rows(ids, registry_path=None, pnl_dir=None, criteria=None,
             "ops_warning": ops_warning(ops, criteria["ops_warn"]),
             "factors": {k: round(v, 3) for k, v in factors.items()},
         })
-    rows.sort(key=lambda row: -(row["internal_fitness"] or -99))
+    rows = selection.ordered_rows(manifest, rows)
+    research_paths.log_view("benchmark", "test", frozen_ids,
+                            note={"selection_id": manifest["selection_id"],
+                                  "selection_path": os.path.abspath(os.fspath(selection_path))})
     return {
         "criteria": criteria,
         "book_members": n,
+        "selection_id": manifest["selection_id"],
+        "frozen_window": manifest["window"],
+        "window": {"mode": "full", "observed_start": dates[0] if dates else None,
+                   "observed_end": dates[-1] if dates else None, "days": len(dates)},
+        "book_state": book_state,
+        "frozen_book_state": manifest["inputs"].get("book_state"),
+        "book_changed": book_state != manifest["inputs"].get("book_state"),
         "rows": rows,
         "note": ("internal_fitness = platform_fitness * shrink * contribution * retention"
                  + (" * block" if criteria.get("block_ratio") else "") + ". "
                  "Shrink and optional block factors are scoring priors; "
-                 "operator count produces auditability warnings without a score penalty."),
+                 "operator count produces auditability warnings without a score penalty. "
+                 "Rows retain immutable training order; scores do not establish platform eligibility."),
     }
 
 
 def cmd_benchmark(args, _sink):
-    criteria = refine_criteria(getattr(args, "criteria", None))
+    criteria = (refine_criteria(args.criteria) if getattr(args, "criteria", None) else None)
     ids = list(getattr(args, "ids", None) or [])
     if getattr(args, "batch", None):
         path = os.path.expanduser(args.batch)
@@ -216,6 +263,6 @@ def cmd_benchmark(args, _sink):
         ids.extend(row.get("alpha_id") for row in document.get("rows") or []
                    if row.get("alpha_id"))
     ids = [alpha_id for alpha_id in dict.fromkeys(ids) if alpha_id and alpha_id != "None"]
-    if not ids:
-        raise ValueError("nothing to benchmark: pass --batch or --ids")
-    return benchmark_rows(ids, getattr(args, "registry", None), criteria=criteria)
+    return benchmark_rows(ids, getattr(args, "registry", None), criteria=criteria,
+                          selection_path=getattr(args, "selection", None),
+                          cost_bps=getattr(args, "cost_bps", None))

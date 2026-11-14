@@ -81,6 +81,10 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 问题和证据 note 等长文本只预览至 240 字符，以 `…` 标记裁剪；需要使用结论时，
 从路径和记录 key 回读完整条件。摘要只呈现已记录事实和判断，不生成机会或自动关闭方向。
 
+`book.evidence` 给出本地 ACTIVE/SUBMITTED 成员摘要、平台快照时间与作用域，以及 PnL
+完整/未知/缺失计数。成员数相同不代表成员相同；digest 用于识别换人。平台快照只证明其
+`as_of` 时刻的所选范围，本地台账和旧 PnL 文件不能被提升为实时完整的组合证据。
+
 ### 发散需要的边界
 
 | 记录 | 能支持的结论 | 下一步可能是什么 |
@@ -91,9 +95,10 @@ CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的
 | 缺记录 / 缺标签 | 当前本地信息不足 | 查工作目录与台账，不推断“没人试过” |
 
 复盘时分别写清观察、解释和待检验假设。文献是候选机制的来源，不能替代本地检验。
-`triage` 默认只用训练期指标和收益；`--show-test` 才展开全窗口平台检查与测试期留存，
-并把这次查看记入 `views.jsonl`。`--internal` 依赖测试期校准，必须显式搭配 `--show-test`。
-`--train-end` 不能越过记录中的测试起点。训练证据缺失时保持 unknown，不用全窗口数字补齐。
+`triage` 默认只用训练期指标和收益；先 `--freeze PATH` 保存选择，再用
+`--show-test --selection PATH` 查看测试期。验证保持冻结的候选集合与顺序，日志绑定选择 ID。
+`--internal` 依赖测试期校准，必须搭配该验证流程；`--train-end` 不能越过记录中的测试起点。
+训练证据缺失时保持 unknown，不用全窗口数字补齐。
 
 ### 用现有问题文件交接
 
@@ -178,6 +183,7 @@ seen 与草稿各自原子提交，草稿先于 seen：草稿失败不会把论�
 | --- | --- |
 | 我要跑一批臂（常态） | 写一个 sample-batch.spec.json，然后 `python3 research_cli.py probe sample-batch.spec.json`——lint、模拟、train-only 表格、对照差值、JSON、台账一次做完 |
 | 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe sample-batch.spec.json --dry-run`；输出完整 payload、设计上下文和精确重复证据，正式模拟前再做实时目录检查 |
+| 按当前账户核验这份 spec，但不模拟 | `python3 research_cli.py probe sample-batch.spec.json --check`；使用与正式运行相同的臂和生效设置 |
 | 我要开一个单次实验 | 直接写一个两三条臂的 spec，`python3 research_cli.py probe sample-batch.spec.json`（没有模板文件了） |
 | 这批臂相对对照变了多少 | 看 `comparisons.rows`：arm 减 control 的训练期差值；缺失项列在 `unavailable`，explore 批次不计算归因 |
 | 换字段 / 换窗口 / 换权重的批量实验 | `research_app/substitution.py` 的 `expand()` 生成 `(label, expression)` 对，再落成 spec |
@@ -185,21 +191,33 @@ seen 与草稿各自原子提交，草稿先于 seen：草稿失败不会把论�
 | 这个池子够不够厚 | `python3 research_cli.py health --pool` |
 | 这个字段到底什么量纲 | `python3 tools/probe_units.py` |
 
-日常实验只维护 spec 文件：先离线预览，再正式运行。`idea` / `mechanism` / `note` 会随输出和批次文件保存；`--strict-gate` 只拒绝表达式和完整生效设置都相同的已完成结果。所有配置组在登录和模拟前完成本地校验；等效设置合并，同一批复用缓存会话。`simulate` 的研究文件和 `probe` 的 spec 文件都按 UTF-8 读取，兼容 BOM。
-
-`probe` 在第一次提交前建立批次文件，之后在提交、等待、完成和失败事件上原子保存，
-并保留原始结果、训练视图与进度 URL。`--max-wait-seconds` 默认 300，限制模拟阶段的等待；
-前一配置组仍有未完成任务时，后面的配置组保持排队，不再叠加提交。
+日常实验维护一份 spec：先 `--dry-run` 离线预览，再用 `--check` 在线核验，最后正式运行。
+`idea` / `mechanism` / `note` 会随输出和批次文件保存；`--strict-gate` 只拒绝表达式与完整设置
+都相同的已完成结果。所有组先通过本地校验，等效设置合并，整批复用会话。输入支持 UTF-8 BOM。
 
 ```bash
-python3 research_cli.py probe --recover <research>/sample-batch.json --max-wait-seconds 60
-python3 research_cli.py resume <checkpoint.json> --max-wait-seconds 60
+python3 research_cli.py probe sample-batch.spec.json --batch-path sample-batch.json --save sample-response.json
+python3 research_cli.py probe --recover sample-batch.json --max-wait-seconds 60
+python3 research_cli.py probe --resume sample-batch.json --dry-run
+python3 research_cli.py probe --resume sample-batch.json --max-wait-seconds 60
+python3 research_cli.py resume checkpoint.json --max-wait-seconds 60
 ```
 
-`probe --recover` 优先用已知 alpha ID 或进度 URL 读取；旧文件中没有任务身份的行才按表达式与
-设置匹配，有多个匹配时继续保留未知。恢复本身不提交模拟；`not_submitted` 列出确定没有启动的
-实验臂，后续只为这些臂准备新 spec。每条恢复证据都会落盘，已完成批次无需重新登录。
-同一批次的运行/恢复和同一 checkpoint 的恢复互斥；`--force` 也不能覆盖正在运行的批次。
+示例文件放在研究目录；从该目录运行或传绝对路径。`--batch-path` 是持久批次，`--save` 是
+输出回执，两者使用不同路径。回执给出 `path`、`run_id`、`started_at`、`request_fingerprint`、
+原始 `arm_order`、逐臂状态、`execution`、`recording` 和 `next_actions`。
+`--save` 与批次、checkpoint、恢复输入或冻结选择同路径时会在执行前拒绝；错误回执也不会
+写入受保护文件。读取保存回执恢复时，同样保护其指向的实际批次。
+
+每个 POST 之前保存提交意图，拿到任务身份后立即保存。没有身份的未知提交不会自动重发。
+`--max-wait-seconds` 默认 300；前组未完成时后组保持排队。`--recover` 只读平台并幂等补账，
+接受批次或保存的回执；`--resume` 才显式继续已知排队/已接受任务，支持离线预览。
+执行失败、未完成和证据缺失列为 deferred，不自动判成研究失败；旧批次的记账策略不明时
+不会推测为允许记账。同批次运行/恢复互斥，`--force` 不能覆盖正在运行的批次。
+
+目录检查携带账户、region/universe/delay/instrumentType、完整性和时效证据。缺失、过期、
+不完整目录不能冒充预检通过；显式覆盖仍保留错误。字段类型按 AST 检查，经济口径不明则提示
+unknown。`feed` 的关键词只产生阅读线索；明确字段需求才与当前作用域目录核对可用性。
 
 
 ### 合并已有结果与读取实时检查
@@ -208,7 +226,8 @@ python3 research_cli.py resume <checkpoint.json> --max-wait-seconds 60
 python3 research_cli.py compare sample-batch-a.json sample-batch-b.json
 python3 research_cli.py compare --match "**/sample-batch*.json" --latest --sort none
 python3 research_cli.py compare --match "sample-batch-a.json" --match "**/sample-batch-b*.json" --latest 2
-python3 research_cli.py compare sample-batch.json --sort fitness --frozen
+python3 research_cli.py compare sample-batch.json --freeze choice.json --cost-bps 5 10 20 --summary
+python3 research_cli.py compare --frozen --selection choice.json --summary
 python3 research_cli.py alpha check ALPHA_A ALPHA_B --workers 2 --max-wait 300
 ```
 
@@ -218,12 +237,15 @@ python3 research_cli.py alpha check ALPHA_A ALPHA_B --workers 2 --max-wait 300
 `selection.selected_paths` 列出文件，`selection.provenance` 保留路径、匹配来源和 mtime。
 显式文件与匹配结果按路径去重；匹配或 latest 选择按文件从新到旧排列，只有显式文件时保持参数顺序。
 
-默认 `--sort fitness` 按训练期 fitness 排序，传 `--frozen` 才改用全窗口指标。
-`--sort none` 明确保留所选文件顺序及文件内的行顺序。支持模拟原始结果和保存的 probe
-`rows` 摘要，并保留 `label`、`train_sharpe_h1`、`train_sharpe_h2`；缺失训练指标不能用
-全窗口数值补齐。
+默认按训练期 fitness 排序；`--sort none` 保留输入顺序。`--freeze PATH` 保存不可覆盖的
+训练选择：候选身份及顺序、指标、阈值、来源与成本场景，并校验内容 hash。
+`--frozen --selection PATH` 才显示全窗口、测试期和检查证据，复用保存的文件与顺序，拒绝
+新的排序/筛选/成本假设。多出的候选忽略，缺失的候选明确列出，测试期分数不能改变训练选择。
+`--summary` 只缩短展示，不改变冻结内容或总数。原始模拟结果与 probe 回执都可比较。
 
-默认视图为 `train`；只有冻结设计后传 `--frozen` 才显示全窗口、测试期和检查证据。
+成本口径为每美元单边成交额：`margin_bps = raw_margin * 10000`，
+`net_margin_bps = margin_bps - cost_bps`，默认情景为 5/10/20 bps。报告保留期间与换手单位；
+缺失训练指标保持未知，汇总换手不能推导精确逐日费用或净 Sharpe。
 `checks_state` 的枚举为 `hidden`（训练视图隐藏）、`available`（冻结视图有保存的检查证据）、
 `unavailable`（没有检查证据）。`failed_checks: null` 代表未知；即使保存的失败列表为空，
 也不能据此认定所有平台检查已完成或通过。
@@ -282,21 +304,28 @@ python3 research_cli.py alpha explain ALPHA_ID
 
 腿是从表达式树读出来的，所以不会和公式漂移。`0.25*(a+b)` 这种会被摊开成两条腿——否则一个六腿复合体会显示成"一条腿"。
 
-## 提交是唯一会写平台的动作
+## 提交与本地回写
 
 ```bash
-python3 research_cli.py alpha submit ALPHA_ID            # 预检：跑 live checks，什么都不发
-python3 research_cli.py alpha submit ALPHA_ID --yes --record   # 真提交 + 回读 + 记账
+python3 research_cli.py alpha submit ALPHA_ID
+python3 research_cli.py alpha submit ALPHA_ID --yes --selection choice.json
+python3 research_cli.py buffer submit ALPHA_ID --yes --selection choice.json
+python3 research_cli.py ledger sync --pnl
 ```
 
-三条硬规矩：
+新提交需要环境提交锁开启、显式 `--yes`、有效 name/category，以及包含该候选的冻结训练选择。
+不带 `--yes` 只预检。`alpha submit` 与 `buffer submit` 共用持久提交状态；未知结果再次运行时
+只回读平台，不隐式重复 POST。
 
-* **没有 `--yes` 就不发**——平台没有"试提交"，预检就是 check 流程；
-* **`name` / `category` 必须先设**，否则拒绝（`alpha describe ALPHA_ID --name ... --category ...`）。没有标签的 alpha 事后无法归属；
-* **`--record` 用 `regular_expression()` 和 `is` 段**取数，兼容 `regular` 为字符串或对象，避免丢失表达式或 metrics；
-* **`--record` 顺带把这条 alpha 的日频 PnL 缓存到 `<research>/pnl/`**。本地相关扫描读的就是那个目录；缺少缓存会让新提交缺席后续扫描，不能把缺失证据解读为独立。
+确认远端成功后自动同步台账、消费候选架、刷新 PnL，并使旧平台组合快照失效，不再需要
+`--record`。回执分别报告 `submission` 与 `reconciliation.{ledger,shelf,book_snapshot,pnl}`；
+某项本地修复失败不抹掉远端成功，`repair_actions` 列出未完成项。对已确认 alpha 再运行
+同一提交命令会修复本地状态，不再次提交。
 
-台账那边现在也会拦：`record_entry` 拒绝用没有 metrics 的行覆盖有 metrics 的行，除非显式 `allow_metrics_loss=True`。
+`ledger sync` 的有效分页大小不超过 100，并保存状态/hidden/type 过滤范围、时间、成员 digest
+和完整性。反向漂移只在完整列表后逐条回读确认。membership、metadata、PnL 各自报告缺口；
+到达页数或记账上限不算完整同步。PnL 只有完整抓取才覆盖缓存，旁车元数据校验 alpha ID 与
+数据 hash；旧缓存完整性为 unknown。台账仍拒绝用缺指标的行覆盖已有指标。
 
 ## 工具会读的封闭清单
 

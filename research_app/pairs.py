@@ -25,7 +25,7 @@ import numpy as np
 import alpha_registry
 import research_paths
 
-from . import legs, stats
+from . import book_state, legs, stats
 
 
 def _ledger(registry_path=None):
@@ -60,7 +60,7 @@ def cmd_pairs(args, _sink):
     latest = _ledger(getattr(args, "registry", None))
 
     book = [aid for aid, entry in latest.items()
-            if str(entry.get("status") or "").upper() in ("ACTIVE", "SUBMITTED")]
+            if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES]
     pool = []
     for alpha_id, entry in latest.items():
         if alpha_id in book:
@@ -187,6 +187,8 @@ def cmd_pairs(args, _sink):
         "window": {"start": dates[0], "end": dates[-1], "days": len(dates)},
         "pool": len(pool),
         "book": len(book),
+        "book_evidence": book_state.describe_book(
+            latest, series=book_series, registry_path=getattr(args, "registry", None), pnl_dir=directory),
         "pairs_tested": len(rows),
         "criteria": {"min_leg_sharpe": args.min_leg_sharpe,
                      "max_leg_sharpe": args.max_leg_sharpe,

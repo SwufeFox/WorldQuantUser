@@ -428,8 +428,8 @@ def auto_verdict(record):
     # warns without failing (UNITS is the common one), and every metric is final. It
     # must not fall into the "not finished" branch and be filed as `rejected` merely
     # because a non-failing check emitted a warning.
-    if (record.get("status") or "").upper() not in FINISHED_STATUSES:
-        return "rejected"
+    if (record.get("status") or "").upper() not in FINISHED_STATUSES | {"UNSUBMITTED", "ACTIVE", "SUBMITTED"}:
+        return "watch"
     checks = record.get("checks") or {}
     if isinstance(checks, dict):
         results = [str((value or {}).get("result") or "").upper()
@@ -461,9 +461,14 @@ def _inherit_judgement(entry, previous, pinned_verdict=False):
     """
     # `batch` belongs here too: a re-record without a batch name is a refresh of an
     # existing row, not evidence that the row came from nowhere.
+    manual_fields = set(previous.get("manual_fields") or [])
+    if previous.get("source") == "relabel":
+        manual_fields.update(("family", "mechanism", "idea", "note"))
     for field in ("family", "mechanism", "idea", "note", "parent", "op", "legs", "batch"):
-        if not entry.get(field) and previous.get(field) is not None:
+        if (not entry.get(field) or field in manual_fields) and previous.get(field) is not None:
             entry[field] = previous[field]
+    if manual_fields:
+        entry["manual_fields"] = sorted(manual_fields)
     # An automatic verdict may not overwrite a verdict a human set; ``relabel``
     # marks those with ``verdict_manual``.
     if (previous.get("verdict_manual") and not pinned_verdict
@@ -496,12 +501,22 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
     entries = []
     written = 0
     skipped = []
+    deferred = []
     for record in records:
         key = record.get("alpha_id")
         previous = stored.get(key) if key else None
         status = record.get("status")
+        evidence_status = (status or "").upper()
+        if evidence_status not in FINISHED_STATUSES | {"UNSUBMITTED", "ACTIVE", "SUBMITTED"}:
+            deferred.append({"alpha_id": key, "label": record.get("mechanism"),
+                             "status": status, "reason": "execution_not_finished"})
+            continue
+        if not key or not _pick_metrics(record.get("metrics")):
+            deferred.append({"alpha_id": key, "label": record.get("mechanism"),
+                             "status": status, "reason": "completed_evidence_missing"})
+            continue
         chosen_verdict = verdict or auto_verdict(record)
-        if previous and (previous.get("status") or "").upper() == "ACTIVE":
+        if previous and (previous.get("status") or "").upper() in {"ACTIVE", "SUBMITTED"}:
             # A simulation cannot un-submit a book alpha. BRAIN hands back the
             # existing id when an identical expression is re-run, so a re-run of a
             # book member arrives here looking like an ordinary new record. Preserve
@@ -532,6 +547,16 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
         )
         if previous:
             entry = _inherit_judgement(entry, previous, pinned_verdict=verdict is not None)
+            entry["metrics"] = {**(previous.get("metrics") or {}), **entry["metrics"]}
+            old_split = previous.get("out_of_sample") or {}
+            new_split = entry.get("out_of_sample") or {}
+            if old_split:
+                entry["out_of_sample"] = {**old_split, **new_split}
+                for period in ("train", "test"):
+                    if old_split.get(period):
+                        entry["out_of_sample"][period] = {**old_split[period],
+                            **{key: value for key, value in (new_split.get(period) or {}).items()
+                               if value is not None}}
         try:
             _, did_write = record_entry(entry, path)
         except ValueError as exc:
@@ -544,11 +569,16 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
             continue
         written += 1 if did_write else 0
         entries.append(entry)
+        stored[entry["key"]] = entry
     return {
         "registry": path,
         "recorded": len(entries),
         "appended": written,
         "skipped": skipped,
+        "deferred": deferred,
+        "deferred_count": len(deferred),
+        "skipped_count": len(skipped),
+        "unchanged": len(entries) - written,
         "by_verdict": {
             name: sum(1 for entry in entries if entry["verdict"] == name)
             for name in VERDICTS
@@ -727,6 +757,11 @@ def relabel(entry, family=None, verdict=None, mechanism=None, idea=None,
         updated["idea"] = idea
     if note is not None:
         updated["note"] = note
+    manual_fields = set(updated.get("manual_fields") or [])
+    manual_fields.update(key for key, value in {"family": family, "mechanism": mechanism,
+                                               "idea": idea, "note": note}.items() if value is not None)
+    if manual_fields:
+        updated["manual_fields"] = sorted(manual_fields)
     updated["recorded_at"] = _now()
     updated["source"] = "relabel"
     return updated

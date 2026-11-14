@@ -440,6 +440,83 @@ class CliWorkflowContractTests(unittest.TestCase):
             self.assertEqual(json.loads(stdout)["error"]["code"], "INVALID_INPUT")
             logout.assert_not_called()
 
+    def test_freeze_response_cannot_replace_new_or_existing_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "results.json"
+            source.write_text(json.dumps([{"alpha_id": "SYNTHETIC_A", "status": "COMPLETE",
+                                          "out_of_sample": {"train": {"fitness": 1.2}}}]), encoding="utf-8")
+            choice = Path(directory) / "choice.json"
+            for existing in (False, True):
+                with self.subTest(existing=existing):
+                    if existing:
+                        code, stdout, _ = self.invoke("compare", str(source), "--freeze", str(choice))
+                        self.assertEqual(code, 0, stdout)
+                    before = choice.read_bytes() if choice.exists() else None
+                    code, stdout, _ = self.invoke("compare", str(source), "--freeze", str(choice),
+                                                 "--save", str(choice), "--research-dir", directory)
+                    self.assertEqual(code, 2, stdout)
+                    self.assertEqual(json.loads(stdout)["error"]["code"], "INVALID_INPUT")
+                    self.assertEqual(choice.read_bytes() if choice.exists() else None, before)
+
+    def test_selection_is_preserved_even_when_argument_parsing_fails(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ml, "load_session", side_effect=AssertionError("authentication")):
+            choice = Path(directory) / "choice.json"
+            original = b'{"format":"research.train-selection","version":1}'
+            choice.write_bytes(original)
+            commands = [
+                ["compare", "--frozen"],
+                ["compare", "--frozen", "--unknown-option"],
+                ["triage", "--show-test"],
+                ["alpha", "submit", "SYNTHETIC_A"],
+            ]
+            for command in commands:
+                with self.subTest(command=command):
+                    code, stdout, _ = self.invoke(*command, "--selection", str(choice),
+                                                 "--save", str(choice), "--research-dir", directory)
+                    self.assertEqual(code, 2, stdout)
+                    self.assertEqual(choice.read_bytes(), original)
+
+    def test_probe_continuation_protects_canonical_batch_through_response(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ml, "load_session", side_effect=AssertionError("authentication")):
+            batch = Path(directory) / "batch.json"
+            batch.write_text(json.dumps({"rows": [{"label": "unknown", "expression": "rank(close)",
+                              "settings": {"decay": 4}, "status": "QUEUED"}]}), encoding="utf-8")
+            before = batch.read_bytes()
+            response = Path(directory) / "response.json"
+            response.write_text(json.dumps({"ok": True, "command": "probe", "data": {"path": str(batch)}}),
+                                encoding="utf-8")
+            for source in (batch, response):
+                for mode in ("--resume", "--recover"):
+                    with self.subTest(source=source, mode=mode):
+                        flags = ["--dry-run"] if mode == "--resume" else []
+                        code, stdout, _ = self.invoke("probe", mode, str(source), *flags,
+                            "--save", str(batch.parent / "unused" / ".." / batch.name),
+                            "--research-dir", directory)
+                        self.assertEqual(code, 2, stdout)
+                        self.assertEqual(batch.read_bytes(), before)
+
+    def test_probe_default_batch_is_protected_but_separate_response_is_saved(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ml, "load_session", side_effect=AssertionError("authentication")):
+            spec = Path(directory) / "sample.spec.json"
+            spec.write_text(json.dumps({"name": "sample", "design": "explore", "arms": [
+                {"label": "base", "expression": "rank(close)"}]}), encoding="utf-8")
+            batch = Path(cli_experiments.research_paths.batch_path("sample", directory=directory))
+            for mode in ([], ["--check"], ["--dry-run"]):
+                with self.subTest(mode=mode):
+                    code, stdout, _ = self.invoke("probe", str(spec), *mode, "--save", str(batch),
+                                                 "--research-dir", directory)
+                    self.assertEqual(code, 2, stdout)
+                    self.assertFalse(batch.exists())
+            response = Path(directory) / "response.json"
+            code, stdout, _ = self.invoke("probe", str(spec), "--dry-run", "--save", str(response),
+                                         "--research-dir", directory)
+            self.assertEqual(code, 0, stdout)
+            self.assertEqual(response.read_text(encoding="utf-8"), stdout)
+            self.assertFalse(batch.exists())
+
     def test_workspace_override_is_local_to_each_invocation(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(ROOT / "unused-research")}):
@@ -618,6 +695,7 @@ class ExpressionWorkflowTests(unittest.TestCase):
             with self.subTest(flags=flags):
                 def fields(_session, **scope):
                     actual = (scope["region"], scope["universe"], scope["delay"])
+                    scope["report"].update(state="verified", coverage={"complete": False})
                     return ([{"id": "scoped_field", "type": "MATRIX", "dataset": "model1"}]
                             if actual == expected else [])
 
@@ -727,6 +805,7 @@ class CredentialTests(unittest.TestCase):
             path.write_text("BRAIN_USERNAME=from-file\nBRAIN_PASSWORD=from-file\n")
             ml._DOTENV_LOADED = False
             with mock.patch.dict(os.environ, {"BRAIN_USERNAME": "from-env"}):
+                os.environ.pop("BRAIN_PASSWORD", None)
                 ml._load_dotenv(path)
                 self.assertEqual(os.environ["BRAIN_USERNAME"], "from-env")
                 self.assertEqual(os.environ["BRAIN_PASSWORD"], "from-file")
@@ -1148,7 +1227,8 @@ class SimulationResumeTests(unittest.TestCase):
                     )],
                 )
                 with mock.patch.object(sys, "stdin", io.StringIO("\ufeff" + json.dumps(source))), \
-                        mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work: work(first_session)):
+                        mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work: work(first_session)), \
+                        mock.patch.object(cli_experiments, "_preflight_lint", return_value={"ok": True}):
                     pending = cli_experiments.cmd_simulate(simulate_args, None)
                 self.assertEqual(pending["status"], "PENDING")
                 checkpoint_path = Path(pending["checkpoint"])

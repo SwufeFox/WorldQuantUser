@@ -456,14 +456,23 @@ class CatalogValidationTests(unittest.TestCase):
         ]
         operators = OPERATORS + [{"name": "vec_avg", "category": "Vector",
                                   "definition": "vec_avg(x)"}]
+        def fields(_session, **kwargs):
+            if kwargs.get("report") is not None:
+                kwargs["report"].update(state="verified", scope={}, coverage={"complete": False})
+            return records
+
+        def catalog(_session, **kwargs):
+            if kwargs.get("report") is not None:
+                kwargs["report"].update(complete=True)
+            return operators
+
         patches = {
-            "fields": mock.patch.object(field_index, "fetch_all_fields", return_value=records),
-            "operators": mock.patch.object(machine_lib, "fetch_operators", return_value=operators),
+            "fields": mock.patch.object(field_index, "fetch_all_fields", side_effect=fields),
+            "operators": mock.patch.object(machine_lib, "fetch_operators", side_effect=catalog),
             "denylist": mock.patch.object(expression_lint, "load_denylist", return_value={}),
             "units": mock.patch.object(expression_units, "load_field_units", return_value={}),
             "sessions": mock.patch.object(cli_validation, "with_session",
                                           side_effect=lambda args, work: work(self.session)),
-            "notes": mock.patch.object(cli_validation, "note"),
         }
         for name, patcher in patches.items():
             setattr(self, name, patcher.start())
@@ -542,11 +551,17 @@ class CatalogValidationTests(unittest.TestCase):
         self.fields.side_effect = RuntimeError("field metadata unavailable")
         self.operators.side_effect = RuntimeError("operator metadata unavailable")
         args.allow_lint_errors = False
-        report = cli_validation._preflight_lint(
+        with self.assertRaises(cli_validation.CliError) as failure:
+            cli_validation._preflight_lint(
+                self.session, [("rank(missing_catalog_field)", 4)], {}, args)
+        report = failure.exception.details
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["coverage"], {"fields": "unknown", "operators": "unknown"})
+        args.allow_lint_errors = True
+        overridden = cli_validation._preflight_lint(
             self.session, [("rank(missing_catalog_field)", 4)], {}, args)
-        self.assertTrue(report["ok"])
-        self.assertTrue(report["field_catalog"].startswith("unavailable:"))
-        self.assertTrue(report["operator_catalog"].startswith("unavailable:"))
+        self.assertFalse(overridden["ok"])
+        args.allow_lint_errors = False
         self.denylist.return_value = {"rank": {"severity": "block", "reason": "rejected"}}
         with self.assertRaises(cli_validation.CliError):
             cli_validation._preflight_lint(self.session, [("rank(close)", 4)], {}, args)
@@ -750,12 +765,7 @@ class ResearchPathTests(unittest.TestCase):
                     os.environ[research_paths.ENV_VAR] = old
 
     def test_default_paths_follow_the_shared_root(self):
-        old = os.environ.pop(research_paths.ENV_VAR, None)
-        try:
-            base = research_paths.research_dir()
-        finally:
-            if old is not None:
-                os.environ[research_paths.ENV_VAR] = old
+        base = research_paths.research_dir()
         self.assertTrue(alpha_registry.default_registry_path().startswith(base))
         self.assertTrue(expression_lint.default_denylist_path().startswith(base))
 
@@ -1211,10 +1221,6 @@ class ExpressionTypeTests(unittest.TestCase):
         self.assertEqual(self.codes("group_rank(close, bucket(rank(close)))"), [])
         self.assertIn("type_mismatch", self.codes("densify(close)"))
 
-    def test_documented_but_unavailable_operator_is_named(self):
-        findings = expression_types.type_findings(
-            "rank(vec_choose(five_minute_price_change_pct, -1))", self.TYPES, strict=True)
-        self.assertIn("operator_documented_unavailable", [f["code"] for f in findings])
 
     def test_unknown_types_are_not_guessed(self):
         self.assertEqual(self.codes("rank(some_assigned_variable)"), [])
@@ -1562,12 +1568,12 @@ class ForecastTargetAlignmentTests(unittest.TestCase):
         self.assertEqual(attribute["state"], "unknown")
         self.assertEqual(attribute["evidence"], "none")
 
-    def test_historical_alignment_is_unverified_with_the_lookback(self):
+    def test_field_metadata_cannot_supply_expression_lookback(self):
         contract = field_contract.audit_field(
             self.record("anl4_afv4_eps_number", "analyst4"))
         attribute = contract["attributes"]["historical_target_alignment"]
         self.assertEqual(attribute["state"], "unverified")
-        self.assertEqual(attribute["lookback"], 63)
+        self.assertIsNone(attribute["lookback"])
 
     def test_forecast_family_is_recognised_narrowly(self):
         self.assertTrue(field_contract.is_forecast({"dataset": "analyst4", "field_id": "x"}))
@@ -1772,7 +1778,7 @@ class UndefinedVariableTests(unittest.TestCase):
 class MetricsLossDoesNotAbortTheBatchTests(unittest.TestCase):
     """One unrecordable arm must not throw away the arms behind it."""
 
-    def test_a_metrics_less_repeat_is_skipped_and_the_run_continues(self):
+    def test_a_metrics_less_repeat_is_deferred_and_the_run_continues(self):
         import json
         import tempfile
         import alpha_registry
@@ -1791,8 +1797,8 @@ class MetricsLossDoesNotAbortTheBatchTests(unittest.TestCase):
             ]
             summary = alpha_registry.record_simulation(records, {}, registry_path=path)
             self.assertEqual(summary["recorded"], 1)
-            self.assertEqual(len(summary["skipped"]), 1)
-            self.assertEqual(summary["skipped"][0]["alpha_id"], "AAA")
+            self.assertEqual(len(summary["deferred"]), 1)
+            self.assertEqual(summary["deferred"][0]["alpha_id"], "AAA")
             with open(path, encoding="utf-8") as handle:
                 rows = [json.loads(line) for line in handle]
             keys = [row["key"] for row in rows]

@@ -10,6 +10,18 @@ from research_app import triage
 
 
 class TriageTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        patcher = patch("research_paths.log_view")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _validate(self, tmp, directory, rows, alpha_id):
+        registry = self._registry(tmp, rows)
+        frozen = os.path.join(tmp, "selection.json")
+        triage.triage([alpha_id], registry_path=registry, pnl_dir=directory, freeze_path=frozen)
+        return triage.triage(show_test=True, selection_path=frozen)
+
     def _workspace(self, book_size=4, days=300):
         tmp = tempfile.mkdtemp()
         directory = os.path.join(tmp, "pnl")
@@ -44,8 +56,7 @@ class TriageTests(unittest.TestCase):
                      "metrics": {"sharpe": 2.0, "fitness": 2.0},
                      "failing_checks": ["CONCENTRATED_WEIGHT"],
                      "out_of_sample": {"train": {"sharpe": 2.0}, "test": {"sharpe": 1.5}}})
-        data = triage.triage(["U1"], registry_path=self._registry(tmp, rows),
-                             pnl_dir=directory, show_test=True)
+        data = self._validate(tmp, directory, rows, "U1")
         self.assertEqual(data["rows"][0]["verdict"], "blocked")
 
     def test_poor_test_retention_vetoes_even_when_the_book_rises(self):
@@ -55,8 +66,7 @@ class TriageTests(unittest.TestCase):
         rows.append({"alpha_id": "U2", "status": "COMPLETE",
                      "metrics": {"sharpe": 2.5, "fitness": 3.0}, "failing_checks": [],
                      "out_of_sample": {"train": {"sharpe": 3.0}, "test": {"sharpe": 0.2}}})
-        data = triage.triage(["U2"], registry_path=self._registry(tmp, rows),
-                             pnl_dir=directory, show_test=True)
+        data = self._validate(tmp, directory, rows, "U2")
         row = data["rows"][0]
         self.assertEqual(row["retention"], 0.07)
         self.assertEqual(row["verdict"], "overfit-risk")
@@ -79,6 +89,10 @@ class TriageEvidenceBoundaryTests(unittest.TestCase):
     def setUp(self):
         from datetime import date, timedelta
         from pathlib import Path
+        from unittest.mock import patch
+        patcher = patch("research_paths.log_view")
+        self.view_log = patcher.start()
+        self.addCleanup(patcher.stop)
 
         self.workspace = tempfile.TemporaryDirectory()
         self.addCleanup(self.workspace.cleanup)
@@ -113,6 +127,8 @@ class TriageEvidenceBoundaryTests(unittest.TestCase):
 
     def test_holdout_changes_cannot_change_selection_or_leak_through_criteria(self):
         selected = self.score()
+        frozen_path = self.root / "selection.json"
+        self.score(freeze_path=frozen_path)
         row = selected["rows"][0]
         self.assertEqual(row["sharpe"], 2.0)
         self.assertEqual(row["fitness"], 1.0)
@@ -130,7 +146,7 @@ class TriageEvidenceBoundaryTests(unittest.TestCase):
             path.write_text(json.dumps(series), encoding="utf-8")
         self.save_registry()
         self.assertEqual(self.score(criteria={"show_test": True, "internal": True}), selected)
-        validation = self.score(show_test=True)
+        validation = self.score(show_test=True, selection_path=frozen_path)
         validated = validation["rows"][0]
         self.assertEqual(validation["window"]["mode"], "full")
         self.assertEqual(validated["overlap_days"], 340)
@@ -160,13 +176,118 @@ class TriageEvidenceBoundaryTests(unittest.TestCase):
         root = Path(__file__).resolve().parent.parent
         command = [sys.executable, str(root / "research_cli.py"), "triage", "--ids", "C1",
                    "--research-dir", str(self.root)]
-        selected = subprocess.run(command, capture_output=True, encoding="utf-8")
+        frozen_path = self.root / "cli-selection.json"
+        selected = subprocess.run(command + ["--freeze", str(frozen_path)], capture_output=True, encoding="utf-8")
         self.assertEqual(selected.returncode, 0, selected.stdout + selected.stderr)
         self.assertFalse((self.root / "views.jsonl").exists())
-        validated = subprocess.run(command + ["--show-test"], capture_output=True, encoding="utf-8")
+        validated = subprocess.run(command + ["--show-test", "--selection", str(frozen_path)], capture_output=True, encoding="utf-8")
         self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
         self.assertIn("test_sharpe", json.loads(validated.stdout)["data"]["rows"][0])
         logged = [json.loads(line) for line in (self.root / "views.jsonl").read_text(
             encoding="utf-8").splitlines()]
         self.assertEqual([(item["tool"], item["view"], item["alpha_ids"]) for item in logged],
                          [("triage", "test", ["C1"])])
+        self.assertEqual(logged[0]["note"]["selection_id"], json.loads(validated.stdout)["data"]["selection_id"])
+
+    def test_validation_requires_selection_and_rejects_input_scope_conflicts(self):
+        with self.assertRaisesRegex(ValueError, "requires --selection"):
+            self.score(show_test=True)
+        frozen = self.root / "selection.json"
+        self.score(freeze_path=frozen, min_delta=0.07, retention_floor=0.4)
+        for kwargs in ({"ids": ["extra"]}, {"registry_path": str(self.root / "other.jsonl")},
+                       {"pnl_dir": str(self.root / "other-pnl")}, {"train_end": "2025-01-01"},
+                       {"min_delta": 0.02}, {"retention_floor": 0.2},
+                       {"criteria": {"delta_full_credit": 9}}, {"cost_bps": [99]},
+                       {"whole_book": True}):
+            with self.subTest(kwargs=kwargs), self.assertRaisesRegex(ValueError, "conflict"):
+                triage.triage(show_test=True, selection_path=frozen, **kwargs)
+        validated = triage.triage(show_test=True, selection_path=frozen)
+        self.assertEqual(validated["criteria"]["min_delta"], 0.07)
+        self.assertEqual(validated["criteria"]["retention_floor"], 0.4)
+
+    def test_reversed_validation_ranking_keeps_frozen_rows_and_reports_missing(self):
+        rng = random.Random(91)
+        second = {day: rng.gauss(-0.5 if day in self.train_days else 20, 1)
+                  for day in self.train_days + self.test_days}
+        (self.pnl / "C2.json").write_text(json.dumps(second), encoding="utf-8")
+        self.rows.append({"alpha_id": "C2", "status": "COMPLETE",
+                          "metrics": {"fitness": 99},
+                          "out_of_sample": {"train": {"fitness": -1},
+                                            "test": {"startDate": "2021-01-01"}}})
+        self.save_registry()
+        frozen = self.root / "selection.json"
+        selected = triage.triage(["C2", "C1"], registry_path=str(self.registry),
+                                 pnl_dir=str(self.pnl), freeze_path=frozen)
+        expected = [row["alpha_id"] for row in selected["rows"]]
+        self.assertEqual(expected, ["C1", "C2"])
+        path = self.pnl / "C1.json"
+        values = json.loads(path.read_text(encoding="utf-8"))
+        values.update({day: -20 + rng.gauss(0, 1) for day in self.test_days})
+        path.write_text(json.dumps(values), encoding="utf-8")
+        self.rows.append({"alpha_id": "extra", "metrics": {"fitness": 10000}})
+        self.rows.reverse()
+        self.save_registry()
+        validated = triage.triage(["C2", "C1"], selection_path=frozen, show_test=True)
+        self.assertEqual([row["alpha_id"] for row in validated["rows"]], expected)
+        self.assertLess(validated["rows"][0]["delta"], validated["rows"][1]["delta"])
+        self.assertEqual(validated["criteria"], selected["criteria"])
+        self.assertEqual(validated["frozen_window"], selected["window"])
+        self.rows = [row for row in self.rows if row["alpha_id"] != "C1"]
+        self.save_registry()
+        missing = triage.triage(selection_path=frozen, show_test=True)["rows"][0]
+        self.assertTrue(missing["missing"])
+        self.assertNotIn("sharpe", missing)
+        self.assertNotIn("delta", missing)
+        self.assertEqual(self.view_log.call_args.kwargs["note"]["selection_id"], selected["selection_id"])
+
+    def test_equal_count_book_replacement_and_settings_change_remain_visible(self):
+        frozen = self.root / "selection.json"
+        selected = self.score(freeze_path=frozen)
+        self.rows[0]["alpha_id"] = self.rows[0]["key"] = "B3"
+        (self.pnl / "B3.json").write_bytes((self.pnl / "B1.json").read_bytes())
+        self.rows[-1]["settings"] = {"universe": "CHANGED"}
+        self.save_registry()
+        validated = self.score(show_test=True, selection_path=frozen)
+        self.assertEqual(validated["book_members"], selected["book_members"])
+        self.assertTrue(validated["book_changed"])
+        self.assertNotEqual(validated["book_state"]["local"]["member_digest"],
+                            validated["frozen_book_state"]["local"]["member_digest"])
+        change = validated["rows"][0]["source_changes"]["source_settings"]
+        self.assertEqual(change, {"frozen": {}, "current": {"universe": "CHANGED"}})
+
+    def test_costs_are_period_scoped_and_do_not_filter_training_rows(self):
+        candidate = self.rows[-1]
+        candidate["metrics"]["margin"] = 0.02
+        candidate["out_of_sample"]["test"]["margin"] = -0.01
+        self.save_registry()
+        frozen = self.root / "selection.json"
+        selected = self.score(freeze_path=frozen, cost_bps=[999])
+        self.assertIsNone(selected["rows"][0]["costs"]["margin_bps"])
+        validated = self.score(show_test=True, selection_path=frozen)["rows"][0]
+        self.assertEqual(validated["costs"]["margin_bps"], 200)
+        self.assertIsNone(validated["costs_by_period"]["train"]["margin_bps"])
+        self.assertEqual(validated["costs_by_period"]["test"]["margin_bps"], -100)
+
+    def test_zero_contribution_sorts_before_negative_and_unknown(self):
+        from unittest.mock import patch
+        self.rows.extend({"alpha_id": alpha_id} for alpha_id in ("C2", "C3"))
+        self.save_registry()
+        with patch("research_app.triage._score", side_effect=lambda alpha_id, *_:
+                   {"alpha_id": alpha_id, "delta": {"C1": 0, "C2": -0.1, "C3": None}[alpha_id]}):
+            result = triage.triage(["C2", "C3", "C1"], registry_path=str(self.registry), pnl_dir=str(self.pnl))
+        self.assertEqual([row["alpha_id"] for row in result["rows"]], ["C1", "C2", "C3"])
+
+    def test_platform_thresholds_are_preserved_without_local_pass_inference(self):
+        self.rows[-1]["checks"] = {
+            "SELF_CORRELATION": {"result": "FAIL", "value": 0.8, "limit": 0.7},
+            "MATCHES_COMPETITION": {"result": "PASS"},
+        }
+        self.rows[-1]["failing_checks"] = []
+        self.save_registry()
+        frozen = self.root / "selection.json"
+        self.score(freeze_path=frozen)
+        row = self.score(show_test=True, selection_path=frozen)["rows"][0]
+        self.assertEqual(row["verdict"], "blocked")
+        self.assertEqual(row["platform_checks"]["SELF_CORRELATION"]["limit"], 0.7)
+        self.assertFalse(row["correlation_policy"]["platform_pass_inferred"])
+        self.assertEqual(row["correlation_policy"]["local_duplicate_threshold"], 0.9)

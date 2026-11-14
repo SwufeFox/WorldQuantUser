@@ -302,6 +302,11 @@ Concurrent feeds reread seen state under a lock after retrieval. Drafts commit b
 each file is atomic, but a crash between commits can repeat drafts, and a crash after seen
 commits can consume picks before delivery. Dry-run leaves seen/drafts alone; caches may write.
 
+`feed` evaluates data requirements only against a fresh, complete catalog snapshot
+for the selected account, region, universe, delay and instrument type. Keyword-derived
+needs remain inferred reading leads. Explicit field requirements can be available,
+missing from a verified scope, or unknown; none of those states establishes a signal's validity.
+
 
 ### Check the account
 
@@ -393,8 +398,9 @@ than sleeping past the four-hour session-cache lifetime. Accepted jobs and
 unsubmitted expressions are atomically saved in a mode-0600 checkpoint under
 `.brain_checkpoints/` (or the path passed to `--checkpoint`); continue later
 with `python research_cli.py resume <checkpoint>`. Resume polls accepted jobs
-before submitting any queued work, so it does not duplicate already accepted
-simulations. `--max-wait-seconds` adjusts the budget for either command.
+before submitting queued work. Each POST first saves its intent; a transport failure
+without a job identity remains `UNKNOWN_SUBMISSION` and is never silently reposted.
+`--max-wait-seconds` adjusts the budget for either command.
 
 A failed expression is reported in its own record instead of aborting the run;
 the command only fails outright when *every* expression failed.
@@ -418,27 +424,31 @@ explicit arm decay. A scan declares `"design": "explore"` at the spec's top leve
 
 ```bash
 python research_cli.py probe sample-batch.spec.json --dry-run
-python research_cli.py probe sample-batch.spec.json
+python research_cli.py probe sample-batch.spec.json --check
+python research_cli.py probe sample-batch.spec.json --batch-path sample-batch.json --save sample-response.json
 ```
 
 `probe --dry-run` is a fully offline preview: it loads no session or credentials,
 contacts no catalog, and spends no simulation quota. It validates every settings
 group, resolves defaults and per-arm decay, and returns the complete settings and
 exact `POST /simulations` payload for each labelled arm in `results`. Structural
-lint and the learned denylist run locally; `blocking` lists their errors. The
-`lint` report explicitly marks the live operator and field catalogs as unchecked.
-Use `lint` when you need authoritative catalog checks.
+lint and the learned denylist run locally; `blocking` lists their errors. Matching
+private catalog snapshots can supply scoped field evidence, but live metadata remains
+unchecked. `probe SPEC --check` authenticates and verifies the exact same resolved
+requests without submitting a simulation. Missing, stale or incomplete required
+catalogs block execution unless explicitly overridden with `--allow-lint-errors`;
+an override preserves the errors and cannot make `preflight_complete` true.
 
 A real probe validates every group locally before loading a session or submitting
 anything, then runs the existing catalog guard for each simulation group. Arms
 with equivalent resolved settings and decay share a group. Results and ledger
 entries retain each arm's actual settings and decay. The table and `rows` show
-train-period metrics by default; `--show-test` also reveals the full-window and
-test metrics, failing checks, and records that view. `comparisons` reports each
-arm minus its control on train metrics, with missing evidence listed under
-`unavailable`; explore batches report no attribution. Spec `idea`, `mechanism`
+train-period metrics by default. Validation requires an existing frozen selection:
+`probe --recover sample-batch.json --show-test --selection choice.json`.
+`comparisons` reports arm-minus-control train deltas, with missing evidence listed
+under `unavailable`; explore batches report no attribution. Spec `idea`, `mechanism`
 and `note` travel with the preview, batch file and summary. Existing batch files
-are protected before simulation; choose another `--name` or pass `--force`.
+are protected before simulation; choose another path/name or pass `--force`.
 
 `--strict-gate` refuses only an arm whose canonical expression and complete
 effective settings already have a finished result in the registry. A dry run
@@ -450,14 +460,50 @@ override the spec and each arm's settings; an arm's top-level `decay` remains it
 per-expression override. One real batch shares a session across all groups.
 Use `probe - --dry-run` to read a spec from stdin.
 
-Probe batches are saved before submitting and after each progress/result event, including
-accepted progress URLs. `--max-wait-seconds` bounds simulation waiting across groups
-(default 300); unfinished jobs stop later settings groups from submitting. Use
-`probe --recover sample-batch.json` to read known IDs/progress URLs without resubmitting, and
-`resume CHECKPOINT` for simulation checkpoints. Recovery persists each result and reports
-`not_submitted` arms separately. Same-batch writers and same-checkpoint resumes are locked;
-Windows and POSIX release ownership when the process exits. A complete batch recovers offline.
+The receipt includes the durable `path`, `run_id`, `started_at`, `request_fingerprint`,
+original `arm_order`, per-arm submission states, `execution`, `recording` and
+`next_actions`. `--batch-path` selects the canonical batch; `--save` only saves the
+response envelope. Keep those files distinct and keep both under `research_dir`.
+`--save` cannot overwrite the batch, checkpoint, recovery input or frozen selection.
+Conflicts fail before execution; even the error envelope is kept off the protected file.
 
+Probe batches save each arm's intent before POST and its accepted job identity before
+waiting. `--max-wait-seconds` bounds simulation waiting across groups (default 300).
+Use `probe --recover sample-batch.json` for platform reads and idempotent local recording;
+it accepts the canonical batch or a saved response. Use `probe --resume sample-batch.json
+--dry-run` to preview continuation offline, then omit `--dry-run` to explicitly continue
+known queued/accepted work. Ambiguous submissions are not reposted. Interrupted
+`simulate` jobs use `resume CHECKPOINT`. Same-batch writers and resumes are locked.
+
+Execution failures and missing evidence remain deferred, separate from scientific
+verdicts. Legacy batches with an unknown recording policy do not silently opt into
+recording. Recovery preserves labels, settings, existing metrics and ACTIVE membership.
+Train-half Sharpe stays unknown without both the train boundary and complete PnL evidence.
+
+
+### Freeze a training choice, then validate it
+
+The example files below belong in `research_dir`; use absolute paths or run from there.
+
+```bash
+python research_cli.py compare sample-batch.json --min-fitness 1 --cost-bps 5 10 20 --freeze choice.json --summary
+python research_cli.py compare --frozen --selection choice.json --summary
+python research_cli.py triage --batch sample-batch.json --freeze triage-choice.json
+python research_cli.py triage --show-test --selection triage-choice.json
+```
+
+A freeze is an immutable manifest of ordered candidate identities, training evidence,
+criteria and source inputs, with a stable content hash. Validation reuses the saved
+set and order even when test rankings reverse. Extra candidates are ignored; missing
+candidates remain explicit, without backfilling old/full-window metrics. Conflicting
+filters, sorting, inputs or cost scenarios are refused. Validation logs its selection ID.
+`--summary` bounds displayed comparison rows without changing the saved choice or counts.
+
+Cost evidence retains the metric period and units. Raw margin is dollars of profit per
+dollar traded; `margin_bps = margin * 10000`. `--cost-bps` gives one-way scenarios per
+dollar traded (default 5, 10, 20), so `net_margin_bps = margin_bps - cost_bps`. Aggregate
+turnover does not identify a daily trading path: daily costs and net Sharpe remain unknown.
+Missing train margin is never replaced by full-window margin.
 
 ### Inspect results
 
@@ -626,8 +672,22 @@ reports the correlation that would decide the submission, and only writes with
 
 ```bash
 python research_cli.py alpha submit ALPHA_ID          # dry-run, nothing written
-python research_cli.py alpha submit ALPHA_ID --yes    # irreversible
+python research_cli.py alpha submit ALPHA_ID --yes --selection choice.json
 ```
+
+A new real submission requires membership in a saved compare/triage training choice.
+Confirmed submissions always reconcile the ledger, shelf and PnL cache and invalidate
+the old platform book snapshot. `--record` is no longer a submission option. The result
+separates remote `submission` from local `reconciliation` and lists `repair_actions`.
+Rerunning the command for an already confirmed alpha repairs local evidence without
+another POST; unresolved durable intents permit only platform read-back.
+
+`ledger sync --pnl` captures the selected status/hidden/type scope with a timestamp,
+member digest and pagination completeness. It reports membership, metadata and PnL
+coverage separately. Reverse drift requires a complete listing and individual status
+reads. Local book members are ACTIVE/SUBMITTED; a local count alone never certifies a
+complete current platform book. Legacy PnL has unknown completeness until refreshed;
+new metadata binds complete coverage to the alpha ID and a hash of the cached series.
 
 An alpha also carries metadata, and a submission is unattributable without it. `name`,
 `category` and `tags` are top-level properties; `description` is writable too but **nested
@@ -658,7 +718,7 @@ A first `POST` may return before asynchronous evaluation finishes. A later check
 can still refuse the candidate. Always confirm with `dateSubmitted`, never with
 the initial status code alone.
 
-`alpha submit` therefore reports a four-state `submission` field instead of a boolean:
+`alpha submit` reports an explicit `submission` state instead of treating HTTP success as confirmation:
 
 | `submission` | meaning |
 | --- | --- |
@@ -666,6 +726,7 @@ the initial status code alone.
 | `ACCEPTED` | the platform took the request but `dateSubmitted` is still empty - re-check before counting it |
 | `REJECTED` | refused, with `failed_checks` naming what failed and its value |
 | `UNCERTAIN` | accepted, but the read-back failed; the outcome is unknown |
+| `INTENT` / `UNKNOWN` | a durable attempt lacks a confirmed outcome; read back, never implicitly POST again |
 | `NOT_SENT` | dry run, nothing was written |
 
 `submitted` is true only for `CONFIRMED`. An HTTP status below 400 alone does not
@@ -757,26 +818,14 @@ group_rank(close, bucket(rank(close)))          # ok: bucket returns GROUP
 densify(close)                                  # type_mismatch: densify wants GROUP
 ```
 
-This replaces a hand-built denylist of "operators that reject VECTOR fields", which had
-been assembled from simulator error messages and was necessarily incomplete. The rule is
-now derived: only `vec_avg` and `vec_sum` accept a VECTOR, so everything else is a type
-error by construction. The denylist survives only for operators the table does not cover,
-so the same problem is never reported twice.
-
-Two details worth knowing:
-
-* `bucket` returns a **GROUP**, not a number. That is why it can be passed to a group
-  operator and nowhere else, and it is the documented way to build a custom grouping.
-* operators that the course material or the formulae paper documents but this account's
-  catalogue lacks — `vec_choose`, `ts_max`, `ts_min`, `floor` — are reported as
-  `operator_documented_unavailable` with that reason, instead of a generic unknown-operator
-  error. `vec_choose` in particular appears in WorldQuant's own short-interest example and
-  cannot run here.
-
-Inference is deliberately pragmatic: a bare field resolves to its declared type, a call to
-its return type, a literal to scalar, and anything else to the first typed piece inside it
-or `UNKNOWN`. It stays silent rather than guessing, so a variable assigned earlier in the
-expression is not mistaken for a type error.
+Type checks follow the expression AST through assignments, calls and infix operations.
+Known operator signatures determine accepted types: reduce a confirmed VECTOR before
+applying a MATRIX operator, and never use a UNIVERSE value as a numeric signal.
+Unknown field types remain unknown and do not generate speculative reducer advice.
+`bucket` returns GROUP. Economic units, target periods and nested derived expressions
+have separate field-contract evidence; unverified economics produces warnings, not
+automatic formula rewrites. Current authenticated operator metadata determines availability;
+historical account restrictions are not hard-coded as universal operator errors.
 
 ### Lint before you spend a simulation
 
@@ -794,11 +843,12 @@ submitting and refuses to spend quota on an expression that cannot work; pass
 `--allow-lint-errors` to override. Exit code is `2` on a lint failure and the
 error envelope carries every finding under `error.details`.
 
-Online `lint` and simulation preflight derive field names, types and market/disclosure
-classification from one scoped field-catalog fetch per check. Both reject a raw
-VECTOR passed to `rank`; reduce it first, for example `rank(vec_avg(vector_field))`.
-`tools.guarded_sim` uses the same field enumerator. Offline lint skips live metadata
-and authentication.
+Online `lint` and simulation preflight derive names and types from one exact field scope.
+Both reject a raw VECTOR passed to `rank`; use `rank(vec_avg(vector_field))` when the
+catalog confirms VECTOR input. Complete captures save private account-bound snapshots.
+Offline lint uses only a matching fresh, complete snapshot and performs no authentication
+or network access; stale, partial, legacy or mismatched metadata stays unknown.
+`tools.guarded_sim` uses the same core field enumerator.
 
 Rejections the simulator reports are written back to
 `<research_dir>/operator-denylist.json` with a severity: `block` when the operator
@@ -885,8 +935,11 @@ carries two more attributes, kept deliberately separate:
 
 ```json
 "target_fiscal_period":         {"state": "unknown", "evidence": "none"},
-"historical_target_alignment":  {"state": "unverified", "lookback": 63}
+"historical_target_alignment":  {"state": "unverified", "lookback": null}
 ```
+
+Field metadata cannot supply an expression's lookback. Window evidence belongs to the
+actual operation being audited.
 
 The consequence is a verdict change: `ts_difference` over an analyst forecast field now
 returns `needs_review` with `target_fiscal_alignment_unverified`, where it used to return

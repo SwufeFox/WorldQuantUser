@@ -2,9 +2,9 @@
 
 After a probe the same questions came up every time, and each was answered by a throwaway
 script: does the platform accept it, how correlated is it with the book, and how much would
-the book actually move. Selection uses train metrics and train PnL. The frozen-design
-validation view adds test retention, full-window checks and the platform's internal bar;
-it is explicit because ranking on those would turn validation into another tuning round.
+the book actually move. Selection uses train metrics and train PnL. ``--freeze`` saves
+the ordered training choice; ``--show-test --selection`` adds validation evidence
+in exactly that order, with the saved criteria and explicit source/book drift.
 
 This module is the consolidation: **one scorer**, applied to a candidate, a batch file, or
 the whole book, with the internal benchmark available as a flag rather than a religion.
@@ -14,7 +14,7 @@ The two numbers that matter and are easy to confuse:
 * ``delta`` - the book's Sharpe after adding this alpha equal-weight, minus the book now.
   Not the slope ``S_a - rho*S_B``, which on a sixty-member book is a different magnitude.
 * ``retention`` - test Sharpe over train Sharpe, available only with ``show_test``
-  after the design is frozen. The default view uses training observations only.
+  and a persisted training selection. Cost scenarios remain period-specific evidence.
 """
 
 import json
@@ -23,7 +23,7 @@ import os
 import alpha_registry
 import research_paths
 
-from . import benchmark, legs, mechanisms
+from . import benchmark, costs, legs, mechanisms, selection
 from .runtime import CliError
 
 
@@ -42,7 +42,12 @@ def _book_series(latest, directory):
 
 
 def _failing(entry):
-    return sorted(entry.get("failing_checks") or [])
+    failures = set(entry.get("failing_checks") or [])
+    for name, body in (entry.get("checks") or {}).items():
+        result = body.get("result") if isinstance(body, dict) else body
+        if result in ("FAIL", "ERROR"):
+            failures.add(name)
+    return sorted(failures)
 
 
 def _sub_universe(entry):
@@ -72,10 +77,10 @@ def _unresolved(entry):
     """
     checks = entry.get("checks") or {}
     names = []
-    for name in ("SELF_CORRELATION", "MATCHES_COMPETITION"):
+    for name in sorted(set(checks) | {"SELF_CORRELATION", "MATCHES_COMPETITION"}):
         body = checks.get(name)
         result = (body or {}).get("result") if isinstance(body, dict) else body
-        if result in (None, "PENDING"):
+        if result not in ("PASS", "FAIL"):
             names.append(name)
     return names
 
@@ -137,6 +142,12 @@ def _score(alpha_id, entry, series, dates, criteria):
         "delta": None,
         "ops": (entry.get("expression") or "").count("("),
     }
+    row["costs"] = costs.evidence(metrics, row["metrics_scope"], criteria.get("cost_bps"))
+    row["source_settings"] = entry.get("settings") or {}
+    row["source_expression"] = entry.get("expression")
+    row["correlation_policy"] = {"local_duplicate_threshold": 0.9,
+                                 "basis": "local_cached_pnl_heuristic",
+                                 "platform_pass_inferred": False}
     if show_test:
         test = (split.get("test") or {}).get("sharpe")
         retention = None if not train or test is None else round(test / train, 2)
@@ -144,6 +155,11 @@ def _score(alpha_id, entry, series, dates, criteria):
                     "retention_percentile": _percentile(criteria.get("cohort") or [], retention),
                     "failing": _failing(entry), "unresolved": _unresolved(entry),
                     "sub_universe": _sub_universe(entry)})
+        row["costs_by_period"] = {
+            "train": costs.evidence(train_metrics, "train", criteria.get("cost_bps")),
+            "test": costs.evidence(split.get("test") or {}, "test", criteria.get("cost_bps")),
+        }
+        row["platform_checks"] = entry.get("checks") or {}
 
     in_book = alpha_id in series
     candidate = legs.load_pnl(alpha_id, directory)
@@ -154,9 +170,8 @@ def _score(alpha_id, entry, series, dates, criteria):
             book_slice = [sum(values[day] for values in series.values()) for day in common]
             values = [candidate[day] for day in common]
             rho = legs.correlation(values, book_slice)
-            # The platform gate uses the worst single-member correlation. A candidate
-            # can duplicate one member while appearing independent of the portfolio
-            # aggregate, so both numbers are needed.
+            # Local cached-PnL correlations are heuristic evidence. Platform
+            # check values and thresholds are displayed separately when available.
             member_rhos = []
             for member, member_values in series.items():
                 other = legs.correlation(values, [member_values[day] for day in common])
@@ -166,10 +181,8 @@ def _score(alpha_id, entry, series, dates, criteria):
             now = legs.sharpe_of(book_slice)
             if member_rhos:
                 worst = max(member_rhos, key=lambda item: abs(item[0]))
-                # The platform counts a duplicate whichever way it is signed, so the
-                # headline number is the magnitude. A member at -0.75 is a stronger
-                # relationship than one at +0.60, and reporting the signed value let a
-                # -0.75 row read as "safe" in a `max_member_rho < 0.8` screen.
+                # Magnitude reports strong relationships in either direction;
+                # it does not establish the platform's correlation verdict.
                 row["max_member_rho"] = round(abs(worst[0]), 3)
                 row["max_member_rho_signed"] = round(worst[0], 3)
                 row["max_member"] = worst[1]
@@ -225,8 +238,8 @@ def _verdict(row, criteria):
     if row.get("failing"):
         return "blocked", "fails %s" % ", ".join(row["failing"])
     if (row.get("max_member_rho") or 0) > 0.9:
-        return ("duplicate", "%.2f correlated with %s - the platform gate is per member, "
-                "not per book" % (row["max_member_rho"], row.get("max_member")))
+        return ("duplicate", "%.2f correlated with %s; exceeds local 0.90 duplicate "
+                "heuristic, not a platform check" % (row["max_member_rho"], row.get("max_member")))
     if row["delta"] is None:
         return "unknown", "insufficient overlapping PnL in this view (%d days; need 120)" % row["overlap_days"]
     # Disqualifying facts come before "not measured yet": an alpha that already lowers
@@ -243,36 +256,68 @@ def _verdict(row, criteria):
         return "weak", "adds %.3f, under the %.2f bar" % (row["delta"], criteria["min_delta"])
     if not criteria["show_test"]:
         return "validate", "train contribution clears the bar; platform and test checks not inspected"
-    return "shelve", "passes checks and moves the book +%.3f" % row["delta"]
+    return "shelve", "recorded checks resolved and moves the book +%.3f; recheck platform eligibility before submission" % row["delta"]
 
 
-def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=0.02,
-           retention_floor=0.2, internal=False, whole_book=False, criteria=None,
-           show_test=False, train_end=None):
-    """Select on train; expose full-window validation only when explicitly requested."""
+def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
+           retention_floor=None, internal=False, whole_book=False, criteria=None,
+           show_test=False, train_end=None, freeze_path=None, selection_path=None,
+           cost_bps=None):
+    """Freeze training decisions and join validation evidence without reranking."""
     from datetime import date
+    from .book_state import describe_book
 
+    if show_test and not selection_path:
+        raise ValueError("--show-test requires --selection from a training freeze")
+    if freeze_path and (show_test or selection_path):
+        raise ValueError("--freeze is only available for a new train selection")
+    if selection_path and not show_test:
+        raise ValueError("--selection requires --show-test")
     if internal and not show_test:
         raise ValueError("--internal uses test-calibrated factors; freeze the design and pass --show-test")
+    manifest = selection.load(selection_path, source="triage") if selection_path else None
     if train_end is not None:
         try:
             if date.fromisoformat(train_end).isoformat() != train_end:
                 raise ValueError
         except (ValueError, TypeError):
             raise ValueError("--train-end must be an ISO date (YYYY-MM-DD)") from None
-    if show_test and train_end is not None:
-        raise ValueError("--train-end applies to the train view; omit --show-test")
+    if manifest:
+        frozen_ids = [row["alpha_id"] for row in manifest["rows"]]
+        if ids and set(ids) != set(frozen_ids):
+            raise ValueError("candidate IDs conflict with the frozen selection")
+        inputs = manifest["inputs"]
+        for key, provided in (("registry_path", registry_path), ("pnl_dir", pnl_dir)):
+            if provided is not None and os.path.abspath(os.path.expanduser(os.fspath(provided))) != inputs.get(key):
+                raise ValueError("%s conflicts with the frozen selection" % key)
+        if whole_book and not inputs.get("whole_book"):
+            raise ValueError("--book conflicts with the frozen selection")
+        if train_end is not None and train_end != manifest["window"].get("end"):
+            raise ValueError("train end conflicts with the frozen selection")
+        registry_path, pnl_dir = inputs.get("registry_path"), inputs.get("pnl_dir")
+        whole_book = inputs.get("whole_book", False)
+        saved = manifest["criteria"]
+        for key, value in (("min_delta", min_delta), ("retention_floor", retention_floor)):
+            if value is not None and value != saved.get(key):
+                raise ValueError("%s conflicts with frozen criteria" % key)
+        if criteria:
+            requested = benchmark.refine_criteria(criteria) if isinstance(criteria, str) else criteria
+            if any(saved.get(key) != value for key, value in requested.items()):
+                raise ValueError("criteria conflict with the frozen selection")
+        if cost_bps is not None and list(cost_bps) != saved.get("cost_bps"):
+            raise ValueError("cost scenarios conflict with the frozen selection")
     latest = {}
     for entry in alpha_registry.load_entries(registry_path):
         key = entry.get("alpha_id") or entry.get("key")
         if key:
             latest[key] = entry
-
-    directory = pnl_dir or os.path.join(research_paths.ensure_dir(), "pnl")
+    directory = os.path.abspath(os.path.expanduser(os.fspath(
+        pnl_dir or os.path.join(research_paths.ensure_dir(), "pnl"))))
     series, dates = _book_series(latest, directory)
-    if not dates:
+    if not dates and not show_test:
         raise ValueError("no cached book PnL; the book cannot be scored")
-    targets = sorted(series) if whole_book else list(dict.fromkeys(ids or []))
+    book_state = describe_book(latest, series=series, registry_path=registry_path, pnl_dir=directory)
+    targets = frozen_ids if manifest else (sorted(series) if whole_book else list(dict.fromkeys(ids or [])))
     window = {"mode": "full" if show_test else "train", "end": None, "source": None}
     if not show_test:
         boundaries = []
@@ -289,55 +334,76 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=0.02,
         if train_end is not None:
             cutoff = min(cutoff, train_end) if boundaries else train_end
             source = "explicit_and_recorded" if boundaries else "explicit"
-        window.update({"end": cutoff, "source": source})
+        window.update({"end": cutoff, "source": source, "end_exclusive": True})
         dates = [day for day in dates if day < cutoff]
         if not dates:
             raise ValueError("no cached book PnL before train end %s" % cutoff)
-    book_sharpe = legs.sharpe_of([sum(values[day] for values in series.values())
-                                  for day in dates])
-    if book_sharpe is None:
+    window.update({"observed_start": dates[0] if dates else None,
+                   "observed_end": dates[-1] if dates else None, "days": len(dates)})
+    book_sharpe = legs.sharpe_of([sum(values[day] for values in series.values()) for day in dates])
+    if book_sharpe is None and not show_test:
         raise ValueError("the book's own Sharpe is not measurable on the cached days")
-
-    settings = {"pnl_dir": directory, "min_delta": min_delta,
-                "retention_floor": retention_floor, "internal": internal,
-                "show_test": bool(show_test),
-                "cohort": _cohort_retentions(latest) if show_test else []}
-    settings.update(benchmark.DEFAULTS)
-    # The weights and the block table live in a file so the internal bar can be changed
-    # without a code edit; without this the file was silently ignored on this path.
-    default_criteria = os.path.join(research_paths.ensure_dir(), "benchmark-criteria.json")
-    settings.update(benchmark.refine_criteria(default_criteria))
-    if criteria:
-        settings.update(benchmark.refine_criteria(criteria)
-                        if isinstance(criteria, str) else criteria)
-    # A criteria dictionary cannot opt a caller into looking at test evidence.
-    settings["show_test"] = bool(show_test)
-    settings["internal"] = bool(internal)
-
+    if manifest:
+        decision_criteria = dict(manifest["criteria"])
+    else:
+        default_criteria = os.path.join(research_paths.ensure_dir(), "benchmark-criteria.json")
+        decision_criteria = benchmark.refine_criteria(default_criteria)
+        if criteria:
+            decision_criteria.update(benchmark.refine_criteria(criteria)
+                                     if isinstance(criteria, str) else criteria)
+        for key in ("show_test", "internal", "cohort", "pnl_dir"):
+            decision_criteria.pop(key, None)
+        decision_criteria.update({"min_delta": 0.02 if min_delta is None else min_delta,
+                                  "retention_floor": 0.2 if retention_floor is None else retention_floor,
+                                  "cost_bps": list(costs.DEFAULT_COST_BPS if cost_bps is None else cost_bps)})
+    costs.evidence({}, "train", decision_criteria["cost_bps"])
+    settings = {**decision_criteria, "pnl_dir": directory, "internal": bool(internal),
+                "show_test": bool(show_test), "cohort": _cohort_retentions(latest) if show_test else []}
     rows = []
     for alpha_id in targets:
         entry = latest.get(alpha_id)
         if entry is None:
-            rows.append({"alpha_id": alpha_id, "verdict": "unknown",
-                         "why": "not in the ledger"})
+            if not manifest:
+                rows.append({"alpha_id": alpha_id, "verdict": "unknown", "missing": True,
+                             "why": "not in the ledger", "costs": costs.evidence({}, "train", settings["cost_bps"])})
             continue
         rows.append(_score(alpha_id, entry, series, dates, settings))
-
-    rows.sort(key=lambda item: -(item.get("delta") or -9))
-    return {
-        "book_sharpe": round(book_sharpe, 3),
-        "book_members": len(series),
-        "mode": "book" if whole_book else "candidates",
-        "internal": bool(internal),
-        "window": window,
-        "criteria": {"min_delta": min_delta,
-                     **({"retention_floor": retention_floor} if show_test else {})},
+    if manifest:
+        rows = selection.ordered_rows(manifest, rows)
+        for row, frozen in zip(rows, manifest["rows"]):
+            row["source_changes"] = {
+                key: {"frozen": frozen.get(key), "current": row.get(key)}
+                for key in ("source_settings", "source_expression")
+                if not row.get("missing") and frozen.get(key) != row.get(key)}
+    else:
+        rows.sort(key=lambda item: (item.get("delta") is None,
+                                   -(item["delta"] if item.get("delta") is not None else 0)))
+    result = {
+        "book_sharpe": _round(book_sharpe), "book_members": len(series),
+        "book_state": book_state, "mode": "book" if whole_book else "candidates",
+        "internal": bool(internal), "window": window, "criteria": decision_criteria,
         "rows": rows,
-        "note": ("Validation view: full-window PnL, platform checks and test retention; "
-                 "use after freezing the design." if show_test else
-                 "Selection view: train metrics and PnL only. Missing train metrics stay "
-                 "unknown. A validate verdict calls for platform/test checks after design freeze."),
+        "note": ("Validation evidence in immutable training order; missing candidates remain missing."
+                 if show_test else "Selection view: train metrics and PnL only. Missing train metrics stay unknown."),
     }
+    if freeze_path:
+        manifest = selection.freeze(freeze_path, source="triage", rows=rows,
+                                    criteria=decision_criteria, window=window,
+                                    inputs={"registry_path": os.path.abspath(os.path.expanduser(os.fspath(
+                                                registry_path or alpha_registry.default_registry_path()))),
+                                            "pnl_dir": directory, "whole_book": bool(whole_book),
+                                            "book_state": book_state})
+    if manifest:
+        result["selection_id"] = manifest["selection_id"]
+        result["selection_path"] = os.path.abspath(os.fspath(selection_path or freeze_path))
+        result["frozen_window"] = manifest["window"]
+        result["frozen_book_state"] = manifest["inputs"].get("book_state")
+        result["book_changed"] = book_state != result["frozen_book_state"]
+    if show_test:
+        research_paths.log_view("triage", "test", [row["alpha_id"] for row in rows],
+                                note={"selection_id": manifest["selection_id"],
+                                      "selection_path": result["selection_path"]})
+    return result
 
 
 def cmd_triage(args, _sink):
@@ -360,14 +426,15 @@ def _cmd_triage(args):
         ids.extend(row.get("alpha_id") for row in document.get("rows") or []
                    if row.get("alpha_id"))
     ids = [alpha_id for alpha_id in dict.fromkeys(ids) if alpha_id and alpha_id != "None"]
-    if not ids and not getattr(args, "book", False):
-        raise ValueError("nothing to triage: pass a batch file, ids, or --book")
+    if not ids and not getattr(args, "book", False) and not getattr(args, "selection", None):
+        raise ValueError("nothing to triage: pass a batch file, ids, --book, or --selection")
     show_test = bool(getattr(args, "show_test", False))
     result = triage(ids, getattr(args, "registry", None),
-                    min_delta=args.min_delta, retention_floor=args.retention_floor,
+                    min_delta=getattr(args, "min_delta", None), retention_floor=getattr(args, "retention_floor", None),
                     internal=getattr(args, "internal", False),
                     whole_book=getattr(args, "book", False), show_test=show_test,
-                    train_end=getattr(args, "train_end", None))
-    if show_test:
-        research_paths.log_view("triage", "test", [row["alpha_id"] for row in result["rows"]])
+                    train_end=getattr(args, "train_end", None),
+                    freeze_path=getattr(args, "freeze", None),
+                    selection_path=getattr(args, "selection", None),
+                    cost_bps=getattr(args, "cost_bps", None))
     return result

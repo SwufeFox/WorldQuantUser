@@ -48,6 +48,7 @@ ERROR_CODES = {
 
 METRIC_KEYS = ("sharpe", "fitness", "turnover", "returns", "drawdown", "margin",
                "longCount", "shortCount", "pnl")
+_PROTECTED_OUTPUT_ARGS = ("freeze", "selection", "batch_path", "checkpoint", "resume", "recover")
 
 
 class CliError(Exception):
@@ -65,6 +66,24 @@ class CliError(Exception):
     @property
     def exit_code(self):
         return EXIT_CODES.get(self.code, 2)
+
+
+class OutputConflict(CliError):
+    """The error document must not be saved over the protected state either."""
+
+
+def protect_output(args, *paths):
+    target = getattr(args, "save", None)
+    if not target or target == "-":
+        return
+    destination = Path(target).expanduser().resolve()
+    protected = (*paths, *(getattr(args, name, None) for name in _PROTECTED_OUTPUT_ARGS))
+    for path in protected:
+        if path and destination == Path(path).expanduser().resolve():
+            raise OutputConflict(
+                "INVALID_INPUT", "--save would overwrite durable research state",
+                "choose a response path distinct from the batch, checkpoint and frozen selection",
+                details={"protected_path": str(destination)})
 
 
 def _error_body(exc):

@@ -5,12 +5,14 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
+import hashlib
 import math
 from pathlib import Path
 
 import requests
 
 import alpha_registry
+import cache_store
 import correlation
 import machine_lib as ml
 import research_paths
@@ -234,85 +236,257 @@ def cmd_alpha_check(args, _sink):
 
 
 def cmd_alpha_submit(args, _sink):
-    """Submit an alpha, or show exactly what would be sent.
+    """Precheck, or submit and independently reconcile each local side effect."""
+    if getattr(args, "max_wait", None) is not None and args.max_wait < 0:
+        raise CliError("USAGE", "--max-wait must be non-negative")
+    return with_session(args, lambda session: submit_workflow(session, args))
 
-    Irreversible, so ``--yes`` is required; otherwise this behaves like the
-    platform's "test submission", which is simply the check flow.
-    """
-    if args.max_wait is not None and args.max_wait < 0:
-        raise CliError("USAGE", "--max-wait must be non-negative",
-                       "pass a number of seconds, or omit the flag for the default")
 
-    def work(session):
-        # A submission carries metadata with it: the platform accepts a name, a
-        # category and tags, and an alpha filed without them is unattributable later.
-        # Checked before the submit call so a missing label cannot cost a submission.
-        current = ml.fetch_alpha_metrics(session, args.alpha_id)
-        missing = [field for field in ("name", "category") if not current.get(field)]
-        if missing:
-            raise CliError(
-                "INVALID_INPUT",
-                "%s has no %s" % (args.alpha_id, ", ".join(missing)),
-                "set them first: alpha describe %s --name ... --category ..."
-                % args.alpha_id)
-        result = ml.submit_alpha(session, args.alpha_id, confirm=args.yes,
-                                 max_wait_seconds=args.max_wait)
-        if args.record and result.get("submitted"):
-            # Read the alpha back rather than trusting the submit response: the
-            # endpoint answers 201 before the checks finish, and the ledger wants what
-            # the platform ended up with.
-            result["recorded"] = _record_submitted_alpha(session, args.alpha_id)
+def _selection_id(args, required=False):
+    path = getattr(args, "selection", None)
+    if not path:
+        if required:
+            raise CliError("INVALID_INPUT", "a new submission requires --selection",
+                           "freeze a training selection containing this alpha first")
+        return None
+    from . import selection
+    try:
+        manifest = selection.load(path)
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc), "use a valid frozen training selection") from exc
+    if not any(row.get("alpha_id") == args.alpha_id for row in manifest.get("rows", [])):
+        raise CliError("INVALID_INPUT", "alpha is absent from the frozen selection",
+                       "submit a candidate included in the training selection")
+    return manifest["selection_id"]
+
+
+def _submission_path(alpha_id):
+    identity = hashlib.sha256(alpha_id.encode("utf-8")).hexdigest()
+    return Path(research_paths.resolve("submissions", identity + ".json"))
+
+
+def _confirmed(current):
+    return (str(current.get("status") or "").upper() in {"ACTIVE", "SUBMITTED"}
+            or bool(current.get("dateSubmitted")))
+
+
+def _platform_entry(current, alpha_id, existing=None, selection_id=None, source="submit"):
+    """Refresh platform facts while preserving research labels and provenance."""
+    existing = existing or {}
+    code, _description, _count = ml.regular_expression(current)
+    checks = ml._extract_checks(current)
+    extra = dict(existing.get("extra") or {})
+    extra.update({"dateSubmitted": current.get("dateSubmitted") or extra.get("dateSubmitted"),
+                  "platform_status": current.get("status"),
+                  "platform_hidden": current.get("hidden"),
+                  "platform_type": current.get("type")})
+    if selection_id:
+        extra["selection_id"] = selection_id
+    facts = {"alpha_id": alpha_id, "expression": code,
+             "settings": current.get("settings") or {},
+             "metrics": current.get("is") or {}, "checks": checks,
+             "status": current.get("status"),
+             "out_of_sample": ml.extract_split(current) or {}}
+    entry = alpha_registry.build_entry(
+        facts, verdict=alpha_registry.auto_verdict(facts), source=source,
+        idea=existing.get("idea"), mechanism=existing.get("mechanism"),
+        family=existing.get("family"), batch=existing.get("batch"),
+        note=existing.get("note"), extra=extra)
+    return {**existing, **entry}
+
+
+def _reconcile_submission(session, args, current, selection_id):
+    from . import book_state, buffer_cmd
+    registry = str(getattr(args, "registry", None) or alpha_registry.default_registry_path())
+    report = {}
+    try:
+        entries = alpha_registry.load_entries(registry)
+        existing = next((row for row in entries if row.get("alpha_id") == args.alpha_id), None)
+        entry = _platform_entry(current, args.alpha_id, existing, selection_id)
+        stored, written = alpha_registry.record_entry(entry, registry)
+        report["ledger"] = {"complete": True, "written": written,
+                            "key": stored.get("key"), "status": stored.get("status"),
+                            "date_submitted": current.get("dateSubmitted")}
+    except Exception as exc:
+        report["ledger"] = {"complete": False, "error": str(exc)}
+    try:
+        report["shelf"] = buffer_cmd.consume_submission(args, selection_id)
+    except Exception as exc:
+        report["shelf"] = {"complete": False, "error": str(exc)}
+    try:
+        book_state.invalidate_snapshot(args.alpha_id, registry)
+        report["book_snapshot"] = {"complete": True, "freshness": "invalidated"}
+    except Exception as exc:
+        report["book_snapshot"] = {"complete": False, "error": str(exc)}
+    pnl_report = {}
+    try:
+        series = ml.fetch_daily_pnl(session, args.alpha_id,
+                                    cache_dir=Path(research_paths.resolve("pnl")),
+                                    max_age_hours=0, report=pnl_report)
+        report["pnl"] = {**pnl_report, "points": len(series or {}),
+                         "complete": pnl_report.get("complete") is True}
+    except Exception as exc:
+        report["pnl"] = {**pnl_report, "complete": False, "error": str(exc)}
+    return report
+
+
+def submit_workflow(session, args, shelf_entry=None):
+    """One state machine for both commands; uncertain attempts are read-only on retry."""
+    from datetime import datetime, timezone
+    from . import costs
+    max_wait = getattr(args, "max_wait", None)
+    if max_wait is not None and max_wait < 0:
+        raise CliError("USAGE", "--max-wait must be non-negative")
+    max_wait = 180 if max_wait is None else max_wait
+    yes = bool(getattr(args, "yes", False))
+    path = _submission_path(args.alpha_id)
+
+    def run():
+        prior, error = cache_store.load_json(path)
+        if error and error != "missing":
+            raise CliError("INVALID_INPUT", "submission journal is unreadable: " + error,
+                           "recover the journal before attempting a new submission")
+        prior = prior or {}
+        if not isinstance(prior, dict):
+            raise CliError("INVALID_INPUT", "submission journal must be an object")
+        readback_error = None
+        try:
+            current = ml.fetch_alpha_metrics(session, args.alpha_id)
+        except Exception as exc:
+            readback_error = str(exc)
+            if not prior.get("state"):
+                raise
+            current = prior.get("platform") or {}
+            if prior.get("state") != "CONFIRMED":
+                return {"alpha_id": args.alpha_id, "submission": prior["state"],
+                        "submitted": False, "post_attempted": False,
+                        "reason": "read-back failed; no repeated POST", "error": str(exc)}
+        result = {"alpha_id": args.alpha_id, "status": current.get("status"),
+                  "post_attempted": False,
+                  "costs": costs.evidence((ml.extract_split(current) or {}).get("train") or {},
+                                          "train", getattr(args, "cost_bps", None))}
+        from .buffer_cmd import _book_evidence
+        try:
+            result["book"] = _book_evidence(args)
+        except Exception as exc:
+            result["book"] = {"available": False, "error": str(exc)}
+        result["confirmation_evidence"] = "durable_journal" if readback_error else "platform_readback"
+        if readback_error:
+            result["readback_error"] = readback_error
+        confirmed = _confirmed(current) or prior.get("state") == "CONFIRMED"
+        if prior.get("state") == "CONFIRMED" and not _confirmed(current):
+            result["confirmation_evidence"] = "durable_journal"
+            current = {**current, "dateSubmitted": (prior.get("platform") or {}).get("dateSubmitted")}
+        selection_id = prior.get("selection_id")
+        if not confirmed:
+            selection_id = _selection_id(args, required=False) or selection_id
+        elif getattr(args, "selection", None):
+            selection_id = _selection_id(args)
+        if not yes:
+            if confirmed:
+                result.update(submitted=True, submission="CONFIRMED",
+                              date_submitted=current.get("dateSubmitted"))
+            elif prior.get("state") in {"INTENT", "ACCEPTED", "UNCERTAIN", "UNKNOWN"}:
+                result.update(submitted=False, submission=prior["state"],
+                              reason="previous attempt requires platform read-back; no repeated POST")
+            else:
+                result.update(ml.submit_alpha(session, args.alpha_id, confirm=False,
+                                               max_wait_seconds=max_wait))
+            result.update(dry_run=True, reconciled=False)
+            return result
+        if not confirmed and prior.get("state") in {"INTENT", "ACCEPTED", "UNCERTAIN", "UNKNOWN"}:
+            result.update(submitted=False, submission=prior["state"],
+                          reason="previous attempt is unresolved; no repeated POST",
+                          repair_actions=["read platform status again with this command"])
+            return result
+        if not confirmed:
+            selection_id = _selection_id(args, required=True)
+            missing = [field for field in ("name", "category") if not current.get(field)]
+            if missing:
+                raise CliError("INVALID_INPUT", "%s has no %s" % (args.alpha_id, ", ".join(missing)),
+                               "set the missing metadata with alpha describe")
+            if shelf_entry is not None:
+                if shelf_entry.get("state") in {"dropped", "consumed"}:
+                    raise CliError("INVALID_INPUT", "candidate is no longer on the shelf",
+                                   "shelve it again before a new buffer submission")
+                from .buffer_cmd import GATE
+                checks = ml.fetch_alpha_checks(session, args.alpha_id, max_wait_seconds=max_wait)
+                fresh = (checks.get("self_correlation") or {}).get("value")
+                result["self_correlation_now"] = fresh
+                if not checks.get("complete") or not checks.get("checks") or fresh is None:
+                    raise CliError("INVALID_INPUT", "fresh submission checks are incomplete",
+                                   "rerun the read-only precheck after the platform finishes")
+                if fresh is not None and fresh >= GATE and not getattr(args, "force", False):
+                    raise CliError("INVALID_INPUT", "fresh self-correlation exceeds the shelf gate",
+                                   "pass --force to attempt the platform gate anyway")
+            journal = {"alpha_id": args.alpha_id, "state": "INTENT",
+                       "selection_id": selection_id,
+                       "started_at": datetime.now(timezone.utc).isoformat()}
+            cache_store.write_json_atomic(path, journal)
+            result["post_attempted"] = True
+            try:
+                response = ml.submit_alpha(session, args.alpha_id, confirm=True,
+                                            max_wait_seconds=max_wait)
+                result.update(response)
+            except ml.SubmissionDisabled:
+                journal["state"] = "NOT_SENT"
+                cache_store.write_json_atomic(path, journal)
+                raise
+            except Exception as exc:
+                result.update(submission="UNKNOWN", submitted=False, error=str(exc))
+            try:
+                refreshed = ml.fetch_alpha_metrics(session, args.alpha_id)
+                if _confirmed(refreshed):
+                    current, confirmed = refreshed, True
+            except Exception as exc:
+                result["readback_error"] = str(exc)
+            if not confirmed and result.get("submission") == "CONFIRMED" and result.get("submitted"):
+                confirmed = True
+                result["confirmation_evidence"] = "submit_result"
+                current = {**current, "status": result.get("status"),
+                           "dateSubmitted": result.get("date_submitted")}
+            if not confirmed:
+                state = result.get("submission") or "UNKNOWN"
+                if state not in {"REJECTED", "NOT_SENT", "ACCEPTED", "UNCERTAIN", "UNKNOWN"}:
+                    state = "UNKNOWN"
+                result.update(submission=state, submitted=False)
+                journal.update(state=state, result=result)
+                cache_store.write_json_atomic(path, journal)
+                return result
+        result.update(submitted=True, submission="CONFIRMED", status=current.get("status"),
+                      date_submitted=current.get("dateSubmitted"), selection_id=selection_id)
+        journal = {"alpha_id": args.alpha_id, "state": "CONFIRMED", "platform": current,
+                   "selection_id": selection_id, "result": dict(result)}
+        # Confirmation is durable before any local repair. Failure here must still
+        # report remote success, and the old intent prevents a repeated POST.
+        try:
+            cache_store.write_json_atomic(path, journal)
+        except Exception as exc:
+            result["journal_error"] = str(exc)
+        result["reconciliation"] = _reconcile_submission(session, args, current, selection_id)
+        try:
+            result["book"] = _book_evidence(args)
+        except Exception as exc:
+            result["book"] = {"available": False, "error": str(exc)}
+        result["repair_actions"] = ["repair " + name for name, value in result["reconciliation"].items()
+                                    if not value.get("complete")]
+        if result.get("journal_error"):
+            result["repair_actions"].append("repair submission journal")
+        result["reconciled"] = not result["repair_actions"]
+        journal["result"] = result
+        try:
+            cache_store.write_json_atomic(path, journal)
+        except Exception as exc:
+            result["journal_error"] = str(exc)
+            if "repair submission journal" not in result["repair_actions"]:
+                result["repair_actions"].append("repair submission journal")
+            result["reconciled"] = False
         return result
 
-    result = with_session(args, work)
-
-    return result
-
-
-def _record_submitted_alpha(session, alpha_id):
-    """Append a normalised row for one alpha to the ledger and return what was written.
-
-    Two payload shapes are handled here because getting them wrong is not a cosmetic
-    mistake: `regular` is a plain string for some alphas and a `{code, description,
-    operatorCount}` object for others, and the metrics live under `is`, not `metrics`.
-    Reading either one naively recorded a row with no metrics on 2026-11-01, which the
-    ledger then treated as the newest truth.
-    """
-    current = ml.fetch_alpha_metrics(session, alpha_id)
-    code, _description, _count = ml.regular_expression(current)
-    checks = ml.fetch_alpha_checks(session, alpha_id, max_wait_seconds=60).get("checks")
-    entry = alpha_registry.build_entry(
-        {"alpha_id": alpha_id,
-         "expression": code,
-         "settings": current.get("settings") or {},
-         "metrics": current.get("is") or {},
-         "checks": checks,
-         "status": current.get("status"),
-         "out_of_sample": {"train": current.get("train") or {},
-                           "test": current.get("test") or {},
-                           "test_period": "P1Y"}},
-        verdict=alpha_registry.auto_verdict({"status": current.get("status"),
-                                             "metrics": current.get("is") or {},
-                                             "checks": checks}),
-        note="recorded by `alpha submit --record`: dateSubmitted %s"
-             % (current.get("dateSubmitted"),),
-        source="submit")
-    stored, written = alpha_registry.record_entry(entry)
-    # Pull the new alpha's daily PnL into the local store as part of recording. Every
-    # local correlation scan reads <research>/pnl/, so a submission that is not cached
-    # here is invisible to the next scan -- and the scan is the cheap way to see what
-    # the submission just displaced.
-    cached = None
-    try:
-        pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
-        series = ml.fetch_daily_pnl(session, alpha_id, cache_dir=pnl_dir,
-                                    max_age_hours=0)
-        cached = len(series or {})
-    except Exception as error:  # noqa: BLE001 - a cache miss must not fail the record
-        cached = "unavailable: %s" % str(error)[:60]
-    return {"key": stored.get("key"), "status": stored.get("status"),
-            "written": written, "metrics": bool(stored.get("metrics")),
-            "pnl_cached": cached}
+    if not yes:
+        return run()
+    with cache_store.file_lock(str(path) + ".lock", timeout=max(30, max_wait + 30)):
+        return run()
 
 
 def cmd_alpha_list(args, _sink):

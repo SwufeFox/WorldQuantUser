@@ -571,19 +571,20 @@ class FeedTests(unittest.TestCase):
 
 
 class DataFitTests(unittest.TestCase):
-    """A paper that needs data this account lacks must say so before a probe is written."""
+    """Reading keywords do not establish account capabilities or signal validity."""
 
-    def test_a_missing_input_outranks_a_present_one(self):
+    def test_keyword_inputs_remain_inferred(self):
         fit = feed.data_fit({"title": "Short interest and the cross-section of stock returns",
                              "abstract": "We study momentum and short interest."})
-        self.assertEqual(fit["verdict"], "blocked")
+        self.assertEqual(fit["verdict"], "unknown")
         needs = {item["need"] for item in fit["needs"]}
         self.assertIn("lending and short interest", needs)
 
-    def test_a_buildable_mechanism_is_reported_as_supported(self):
+    def test_estimate_keywords_do_not_prove_field_availability(self):
         fit = feed.data_fit({"title": "Analyst forecast dispersion and returns",
                              "abstract": "Using consensus estimates we study revision."})
-        self.assertEqual(fit["verdict"], "supported")
+        self.assertEqual(fit["verdict"], "unknown")
+        self.assertTrue(all(item["state"] == "inferred" for item in fit["needs"]))
 
     def test_an_unmatched_paper_stays_unknown_instead_of_guessing(self):
         fit = feed.data_fit({"title": "A history of double-entry bookkeeping",

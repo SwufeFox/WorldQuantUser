@@ -27,7 +27,7 @@ while staying silent instead of inventing a verdict where it cannot tell.
 
 from __future__ import annotations
 
-import re
+import fastexpr_ast as ast
 
 MATRIX = "MATRIX"
 VECTOR = "VECTOR"
@@ -43,8 +43,7 @@ FIELD_TYPES = (MATRIX, VECTOR, GROUP, UNIVERSE, SYMBOL)
 #: operator -> (positional parameter types, return type). Value parameters only; window
 #: lengths and flag parameters are scalars and are accepted as anything.
 SIGNATURES = {
-    # Arithmetic. These operate on matrices; a vector has to be reduced first, which is
-    # exactly why `multiply` rejects event inputs.
+    # Arithmetic signatures require matrix values; event error text is not type evidence.
     "abs": ([MATRIX], MATRIX),
     "add": ([MATRIX, MATRIX], MATRIX),
     "subtract": ([MATRIX, MATRIX], MATRIX),
@@ -121,148 +120,77 @@ SIGNATURES = {
     "ts_step": ([SCALAR], MATRIX),
 }
 
-#: Operators that appear in the course material and in some documentation, but are not in
-#: this account's operator catalogue. Recording them here means a batch that uses one gets
-#: a typed reason ("documented, unavailable") rather than a generic unknown-operator error.
-DOCUMENTED_UNAVAILABLE = {
-    "vec_choose": ([VECTOR, SCALAR], MATRIX,
-                   "documented as a vector-to-matrix selector, absent from /operators"),
-    "ts_max": ([MATRIX], MATRIX, "documented in the formulae paper, absent from /operators"),
-    "ts_min": ([MATRIX], MATRIX, "documented in the formulae paper, absent from /operators"),
-    "floor": ([MATRIX], MATRIX, "documented, absent from /operators"),
-}
-
-_number = re.compile(r"^-?\d+(\.\d+)?$")
-_field = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_call = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)$", re.S)
 
 
-def split_arguments(text):
-    """Split a call's arguments on commas that are not nested inside brackets or quotes."""
-    parts, depth, buffer, quoted = [], 0, "", False
-    for char in text:
-        if char == '"':
-            quoted = not quoted
-        if not quoted:
-            if char in "([{":
-                depth += 1
-            elif char in ")]}":
-                depth -= 1
-            elif char == "," and depth == 0:
-                parts.append(buffer.strip())
-                buffer = ""
-                continue
-        buffer += char
-    if buffer.strip():
-        parts.append(buffer.strip())
-    return parts
+def _typed_program(expression, field_types):
+    """Infer from the syntax tree, preserving assignment and reduction order."""
+    try:
+        program = ast.parse(expression)
+    except Exception:
+        return UNKNOWN, []
+    bindings, findings = {}, []
+
+    def mismatch(operator, position, want, got, node):
+        if got in (UNKNOWN, SCALAR) or got == want:
+            return
+        finding = {"code": "type_mismatch", "severity": "error", "operator": operator,
+                   "position": position, "expected": want, "actual": got,
+                   "expression": node.render(),
+                   "message": "%s argument %d expects %s, got %s" % (operator, position + 1, want, got)}
+        if got == VECTOR and want == MATRIX:
+            finding["suggestion"] = ("A confirmed VECTOR requires an appropriate vector reduction before this operator; "
+                                     "choose the reduction from field semantics and the current operator catalog.")
+        findings.append(finding)
+
+    def infer_node(node):
+        if isinstance(node, (ast.Number, ast.String)):
+            return SCALAR
+        if isinstance(node, ast.Field):
+            if node.name in bindings:
+                return bindings[node.name]
+            return str((field_types or {}).get(node.name) or UNKNOWN).upper()
+        if isinstance(node, ast.Call):
+            values = [infer_node(arg) for arg in node.args]
+            for _key, value in node.kwargs:
+                infer_node(value)
+            signature = SIGNATURES.get(node.name.lower())
+            if signature is None:
+                return UNKNOWN
+            for position, (value, want) in enumerate(zip(values, signature[0])):
+                if want != SCALAR:
+                    mismatch(node.name, position, want, value, node.args[position])
+            return signature[1]
+        if isinstance(node, ast.BinOp):
+            left, right = infer_node(node.left), infer_node(node.right)
+            mismatch(node.op, 0, MATRIX, left, node.left)
+            mismatch(node.op, 1, MATRIX, right, node.right)
+            return SCALAR if left == right == SCALAR else MATRIX if UNKNOWN not in (left, right) else UNKNOWN
+        if isinstance(node, ast.UnaryOp):
+            value = infer_node(node.operand)
+            mismatch(node.op, 0, MATRIX, value, node.operand)
+            return value
+        if isinstance(node, ast.Ternary):
+            for index, child in enumerate((node.condition, node.when_true, node.when_false)):
+                mismatch("conditional", index, MATRIX, infer_node(child), child)
+            return MATRIX
+        return UNKNOWN
+
+    for name, value in program.assignments:
+        bindings[name] = infer_node(value)
+    result = infer_node(program.signal) if program.signal is not None else UNKNOWN
+    return result, findings
 
 
 def infer(expression, field_types, _depth=0):
-    """Infer the type of an expression, or UNKNOWN when it cannot be told."""
-    if _depth > 40:
-        return UNKNOWN
-    text = (expression or "").strip()
-    if not text:
-        return UNKNOWN
-    if _number.match(text):
-        return SCALAR
-    if text.startswith('"') and text.endswith('"'):
-        return SCALAR
-    match = _call.match(text)
-    if match:
-        name = match.group(1).lower()
-        if name in SIGNATURES:
-            return SIGNATURES[name][1]
-        if name in DOCUMENTED_UNAVAILABLE:
-            return DOCUMENTED_UNAVAILABLE[name][1]
-        return UNKNOWN
-    if _field.match(text):
-        declared = (field_types or {}).get(text)
-        if declared:
-            return str(declared).upper()
-        # A bare identifier that is not a field is almost always an assigned variable.
-        return UNKNOWN
-    # A compound expression. Prefer the return type of a call over the type of a field
-    # inside it: `-ts_mean(vec_avg(vector_field), 5)` is a MATRIX, and picking the field
-    # instead produced a false type error on four alphas the platform had already scored.
-    for operator in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
-        name = operator.lower()
-        if name in SIGNATURES:
-            return SIGNATURES[name][1]
-        if name in DOCUMENTED_UNAVAILABLE:
-            return DOCUMENTED_UNAVAILABLE[name][1]
-    # No calls at all: look at bare identifiers that are not already inside one.
-    spans = [(m.start(), text.find(")", m.end()) + 1 or len(text))
-             for m in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*\s*\(", text)]
-    for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_]*", text):
-        if any(start <= match.start() < end for start, end in spans):
-            continue
-        declared = (field_types or {}).get(match.group(0))
-        if declared:
-            return str(declared).upper()
-    return UNKNOWN
-
-
-def _calls(expression):
-    """Yield ``(operator, argument_text, offset)`` for each call, outermost first."""
-    text = expression or ""
-    for match in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", text):
-        start = match.end() - 1
-        depth = 0
-        for index in range(start, len(text)):
-            if text[index] == "(":
-                depth += 1
-            elif text[index] == ")":
-                depth -= 1
-                if depth == 0:
-                    yield match.group(1).lower(), text[start + 1:index], match.start()
-                    break
+    """Return the AST-derived type, or UNKNOWN without declared evidence."""
+    return _typed_program(expression, field_types)[0]
 
 
 def type_findings(expression, field_types, strict=False):
-    """Report arguments whose type the operator cannot accept.
-
-    Each finding names the operator, the argument position, what it wanted and what it
-    got, because "operator does not support event inputs" is the message the simulator
-    gives and it does not say which argument or which type.
-    """
-    findings = []
-    for operator, arguments, offset in _calls(expression):
-        if operator in DOCUMENTED_UNAVAILABLE:
-            _params, _ret, note = DOCUMENTED_UNAVAILABLE[operator]
-            findings.append({
-                "code": "operator_documented_unavailable",
-                "severity": "error" if strict else "warning",
-                "operator": operator,
-                "offset": offset,
-                "message": "%s is documented but not in this account's operator "
-                           "catalogue (%s)" % (operator, note),
-            })
-            continue
-        signature = SIGNATURES.get(operator)
-        if not signature:
-            continue
-        expected = signature[0]
-        for position, raw in enumerate(split_arguments(arguments)):
-            if position >= len(expected):
-                break
-            want = expected[position]
-            if want == SCALAR:
-                continue
-            got = infer(raw, field_types)
-            if got in (UNKNOWN, SCALAR):
-                continue
-            if got != want:
-                findings.append({
-                    "code": "type_mismatch",
-                    "severity": "error",
-                    "operator": operator,
-                    "position": position,
-                    "expected": want,
-                    "actual": got,
-                    "offset": offset,
-                    "message": "%s argument %d expects %s, got %s (%s)"
-                               % (operator, position + 1, want, got, raw.strip()[:48]),
-                })
+    """Declared type mismatches are hard errors; unknown types remain unknown."""
+    result, findings = _typed_program(expression, field_types)
+    if result in (VECTOR, UNIVERSE, GROUP, SYMBOL):
+        findings.append({"code": "invalid_signal_type", "severity": "error",
+                         "actual": result, "expected": MATRIX,
+                         "message": "%s is not a matrix signal" % result})
     return findings

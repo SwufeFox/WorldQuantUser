@@ -18,6 +18,7 @@ import research_paths
 
 from . import runtime
 from .runtime import CliError
+from .validation import cached_field_scope
 
 
 _TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9\-]{2,}")
@@ -353,6 +354,12 @@ def _feed_argv(args, topics, seen_path):
                           ("--timeout", getattr(args, "timeout", 30)), ("--seen", seen_path)):
         if value is not None:
             argv.extend((option, str(value)))
+    for option, attribute in (("--region", "region"), ("--universe", "universe"),
+                              ("--delay", "delay"), ("--instrument-type", "instrument_type"),
+                              ("--meta-max-age", "meta_max_age")):
+        value = getattr(args, attribute, None)
+        if value is not None:
+            argv.extend((option, str(value)))
     if args.draft_cards:
         argv.extend(("--draft-cards", os.path.abspath(args.draft_cards)))
     for option, attribute in (("--dry-run", "dry_run"), ("--action", "action")):
@@ -361,49 +368,49 @@ def _feed_argv(args, topics, seen_path):
     return argv
 
 
-#: What a mechanism would need from *this* account, and whether it exists.
-#: Curated on 2026-11-13 from the catalogue: 14 datasets, 66 operators, USA delay 0/1
-#: only. Two of twelve papers that day were worth a simulation; the rest needed data
-#: this account does not have (call transcripts, patents, lending, bonds, supply-chain
-#: links) or a field type that cannot be a signal (`univ1` is UNIVERSE, not MATRIX).
-#: The point is to say so before a probe is written, not after.
+# Keywords describe possible reading needs, never account entitlements.
 DATA_NEEDS = (
-    (("conference call", "transcript", "managerial tone", "tone of"), "call transcripts", "blocked"),
-    (("patent", "innovation and productivity", "citation-weighted"), "patent data", "blocked"),
-    (("short interest", "securities lending", "lending market", "borrow fee"), "lending and short interest", "blocked"),
-    (("corporate bond", "credit spread", "bond return"), "bond prices", "blocked"),
-    (("supply chain", "supplier", "bullwhip", "customer-supplier"), "supply-chain links", "blocked"),
-    (("index reconstitution", "index addition", "index deletion", "indexing"), "index membership history", "blocked"),
-    (("monetary policy", "macro variable", "macroeconomic"), "macro series", "blocked"),
-    (("earnings announcement", "announcement date", "post-earnings"), "announcement dates", "partial"),
-    (("analyst forecast", "forecast dispersion", "estimate dispersion", "revision"), "analyst4 estimates", "supported"),
+    (("conference call", "transcript", "managerial tone", "tone of"), "call transcripts"),
+    (("patent", "innovation and productivity", "citation-weighted"), "patent data"),
+    (("short interest", "securities lending", "lending market", "borrow fee"), "lending and short interest"),
+    (("corporate bond", "credit spread", "bond return"), "bond prices"),
+    (("supply chain", "supplier", "bullwhip", "customer-supplier"), "supply-chain links"),
+    (("index reconstitution", "index addition", "index deletion", "indexing"), "index membership history"),
+    (("monetary policy", "macro variable", "macroeconomic"), "macro series"),
+    (("earnings announcement", "announcement date", "post-earnings"), "announcement dates"),
+    (("analyst forecast", "forecast dispersion", "estimate dispersion", "revision"), "analyst estimates"),
     (("accrual", "inventory", "deferred revenue", "earnings quality", "fundamental",
-      "r&d", "research and development", "capex", "dividend", "payout"), "fundamental2/fundamental6", "supported"),
-    (("implied volatility", "option", "skew", "open interest"), "option8/option9", "supported"),
-    (("news", "sentiment", "social media", "attention", "tweet"), "news12/news18, socialmedia", "supported"),
-    (("turnover", "volume", "momentum", "reversal", "liquidity", "price"), "pv1/pv13", "supported"),
+      "r&d", "research and development", "capex", "dividend", "payout"), "fundamentals"),
+    (("implied volatility", "option", "skew", "open interest"), "options"),
+    (("news", "sentiment", "social media", "attention", "tweet"), "news and sentiment"),
+    (("turnover", "volume", "momentum", "reversal", "liquidity", "price"), "prices and volume"),
 )
 
 
-def data_fit(paper):
-    """Whether this account has the data a paper's mechanism would need.
-
-    A keyword screen over title and abstract, stated as such: it is a reading aid, not
-    a measurement. ``blocked`` outranks ``partial`` outranks ``supported``, so a paper
-    that needs one missing input is not advertised as buildable just because it also
-    mentions prices.
-    """
+def data_fit(paper, field_scope=None):
+    """Separate inferred reading needs from explicitly named field availability."""
     text = ("%s %s" % (paper.get("title") or "", paper.get("abstract") or "")).lower()
-    needs = []
-    for phrases, need, verdict in DATA_NEEDS:
-        if any(phrase in text for phrase in phrases):
-            needs.append({"need": need, "verdict": verdict})
-    if not needs:
-        return {"verdict": "unknown", "needs": [], "why": "no data term matched"}
-    order = {"blocked": 0, "partial": 1, "supported": 2}
-    worst = min(needs, key=lambda item: order[item["verdict"]])
-    return {"verdict": worst["verdict"], "needs": needs,
-            "why": "; ".join("%s (%s)" % (item["need"], item["verdict"]) for item in needs)}
+    needs = [{"need": need, "state": "inferred", "verdict": "unknown", "basis": "title_abstract_keywords"}
+             for phrases, need in DATA_NEEDS if any(phrase in text for phrase in phrases)]
+    supplied = paper.get("required_fields")
+    valid = supplied is None or (isinstance(supplied, list) and all(isinstance(item, str) and item.strip() for item in supplied))
+    required = sorted({item.strip() for item in supplied}) if valid and supplied else []
+    scope = field_scope or {}
+    evidence = scope.get("evidence") or {"state": "unknown", "reasons": ["no_scoped_catalog"]}
+    known = scope.get("known_fields")
+    verified = evidence.get("state") == "verified" and known is not None
+    available = sorted(set(required) & set(known)) if verified else []
+    missing = sorted(set(required) - set(known)) if verified else []
+    verdict = "unknown"
+    if required and verified:
+        verdict = "required_fields_missing" if missing else "fields_available"
+    return {"verdict": verdict, "needs": needs, "catalog": evidence,
+            "required_fields": required, "available_fields": available,
+            "missing_fields": missing, "unknown_fields": required if not verified else [],
+            "requirement_state": "declared" if required else "invalid" if not valid else "unspecified",
+            "why": ("Only explicitly required field IDs can be checked against a complete current scoped catalog. "
+                    "Keywords suggest reading needs. Available fields do not prove a valid signal; "
+                    "missing direct inputs do not rule out a separately justified proxy.")}
 
 
 def _next_actions(args, reports, unresolved, deferred, papers, seen_path):
@@ -498,6 +505,9 @@ def cmd_feed(args, _sink):
                                 "type": type(error).__name__}) from error
 
     deferred = topics[len(selected):]
+    settings = {"region": getattr(args, "region", None), "universe": getattr(args, "universe", None),
+                "delay": getattr(args, "delay", None), "instrumentType": getattr(args, "instrument_type", None)}
+    scope = cached_field_scope(settings, getattr(args, "meta_max_age", None))
     return {
         "topics": selected,
         "unsearched_topics": deferred,
@@ -505,14 +515,15 @@ def cmd_feed(args, _sink):
         "searches": reports,
         "seen_before": repeats,
         "count": len(picked),
+        "capabilities": scope["evidence"],
         "seen": seen_path,
         "closed_register": {"path": register["path"],
                             "available": "error" not in register,
                             "match_basis": "exact declared family only"},
         "papers": [{**{k: paper.get(k) for k in
                      ("title", "year", "journal", "doi", "url", "landing_page_url", "pdf_url",
-                      "abstract", "family", "citations", "query", "queries", "rank", "closure_cautions")},
-                    "data_fit": data_fit(paper)}
+                      "abstract", "family", "citations", "query", "queries", "rank", "closure_cautions", "required_fields")},
+                    "data_fit": data_fit(paper, scope)}
                    for paper in picked],
         "next_actions": _next_actions(args, reports, unresolved, deferred, picked, seen_path),
         "note": ("Picks take turns across queries, ranked within each query. Closure "

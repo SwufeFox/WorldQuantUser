@@ -8,7 +8,7 @@ import correlation
 import json
 import research_paths
 
-from . import experiments
+from . import book_state, experiments
 from .runtime import CliError
 
 
@@ -162,7 +162,7 @@ def cmd_health(args, _sink):
         if alpha_id:
             latest[alpha_id] = entry
     book = {alpha_id: entry for alpha_id, entry in latest.items()
-            if str(entry.get("status") or "").upper() == "ACTIVE"}
+            if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES}
     pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
     series = {}
     for alpha_id in book:
@@ -229,7 +229,7 @@ def cmd_health(args, _sink):
         for alpha_id, entry in latest.items():
             if alpha_id in book_ids:
                 continue
-            if str(entry.get("status") or "").upper() == "ACTIVE":
+            if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES:
                 continue
             path = pnl_dir / ("%s.json" % alpha_id)
             if not path.exists():
@@ -311,6 +311,8 @@ def cmd_health(args, _sink):
     measured = [row for row in rows if row["marginal"] is not None]
     return {"window": getattr(args, "window", "train"), "train_end": getattr(args, "train_end", None),
             "days": len(dates), "count": len(measured),
+            "book": book_state.describe_book(latest, series=series, registry_path=args.registry,
+                                               pnl_dir=pnl_dir),
             "book_sharpe": None if book_sharpe is None else round(book_sharpe, 2),
             "negative": [row for row in measured if row["marginal"] < 0][: args.limit],
             "weakest": measured[: args.limit],
@@ -461,16 +463,9 @@ def cmd_brief(args, _sink):
     def metric(entry, name):
         return experiments._train_metrics(entry).get(name)
 
-    book = {}
-    for entry in entries:
-        if (entry.get("status") or "").upper() != "ACTIVE":
-            continue
-        alpha_id = entry.get("alpha_id")
-        if alpha_id:
-            # The ledger is append-only, so the last row for an alpha is its current
-            # truth. Keeping the first one hid fields added later - the out-of-sample
-            # split among them, which is what the stability split needs.
-            book[alpha_id] = entry
+    latest = {entry["alpha_id"]: entry for entry in entries if entry.get("alpha_id")}
+    book = {alpha_id: entry for alpha_id, entry in latest.items()
+            if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES}
 
     sharpes = [metric(entry, "sharpe") for entry in book.values()
                if isinstance(metric(entry, "sharpe"), (int, float))]
@@ -555,6 +550,16 @@ def cmd_brief(args, _sink):
                     if not entry.get("family") or not entry.get("mechanism"))
     no_checks = sum(1 for entry in entries
                     if (entry.get("metrics") or {}) and not (entry.get("checks") or {}))
+    evidence = book_state.describe_book(latest, registry_path=registry_path)
+    capture = evidence["platform"]
+    book_evidence = {
+        "source": "local_ledger", "member_digest": evidence["local"]["member_digest"],
+        "statuses": evidence["local"]["statuses"],
+        "platform": {key: capture.get(key) for key in
+                     ("available", "as_of", "scope", "complete", "matches_local_members",
+                      "current_capture", "freshness", "live_verified")},
+        "pnl": {key: len(evidence["pnl"][key + "_ids"])
+                for key in ("available", "missing", "complete", "unknown", "incomplete")}}
     data = {
         "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "window_days": days,
@@ -565,6 +570,7 @@ def cmd_brief(args, _sink):
                    "rows_with_metrics_but_no_checks": no_checks},
         "book": {
             "count": len(book),
+            "evidence": book_evidence,
             "metrics_scope": "train",
             "sharpe_median": (round(sorted(sharpes)[len(sharpes) // 2], 3)
                               if sharpes else None),

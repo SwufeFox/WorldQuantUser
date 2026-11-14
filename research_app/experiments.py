@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import datetime
+import hashlib
 import json
 import math
 import os
@@ -20,9 +22,9 @@ import research_config as config_io
 import research_paths
 from tools import guarded_sim
 
-from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, with_session
-from . import stats
-from .validation import _preflight_lint, cached_field_types as _cached_field_types
+from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, protect_output, with_session
+from . import costs, selection, stats
+from .validation import _preflight_lint, attach_field_contracts, cached_field_scope
 
 
 #: Operators per arm above which the report says so. Not a hard limit (the platform's
@@ -42,11 +44,9 @@ def half_split_sharpes(pnl, test_start=None):
     PnL rather than returns: only the PnL series is exposed, and Sharpe is
     scale-invariant, so a within-alpha comparison is unaffected.
     """
-    if not pnl:
+    if not pnl or not test_start:
         return None, None
-    days = sorted(pnl)
-    if test_start:
-        days = [day for day in days if day < test_start]
+    days = sorted(day for day in pnl if day < test_start)
     if len(days) < 120:
         return None, None
     middle = len(days) // 2
@@ -133,7 +133,7 @@ def _simulation_checkpoint_callback(path, checkpoint, sink):
 
     def on_event(kind, payload):
         with lock:
-            if kind in {"submitted", "pending", "completed", "failed", "deferred"}:
+            if kind in {"submitting", "submitted", "pending", "completed", "failed", "deferred"}:
                 index = payload.get("index")
                 if isinstance(index, int) and 0 <= index < len(checkpoint["records"]):
                     checkpoint["records"][index] = {
@@ -229,7 +229,7 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
     _write_simulation_checkpoint(checkpoint_path, checkpoint)
     has_unfinished = any(
         record.get("progress_url")
-        or record.get("status") in {"PENDING", "QUEUED"}
+        or record.get("status") in {"PENDING", "QUEUED", "UNKNOWN_SUBMISSION"}
         for record in records
     )
     if not explicit and not has_unfinished:
@@ -244,7 +244,8 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
     display = _sort_simulation_results(records, args)
     summary = summarize(every)
     if summary["completed"] == 0 and summary["total"] and not (
-        summary["pending"] or summary["queued"]
+        summary["pending"] or summary["queued"] or any(
+            record.get("status") == "UNKNOWN_SUBMISSION" for record in every)
     ):
         first_error = next(
             (r.get("error") for r in every if r.get("error")), "unknown error"
@@ -256,6 +257,8 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
         )
     result = _simulation_result(every, settings, checkpoint_path)
     result["results"] = display
+    result["unknown_submission"] = [index for index, record in enumerate(every)
+                                    if record.get("status") == "UNKNOWN_SUBMISSION"]
     result["results_total"] = len(every)
     for key in ("legs", "legend", "note"):
         value = (checkpoint.get("metadata") or {}).get(key)
@@ -486,6 +489,11 @@ def _compare_document(path, payload):
     """Keep raw records for ablation; normalize only explicit probe display fields."""
     while isinstance(payload, dict) and "data" in payload:
         payload = payload["data"]
+    if isinstance(payload, dict) and payload.get("path") and not payload.get("records"):
+        destination = Path(payload["path"]).expanduser()
+        if not destination.is_absolute() and str(path) != "-":
+            destination = Path(path).parent / destination
+        _canonical, payload = _load_probe_batch(destination)
     display = []
     probe = False
     ordered_probe = False
@@ -570,12 +578,15 @@ def _compare_row(record, display, path, frozen):
            for key in ("candidate_id", "alpha_id", "decay", "status")}
     row.update({"label": display.get("label") or record.get("label") or record.get("mechanism"),
                 "source_file": path,
+                "source_expression": record.get("expression") or display.get("expression"),
+                "source_settings": record.get("settings") or display.get("settings"),
+                "train_period": {key: train.get(key) for key in ("startDate", "endDate", "turnoverPeriod")},
                 "train_sharpe_h1": halves[0] if len(halves) > 0 and halves[0] is not None
                 else display.get("train_sharpe_h1"),
                 "train_sharpe_h2": halves[1] if len(halves) > 1 and halves[1] is not None
                 else display.get("train_sharpe_h2"),
                 "failed_checks": None, "checks_state": "hidden"})
-    for key in ("sharpe", "fitness", "turnover", "returns"):
+    for key in ("sharpe", "fitness", "turnover", "returns", "margin"):
         row["train_" + key] = train.get(key, display.get("train_" + key))
     if frozen:
         metrics = record.get("metrics") or {}
@@ -593,6 +604,13 @@ def _compare_row(record, display, path, frozen):
         row["checks_state"] = "available" if row["failed_checks"] is not None else "unavailable"
     return row
 
+def _selection_call(function, *args, **kwargs):
+    try:
+        return function(*args, **kwargs)
+    except (ValueError, OSError) as exc:
+        raise CliError("INVALID_INPUT", str(exc)) from exc
+
+
 
 def cmd_compare(args, _sink):
     """Merge result documents into one table.
@@ -605,7 +623,33 @@ def cmd_compare(args, _sink):
     them for a design that is already fixed.
     """
     frozen = bool(getattr(args, "frozen", False))
-    paths, selection = _compare_inputs(args)
+    sort_key = getattr(args, "sort", None) or "fitness"
+    cost_bps = getattr(args, "cost_bps", None)
+    cost_bps = list(costs.DEFAULT_COST_BPS) if cost_bps is None else list(cost_bps)
+    manifest = None
+    if frozen:
+        if not getattr(args, "selection", None):
+            raise CliError("USAGE", "--frozen requires --selection from a train --freeze")
+        if getattr(args, "freeze", None):
+            raise CliError("USAGE", "cannot freeze a validation view")
+        if getattr(args, "sort", None) is not None or getattr(args, "min_fitness", None) is not None:
+            raise CliError("USAGE", "frozen validation cannot change --sort or --min-fitness")
+        manifest = _selection_call(selection.load, args.selection, source="compare")
+        saved_costs = manifest["criteria"].get("cost_bps", list(costs.DEFAULT_COST_BPS))
+        if getattr(args, "cost_bps", None) is not None and cost_bps != saved_costs:
+            raise CliError("USAGE", "cost scenarios conflict with the frozen selection")
+        cost_bps = saved_costs
+        paths = list((manifest.get("inputs") or {}).get("files") or [])
+        if not paths:
+            raise CliError("INVALID_INPUT", "selection has no saved compare input files")
+        provenance = (manifest.get("inputs") or {}).get("provenance") or {}
+        supplied = [str(Path(path).resolve()) for path in getattr(args, "files", [])]
+        if supplied and supplied != paths or getattr(args, "match", None) or getattr(args, "latest", None):
+            raise CliError("USAGE", "frozen comparison reuses the saved input files")
+    else:
+        if getattr(args, "selection", None):
+            raise CliError("USAGE", "--selection requires --frozen")
+        paths, provenance = _compare_inputs(args)
     records = []
     inputs = []
     rows = []
@@ -613,6 +657,8 @@ def cmd_compare(args, _sink):
         try:
             payload = json.loads(config_io.read_input_text(path))
         except (config_io.ResearchError, ValueError) as exc:
+            if frozen:
+                continue
             raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc),
                            "point at a file written by `simulate` or `probe`") from exc
         file_records, aligned = _compare_document(path, payload)
@@ -620,29 +666,52 @@ def cmd_compare(args, _sink):
         inputs.append((path, payload, file_records))
         rows.extend(_compare_row(record, display, path, frozen) for record, display in aligned)
 
-    if not rows:
+    if not rows and not frozen:
         raise CliError("NOT_FOUND", "no result records in the given files",
                        "the file must come from `simulate` or `probe`")
 
-    fitness_key = "fitness" if frozen else "train_fitness"
-    if args.min_fitness is not None:
+    fitness_key = "train_fitness"
+    if not frozen and args.min_fitness is not None:
         rows = [row for row in rows
                 if isinstance(row.get(fitness_key), (int, float))
                 and row[fitness_key] >= args.min_fitness]
 
-    if args.sort != "none":
-        key = "alpha_id" if args.sort == "id" else args.sort
-        if not frozen and key in {"sharpe", "fitness", "turnover", "returns"}:
+    if not frozen and sort_key != "none":
+        key = "alpha_id" if sort_key == "id" else sort_key
+        if key in {"sharpe", "fitness", "turnover", "returns"}:
             key = "train_" + key
         rows.sort(key=lambda row: (row[key] is None, -(row[key] or 0)
                                    if isinstance(row[key], (int, float))
                                    else str(row[key])))
 
-    data = {"files": paths, "selection": selection, "count": len(rows),
-            "view": "frozen" if frozen else "train", "rows": rows}
+    for row in rows:
+        row["cost_evidence"] = costs.evidence(
+            {**row["train_period"], **{key: row.get("train_" + key) for key in ("margin", "turnover")}},
+            "train", cost_bps)
+    if manifest:
+        rows = _selection_call(selection.ordered_rows, manifest, [row for row in rows if row.get("alpha_id")])
+        for row, saved in zip(rows, manifest["rows"]):
+            row["source_changes"] = {key: {"frozen": saved.get(key), "current": row.get(key)}
+                                     for key in ("source_expression", "source_settings", "train_period")
+                                     if not row.get("missing") and saved.get(key) != row.get(key)}
+    data = {"files": paths, "selection": provenance, "count": len(rows),
+            "view": "frozen" if frozen else "train", "rows": rows,
+            "missing_evidence": [{"alpha_id": row.get("alpha_id"), "source_file": row.get("source_file"),
+                "train_missing": [key for key in ("sharpe", "fitness", "turnover", "margin")
+                                  if row.get("train_" + key) is None]} for row in rows
+                if any(row.get("train_" + key) is None for key in ("sharpe", "fitness", "turnover", "margin"))]}
+    if getattr(args, "freeze", None):
+        if "-" in paths:
+            raise CliError("USAGE", "freeze requires durable input files, not stdin")
+        manifest = _selection_call(selection.freeze, args.freeze, source="compare", rows=rows,
+            criteria={"min_fitness": args.min_fitness, "sort": sort_key, "scope": "train", "cost_bps": cost_bps},
+            inputs={"files": paths, "provenance": provenance}, window={"scope": "train"})
+        data["selection_path"] = str(Path(args.freeze).resolve())
+    if manifest:
+        data["selection_id"] = manifest["selection_id"]
     if frozen:
         research_paths.log_view("compare", "frozen", [row.get("alpha_id") for row in rows],
-                                note=", ".join(paths))
+                                note={"selection_id": manifest["selection_id"], "files": paths})
     if getattr(args, "per_file", False):
         # Variant ids repeat across files, so keep their contributions separate.
         rules = alpha_unit.load_rules() or {}
@@ -665,7 +734,7 @@ def cmd_compare(args, _sink):
                     except (config_io.ResearchError, ValueError):
                         pass
             report = ablation.report(
-                file_records, metrics_of=None if frozen else _train_metrics)
+                file_records, metrics_of=_train_metrics)
             for row in report["legs"]:
                 if legend and row["leg"] in legend:
                     row["fields"] = legend[row["leg"]].get("fields")
@@ -682,15 +751,18 @@ def cmd_compare(args, _sink):
                 "contributions": report,
             })
         data["per_file"] = per_file
-        data["per_file_view"] = "frozen" if frozen else "train"
+        data["per_file_view"] = "train"
     elif args.contributions:
         # The contribution is a selection decision ("does this leg earn its place"),
         # so in the exploration view it has to be computed from train-period fitness.
         # It used to read the full-window block regardless, which put the test year
         # back into the answer the table had just hidden.
         data["contributions"] = ablation.report(
-            records, metrics_of=None if frozen else _train_metrics)
-        data["contributions"]["view"] = "frozen" if frozen else "train"
+            records, metrics_of=_train_metrics)
+        data["contributions"]["view"] = "train"
+    if getattr(args, "summary", False):
+        data["rows"] = rows[:20]
+        data["rows_omitted"] = max(0, len(rows) - 20)
 
     return data
 
@@ -871,12 +943,14 @@ def _normalized_expression(text):
 def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.0,
                         on_progress=None):
     """Read known jobs first; use expression/settings lookup only for unidentified arms."""
-    missing = [row for row in rows if row.get("train_fitness") is None]
+    limit = min(100, max(1, limit))
+    missing = [row for row in rows if row.get("train_fitness") is None or row.get("metrics_pending")]
     matched, still_missing, ambiguous = {}, [], []
     not_submitted = [row["label"] for row in missing if row.get("submission_attempted") is False]
     deadline = time.monotonic() + max_wait_seconds
     lookup = [row for row in missing if row.get("submission_attempted") is not False
-              and not row.get("alpha_id") and not row.get("progress_url")]
+              and not row.get("alpha_id") and not row.get("progress_url")
+              and (row.get("settings") or row.get("settings_signature") not in (None, "", "{}"))]
     index = {}
     if lookup:
         for page in range(pages):
@@ -921,6 +995,9 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
                 if on_progress:
                     on_progress(row)
             if not alpha_id:
+                if not row.get("settings") and row.get("settings_signature") in (None, "", "{}"):
+                    still_missing.append(label)
+                    continue
                 wanted = (_settings_signature(row["settings"]) if "settings" in row
                           else row.get("settings_signature") or _settings_signature(None))
                 exact = [candidate for candidate in index.get(
@@ -941,7 +1018,6 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
             train = split.get("train") or {}
             if train.get("fitness") is None:
                 still_missing.append(label)
-                continue
             row.update({"status": payload.get("status"), "train_sharpe": train.get("sharpe"),
                         "train_fitness": train.get("fitness"), "train_turnover": train.get("turnover"),
                         "train_returns": train.get("returns"), "error": None,
@@ -950,8 +1026,11 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
             raw = {"alpha_id": alpha_id, "status": row["status"],
                    "expression": row.get("expression"), "settings": row.get("settings") or {},
                    "metrics": payload.get("is"), "out_of_sample": split,
-                   "checks": ml._extract_checks(payload), "error": None}
-            matched[label] = alpha_id
+                   "checks": ml._extract_checks(payload), "error": None,
+                   "submission_attempted": True, "mechanism": label,
+                   "decay": (row.get("settings") or {}).get("decay")}
+            if train.get("fitness") is not None:
+                matched[label] = alpha_id
         except ml.AuthError:
             raise
         except (ml.BrainError, ml.requests.RequestException) as exc:
@@ -966,9 +1045,86 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
             "ambiguous": ambiguous, "matched": matched, "not_submitted": not_submitted}
 
 
+def _load_probe_batch(value):
+    path = Path(value).expanduser().resolve()
+    visited = set()
+    while True:
+        if path in visited:
+            raise CliError("INVALID_INPUT", "cyclic probe response path")
+        visited.add(path)
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise CliError("INVALID_INPUT", "cannot read batch file %s" % path, str(exc)) from exc
+        if isinstance(document, dict) and isinstance(document.get("data"), dict):
+            document = document["data"]
+        if not isinstance(document, dict):
+            raise CliError("INVALID_INPUT", "probe batch must be an object")
+        if document.get("path") and not document.get("arms"):
+            destination = Path(document["path"]).expanduser()
+            path = (destination if destination.is_absolute() else path.parent / destination).resolve()
+            continue
+        break
+    rows = document.get("rows") or []
+    if not rows:
+        raise CliError("INVALID_INPUT", "%s has no probe rows" % path.name)
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise CliError("INVALID_INPUT", "probe rows must be objects")
+    saved = document.get("records") or [{} for _ in rows]
+    if not isinstance(saved, list) or len(saved) != len(rows) or not all(isinstance(record, dict) for record in saved):
+        raise CliError("INVALID_INPUT", "probe batch records do not align with rows")
+    if not document.get("arms"):
+        arms = []
+        for index, (row, record) in enumerate(zip(rows, saved)):
+            settings = row.get("settings") or record.get("settings")
+            if not settings and row.get("settings_signature"):
+                try:
+                    settings = json.loads(row["settings_signature"])
+                except (ValueError, TypeError) as exc:
+                    raise CliError("INVALID_INPUT", "legacy settings signature is not recoverable") from exc
+            if settings is not None and not isinstance(settings, dict):
+                raise CliError("INVALID_INPUT", "probe arm settings must be an object")
+            arms.append({"label": row.get("label", "arm%d" % (index + 1)),
+                "expression": row.get("expression") or record.get("expression") or "",
+                "settings": settings or {}, "arm_index": index, "ops": row.get("ops"),
+                "design": row.get("design"), "proxy_of": row.get("proxy_of")})
+        document["arms"] = arms
+    arms = document["arms"]
+    if (not isinstance(arms, list) or len(arms) != len(rows)
+            or not all(isinstance(arm, dict) and isinstance(arm.get("settings"), dict)
+                       and isinstance(arm.get("expression"), str) and arm.get("label") for arm in arms)
+            or len({arm["label"] for arm in arms}) != len(arms)):
+        raise CliError("INVALID_INPUT", "probe batch arm identities are inconsistent")
+    records = []
+    for index, (arm, row, record) in enumerate(zip(arms, rows, saved)):
+        arm["arm_index"] = index
+        arm.setdefault("ops", row.get("ops"))
+        record = {**record, "expression": arm["expression"], "settings": arm["settings"],
+                  "decay": arm["settings"].get("decay"), "mechanism": arm["label"]}
+        for key in ("alpha_id", "status", "progress_url", "next_poll_at", "submission_attempted", "error"):
+            if key not in record and key in row:
+                record[key] = row[key]
+        if not record.get("out_of_sample"):
+            record["out_of_sample"] = {"train": {key: row.get("train_" + key)
+                for key in ("sharpe", "fitness", "turnover", "returns")}}
+        if record.get("alpha_id") and not record.get("metrics"):
+            record["metrics_pending"] = True
+        records.append(record)
+    document["records"] = records
+    fingerprint = _request_fingerprint(arms)
+    if document.get("request_fingerprint") and document["request_fingerprint"] != fingerprint:
+        raise CliError("INVALID_INPUT", "saved probe request fingerprint does not match its arms")
+    document.setdefault("request_fingerprint", fingerprint)
+    document.setdefault("arm_order", [arm["label"] for arm in arms])
+    document.setdefault("run_id", None)
+    document.setdefault("started_at", None)
+    _probe_document_update(document, path)
+    return path, document
+
+
 def _cmd_probe_recover(args):
-    """Refresh saved batch evidence under the same lock as its producer."""
-    path = Path(args.recover).expanduser().resolve()
+    path, _document = _load_probe_batch(args.recover)
+    protect_output(args, path)
     try:
         with cache_store.file_lock(str(path) + ".lock", timeout=0):
             return _recover_probe_batch(args, path)
@@ -977,61 +1133,50 @@ def _cmd_probe_recover(args):
 
 
 def _recover_probe_batch(args, path):
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise CliError("INVALID_INPUT", "cannot read batch file %s" % path, str(exc))
-    rows = document.get("rows") or []
-    if not rows:
-        raise CliError("INVALID_INPUT", "%s has no rows" % path.name)
+    path, document = _load_probe_batch(path)
+    show_test = bool(getattr(args, "show_test", False))
+    if show_test and not getattr(args, "selection", None):
+        raise CliError("USAGE", "--show-test requires --selection")
+    manifest = _selection_call(selection.load, args.selection) if show_test else None
+    rows = document["rows"]
     positions = {id(row): index for index, row in enumerate(rows)}
-    saved_records = document.get("records") or [{} for _ in rows]
 
     def save_recovered(row, raw=None):
+        index = positions[id(row)]
+        record = document["records"][index]
         if raw is not None:
-            saved_records[positions[id(row)]] = raw
-            document["records"] = saved_records
-        document["incomplete"] = [item["label"] for item in rows if item.get("train_fitness") is None]
-        document["complete"] = not document["incomplete"]
-        document["comparisons"] = _probe_comparisons(rows, document.get("design"))
+            record.update(raw)
+        for key in ("alpha_id", "status", "progress_url", "next_poll_at", "error"):
+            if key in row:
+                record[key] = row[key]
+            elif key in {"progress_url", "next_poll_at"}:
+                record.pop(key, None)
+        if raw is not None:
+            record.pop("metrics_pending", None)
+        _probe_document_update(document, path)
         cache_store.write_json_atomic(path, document, indent=1)
 
     def recover(session):
-        return _recover_probe_rows(session, rows, on_progress=save_recovered,
-                                   max_wait_seconds=getattr(args, "max_wait_seconds", 300.0))
+        outcome = _recover_probe_rows(session, rows, on_progress=save_recovered,
+                                     max_wait_seconds=getattr(args, "max_wait_seconds", 300.0))
+        _probe_halves(session, document["records"])
+        return outcome
 
-    needs_platform = any(row.get("train_fitness") is None
+    needs_platform = any((row.get("train_fitness") is None or row.get("metrics_pending"))
                          and row.get("submission_attempted") is not False for row in rows)
-    outcome = with_session(args, recover) if needs_platform else recover(None)
-    for row in rows:
-        if row.get("train_fitness") is not None:
-            note("%-28s %7s %6s %7s" % (row["label"], row.get("train_sharpe"),
-                                        row.get("train_fitness"), row.get("train_turnover")))
-    document["rows"] = rows
-    document["complete"] = not outcome["still_missing"]
-    document["incomplete"] = outcome["still_missing"]
-    document["recovered"] = outcome["matched"]
-    document["all_empty"] = len(outcome["still_missing"]) == len(rows)
-    document["comparisons"] = _probe_comparisons(rows, document.get("design"))
+    needs_halves = any(record.get("alpha_id") and _has_finished_result(record)
+        and ((record.get("out_of_sample") or {}).get("test") or {}).get("startDate")
+        and (not record.get("half_sharpes") or any(value is None for value in record["half_sharpes"]))
+        for record in document["records"])
+    outcome = with_session(args, recover) if needs_platform or needs_halves else recover(None)
+    _probe_reconcile(document)
+    _probe_document_update(document, path)
     cache_store.write_json_atomic(path, document, indent=1)
-    note("recovered %d arm(s) from the platform; still missing: %s"
-         % (outcome["recovered"], ", ".join(outcome["still_missing"]) or "none"))
-    for item in outcome.get("ambiguous") or []:
-        note("ambiguous: %s matches several alphas %s - left empty on purpose"
-             % (item["label"], ", ".join(item["candidates"])))
-    note("wrote %s" % path)
-    if getattr(args, "show_test", False):
-        research_paths.log_view("probe-recover", "test", [row.get("alpha_id") for row in rows])
-    return {"name": document.get("name"), "path": str(path),
-            "show_test": bool(getattr(args, "show_test", False)),
-            **{key: document[key] for key in ("idea", "mechanism", "note", "design")
-               if key in document},
-            "complete": document["complete"], "all_empty": document["all_empty"],
-            "comparisons": document["comparisons"],
-            "recovered": outcome["recovered"], "ambiguous": outcome["ambiguous"],
-            "still_missing": outcome["still_missing"],
-            "not_submitted": outcome["not_submitted"],
-            "rows": [_probe_visible_row(row, getattr(args, "show_test", False)) for row in rows]}
+    result = _probe_response(document, path, show_test, manifest)
+    if show_test:
+        research_paths.log_view("probe-recover", "test", [row.get("alpha_id") for row in result["rows"]],
+                                note={"selection_id": manifest["selection_id"], "batch_path": str(path)})
+    return {**result, **outcome}
 
 
 def _require_spec(args):
@@ -1156,147 +1301,117 @@ def _novelty_gate(arms, registry_path=None):
     return verdicts
 
 
-def cmd_probe(args, _sink):
-    """Run a batch of arms from one spec file: lint, simulate, table, record.
-
-    Every experiment in this campaign is those four steps, and each was being
-    re-written as a throwaway script. The copies drifted in ways that cost real time:
-    one printed its table to stdout and broke the one-JSON-document contract, one
-    reused its own output filename and silently overwrote the previous batch, one had
-    a quoting bug that only surfaced at import, and none logged progress, so a
-    four-minute wait looked like a hang.
-
-    A spec file plus this verb removes all four: expressions are JSON strings so
-    quoting cannot break, the output name carries the spec name *and* refuses to
-    overwrite, progress goes to stderr, and the table shows **train only** unless
-    ``--show-test`` is passed - selecting on the test year turns the only
-    out-of-sample evidence into training data.
-    """
-    if getattr(args, "recover", None):
-        return _cmd_probe_recover(args)
-    _require_spec(args)
-
-    # Resolve every arm before authenticating or spending quota on the first group.
-    spec = _load_probe_spec(args.spec)
-    settings = dict(spec.get("settings") or {})
-    arms = spec["arms"]
-    name = args.name or spec.get("name") or ("stdin" if args.spec == "-" else Path(args.spec).stem)
-
-    raw_groups = {}
-    for arm in arms:
-        overrides = merge_settings({**settings, **arm.get("settings", {})}, args)
-        key = json.dumps(overrides, sort_keys=True)
-        raw_groups.setdefault(key, {"settings": overrides, "arms": []})["arms"].append(arm)
-
+def _prepare_probe(args):
+    """Resolve one ordered request used by preview, preflight and execution."""
+    spec = _load_probe_spec(_require_spec(args))
+    name = getattr(args, "name", None) or spec.get("name") or Path(args.spec).stem
     groups = {}
-    for group in raw_groups.values():
-        entries = [{key: value for key, value in arm.items()
-                    if key not in {"settings", "design", "proxy_of"}}
-                   for arm in group["arms"]]
+    arms = []
+    for index, original in enumerate(spec["arms"]):
+        overrides = merge_settings({**(spec.get("settings") or {}),
+                                    **(original.get("settings") or {})}, args)
+        entry = {key: value for key, value in original.items()
+                 if key not in {"settings", "design", "proxy_of"}}
         try:
-            resolved, pairs = config_io.build_config(group["settings"], entries)
+            resolved, pairs = config_io.build_config(overrides, [entry])
         except config_io.ResearchError as exc:
             raise CliError("INVALID_INPUT", str(exc)) from exc
-        for arm, (expression, decay) in zip(group["arms"], pairs):
-            # guarded_sim lints strings, so each group must share the effective
-            # decay as well as the other request settings. Explicit defaults and
-            # per-arm decay overrides then coalesce into identical payload scopes.
-            effective = {**resolved, "decay": decay}
-            key = json.dumps(effective, sort_keys=True)
-            prepared = groups.setdefault(key, {"settings": effective, "arms": [], "pairs": []})
-            prepared["arms"].append({**arm, "expression": expression})
-            prepared["pairs"].append((expression, decay))
+        expression, decay = pairs[0]
+        settings = {**resolved, "decay": decay}
+        arm = {**original, "expression": expression, "settings": settings,
+               "arm_index": index, "ops": expression_lint.estimate_operator_count(expression)}
+        arms.append(arm)
+        group = groups.setdefault(_settings_signature(settings),
+                                  {"settings": settings, "arms": [], "pairs": []})
+        group["arms"].append(arm)
+        group["pairs"].append((expression, decay))
+    design = _probe_design({**spec, "arms": arms}, {})
+    gate = _novelty_gate(arms, registry_path=getattr(args, "registry", None))
+    return spec, name, groups, arms, design, gate
 
-    # Compare the actual requests, including explicit per-arm decay and CLI flags.
-    design_arms = [{**arm, "settings": group["settings"]}
-                   for group in groups.values() for arm in group["arms"]]
-    design = _probe_design({**spec, "arms": design_arms}, {})
+
+def _request_fingerprint(arms):
+    request = [{"label": arm["label"], "expression": arm["expression"],
+                "settings": arm["settings"]} for arm in arms]
+    return hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def cmd_probe(args, _sink):
+    """Prepare exact requests before checking, executing or continuing a batch."""
+    recover = getattr(args, "recover", None)
+    resume = getattr(args, "resume", None)
+    check = bool(getattr(args, "check", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    if sum(bool(value) for value in (recover, resume, check)) > 1 or check and dry_run:
+        raise CliError("USAGE", "--check, --recover and --resume are exclusive; --check cannot use --dry-run")
+    if getattr(args, "show_test", False) and (not recover or not getattr(args, "selection", None)):
+        raise CliError("USAGE", "--show-test requires --recover and --selection; it cannot start simulations")
+    if recover:
+        return _cmd_probe_recover(args)
+    if resume:
+        return _cmd_probe_resume(args)
+    spec, name, groups, arms, design, gate = _prepare_probe(args)
+    target = Path(getattr(args, "batch_path", None) or research_paths.batch_path(name)).expanduser().resolve()
+    protect_output(args, target)
     context = {key: spec[key] for key in ("idea", "mechanism", "note") if key in spec}
-    gate = _novelty_gate(design_arms, registry_path=getattr(args, "registry", None))
-    duplicates = [arm["label"] for arm, verdict in zip(design_arms, gate)
-                  if verdict.get("already_simulated")]
-    gate_blocking = ([{"code": "exact_repeat", "label": arm["label"],
-                       "evidence_keys": verdict["exact_repeat_keys"]}
-                      for arm, verdict in zip(design_arms, gate) if verdict.get("already_simulated")]
-                     if getattr(args, "strict_gate", False) else [])
-    if design["mode"] == "explore":
-        note("design: explore -- no control arm, so no arm is being attributed")
-
-    # The output path and its collision rule are decided before anything is spent:
-    # an existing batch file used to raise only after the simulations had run, so a
-    # same-day re-run paid full quota and then refused to save the result.
-    target = Path(research_paths.batch_path(name))
-    if target.exists() and not args.force:
-        raise CliError("INVALID_INPUT", "%s already exists" % target.name,
-                       "pass --name to label this batch, or --force to overwrite it")
-
-    if args.dry_run:
-        results = []
-        pairs = []
+    base = {"name": name, **context, "path": str(target), "arms": len(arms),
+            "groups": len(groups), "design": design, "arm_order": [arm["label"] for arm in arms],
+            "request_fingerprint": _request_fingerprint(arms),
+            "settings": [group["settings"] for group in groups.values()]}
+    gate_blocking = [{"code": "exact_repeat", "label": arm["label"],
+                      "evidence_keys": verdict["exact_repeat_keys"]}
+                     for arm, verdict in zip(arms, gate)
+                     if getattr(args, "strict_gate", False) and verdict.get("already_simulated")]
+    if dry_run:
+        results = [None] * len(arms)
+        reports = []
         for group in groups.values():
-            labels = [arm["label"] for arm in group["arms"]]
-            preview = ml.simulate_alphas(
-                None, group["pairs"], settings=group["settings"],
-                dry_run=True, labels=labels)
+            scoped = cached_field_scope(group["settings"])
+            report = expression_lint.lint_all(group["pairs"],
+                denylist=expression_lint.load_denylist(),
+                known_fields=scoped.get("known_fields"), field_types=scoped.get("field_types"),
+                strict_fields=scoped.get("known_fields") is not None)
+            attach_field_contracts(report, scoped)
+            reports.append({**report, "scope": scoped.get("evidence")})
+            preview = ml.simulate_alphas(None, group["pairs"], settings=group["settings"],
+                                        labels=[arm["label"] for arm in group["arms"]], dry_run=True)
             for record, arm in zip(preview, group["arms"]):
-                record["label"] = arm["label"]
-                record["design"] = arm.get("design")
-                record["proxy_of"] = arm.get("proxy_of")
-                record["gate"] = gate[len(results)]
-                results.append(record)
-                record["settings"] = dict(group["settings"])
-                # Pre-flight cost estimate: the fields bound the turnover band, and a long
-                # window pulls it below the dataset median. An arm that cannot escape the
-                # fitness floor should be known before it spends a simulation.
-                record["turnover_band"] = _turnover_band(record.get("expression") or "")
-            pairs.extend(group["pairs"])
-        field_types = _cached_field_types()
-        report = expression_lint.lint_all(
-            pairs, denylist=expression_lint.load_denylist(),
-            field_types=field_types or None,
-            strict_fields=bool(field_types))
-        blocking = report["errors"]
-        note("dry run: %d arm(s) in %d settings group(s), %d blocking finding(s)"
-             % (len(arms), len(groups), len(blocking)))
-        # A dry run is a preview: it reports blocking findings instead of aborting,
-        # because the caller asked to see the payloads. The real run is where a blocking
-        # finding stops the batch - and it now does, before a session is even opened.
-        if blocking:
-            note("  these would stop a real run: %s"
-                 % ", ".join(sorted({item.get("code") or "?" for item in blocking})))
-        return {"dry_run": True, "name": name, **context,
-                "arms": len(arms), "groups": len(groups),
-                "blocking": blocking, "gate_blocking": gate_blocking,
-                "would_block": bool(blocking or gate_blocking), "design": design,
+                index = arm["arm_index"]
+                results[index] = {**record, "label": arm["label"], "arm_index": index,
+                    "design": arm.get("design"), "proxy_of": arm.get("proxy_of"),
+                    "settings": arm["settings"], "gate": gate[index],
+                    "turnover_band": _turnover_band(arm["expression"])}
+        blocking = [item for report in reports for item in report.get("errors", [])]
+        return {**base, "dry_run": True, "results": results, "blocking": blocking,
+                "gate_blocking": gate_blocking, "would_block": bool(blocking or gate_blocking),
+                "preflight_complete": False, "run_id": None, "started_at": None,
                 "comparisons": _probe_comparisons(results, design),
-                "settings": [group["settings"] for group in groups.values()],
-                "results": results,
-                "lint": {"operator_catalog_checked": False,
-                         "field_catalog_checked": False,
-                         "hint": "Live operator and field catalogs were not checked; "
-                                 "run `lint` for authoritative catalog checks.",
-                         "ok": report["ok"], "errors": report["errors"],
-                         "warnings": report["warnings"]}}
-    if duplicates:
-        note("")
-        note("novelty gate: %d arm(s) repeat finished results under identical settings: %s"
-             % (len(duplicates), ", ".join(duplicates))[:300])
-        if getattr(args, "strict_gate", False):
-            raise CliError("INVALID_INPUT",
-                           "%d arm(s) repeat finished results under identical settings" % len(duplicates),
-                           "drop them, or rerun without --strict-gate")
-
-
-
+                "lint": {"ok": not blocking, "errors": blocking,
+                         "warnings": [item for report in reports for item in report.get("warnings", [])],
+                         "operator_catalog_checked": False, "field_catalog_checked": False,
+                         "hint": "Live catalogs were not checked; run probe --check for exact authenticated preflight.",
+                         "groups": reports},
+                "next_actions": [{"action": "check", "spec": str(args.spec)}]}
+    if gate_blocking:
+        raise CliError("INVALID_INPUT", "exact finished requests repeat under --strict-gate",
+                       details={"gate_blocking": gate_blocking})
+    if check:
+        reports = with_session(args, lambda session: [
+            _preflight_lint(session, group["pairs"], group["settings"], args)
+            for group in groups.values()])
+        return {**base, "check": True, "preflight": reports,
+                "preflight_complete": all(bool(report) and report.get("ok", False) for report in reports),
+                "run_id": None, "started_at": None,
+                "next_actions": [{"action": "run", "spec": str(args.spec), "batch_path": str(target)}]}
     try:
         with cache_store.file_lock(str(target) + ".lock", timeout=0):
-            if target.exists() and not args.force:
+            if target.exists() and not getattr(args, "force", False):
                 raise CliError("INVALID_INPUT", "%s already exists" % target.name,
-                               "recover the saved batch or use another --name")
+                               "recover or resume the saved batch, or choose another --batch-path")
             return _run_probe(args, spec, name, groups, design, gate, target)
     except cache_store.LockTimeout as exc:
-        raise CliError("SERVICE_ERROR", "this probe batch is already being updated",
-                       str(target)) from exc
+        raise CliError("SERVICE_ERROR", "this probe batch is already being updated", str(target)) from exc
 
 
 def _probe_row(record, arm, gate, show_test):
@@ -1325,178 +1440,220 @@ def _probe_row(record, arm, gate, show_test):
     return row
 
 
-def _run_probe(args, spec, name, groups, design, gate, target):
-    """Own a batch under its process lock; snapshot every accepted or completed arm."""
-    settings = dict(spec.get("settings") or {})
-    context = {key: spec[key] for key in ("idea", "mechanism", "note") if key in spec}
-    arms = [{**arm, "settings": group["settings"],
-             "ops": expression_lint.estimate_operator_count(arm["expression"])}
-            for group in groups.values() for arm in group["arms"]]
-    records = [{"expression": arm["expression"], "decay": arm["settings"]["decay"],
-                "settings": dict(arm["settings"]), "mechanism": arm["label"],
-                "status": "QUEUED", "alpha_id": None, "metrics": None,
-                "submission_attempted": False} for arm in arms]
+def _submission_state(record):
+    if record.get("alpha_id") or record.get("progress_url"):
+        return "accepted"
+    return "not_submitted" if record.get("submission_attempted") is False else "unknown_submission"
+
+
+def _probe_document_update(document, target):
+    arms, records = document["arms"], document["records"]
+    rows = [_probe_row(record, arm, (document.get("gate") or [{}] * len(arms))[index], True)
+            for index, (record, arm) in enumerate(zip(records, arms))]
+    for index, row in enumerate(rows):
+        row["arm_index"] = index
+        row["submission_state"] = _submission_state(records[index])
+        row["cost_evidence"] = costs.evidence(_train_metrics(records[index]), "train", document.get("cost_bps"))
+    incomplete = [row["label"] for row in rows if row.get("train_fitness") is None]
+    document.update({"rows": rows, "complete": not incomplete, "incomplete": incomplete,
+                     "all_empty": bool(rows) and len(incomplete) == len(rows),
+                     "comparisons": _probe_comparisons(rows, document.get("design"))})
+    document["execution"] = {"total": len(rows), "finished": sum(_has_finished_result(r) for r in records),
+        "train_evidence": len(rows) - len(incomplete),
+        **{state: sum(row["submission_state"] == state for row in rows)
+           for state in ("accepted", "not_submitted", "unknown_submission")}}
+    actions = []
+    if any(row["submission_state"] != "not_submitted" and row["label"] in incomplete for row in rows):
+        actions.append({"action": "recover", "batch_path": str(target), "platform_read_only": True})
+    if any(row["submission_state"] == "not_submitted" or row.get("progress_url") for row in rows):
+        actions.append({"action": "resume", "batch_path": str(target), "requires_explicit_request": True})
+    if document.get("recording_policy", {}).get("enabled") and not document.get("recording"):
+        actions.append({"action": "recover", "batch_path": str(target), "reason": "reconcile_recording"})
+    document["next_actions"] = actions
+
+
+def _probe_response(document, path, show_test=False, manifest=None):
+    keys = ("name", "idea", "mechanism", "note", "run_id", "started_at", "request_fingerprint",
+            "arm_order", "design", "complete", "incomplete", "all_empty", "comparisons",
+            "execution", "recording", "recording_policy", "next_actions", "preflight")
+    rows = [_probe_visible_row(row, show_test) for row in document["rows"]]
+    if manifest is not None:
+        sources = {row.get("source_file") for row in manifest["rows"] if row.get("source_file")}
+        matching_sources = []
+        for source in sources:
+            if Path(source).resolve() == Path(path).resolve():
+                matching_sources.append(source)
+                continue
+            try:
+                canonical, _saved = _load_probe_batch(source)
+            except CliError:
+                continue
+            if canonical == Path(path).resolve():
+                matching_sources.append(source)
+        current = [{**row, "source_file": source} for source in matching_sources for row in rows
+                   if row.get("alpha_id")]
+        rows = _selection_call(selection.ordered_rows, manifest, current)
+    response = {key: document[key] for key in keys if key in document}
+    response.update({"path": str(path), "rows": rows, "show_test": show_test,
+                     "simulated": document["execution"]["accepted"]})
+    if document.get("recording"):
+        response["registry"] = document["recording"]
+    if manifest:
+        response["selection_id"] = manifest["selection_id"]
+    return response
+
+
+def _probe_reconcile(document):
+    policy = document.get("recording_policy")
+    if not policy or not policy.get("enabled"):
+        document["recording"] = {"state": "skipped" if policy else "deferred",
+            "reason": "recording_disabled" if policy else "legacy_recording_policy_unknown",
+            "recorded": 0, "appended": 0}
+        return
+    document["recording"] = {"state": "reconciled", **alpha_registry.record_simulation(
+        document["records"], {}, idea=document.get("idea"), mechanism=document.get("mechanism"),
+        note=document.get("note"), registry_path=policy["registry"], source="simulate", batch=document.get("name"))}
+
+
+def _probe_halves(session, records):
+    for record in records:
+        if not _has_finished_result(record) or not record.get("alpha_id"):
+            continue
+        boundary = ((record.get("out_of_sample") or {}).get("test") or {}).get("startDate")
+        if not boundary:
+            record["half_sharpes"] = [None, None]
+            continue
+        if record.get("half_sharpes") and all(value is not None for value in record["half_sharpes"]):
+            continue
+        evidence = {}
+        try:
+            pnl = ml.fetch_daily_pnl(session, record["alpha_id"],
+                cache_dir=Path(research_paths.ensure_dir()) / "pnl", max_age_hours=24, report=evidence)
+        except (ml.BrainError, ml.requests.RequestException, OSError) as exc:
+            record["half_sharpes"] = [None, None]
+            record["half_sharpes_error"] = str(exc)
+        else:
+            record["pnl_evidence"] = evidence
+            record["half_sharpes"] = half_split_sharpes(pnl, boundary) if evidence.get("complete") is True else (None, None)
+            record.pop("half_sharpes_error", None)
+
+
+def _execute_probe(args, document, target, groups):
+    records = document["records"]
     state_lock = threading.Lock()
 
-    def save_batch():
-        rows = [_probe_row(record, arm, gate[index], args.show_test)
-                for index, (record, arm) in enumerate(zip(records, arms))]
-        incomplete = [row["label"] for row in rows if row.get("train_fitness") is None]
-        document = {"spec": str(args.spec), "name": name, **context, "rows": rows,
-                    "design": design, "comparisons": _probe_comparisons(rows, design),
-                    "records": records, "complete": not incomplete, "incomplete": incomplete}
+    def save():
+        _probe_document_update(document, target)
         cache_store.write_json_atomic(target, document, indent=1)
 
-    def update_record(index, payload):
-        records[index] = {**payload, "settings": dict(arms[index]["settings"]),
-                          "expression": arms[index]["expression"],
-                          "submission_attempted": True}
+    def update(index, payload, kind=None):
+        merged = {**records[index], **{key: value for key, value in payload.items() if key != "index"}}
+        arm = document["arms"][index]
+        merged.update({"settings": dict(arm["settings"]), "expression": arm["expression"],
+                       "mechanism": arm["label"], "decay": arm["settings"]["decay"]})
+        if kind == "submitting":
+            merged.update({"submission_attempted": True, "status": "UNKNOWN_SUBMISSION"})
+        if merged.get("alpha_id") or merged.get("progress_url"):
+            merged["submission_attempted"] = True
+        if _has_finished_result(merged):
+            for key in ("progress_url", "next_poll_at", "metrics_pending"):
+                if key not in payload:
+                    merged.pop(key, None)
+        records[index] = merged
 
-    def progress(offset, kind, payload):
-        if kind in {"submitted", "pending", "completed", "failed", "deferred"}:
-            index = payload.get("index")
-            if isinstance(index, int) and 0 <= offset + index < len(records):
-                with state_lock:
-                    update_record(offset + index, {key: value for key, value in payload.items()
-                                                   if key != "index"})
-                    save_batch()
+    def progress(indices, kind, payload):
+        index = payload.get("index")
+        if kind in {"submitting", "submitted", "pending", "completed", "failed", "deferred"} \
+                and isinstance(index, int) and 0 <= index < len(indices):
+            with state_lock:
+                update(indices[index], payload, kind)
+                save()
         note("  %s" % kind)
 
     def work(session):
-        # The live preflight runs inside this one session, before any arm is submitted:
-        # probe used to lint offline only, so an unknown field or a VECTOR field in a
-        # MATRIX slot was discovered by the simulator - five arms at a time.
-        if not getattr(args, "allow_lint_errors", False):
-            for group in groups.values():
-                _preflight_lint(session, group["pairs"], group["settings"], args)
-
-        save_batch()
-        note("progress saved to %s; recover it before repeating submitted work" % target)
+        document["preflight"] = [_preflight_lint(session, group["pairs"], group["settings"], args)
+                                 for group in groups.values()]
+        save()
         deadline = time.monotonic() + getattr(args, "max_wait_seconds", 300.0)
-        offset = 0
         for group in groups.values():
-            size = len(group["arms"])
+            indices = [arm["arm_index"] for arm in group["arms"]]
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            arm_settings = group["settings"]
-            note("simulating %d arm(s) under %s/%s/%s"
-                 % (len(group["arms"]), arm_settings.get("region"), arm_settings.get("universe"),
-                    arm_settings.get("neutralization")))
+            produced = guarded_sim.simulate([expression for expression, _ in group["pairs"]],
+                group["settings"], labels=[arm["label"] for arm in group["arms"]], session=session,
+                force=getattr(args, "allow_lint_errors", False),
+                initial_records=[records[index] for index in indices], max_wait_seconds=remaining,
+                on_event=lambda kind, payload, positions=indices: progress(positions, kind, payload))
             with state_lock:
-                for record in records[offset:offset + size]:
-                    record["submission_attempted"] = True
-                save_batch()
-            produced = guarded_sim.simulate(
-                [expression for expression, _decay in group["pairs"]], arm_settings,
-                labels=[arm["label"] for arm in group["arms"]], session=session,
-                initial_records=records[offset:offset + size], max_wait_seconds=remaining,
-                on_event=lambda kind, payload, start=offset: progress(start, kind, payload))
-            with state_lock:
-                for index, record in enumerate(produced):
-                    update_record(offset + index, record)
-                save_batch()
-            offset += size
+                for index, record in zip(indices, produced):
+                    update(index, record)
+                save()
             if any(record.get("progress_url") or record.get("metrics_pending")
-                   or record.get("status") in {"PENDING", "QUEUED"} for record in produced):
+                   or record.get("status") in {"PENDING", "QUEUED", "UNKNOWN_SUBMISSION"} for record in produced):
                 break
-        # Half-split stability, from the daily PnL the platform already exposes.
-        # Inside the session because this is the only place one is open; the fetch is
-        # cached, so a re-run costs nothing and no simulation is involved.
-        pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
-        for record in records:
-            if (record.get("status") or "").upper() not in alpha_registry.FINISHED_STATUSES:
+        _probe_halves(session, records)
+
+    save()
+    if groups:
+        with_session(args, work)
+    _probe_reconcile(document)
+    save()
+    return _probe_response(document, target)
+
+
+def _run_probe(args, spec, name, groups, design, gate, target):
+    arms = sorted([arm for group in groups.values() for arm in group["arms"]], key=lambda arm: arm["arm_index"])
+    document = {"format": "probe-batch", "version": 2, "spec": str(args.spec), "name": name,
+        **{key: spec[key] for key in ("idea", "mechanism", "note") if key in spec},
+        "run_id": str(uuid.uuid4()), "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "request_fingerprint": _request_fingerprint(arms), "arm_order": [arm["label"] for arm in arms],
+        "arms": arms, "design": design, "gate": gate, "cost_bps": getattr(args, "cost_bps", None),
+        "recording_policy": {"enabled": not getattr(args, "no_record", False),
+            "registry": str(Path(getattr(args, "registry", None) or alpha_registry.default_registry_path()).resolve())},
+        "records": [{"expression": arm["expression"], "decay": arm["settings"]["decay"],
+                     "settings": dict(arm["settings"]), "mechanism": arm["label"], "status": "QUEUED",
+                     "alpha_id": None, "metrics": None, "submission_attempted": False} for arm in arms]}
+    return _execute_probe(args, document, target, groups)
+
+
+def _cmd_probe_resume(args):
+    changing = ("spec", "name", "batch_path", "registry", "cost_bps", "region", "universe",
+                "instrument_type", "neutralization", "decay", "delay", "truncation",
+                "pasteurization", "nan_handling", "test_period", "force", "no_record")
+    if any(getattr(args, key, None) is not None and getattr(args, key) is not False for key in changing):
+        raise CliError("USAGE", "--resume uses saved requests and recording policy; parameters cannot change")
+    path, document = _load_probe_batch(args.resume)
+    protect_output(args, path)
+
+    def groups_for(saved):
+        groups = {}
+        for arm, record in zip(saved["arms"], saved["records"]):
+            if _submission_state(record) == "unknown_submission" or _has_finished_result(record):
                 continue
-            alpha_id = record.get("alpha_id")
-            if not alpha_id:
-                continue
-            test_start = ((record.get("out_of_sample") or {}).get("test") or {}).get("startDate")
-            try:
-                pnl = ml.fetch_daily_pnl(session, alpha_id, cache_dir=pnl_dir,
-                                         max_age_hours=24)
-            except Exception:  # noqa: BLE001 - a cache miss must not fail the batch
-                pnl = None
-            record["half_sharpes"] = half_split_sharpes(pnl, test_start)
-        return records
+            if not arm.get("settings") or not arm.get("expression"):
+                raise CliError("INVALID_INPUT", "legacy batch lacks exact requests; cannot resume")
+            if _submission_state(record) == "not_submitted" and ml.resolve_settings(arm["settings"]) != arm["settings"]:
+                raise CliError("INVALID_INPUT", "legacy batch lacks complete resolved settings; cannot start a new POST")
+            group = groups.setdefault(_settings_signature(arm["settings"]),
+                                      {"settings": arm["settings"], "arms": [], "pairs": []})
+            group["arms"].append(arm)
+            group["pairs"].append((arm["expression"], arm["settings"].get("decay")))
+        return groups
 
-
-    # probe had no live preflight: the dry run linted offline and the real run went
-    # straight to the simulator, so a VECTOR field in a MATRIX slot was only discovered
-    # by the simulator - five arms at a time. The check runs per settings group because
-    # the field catalog is scoped by region/universe/delay.
-    records = with_session(args, work)
-
-    rows = []
-    note("")
-    header = "%-28s %7s %6s %7s %4s %7s %7s" % ("label", "trS", "trF", "trT", "ops",
-                                               "trH1", "trH2")
-    if args.show_test:
-        header += " %7s %6s %7s %7s" % ("S", "F", "T", "testS")
-    note(header)
-    for position, (record, arm) in enumerate(zip(records, arms)):
-        row = _probe_row(record, arm, gate[position], args.show_test)
-        failed = row.get("failed_checks") or []
-        line = "%-28s %7s %6s %7s %4s %7s %7s" % (
-            arm["label"], row["train_sharpe"], row["train_fitness"],
-            row["train_turnover"], row["ops"],
-            None if row["train_sharpe_h1"] is None else round(row["train_sharpe_h1"], 2),
-            None if row["train_sharpe_h2"] is None else round(row["train_sharpe_h2"], 2))
-        if args.show_test:
-            # Validation fields were explicitly added by _probe_row.
-            line += " %7s %6s %7s %7s" % (row["sharpe"], row["fitness"],
-                                          row["turnover"], row["test_sharpe"])
-        rows.append(row)
-        note(line + ("  fail=" + ",".join(failed) if args.show_test and failed else ""))
-
-    dense = [row["label"] for row in rows if (row.get("ops") or 0) > SIMPLE_OPERATOR_LIMIT]
-    if dense:
-        note("")
-        note("complexity: %d arm(s) above %d operators: %s"
-             % (len(dense), SIMPLE_OPERATOR_LIMIT, ", ".join(dense)))
-        note("  when two arms score alike, prefer the simpler one - and do not read a "
-             "dense arm as evidence for a mechanism until it transfers")
-
-    # An arm can come back QUEUED with no metrics - the platform rate-limits a batch
-    # and `guarded_sim` gives up after its backoff budget. The batch file then looks
-    # complete while seven rows are empty, which is how a 34-arm sweep quietly became
-    # a 27-arm one. Say it out loud, in the table and in the document.
-    incomplete = [row["label"] for row in rows if row.get("train_fitness") is None]
-    if incomplete:
-        note("")
-        note("INCOMPLETE: %d arm(s) produced no train metrics: %s"
-             % (len(incomplete), ", ".join(incomplete)))
-        note("  inspect the submitted results with `probe --recover %s` before deciding "
-             "whether any arm needs another simulation" % target)
-
-    comparisons = _probe_comparisons(rows, design)
-    save_batch()
-    if args.show_test:
-        research_paths.log_view("probe", "test", [row.get("alpha_id") for row in rows],
-                                note=name)
-    note("wrote %s" % target)
-
-    # A batch where every arm came back empty is a failure, not a batch with gaps. The
-    # caller (and any script reading this JSON) should be able to tell the two apart
-    # without parsing row-level metrics: an all-empty run raises, a partial one reports.
-    all_empty = bool(rows) and len(incomplete) == len(rows)
-    summary = {"name": name, **context, "path": str(target), "rows": rows,
-               "comparisons": comparisons,
-               "simulated": len(rows), "show_test": bool(args.show_test),
-               "design": design, "complete": not incomplete,
-               "all_empty": all_empty,
-               "incomplete": incomplete}
-    if all_empty:
-        # Do not raise: recovery (`--recover`) is a legitimate next step, and the batch
-        # file is the record of what was submitted. But say it in the document, not only
-        # on stderr, because stderr is what gets scrolled past.
-        note("ALL EMPTY: none of the %d arm(s) produced train metrics" % len(rows))
-    if not args.no_record:
-        summary["registry"] = alpha_registry.record_simulation(
-            records, settings, idea=spec.get("idea"), mechanism=spec.get("mechanism"),
-            note=spec.get("note"), registry_path=args.registry, source="simulate",
-            batch=name)
-
-    return summary
+    if getattr(args, "dry_run", False):
+        groups = groups_for(document)
+        _probe_document_update(document, path)
+        return {**_probe_response(document, path), "dry_run": True, "resume": True,
+                "continuing": [arm["label"] for group in groups.values() for arm in group["arms"]],
+                "blocked_unknown": [arm["label"] for arm, record in zip(document["arms"], document["records"])
+                                    if _submission_state(record) == "unknown_submission"]}
+    try:
+        with cache_store.file_lock(str(path) + ".lock", timeout=0):
+            path, document = _load_probe_batch(path)
+            return _execute_probe(args, document, path, groups_for(document))
+    except cache_store.LockTimeout as exc:
+        raise CliError("SERVICE_ERROR", "this probe batch is already being updated", str(path)) from exc
 
 
 def cmd_simulate(args, sink):

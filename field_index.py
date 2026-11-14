@@ -151,28 +151,61 @@ def field_ids(fields):
 
 
 def fetch_all_fields(session, region="USA", universe="TOP3000", delay=1,
-                     instrument_type="EQUITY", dataset_ids=None):
-    """Fetch every datafield for a scope, across all of its datasets.
+                     instrument_type="EQUITY", dataset_ids=None, report=None,
+                     refresh=None):
+    """Fetch a scope with explicit completeness and freshness evidence.
 
-    This is the authoritative list for name verification. It rides the existing
-    catalog cache, so repeated calls inside one session are cheap.
+    Application services attach account identity and save capability snapshots.
     """
+    import cache_store
     import machine_lib as ml
 
-    if dataset_ids is None:
+    scope = {"region": region, "universe": universe, "delay": delay,
+             "instrumentType": instrument_type}
+    evidence = {"state": "unknown", "scope": scope,
+                "source": "authenticated_catalog", "catalogs": [],
+                "coverage": {"complete": False, "field_count": 0},
+                "freshness": {"state": "unknown"}}
+    if report is not None:
+        report.update(evidence)
+    full_scope = dataset_ids is None
+    if full_scope:
+        cache = {}
         records = ml.get_datasets(
             session, instrument_type=instrument_type, region=region,
-            universe=universe, delay=delay,
+            universe=universe, delay=delay, refresh=refresh, report=cache,
         ) or []
-        dataset_ids = [r.get("id") for r in records if r.get("id")]
-
+        evidence["catalogs"].append({"kind": "datasets", **cache})
+        if any(not isinstance(row, dict) or not row.get("id") for row in records):
+            raise ValueError("dataset catalog contains records without identifiers")
+        dataset_ids = [row["id"] for row in records]
+    dataset_ids = list(dict.fromkeys(dataset_ids))
     fields = []
     for dataset_id in dataset_ids:
-        for record in ml.get_datafields(
+        cache = {}
+        records = ml.get_datafields(
             session, instrument_type=instrument_type, region=region,
             delay=delay, universe=universe, dataset_id=dataset_id,
-        ) or []:
+            refresh=refresh, report=cache,
+        ) or []
+        evidence["catalogs"].append({"kind": "datafields", "dataset": dataset_id, **cache})
+        for record in records:
+            if not isinstance(record, dict) or not record.get("id"):
+                raise ValueError("field catalog contains records without identifiers")
             item = dict(record)
             item.setdefault("dataset", dataset_id)
+            item.setdefault("region", region)
+            item.setdefault("delay", delay)
             fields.append(item)
+    fresh = all(row.get("complete") is True and not row.get("stale") and not row.get("degraded")
+                and not row.get("error") and not row.get("hit")
+                for row in evidence["catalogs"])
+    complete = full_scope and bool(dataset_ids) and bool(fields) and fresh
+    evidence["coverage"] = {"complete": complete, "field_count": len(fields),
+                            "dataset_ids": dataset_ids, "full_scope": full_scope}
+    evidence["freshness"] = {"state": "fresh" if fresh else "unknown",
+                             "as_of": cache_store.utc_now().isoformat() if fresh else None}
+    evidence["state"] = "verified" if complete else "unknown"
+    if report is not None:
+        report.update(evidence)
     return fields

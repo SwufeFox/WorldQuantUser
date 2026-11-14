@@ -85,6 +85,16 @@ def result_record(alpha_id="A1", sharpe=2.0, test_sharpe=1.4):
             "out_of_sample": {"train": {"sharpe": sharpe + 0.1},
                               "test": {"sharpe": test_sharpe}}}
 
+def freeze_compare_args(args):
+    """Exercise a persisted training choice before the validation view."""
+    target = os.path.join(tempfile.mkdtemp(), "selection.json")
+    train = argparse.Namespace(**{**vars(args), "frozen": False, "freeze": target})
+    cli_experiments.cmd_compare(train, mock.MagicMock())
+    args.selection = target
+    args.sort = None
+    args.min_fitness = None
+
+
 
 class CompareShapeTests(unittest.TestCase):
     """`compare` has to read what this repository actually writes."""
@@ -98,6 +108,7 @@ class CompareShapeTests(unittest.TestCase):
             paths.append(path)
         args = argparse.Namespace(files=paths, min_fitness=None, sort="sharpe",
                                   contributions=False, save=None, frozen=True)
+        freeze_compare_args(args)
         # `--frozen` writes an audit line; without this the test appends to the real
         # research log, which is how 480 test entries ended up in views.jsonl.
         log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
@@ -235,6 +246,8 @@ class CompareSortAndContributionTests(unittest.TestCase):
                                   contributions=False, save=None, frozen=False)
         for key, value in overrides.items():
             setattr(args, key, value)
+        if args.frozen:
+            freeze_compare_args(args)
         # Same reason as CompareShapeTests._run: frozen writes an audit line, and the
         # audit line belongs in a temp file during a test run.
         log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
@@ -261,8 +274,8 @@ class CompareSortAndContributionTests(unittest.TestCase):
         self.assertEqual(train["contributions"]["view"], "train")
         self.assertEqual(train["contributions"]["legs"][0]["verdict"], "hurts")
         frozen = self._run(records, contributions=True, frozen=True)
-        self.assertEqual(frozen["contributions"]["view"], "frozen")
-        self.assertEqual(frozen["contributions"]["legs"][0]["verdict"], "adds")
+        self.assertEqual(frozen["contributions"]["view"], "train")
+        self.assertEqual(frozen["contributions"]["legs"][0]["verdict"], "hurts")
 
     def test_row_only_probe_preserves_ten_arm_order_and_explicit_train_metrics(self):
         labels = ["control", "decay-4", "decay-8", "decay-16", "industry",
@@ -292,10 +305,8 @@ class CompareSortAndContributionTests(unittest.TestCase):
             self.assertEqual(row["checks_state"], "unavailable" if frozen else "hidden")
         row_only = {"name": "probe", "incomplete": ["missing"], "rows": [
             {"label": "missing", "status": "PENDING", "sharpe": 9, "test_sharpe": 7}]}
-        row = self._run(row_only, frozen=True)["rows"][0]
-        self.assertIsNone(row["train_sharpe"])
-        self.assertIsNone(row["failed_checks"])
-        self.assertEqual(row["status"], "PENDING")
+        with self.assertRaises(cli_runtime.CliError):
+            self._run(row_only, frozen=True)
 
     def test_cached_check_failures_are_frozen_only_and_empty_is_known(self):
         failed = result_record("FAIL")
@@ -324,7 +335,7 @@ class CompareSortAndContributionTests(unittest.TestCase):
         self.assertEqual([row["train_sharpe_h1"] for row in data["rows"]], [2.1, 1.1])
         self.assertEqual(data["contributions"]["legs"][0]["verdict"], "hurts")
         frozen = self._run(payload, sort="none", contributions=True, frozen=True)
-        self.assertEqual(frozen["contributions"]["legs"][0]["verdict"], "adds")
+        self.assertEqual(frozen["contributions"]["legs"][0]["verdict"], "hurts")
 
     def test_probe_alignment_uses_order_only_without_conflicting_identity(self):
         payload = {"spec": "probe.json", "rows": [
@@ -362,7 +373,9 @@ class CompareSortAndContributionTests(unittest.TestCase):
             {"label": "second", "train_sharpe": 2, "failed_checks": ["LOW_FITNESS"]}],
             "records": [{"mechanism": "second", "half_sharpes": [2.1, 2.2]},
                         {"mechanism": "first", "half_sharpes": [1.1, 1.2]}]}
-        rows = self._run(payload, sort="none", frozen=True)["rows"]
+        _records, aligned = cli_experiments._compare_document("synthetic.json", payload)
+        rows = [cli_experiments._compare_row(record, row, "synthetic.json", True)
+                for record, row in aligned]
         self.assertEqual([row["train_sharpe_h1"] for row in rows], [1.1, 2.1])
         self.assertEqual([row["failed_checks"] for row in rows], [[], ["LOW_FITNESS"]])
 
@@ -444,6 +457,7 @@ class ViewsCommandTests(unittest.TestCase):
             cli_experiments.cmd_compare(args, mock.MagicMock())
             self.assertFalse(os.path.exists(log))
             args.frozen = True
+            freeze_compare_args(args)
             cli_experiments.cmd_compare(args, mock.MagicMock())
         entries = [json.loads(line) for line in open(log, encoding="utf-8")]
         self.assertEqual(entries[0]["tool"], "compare")
@@ -459,9 +473,7 @@ class ViewsCommandTests(unittest.TestCase):
 
 
 class CompareMinFitnessTests(unittest.TestCase):
-    def test_min_fitness_applies_to_the_view_it_reports_on(self):
-        # The train view filters on train_fitness; --frozen filters on the full-window
-        # number. Mixing them would let a row pass a bar it never cleared.
+    def test_frozen_membership_rejects_later_fitness_filter(self):
         path = os.path.join(tempfile.mkdtemp(), "batch.json")
         with open(path, "w", encoding="utf-8") as handle:
             json.dump([{"alpha_id": "A1", "metrics": {"sharpe": 2.0, "fitness": 1.6},
@@ -471,7 +483,13 @@ class CompareMinFitnessTests(unittest.TestCase):
         args = argparse.Namespace(files=[path], min_fitness=1.0, sort="fitness",
                                   contributions=False, save=None, frozen=False)
         self.assertEqual(cli_experiments.cmd_compare(args, mock.MagicMock())["count"], 0)
+        args.min_fitness = None
+        freeze_compare_args(args)
+        args.min_fitness = 99
         args.frozen = True
+        with self.assertRaises(cli_runtime.CliError):
+            cli_experiments.cmd_compare(args, mock.MagicMock())
+        args.min_fitness = None
         log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
         with mock.patch.object(research_paths, "views_log_path", lambda: log):
             self.assertEqual(
@@ -498,6 +516,7 @@ class ViewLogIsolationTests(unittest.TestCase):
         log = os.path.join(tempfile.mkdtemp(), "views.jsonl")
         args = argparse.Namespace(files=[path], min_fitness=None, sort="sharpe",
                                   contributions=False, save=None, frozen=True)
+        freeze_compare_args(args)
         with mock.patch.object(research_paths, "views_log_path", lambda: log):
             cli_experiments.cmd_compare(args, mock.MagicMock())
         self.assertTrue(os.path.exists(log))

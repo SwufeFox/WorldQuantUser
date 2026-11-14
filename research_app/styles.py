@@ -107,6 +107,8 @@ def summarize(entries):
             "expression": expression,
         })
     order = {"static": 0, "level": 1, "window": 2, "history": 3}
-    rows.sort(key=lambda row: (order.get(row["comparison"], 9), -(row["fitness"] or -9)))
+    rows.sort(key=lambda row: (order.get(row["comparison"], 9),
+                               row["train_fitness"] is None,
+                               -(row["train_fitness"] if row["train_fitness"] is not None else 0)))
     return {"counts": by_comparison, "rows": rows, "skipped": skipped,
             "measured": len(rows)}

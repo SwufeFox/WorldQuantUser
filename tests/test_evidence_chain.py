@@ -45,9 +45,23 @@ class WarningStatusTests(unittest.TestCase):
         self.assertEqual(summary["failed"], 0)
         self.assertEqual(summary["best"]["sharpe"], 2.0)
 
-    def test_only_an_unfinished_status_is_rejected(self):
+    def test_unfinished_execution_is_not_a_scientific_rejection(self):
         self.assertEqual(alpha_registry.auto_verdict(record(status="WARNING")), "candidate")
-        self.assertEqual(alpha_registry.auto_verdict(record(status="PENDING")), "rejected")
+        for status in ("PENDING", "FAILED", "UNKNOWN_SUBMISSION", "QUEUED"):
+            self.assertEqual(alpha_registry.auto_verdict(record(status=status)), "watch")
+
+    def test_unfinished_refresh_preserves_active_metrics_and_manual_labels(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "registry.jsonl")
+            original = alpha_registry.build_entry(record(status="ACTIVE"), mechanism="human", verdict="candidate")
+            original = alpha_registry.relabel(original, verdict="candidate")
+            alpha_registry.record_entry(original, path)
+            before = open(path, encoding="utf-8").read()
+            result = alpha_registry.record_simulation([record(status="FAILED", sharpe=0, fitness=0)],
+                                                       {}, registry_path=path)
+            self.assertEqual(result["recorded"], 0)
+            self.assertEqual(len(result["deferred"]), 1)
+            self.assertEqual(open(path, encoding="utf-8").read(), before)
 
     def test_an_all_warning_batch_does_not_raise(self):
         tmp = tempfile.mkdtemp()
@@ -212,3 +226,24 @@ class IdentifierSubstitutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CompletedEvidencePreservationTests(unittest.TestCase):
+    def test_completed_refresh_keeps_manual_labels_active_state_and_missing_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "registry.jsonl")
+            base = alpha_registry.build_entry(record(status="ACTIVE"), mechanism="old")
+            base = alpha_registry.relabel(base, mechanism="human choice", family="quality")
+            base["metrics"]["margin"] = .002
+            base["out_of_sample"]["test"] = {"sharpe": .8}
+            alpha_registry.record_entry(base, path)
+            fresh = record(sharpe=1.7)
+            fresh["mechanism"] = "automatic arm label"
+            summary = alpha_registry.record_simulation([fresh], {}, registry_path=path)
+            self.assertEqual(summary["recorded"], 1)
+            stored = alpha_registry.load_entries(path)[0]
+            self.assertEqual(stored["status"], "ACTIVE")
+            self.assertEqual(stored["mechanism"], "human choice")
+            self.assertEqual(stored["family"], "quality")
+            self.assertEqual(stored["metrics"]["margin"], .002)
+            self.assertEqual(stored["out_of_sample"]["test"]["sharpe"], .8)

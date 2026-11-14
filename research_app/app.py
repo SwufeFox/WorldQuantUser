@@ -18,6 +18,7 @@ from .runtime import CliError, EXIT_CODES, _error_body, _prepare_output, emit, m
 
 def _dispatch(args):
     """Validate common argument constraints, configure logging and caches, and invoke command."""
+    runtime.protect_output(args)
     for name, value in vars(args).items():
         if isinstance(value, float) and not math.isfinite(value):
             args._parser.error("--%s must be finite" % name.replace("_", "-"))
@@ -43,6 +44,7 @@ def main(argv=None):
     options = argparse.Namespace(save=None, compact=False, quiet=False, research_dir=None,
                                  command="help")
     prepared = None
+    save_allowed = True
     previous_quiet = runtime._QUIET
     previous_directory = os.environ.get(research_paths.ENV_VAR)
     previous_policy = ml.metadata_cache_policy()
@@ -53,6 +55,8 @@ def main(argv=None):
             # Read only common options first, so errors honour --save/--compact too.
             common = JsonArgumentParser(prog="research_cli.py", add_help=False, common=False)
             _add_common_args(common)
+            for name in runtime._PROTECTED_OUTPUT_ARGS:
+                common.add_argument("--" + name.replace("_", "-"), default=argparse.SUPPRESS)
             common.parse_known_args(arguments, namespace=options)
             runtime._QUIET = options.quiet
             if options.research_dir is not None:
@@ -63,6 +67,11 @@ def main(argv=None):
             data = _dispatch(options)
             payload = {"ok": True, "command": options.command, "data": data}
         except CliError as exc:
+            try:
+                runtime.protect_output(options)
+            except runtime.OutputConflict as conflict:
+                exc = conflict
+            save_allowed = not isinstance(exc, runtime.OutputConflict)
             payload = {"ok": False, "command": getattr(exc, "command", options.command),
                        "error": _error_body(exc)}
             code = exc.exit_code
@@ -87,7 +96,7 @@ def main(argv=None):
             code = EXIT_CODES["SERVICE_ERROR"]
 
         try:
-            emit(payload, compact=options.compact, prepared=prepared)
+            emit(payload, compact=options.compact, prepared=prepared if save_allowed else None)
         except OSError as exc:
             payload = {"ok": False, "command": options.command,
                        "error": {"code": "INVALID_INPUT", "message": "cannot write output: %s" % exc,

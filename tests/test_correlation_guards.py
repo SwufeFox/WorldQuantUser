@@ -23,7 +23,6 @@ sys.path.insert(0, ROOT)
 
 import ablation  # noqa: E402
 import correlation  # noqa: E402
-import field_index
 import machine_lib as ml
 import research_paths
 from research_app import alphas as cli_alphas
@@ -135,23 +134,24 @@ class CorrCommandTests(unittest.TestCase):
 
 
 class PreflightSettingsTests(unittest.TestCase):
-    def test_field_catalog_uses_resolved_settings(self):
-        # Wrong answer this prevents: a research file asking for TOP500 is linted
-        # against TOP3000, so the field check runs on the wrong catalogue.
-        captured = {}
+    def test_preflight_checks_fields_in_the_requested_universe(self):
+        def fields(session, **scope):
+            scope["report"].update(state="verified", coverage={"complete": True})
+            return ([{"id": "scoped_field", "type": "MATRIX"}]
+                    if scope["universe"] == "TOP500" else [])
 
-        def fake_fetch(session, **kwargs):
-            captured.update(kwargs)
-            return []
+        def operators(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"name": "rank"}]
 
-        args = argparse.Namespace(allow_lint_errors=True, region=None, universe=None,
-                                  delay=None, instrument_type=None)
         settings = {"region": "USA", "universe": "TOP500", "delay": 1,
                     "instrumentType": "EQUITY"}
-        with mock.patch.object(cli_validation, "_operator_index_from_catalog", return_value={}), \
-                mock.patch.object(field_index, "fetch_all_fields", fake_fetch):
-            cli_validation._preflight_lint(None, [("x", "rank(close)")], settings, args)
-        self.assertEqual(captured.get("universe"), "TOP500")
+        with mock.patch.object(cli_validation.capabilities, "fetch_fields", side_effect=fields), \
+                mock.patch.object(ml, "fetch_operators", side_effect=operators), \
+                mock.patch.object(cli_validation.expression_lint, "load_denylist", return_value={}):
+            report = cli_validation._preflight_lint(
+                None, [("rank(scoped_field)", 4)], settings, argparse.Namespace(allow_lint_errors=False))
+        self.assertTrue(report["ok"])
 
 
 class AblationReportTests(unittest.TestCase):

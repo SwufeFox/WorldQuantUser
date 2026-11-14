@@ -8,6 +8,7 @@ import field_search
 import machine_lib as ml
 
 from .runtime import CliError, with_session
+from . import capabilities
 
 
 def cmd_catalog_operators(args, _sink):
@@ -215,10 +216,12 @@ def cmd_catalog_concepts(args, _sink):
     snapshot of the naming and rot silently, so the judgment stays here at the
     command line.
     """
-    records = with_session(args, lambda s: field_index.fetch_all_fields(
+    evidence = {}
+    records = with_session(args, lambda s: capabilities.fetch_fields(
         s, region=args.region, universe=args.universe, delay=args.delay,
         instrument_type=args.instrument_type,
         dataset_ids=[args.dataset] if args.dataset else None,
+        report=evidence,
     ))
     concepts = field_index.duplicate_concepts(
         records, ignore_words=args.ignore_words,
@@ -256,6 +259,7 @@ def cmd_catalog_concepts(args, _sink):
         "ignore_words": list(args.ignore_words or []),
         "drop_numeric": bool(args.drop_numeric),
         "tail_tokens": args.tail_tokens,
+        "capabilities": evidence,
         "fields_scanned": len(records),
         "concepts_with_variants": len(concepts),
         "shown": min(limit, len(concepts)),
@@ -283,26 +287,29 @@ def cmd_catalog_verify(args, _sink):
         raise CliError("USAGE", "nothing to verify",
                        "pass --fields with one or more field ids, comma or space separated")
 
+    evidence = {}
     known = with_session(args, lambda s: field_index.field_ids(
-        field_index.fetch_all_fields(
+        capabilities.fetch_fields(
             s, region=args.region, universe=args.universe, delay=args.delay,
-            instrument_type=args.instrument_type,
+            instrument_type=args.instrument_type, report=evidence,
         )
     ))
-    unknown = [name for name in wanted if name not in known]
-    found = [name for name in wanted if name in known]
+    verified = evidence.get("state") == "verified"
+    unknown = [name for name in wanted if name not in known] if verified else list(wanted)
+    found = [name for name in wanted if name in known] if verified else []
     data = {
         "region": args.region, "universe": args.universe, "delay": args.delay,
+        "capabilities": evidence,
         "catalog_size": len(known),
         "checked": len(wanted),
         "found": found,
         "unknown": unknown,
-        "verdict": "ok" if not unknown else "unknown_fields",
+        "verdict": "unverified_catalog" if not verified else "ok" if not unknown else "unknown_fields",
     }
     if unknown and args.strict:
         raise CliError(
             "INVALID_INPUT",
-            "field name(s) not present in the live catalog: %s" % ", ".join(unknown),
+            "catalog could not verify field name(s): %s" % ", ".join(unknown),
             "run `catalog concepts --search <word>` to see the real variants for that idea",
             details=data,
         )

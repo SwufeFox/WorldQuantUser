@@ -4,122 +4,76 @@ from __future__ import annotations
 
 import expression_lint
 import expression_units
-import field_index
+import field_contract
 import machine_lib as ml
 import research_config as config_io
 
-from .runtime import CliError, collect_alphas, merge_settings, note, with_session
-
-
-def cached_field_types():
-    """``{field_id: type}`` from the on-disk catalog cache, or ``{}`` when absent.
-
-    The dry run is supposed to be the cheap, authoritative rehearsal: it must not need a
-    session, but it also must not be blind. The catalog cache already holds every field's
-    type, so a VECTOR field handed to `rank` can be caught before a login - which is
-    exactly the failure that cost a five-arm round: ``Operator ts_backfill does not
-    support event inputs``, five times, after a dry run that said "0 blocking findings".
-    """
-    import glob
-    import json
-    import os
-
-    import research_paths
-
-    types = {}
-    pattern = os.path.join(research_paths.metadata_root(), "datafields", "*.json")
-    for path in glob.glob(pattern):
-        try:
-            with open(path, encoding="utf-8") as handle:
-                payload = json.load(handle).get("payload") or []
-        except (OSError, ValueError):
-            continue
-        for row in payload:
-            field_id = row.get("id")
-            if field_id:
-                types[field_id] = row.get("type")
-    return types
+from . import capabilities
+from .capabilities import cached_field_scope
+from .runtime import CliError, collect_alphas, merge_settings, with_session
 
 
 def _preflight_lint(session, pairs, settings, args):
-    """Lint against the operator catalog before spending simulation quota.
-
-    Two catalogs are consulted, not one. The operator index catches
-    ``regression_neut``-style names that have docs but cannot be simulated. The
-    field index catches identifiers that were typed from memory and never
-    existed, which the operator list cannot see because such a name is not an
-    operator at all -- one such typo cost a full simulation round trip before
-    this check existed.
-
-    Raises ``INVALID_INPUT`` on a hard lint failure unless the caller passed
-    ``--allow-lint-errors``; a clean pass is reported on stderr as an event so
-    stdout stays a single JSON document.
-    """
+    """Require complete scoped metadata before spending simulation quota."""
     operator_index = None
-    catalog_note = "checked"
+    operator_evidence = {"state": "unknown", "complete": False}
+    fields = capabilities.field_scope([], {
+        "state": "unknown", "scope": capabilities.scope_settings(settings),
+        "account": capabilities.account_provenance(session),
+        "coverage": {"complete": False}, "freshness": {"state": "unknown"}})
     try:
-        operator_index = _operator_index_from_catalog(session)
-    except Exception as exc:  # noqa: BLE001
-        # The operator list is metadata. A hiccup there must not block a run that
-        # is otherwise fine, but the degradation is announced rather than hidden
-        # so nobody mistakes a partial lint for a full one.
-        catalog_note = "unavailable: %s: %s" % (type(exc).__name__, exc)
-        note("lint: operator catalog %s; continuing with the learned denylist only"
-             % catalog_note)
-
-    known_fields = None
-    field_types = None
-    market_fields = None
-    field_note = "unavailable"
+        records = ml.fetch_operators(session, refresh=True, report=operator_evidence)
+        if (records and operator_evidence.get("complete") is True
+                and not operator_evidence.get("stale") and not operator_evidence.get("error")
+                and not operator_evidence.get("degraded") and not operator_evidence.get("hit")):
+            operator_index = expression_lint.build_operator_index(records)
+        operator_evidence["state"] = "verified" if operator_index else "unknown"
+        operator_evidence["complete"] = bool(operator_index)
+    except Exception as exc:  # noqa: BLE001 - preserve failed metadata evidence
+        operator_evidence.update(state="unknown", complete=False, error=str(exc))
     try:
-        known_fields, field_types, market_fields = _field_scope(session, settings)
-        field_note = "checked (%d names)" % len(known_fields)
-    except Exception as exc:  # noqa: BLE001
-        field_note = "unavailable: %s: %s" % (type(exc).__name__, exc)
-        note("lint: field catalog unavailable (%s); field names are NOT verified "
-             "for this run, so a typo will only surface at the simulator" % exc)
-
+        fields = _field_scope(session, settings)
+    except Exception as exc:  # noqa: BLE001 - a failure must never become a green light
+        fields["evidence"]["error"] = str(exc)
     report = expression_lint.lint_all(
-        pairs,
-        operator_index=operator_index,
+        pairs, operator_index=operator_index,
         denylist=expression_lint.load_denylist(),
-        known_fields=known_fields,
-        strict_fields=bool(known_fields),
-        field_types=field_types,
-        market_fields=market_fields,
-        field_units=expression_units.load_field_units(),
-    )
+        known_fields=fields["known_fields"], strict_fields=True,
+        field_types=fields["field_types"], market_fields=fields["market_fields"],
+        field_units=expression_units.load_field_units())
+    attach_field_contracts(report, fields)
     report["operator_catalog_size"] = len(operator_index or {})
-    report["operator_catalog"] = catalog_note
-    report["field_catalog"] = field_note
-    if report["ok"]:
+    report["operator_catalog"] = operator_evidence
+    report["field_catalog"] = fields["evidence"]
+    report["coverage"] = {"operators": operator_evidence["state"],
+                          "fields": fields["evidence"]["state"]}
+    for catalog, state in report["coverage"].items():
+        if state != "verified":
+            report["errors"].append({"code": "catalog_unverified", "catalog": catalog,
+                                     "message": "required %s catalog is unavailable, empty, stale or incomplete" % catalog})
+    report["ok"] = not report["errors"]
+    report["allow_lint_errors"] = bool(getattr(args, "allow_lint_errors", False))
+    if report["ok"] or report["allow_lint_errors"]:
         return report
-    if getattr(args, "allow_lint_errors", False):
-        return report
-    unknown = sorted({item.get("operator") for item in report["errors"]
-                      if item.get("code") == "unknown_operator"})
-    unknown_fields = sorted({item.get("identifier") for item in report["errors"]
-                             if item.get("code") == "unknown_identifier"})
-    hint = "fix the expressions, or pass --allow-lint-errors to submit anyway"
-    if unknown:
-        hint = ("operator(s) %s are not in the BRAIN operator list; a docs page "
-                "existing does not make them simulatable" % ", ".join(unknown))
-    if unknown_fields:
-        hint = ("field name(s) %s do not exist in the live catalog for this scope; "
-                "run `catalog concepts --search <word>` to find the real variants "
-                "instead of typing a name from memory" % ", ".join(unknown_fields))
-    raise CliError(
-        "INVALID_INPUT",
-        "expression lint failed; nothing was submitted",
-        hint,
-        details={
-            "operator_catalog_size": report["operator_catalog_size"],
-            "field_catalog": field_note,
-            "unknown_fields": unknown_fields,
-            "errors": report["errors"],
-            "warnings": report["warnings"],
-        },
-    )
+    raise CliError("INVALID_INPUT", "expression preflight failed; nothing was submitted",
+                   "refresh the required catalogs and fix expression errors; --allow-lint-errors explicitly overrides this guard",
+                   details=report)
+
+
+def attach_field_contracts(report, fields):
+    """Attach economic evidence without confusing unknown semantics with type errors."""
+    contracts = []
+    for result in report.get("results", []):
+        evidence = field_contract.audit_expression(result["expression"], fields.get("records") or [])
+        result["field_contract"] = evidence
+        contracts.append({"expression": result["expression"], **evidence})
+        if evidence["state"] != "reviewed":
+            warning = {"code": "field_contract_unknown", "severity": "warning",
+                       "message": "economic units, periods or nested operation semantics remain unverified"}
+            result["warnings"].append(warning)
+            report["warnings"].append({**warning, "expression": result["expression"]})
+    report["field_contracts"] = contracts
+    return report
 
 
 def _collect_lint_pairs(args):
@@ -136,30 +90,21 @@ def _operator_index_from_catalog(session):
     return expression_lint.build_operator_index(ml.fetch_operators(session))
 
 
-DISCLOSURE_DATASETS = frozenset({"fundamental2", "fundamental6", "analyst4"})
-
-
-def _dataset_id(record):
-    """Dataset id from a catalogue record, which may nest it or not."""
-    dataset = record.get("dataset")
-    return dataset.get("id") if isinstance(dataset, dict) else dataset
-
-
 def _field_scope(session, settings):
-    """Return known ids, types and market ids from one resolved-scope fetch."""
-    records = field_index.fetch_all_fields(
-        session,
-        region=settings.get("region") or ml.DEFAULT_SETTINGS["region"],
-        universe=settings.get("universe") or ml.DEFAULT_SETTINGS["universe"],
-        delay=settings.get("delay") if settings.get("delay") is not None else ml.DEFAULT_SETTINGS["delay"],
-        instrument_type=settings.get("instrumentType") or ml.DEFAULT_SETTINGS["instrumentType"],
-    )
-    known = field_index.field_ids(records)
-    types = {record.get("id"): record.get("type")
-             for record in records if record.get("id")}
-    market = {record.get("id") for record in records
-              if record.get("id") and _dataset_id(record) not in DISCLOSURE_DATASETS}
-    return known, types, market
+    scope = capabilities.scope_settings(settings)
+    evidence = {}
+    try:
+        records = capabilities.fetch_fields(
+            session, region=scope["region"], universe=scope["universe"],
+            delay=scope["delay"], instrument_type=scope["instrumentType"],
+            refresh=True, report=evidence)
+    except Exception as exc:
+        evidence.update(state="unknown", error=str(exc))
+        evidence.setdefault("scope", scope)
+        evidence.setdefault("coverage", {"complete": False})
+        evidence.setdefault("freshness", {"state": "unknown"})
+        records = []
+    return capabilities.field_scope(records, evidence)
 
 
 def cmd_lint(args, sink):
@@ -167,17 +112,17 @@ def cmd_lint(args, sink):
     settings, pairs = _collect_lint_pairs(args)
     denylist = expression_lint.load_denylist(getattr(args, "denylist", None))
     operator_index = None
-    known_fields = None
-    field_types = None
-    market_fields = None
+    fields = cached_field_scope(settings, getattr(args, "meta_max_age", None))
     catalog_checked = False
     if not getattr(args, "offline", False):
         def work(session):
-            known, types, market = _field_scope(session, settings)
-            return _operator_index_from_catalog(session), known, types, market
+            return _operator_index_from_catalog(session), _field_scope(session, settings)
 
-        operator_index, known_fields, field_types, market_fields = with_session(args, work)
-        catalog_checked = operator_index is not None
+        operator_index, fields = with_session(args, work)
+        catalog_checked = bool(operator_index) and fields["evidence"]["state"] == "verified"
+    known_fields = fields["known_fields"]
+    field_types = fields["field_types"]
+    market_fields = fields["market_fields"]
 
     results = []
     for expression, decay in pairs:
@@ -195,6 +140,7 @@ def cmd_lint(args, sink):
         if decay is not None:
             report["decay"] = decay
         results.append(report)
+    contract_report = attach_field_contracts({"results": results, "warnings": []}, fields)
 
     failed = [item for item in results if not item["ok"]]
     document = {
@@ -205,6 +151,8 @@ def cmd_lint(args, sink):
         "denylist_size": len(denylist),
         "known_field_count": None if known_fields is None else len(known_fields),
         "settings": settings or None,
+        "field_catalog": fields["evidence"],
+        "field_contracts": contract_report["field_contracts"],
         "summary": {
             "errors": sum(len(item["errors"]) for item in results),
             "warnings": sum(len(item["warnings"]) for item in results),

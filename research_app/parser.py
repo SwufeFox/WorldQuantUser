@@ -109,6 +109,30 @@ def _non_negative_seconds(value):
     return seconds
 
 
+def _cost_bps(value):
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("cost must be a number of basis points") from exc
+    if not math.isfinite(number) or number < 0:
+        raise argparse.ArgumentTypeError("cost must be finite and non-negative")
+    return number
+
+
+def _add_cost_args(parser):
+    parser.add_argument("--cost-bps", nargs="+", type=_cost_bps, default=None, metavar="BPS",
+                        help="One-way cost scenarios per dollar traded; reports net margin, "
+                             "not an inferred daily cost path or net Sharpe.")
+
+
+def _add_selection_args(parser, freeze=True):
+    if freeze:
+        parser.add_argument("--freeze", default=None, metavar="PATH",
+                            help="Save an immutable training selection and its evidence.")
+    parser.add_argument("--selection", default=None, metavar="PATH",
+                        help="Frozen training choice; validation preserves its candidates and order.")
+
+
 def _positive_seconds(value):
     try:
         seconds = float(value)
@@ -308,13 +332,15 @@ def build_parser():
                               help="Weights file (default: built-in priors).")
     bench_parser.add_argument("--registry", default=None)
     bench_parser.set_defaults(func=benchmark.cmd_benchmark)
+    _add_selection_args(bench_parser, freeze=False)
+    _add_cost_args(bench_parser)
 
     triage_parser = sub.add_parser(
         "triage",
         help="Train-only candidate screening; explicit test view after design freeze.",
-        description="Compare candidates or book members using train metrics and PnL. "
-                    "Use --show-test only for frozen-design validation, including "
-                    "full-window platform checks and test retention.")
+        description="Compare candidates or book members using train metrics, costs and PnL. "
+                    "Save a choice with --freeze; --show-test requires --selection and "
+                    "cannot change the frozen candidates or their order.")
     triage_parser.add_argument("--batch", default=None, metavar="BATCH_JSON",
                                help="Triage every alpha id in this batch file.")
     triage_parser.add_argument("--ids", nargs="+", default=None, metavar="ID")
@@ -324,15 +350,18 @@ def build_parser():
     triage_parser.add_argument("--internal", action="store_true",
                                help="Report test-calibrated internal fitness; requires --show-test.")
     triage_parser.add_argument("--show-test", action="store_true",
-                               help="Reveal full-window and test evidence after design freeze; logs the view.")
+                               help="Validate --selection using full-window and test evidence; logs the view.")
     triage_parser.add_argument("--train-end", metavar="YYYY-MM-DD",
                                help="Exclusive train end; cannot extend past recorded test starts. "
                                     "Default: earliest recorded test start, else 2023-01-01.")
-    triage_parser.add_argument("--min-delta", type=float, default=0.02, dest="min_delta")
-    triage_parser.add_argument("--retention-floor", type=float, default=0.2,
+    triage_parser.add_argument("--min-delta", type=float, default=None, dest="min_delta",
+                               help="Minimum train delta; validation retains the frozen criterion.")
+    triage_parser.add_argument("--retention-floor", type=float, default=None,
                                dest="retention_floor",
-                               help="Validation-only test/train retention floor with --show-test.")
+                               help="Validation test/train floor; retained in the frozen choice.")
     triage_parser.add_argument("--registry", default=None)
+    _add_selection_args(triage_parser)
+    _add_cost_args(triage_parser)
     triage_parser.set_defaults(func=triage.cmd_triage)
 
     feed_parser = sub.add_parser(
@@ -368,6 +397,14 @@ def build_parser():
                              help="Add declared book exposure and prior-trial context; unknown is not unexplored.")
     feed_parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                              help="Report only; do not update the seen store.")
+    feed_parser.add_argument("--region", type=str.upper, choices=ml.REGIONS,
+                             default=ml.DEFAULT_SETTINGS["region"])
+    feed_parser.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
+    feed_parser.add_argument("--delay", type=int, choices=(0, 1), default=ml.DEFAULT_SETTINGS["delay"])
+    feed_parser.add_argument("--instrument-type", type=str.upper,
+                             default=ml.DEFAULT_SETTINGS["instrumentType"])
+    feed_parser.add_argument("--meta-max-age", type=_non_negative_seconds, default=None,
+                             metavar="SECONDS", help="Maximum age of local scoped capability evidence.")
     def _feed_dispatch(args, sink):
         return feed.cmd_feed_action(args, sink) if getattr(args, "action", False) \
             else feed.cmd_feed(args, sink)
@@ -718,16 +755,19 @@ def build_parser():
     cmp_.add_argument("--latest", nargs="?", type=int, const=1, default=None, metavar="N",
                       help="Read only the newest N matching files by modification time (1 when omitted).")
     cmp_.add_argument("--min-fitness", type=float, default=None)
-    cmp_.add_argument("--sort", default="fitness",
-                      choices=["none", "fitness", "sharpe", "turnover", "returns", "id"])
+    cmp_.add_argument("--sort", default=None,
+                      choices=["none", "fitness", "sharpe", "turnover", "returns", "id"],
+                      help="Train sort (default fitness); frozen validation retains saved order.")
     cmp_.add_argument("--frozen", action="store_true",
-                      help="Show full-window and test-period columns. Only for a "
-                           "design that is already frozen: the full window contains "
-                           "the test year.")
+                      help="Validate --selection without filtering or reordering on test evidence.")
     cmp_.add_argument("--contributions", action="store_true",
                       help="Also compute per-leg contributions from ablate labels.")
     cmp_.add_argument("--per-file", action="store_true",
                       help="Report contributions per input file so identically named ablation arms stay separate.")
+    _add_selection_args(cmp_)
+    _add_cost_args(cmp_)
+    cmp_.add_argument("--summary", action="store_true",
+                      help="Show bounded evidence rows with run identity, scope and missing evidence.")
 
     cmp_.set_defaults(func=experiments.cmd_compare)
 
@@ -793,51 +833,55 @@ def build_parser():
     probe = sub.add_parser(
         "probe",
         help="Run a batch of arms from a spec file (lint, simulate, table, record).",
-        description="One command for the experiment shape used every day here: a list "
-                    "of labelled expressions, one lint pass, one simulation run, a "
-                    "train-only table on stderr, a JSON document on stdout, and a "
-                    "ledger entry per arm. The table hides the test period unless "
-                    "--show-test is passed, because selecting on it destroys the only "
-                    "out-of-sample evidence there is.")
+        description="Prepare, check, run and recover labelled experiments from the same spec. "
+                    "--dry-run is offline; --check verifies live metadata without simulations. "
+                    "Results include durable path, run identity, per-arm outcomes and next actions. "
+                    "--recover only reads platform jobs; --resume explicitly starts unsubmitted work.")
     probe.add_argument("--allow-lint-errors", action="store_true", dest="allow_lint_errors",
                        help="Simulate even when the lint reports blocking findings. Not "
                             "recommended: the platform will reject the arm anyway.")
     probe.add_argument("--strict-gate", action="store_true", dest="strict_gate",
                        help="Refuse a finished prior result with the same expression and "
                             "effective settings. Dry-run previews the blocking evidence.")
-    probe.add_argument("--recover", default=None, metavar="BATCH_JSON",
-                       help="Fill a batch file's empty arms by matching expressions to "
-                            "alphas already on the platform (no simulation). Use after a "
-                            "killed run or a rate-limited batch.")
+    probe_source = probe.add_mutually_exclusive_group()
+    probe_source.add_argument("--recover", default=None, metavar="BATCH_JSON",
+                              help="Refresh accepted jobs and reconcile local evidence without new simulations.")
+    probe_source.add_argument("--resume", default=None, metavar="BATCH_JSON",
+                              help="Continue a saved batch, including definitely unsubmitted arms; "
+                                   "use --dry-run to preview first.")
     probe.add_argument("spec", nargs="?", default=None,
                        help="JSON spec: {name, design?, settings, arms:[{label, expression, "
                             "design?, proxy_of?, settings?}]}; use design=explore for scans. "
-                            "Omitted when --recover is given.")
+                            "Omitted with --recover or --resume.")
     _add_settings_args(probe)
     _add_session_args(probe)
     probe.add_argument("--name", default=None,
                        help="Batch name for the output file (default: the spec's name).")
-    probe.add_argument("--dry-run", action="store_true",
-                       help="Offline validation and exact request preview; no login or quota spent.")
+    probe_mode = probe.add_mutually_exclusive_group()
+    probe_mode.add_argument("--dry-run", action="store_true",
+                            help="Offline request preview; unchecked catalogs remain explicit.")
+    probe_mode.add_argument("--check", action="store_true",
+                            help="Validate this spec against live scoped metadata without simulating.")
+    probe.add_argument("--batch-path", default=None, metavar="PATH",
+                       help="Durable batch/checkpoint path; distinct from the final --save response.")
     probe.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
                        help="Simulation wait budget across settings groups; accepted jobs remain recoverable.")
     probe.add_argument("--show-test", action="store_true",
-                       help="Also print the test period. Do not pass this while "
-                            "choosing between arms.")
+                       help="Validate --selection while recovering saved results; never run new simulations.")
     probe.add_argument("--force", action="store_true",
                        help="Overwrite an existing batch file of the same name.")
     probe.add_argument("--no-record", action="store_true",
                        help="Do not append the arms to the ledger.")
     probe.add_argument("--registry", default=None)
+    _add_selection_args(probe, freeze=False)
+    _add_cost_args(probe)
 
     probe.set_defaults(func=experiments.cmd_probe)
 
     views = sub.add_parser(
         "views",
         help="Who looked at test-period numbers, when, and for which alphas.",
-        description="Reads the append-only views log that `probe --show-test` and "
-                    "`compare --frozen` write. Hiding a column does not stop the leak; "
-                    "recording when it was opened does.")
+        description="Reads the append-only log of validation views and their frozen selection identity.")
     views.add_argument("--alpha", default=None, help="Only entries naming this alpha id.")
     views.add_argument("--limit", type=int, default=50)
 
@@ -916,9 +960,11 @@ def build_parser():
     a_sub.add_argument("--yes", action="store_true",
                        help="Actually submit. Without it nothing is written.")
     a_sub.add_argument("--max-wait", type=float, default=180.0)
-    a_sub.add_argument("--record", action="store_true",
-                       help="after a confirmed submission, read the alpha back and "
-                            "append it to the ledger (normalised, not raw)")
+    a_sub.add_argument("--registry", default=None)
+    a_sub.add_argument("--buffer", default=None,
+                       help="Shelf to reconcile after a confirmed submission.")
+    _add_selection_args(a_sub, freeze=False)
+    _add_cost_args(a_sub)
     _add_session_args(a_sub)
 
     a_sub.set_defaults(func=alphas.cmd_alpha_submit)
@@ -1059,11 +1105,9 @@ def build_parser():
 
     l_sync = ledger_sub.add_parser(
         "sync",
-        help="Record platform alphas the ledger has never seen (online, no simulations).",
-        description="The ledger only grows when something records an alpha, so it drifts "
-                    "from the account after any sweep or manual submission. This walks "
-                    "the account and appends rows for ids that are missing; it does not "
-                    "re-record existing ones (append-only: that would duplicate a row).")
+        help="Reconcile platform membership, local records and optional PnL evidence.",
+        description="Read the complete requested platform scope before resolving reverse drift. "
+                    "Report listing completeness, record limits, member identity and data coverage.")
     l_sync.add_argument("--platform-status", default="ACTIVE",
                         help="Status filter for the listing (default ACTIVE).")
     l_sync.add_argument("--status", default=None,
@@ -1074,6 +1118,11 @@ def build_parser():
     l_sync.add_argument("--limit-record", type=int, default=25, dest="limit_record")
     l_sync.add_argument("--dry-run", action="store_true", dest="dry_run")
     l_sync.add_argument("--registry", default=None)
+    l_sync.add_argument("--hidden", action="store_true", help="Select the platform's hidden-alpha scope.")
+    l_sync.add_argument("--alpha-type-not", default=None, metavar="TYPE",
+                        help="Explicit type exclusion; omitted means no type exclusion.")
+    l_sync.add_argument("--pnl", action="store_true",
+                        help="Refresh daily PnL and record pagination/coverage evidence.")
     l_sync.set_defaults(func=ledger.cmd_ledger_sync)
 
     l_fmt = ledger_sub.add_parser(
@@ -1186,11 +1235,14 @@ def build_parser():
     b_add.add_argument("--max-wait", type=int, default=None, dest="max_wait")
     b_add.add_argument("--buffer", default=None, help="Shelf file (default: in research dir).")
     b_add.add_argument("--registry", default=None)
+    _add_selection_args(b_add, freeze=False)
+    _add_cost_args(b_add)
     b_add.set_defaults(func=buffer_cmd.cmd_buffer_add)
 
     b_list = buf_sub.add_parser("list", help="Show the shelf and how stale it is.")
     b_list.add_argument("--buffer", default=None)
     b_list.add_argument("--registry", default=None)
+    _add_cost_args(b_list)
     b_list.set_defaults(func=buffer_cmd.cmd_buffer_list)
 
     b_drop = buf_sub.add_parser("drop", help="Take an alpha off the shelf.")
@@ -1208,6 +1260,8 @@ def build_parser():
     b_sub.add_argument("--max-wait", type=int, default=None, dest="max_wait")
     b_sub.add_argument("--buffer", default=None)
     b_sub.add_argument("--registry", default=None)
+    _add_selection_args(b_sub, freeze=False)
+    _add_cost_args(b_sub)
     b_sub.set_defaults(func=buffer_cmd.cmd_buffer_submit)
 
     fmt = sub.add_parser(
@@ -1354,26 +1408,33 @@ _COMMAND_EXAMPLES = {
                  "simulate research.json --sort fitness --save results.json"],
     "resume": ["resume CHECKPOINT.json --save results.json"],
     "ablate": ['ablate --expr "a = rank(close); b = rank(volume); a + b" --out variants.json'],
-    "compare": ["compare results.json --sort fitness",
+    "compare": ["compare results.json --cost-bps 5 10 20 --freeze choice.json --summary",
+                "compare --frozen --selection choice.json --summary",
                 'compare --match "sample-batch*.json" --latest --sort none'],
+    "triage": ["triage --batch BATCH.json --freeze choice.json",
+               "triage --show-test --selection choice.json"],
     "brief": ["brief", "brief --days 7 --top 5"],
     "ask": ["ask --by neutralization --stat n,median:sharpe,floor_share",
             "ask --where status=ACTIVE --list"],
-    "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json",
-              "probe --recover BATCH.json --max-wait-seconds 60"],
+    "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json --check",
+              "probe batch.spec.json --batch-path BATCH.json --save response.json",
+              "probe --recover BATCH.json --max-wait-seconds 60",
+              "probe --resume BATCH.json --dry-run"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],
     "alpha get": ["alpha get ALPHA_ID"],
     "alpha check": ["alpha check ALPHA_ID", "alpha check ALPHA_A ALPHA_B --workers 2"],
     "alpha self-corr": ["alpha self-corr ALPHA_ID"],
     "alpha describe": ['alpha describe ALPHA_ID --name "quality signal" --category FUNDAMENTAL'],
-    "alpha submit": ["alpha submit ALPHA_ID"],
+    "alpha submit": ["alpha submit ALPHA_ID", "alpha submit ALPHA_ID --yes --selection choice.json"],
+    "buffer submit": ["buffer submit ALPHA_ID --yes --selection choice.json"],
     "alpha explain": ["alpha explain ALPHA_ID --no-corr"],
     "alpha list": ["alpha list --limit 10 --min-fitness 1"],
     "alpha self-check": ["alpha self-check ALPHA_ID"],
     "alpha corr": ["alpha corr ALPHA_A ALPHA_B --vs-book"],
     "alpha book": ["alpha book --limit 10"],
     "ledger": ["ledger list --family quality", "ledger coverage --list-missing"],
+    "ledger sync": ["ledger sync --dry-run", "ledger sync --pnl"],
     "ledger record": ['ledger record ALPHA_ID --family quality --mechanism "profitability"'],
     "ledger list": ["ledger list --family quality --min-fitness 1", "ledger list --field close"],
     "ledger label": ["ledger label ALPHA_ID --family quality --verdict candidate"],

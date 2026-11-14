@@ -36,7 +36,7 @@ def record(alpha_id, sharpe, fitness, turnover=0.12, train=1.5, test=0.9, fails=
             "metrics": {"sharpe": sharpe, "fitness": fitness, "turnover": turnover,
                         "returns": 0.06},
             "checks": checks,
-            "out_of_sample": {"train": {"sharpe": train}, "test": {"sharpe": test},
+            "out_of_sample": {"train": {"sharpe": train, "fitness": fitness}, "test": {"sharpe": test},
                               "test_period": "P1Y"}}
 
 
@@ -110,6 +110,15 @@ class ProbeTests(unittest.TestCase):
                                   lambda *a, **k: self.preflights.append(a)):
             return cli_experiments.cmd_probe(self._args(**overrides), mock.MagicMock())
 
+    def _view(self, data):
+        selection_path = os.path.join(self.tmp, "selection.json")
+        cli_experiments.cmd_compare(argparse.Namespace(files=[data["path"]], min_fitness=None,
+            sort="none", contributions=False, frozen=False, freeze=selection_path), None)
+        with mock.patch.object(research_paths, "views_log_path",
+                               lambda: os.path.join(self.output_dir, "views.jsonl")):
+            return cli_experiments.cmd_probe(self._args(recover=data["path"],
+                show_test=True, selection=selection_path), None)
+
 
     def test_arms_that_come_back_empty_are_reported_as_incomplete(self):
         # A rate-limited arm comes back QUEUED with no metrics. The batch file used to
@@ -132,10 +141,11 @@ class ProbeTests(unittest.TestCase):
         # After a killed run the sims may already exist on the platform; reading them
         # back is cheaper and more honest than re-running twenty minutes of work.
         rows = [
-            {"label": "a", "expression": "rank( close )", "train_fitness": None},
+            {"label": "a", "expression": "rank( close )", "train_fitness": None,
+             "settings": dict(ml.DEFAULT_SETTINGS)},
             {"label": "b", "expression": "rank(volume)", "train_fitness": 1.0},
         ]
-        platform = [{"id": "Z1", "regular": "rank(close)"}]
+        platform = [{"id": "Z1", "regular": "rank(close)", "settings": dict(ml.DEFAULT_SETTINGS)}]
         payload = {"id": "Z1", "status": "COMPLETE",
                    "oos": {"train": {"sharpe": 1.8, "fitness": 1.4,
                                      "turnover": 0.05, "returns": 0.09}}}
@@ -175,7 +185,7 @@ class ProbeTests(unittest.TestCase):
         # The full-window numbers contain the test year, so they are protected too.
         self.assertTrue(all("sharpe" not in row for row in data["rows"]))
         self.assertTrue(all("test_sharpe" not in row for row in data["rows"]))
-        data = self._run(force=True, show_test=True)
+        data = self._view(data)
         self.assertTrue(all("test_sharpe" in row for row in data["rows"]))
 
     def test_a_name_collision_is_detected_before_anything_is_spent(self):
@@ -432,11 +442,11 @@ class ProbeTests(unittest.TestCase):
         # validation apart from an iterative peek three rounds later.
         log = os.path.join(self.output_dir, "views.jsonl")
         with mock.patch.object(research_paths, "views_log_path", lambda: log):
-            self._run(force=True, show_test=True)
+            self._view(self._run())
             self._run(force=True)
         entries = [json.loads(line) for line in open(log, encoding="utf-8")]
         self.assertEqual(len(entries), 1)
-        self.assertEqual(entries[0]["tool"], "probe")
+        self.assertEqual(entries[0]["tool"], "probe-recover")
         self.assertEqual(entries[0]["view"], "test")
         self.assertEqual(sorted(entries[0]["alpha_ids"]), ["A1", "B1"])
 
@@ -447,7 +457,7 @@ class ProbeTests(unittest.TestCase):
             data = self._run()
         self.assertNotIn("failed_checks", data["rows"][0])
         self.assertFalse(any("LOW_SHARPE" in call.args[0] for call in notes.call_args_list))
-        data = self._run(force=True, show_test=True)
+        data = self._view(data)
         self.assertEqual(data["rows"][0]["failed_checks"], ["LOW_SHARPE"])
 
     def test_strict_repeat_is_previewed_offline_then_blocks_before_authentication(self):
@@ -785,13 +795,12 @@ class DesignTests(unittest.TestCase):
         ])
         self.fake.records[0]["out_of_sample"]["train"] = {"sharpe": 1.0, "fitness": 0.5}
         self.fake.records[1]["out_of_sample"].pop("train")
-        with mock.patch.object(cli_experiments, "note") as notes:
-            data = self._run(show_test=True)
+        data = self._run()
         comparison = data["comparisons"]["rows"][0]
         self.assertEqual(comparison["deltas"], {})
         self.assertIn("arm_train_metric_unavailable", comparison["unavailable"]["sharpe"])
         self.assertIn("control_train_metric_unavailable", comparison["unavailable"]["returns"])
-        self.assertTrue(any("probe --recover" in call.args[0] for call in notes.call_args_list))
+        self.assertTrue(any(action["action"] == "recover" for action in data["next_actions"]))
         self.assertEqual(data["incomplete"], ["plus"])
 
 

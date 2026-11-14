@@ -10,6 +10,18 @@ from research_app import triage
 
 
 class TriageModeTests(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        patcher = patch("research_paths.log_view")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _validate(self, tmp, directory, rows, alpha_id, **kwargs):
+        registry = self._registry(tmp, rows)
+        frozen = os.path.join(tmp, "selection.json")
+        triage.triage([alpha_id], registry_path=registry, pnl_dir=directory, freeze_path=frozen)
+        return triage.triage(show_test=True, selection_path=frozen, **kwargs)
+
     def _workspace(self, book_size=5, days=300):
         tmp = tempfile.mkdtemp()
         directory = os.path.join(tmp, "pnl")
@@ -50,8 +62,7 @@ class TriageModeTests(unittest.TestCase):
         rows.append({"alpha_id": "C1", "status": "COMPLETE",
                      "metrics": {"sharpe": 2.0, "fitness": 3.0},
                      "out_of_sample": {"train": {"sharpe": 1.7}, "test": {"sharpe": 1.4}}})
-        data = triage.triage(["C1"], registry_path=self._registry(tmp, rows),
-                             pnl_dir=directory, internal=True, show_test=True)
+        data = self._validate(tmp, directory, rows, "C1", internal=True)
         row = data["rows"][0]
         self.assertIn("internal_fitness", row)
         self.assertLessEqual(row["internal_fitness"], row["fitness"])
@@ -71,8 +82,7 @@ class UnresolvedCheckTests(TriageModeTests):
                      "failing_checks": [],
                      "checks": {"SELF_CORRELATION": {"result": "PENDING"}},
                      "out_of_sample": {"train": {"sharpe": 2.0}, "test": {"sharpe": 1.0}}})
-        data = triage.triage(["P1"], registry_path=self._registry(tmp, rows),
-                             pnl_dir=directory, show_test=True)
+        data = self._validate(tmp, directory, rows, "P1")
         row = data["rows"][0]
         self.assertIn("SELF_CORRELATION", row["unresolved"])
         self.assertEqual(row["verdict"], "unverified")
@@ -92,8 +102,7 @@ class SubUniverseMarginTests(TriageModeTests):
                                                             "value": 1.14,
                                                             "limit": 1.08}},
                      "out_of_sample": {"train": {"sharpe": 2.0}, "test": {"sharpe": 1.5}}})
-        data = triage.triage(["S1"], registry_path=self._registry(tmp, rows),
-                             pnl_dir=directory, show_test=True)
+        data = self._validate(tmp, directory, rows, "S1")
         self.assertAlmostEqual(data["rows"][0]["sub_universe"]["margin"], 1.056, places=3)
 
 

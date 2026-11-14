@@ -599,6 +599,7 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
         "expires_in_seconds": None,
         "refreshed_at": None,
         "error": None,
+        "complete": None,
     }
 
     def done(data):
@@ -609,7 +610,10 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
 
     if not policy["enabled"] or ttl <= 0:
         status["disabled"] = True
-        return done(fetch())
+        data = fetch()
+        status["complete"] = not bool(params.get("limit"))
+        status["refreshed_at"] = datetime.now(timezone.utc).isoformat()
+        return done(data)
 
     entry = cache_store.read_entry(path)
     if entry["present"] and not do_refresh:
@@ -633,12 +637,14 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
             note("metadata cache: serving stale %s snapshot (%s)" % (kind, exc.code))
             return done(entry["payload"])
         raise
+    status["complete"] = not bool(params.get("limit"))
+    status["refreshed_at"] = datetime.now(timezone.utc).isoformat()
     try:
         cache_store.write_json_atomic(
             path, cache_store.build_entry(kind, data, ttl=ttl, source="brain-api"))
     except OSError as exc:
         note("metadata cache: could not write %s (%s)" % (path, exc))
-    status["refreshed_at"] = cache_store.read_entry(path).get("created_at")
+    status["refreshed_at"] = cache_store.read_entry(path).get("created_at") or status["refreshed_at"]
     status["age_seconds"] = 0.0
     status["expires_in_seconds"] = ttl
     return done(data)
@@ -668,17 +674,14 @@ def _get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
     Quota-free. Returns ``[]`` when the account has no data for that
     combination (which is what a TUTORIAL account sees outside USA).
     """
-    payload = request_json(
-        s, "GET", "/data-sets",
-        params={
-            "instrumentType": instrument_type,
-            "region": region,
-            "delay": delay,
-            "universe": universe,
-        },
-    )
-    results = _as_results(payload, "data-sets")
-    return results[:limit] if limit else results
+    results = []
+    params = {"instrumentType": instrument_type, "region": region,
+              "delay": delay, "universe": universe}
+    for batch in _catalog_pages(s, "/data-sets", params, keys=("data-sets",)):
+        results.extend(batch)
+        if limit and len(results) >= limit:
+            return results[:limit]
+    return results
 
 
 def _as_results(payload, *keys):
@@ -699,6 +702,52 @@ def _as_results(payload, *keys):
             if isinstance(value, list):
                 return value
     return []
+
+
+def _catalog_pages(session, path, params=None, keys=(), page_size=None):
+    """Yield complete collection pages; incomplete or repeated pages are errors."""
+    offset = 0
+    seen = set()
+    total = None
+    while True:
+        query = dict(params or {})
+        if page_size is not None or offset:
+            query.update(limit=page_size or 50, offset=offset)
+        payload = request_json(session, "GET", path, params=query or None)
+        collections = (*keys, "results", "operators", "categories", "data-sets", "datafields")
+        if not isinstance(payload, list) and not (
+            isinstance(payload, dict) and any(isinstance(payload.get(key), list) for key in collections)
+        ):
+            raise ServiceError("catalog %s returned no collection" % path)
+        batch = _as_results(payload, *keys)
+        if any(not isinstance(row, dict) for row in batch):
+            raise ServiceError("catalog %s returned an invalid row" % path)
+        reported = payload.get("count") if isinstance(payload, dict) else None
+        if reported is not None:
+            if isinstance(reported, bool) or not isinstance(reported, int) or reported < 0:
+                raise ServiceError("catalog %s returned an invalid count" % path)
+            if total is not None and total != reported:
+                raise ServiceError("catalog %s changed during pagination" % path)
+            total = reported
+        more = bool(payload.get("next")) if isinstance(payload, dict) else False
+        if not batch:
+            if more or (total is not None and offset < total):
+                raise ServiceError("catalog %s ended before all rows were received" % path)
+            return
+        signature = tuple(json.dumps(row, sort_keys=True, separators=(",", ":")) for row in batch)
+        if signature in seen:
+            raise ServiceError("catalog %s repeated a page" % path)
+        seen.add(signature)
+        offset += len(batch)
+        if total is not None and offset > total:
+            raise ServiceError("catalog %s returned more rows than its count" % path)
+        yield batch
+        if total is not None and offset == total:
+            return
+        if total is None and not more and (page_size is None or len(batch) < page_size):
+            return
+        if page_size is None:
+            page_size = len(batch)
 
 
 def fetch_operators(s, search="", group="", refresh=None, report=None):
@@ -726,7 +775,7 @@ def _fetch_operators(s, search="", group=""):
     Quota-free. ``search`` matches the name or description, ``group`` an exact
     category such as ``Time Series``.
     """
-    operators = _as_results(request_json(s, "GET", "/operators"))
+    operators = [row for batch in _catalog_pages(s, "/operators") for row in batch]
     if group:
         operators = [o for o in operators if (o.get("category") or "") == group]
     if search:
@@ -812,25 +861,10 @@ def _get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
     Quota-free.
     """
     fields = []
-    offset = 0
-    page = 50  # BRAIN rejects larger pages with HTTP 400
-    while True:
-        payload = request_json(
-            s, "GET", "/data-fields",
-            params={
-                "instrumentType": instrument_type,
-                "region": region,
-                "delay": delay,
-                "universe": universe,
-                "dataset.id": dataset_id,
-                "limit": page,
-                "offset": offset,
-            },
-        )
-        results = _as_results(payload, "datafields")
-        if not results:
-            break
-        for item in results:
+    params = {"instrumentType": instrument_type, "region": region, "delay": delay,
+              "universe": universe, "dataset.id": dataset_id}
+    for batch in _catalog_pages(s, "/data-fields", params, keys=("datafields",), page_size=50):
+        for item in batch:
             if field_type and item.get("type") != field_type:
                 continue
             if search and search.lower() not in (
@@ -840,9 +874,6 @@ def _get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
             fields.append(item)
             if limit and len(fields) >= limit:
                 return fields
-        offset += page
-        if offset >= (payload.get("count") or 0):
-            break
     return fields
 
 
@@ -1381,6 +1412,7 @@ def simulate_alphas(
                 "family": families[index],
                 "alpha_id": None,
                 "status": "QUEUED",
+                "submission_attempted": False,
                 "metrics": None,
                 "checks": None,
                 "error": None,
@@ -1565,6 +1597,7 @@ def simulate_alphas(
     poll_many(range(len(records)))
     if any(
         record.get("progress_url") or record.get("metrics_pending")
+        or record.get("status") == "UNKNOWN_SUBMISSION"
         for record in records
     ):
         return records
@@ -1579,8 +1612,18 @@ def simulate_alphas(
             }
             if record.get("status") not in {"QUEUED", None}:
                 continue
+            if record.get("submission_attempted"):
+                record["status"] = "UNKNOWN_SUBMISSION"
+                record["error"] = "submission outcome needs reconciliation before another POST"
+                records[index] = record
+                emit("pending", index, record)
+                return records
             if deadline is not None and deadline - time.monotonic() <= 0:
                 break
+            record["submission_attempted"] = True
+            record["status"] = "UNKNOWN_SUBMISSION"
+            records[index] = record
+            emit("submitting", index, record)
             try:
                 location = submit_single_simulation(
                     s, _single_simulation_data(expression, decay, settings),
@@ -1589,12 +1632,21 @@ def simulate_alphas(
                 )
             except RateLimited as exc:
                 record["status"] = "QUEUED"
+                record["submission_attempted"] = False
                 record["error"] = "%s: %s" % (exc.code, exc)
                 records[index] = record
                 emit("deferred", index, record)
                 break
-            except AuthError:
+            except AuthError as exc:
+                record.update(status="QUEUED", submission_attempted=False, error=str(exc))
+                records[index] = record
+                emit("deferred", index, record)
                 raise
+            except SimulationError as exc:
+                record.update(status="UNKNOWN_SUBMISSION", error=str(exc))
+                records[index] = record
+                emit("pending", index, record)
+                break
             except BrainError as exc:
                 record["status"] = "FAILED"
                 record["error"] = "%s: %s" % (exc.code, exc)
@@ -1603,12 +1655,22 @@ def simulate_alphas(
                 emit("failed", index, record)
                 continue
             except requests.HTTPError as exc:
-                record["status"] = "FAILED"
+                status_code = getattr(exc.response, "status_code", None)
+                refused = status_code is not None and 400 <= status_code < 500
+                record["status"] = "FAILED" if refused else "UNKNOWN_SUBMISSION"
                 record["error"] = "submit failed: %s" % exc
-                note_operator_rejection(record.get("expression"), record["error"])
+                if refused:
+                    note_operator_rejection(record.get("expression"), record["error"])
                 records[index] = record
-                emit("failed", index, record)
+                emit("failed" if refused else "pending", index, record)
+                if not refused:
+                    break
                 continue
+            except requests.RequestException as exc:
+                record.update(status="UNKNOWN_SUBMISSION", error="submit transport failed: %s" % type(exc).__name__)
+                records[index] = record
+                emit("pending", index, record)
+                break
             record["status"] = "PENDING"
             record["progress_url"] = location
             record["error"] = None
@@ -1617,6 +1679,8 @@ def simulate_alphas(
             submitted.append(index)
 
         poll_many(submitted)
+        if any(record.get("status") == "UNKNOWN_SUBMISSION" for record in records):
+            break
         if any(
             records[index].get("progress_url")
             or records[index].get("metrics_pending")
@@ -1780,76 +1844,168 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
     }
 
 
+def pnl_cache_status(cache_dir, alpha_id, series=None):
+    """Describe cache evidence without assuming a legacy file was fully fetched."""
+    path = Path(cache_dir) / (alpha_id + ".json")
+    metadata_path = Path(cache_dir) / ".meta" / (alpha_id + ".json")
+    metadata, error = cache_store.load_json(metadata_path)
+    evidence = {"source": "cache", "path": str(path), "metadata_path": str(metadata_path),
+                "complete": None, "as_of": None, "error": error, "points": 0}
+    if series is None:
+        series, data_error = cache_store.load_json(path)
+        if data_error:
+            evidence["error"] = data_error
+            return evidence
+    if not isinstance(series, dict):
+        evidence.update(complete=False, error="invalid_pnl_cache")
+        return evidence
+    evidence["points"] = len(series)
+    if not isinstance(metadata, dict) or metadata.get("format") != "worldquantuser.pnl-evidence":
+        return evidence
+    try:
+        digest = hashlib.sha256(json.dumps(series, sort_keys=True, separators=(",", ":"),
+                                           allow_nan=False).encode("utf-8")).hexdigest()
+    except (TypeError, ValueError):
+        evidence.update(complete=False, error="invalid_pnl_values")
+        return evidence
+    if metadata.get("alpha_id") != alpha_id or metadata.get("data_sha256") != digest:
+        evidence.update(complete=False, error="pnl_metadata_mismatch")
+        return evidence
+    evidence.update({key: metadata.get(key) for key in
+                     ("complete", "as_of", "pages", "start", "end", "missing_values")})
+    evidence["error"] = None
+    return evidence
+
+
 def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
-                    page_limit=10000, attempts=3):
-    """Return ``{date: pnl}`` for one alpha from the daily-pnl recordset.
+                    page_limit=10000, attempts=3, report=None):
+    """Read daily PnL; never return or cache a silently truncated recordset.
 
-    This is the only view of an alpha's returns the platform exposes, and it is
-    what makes an independence claim testable instead of a guess. The
-    ``SELF_CORRELATION`` check reports one number against an opaque comparison
-    set and never names the counterpart, so reasoning about a pool needs the
-    series itself.
-
-    The endpoint answers 200 with an empty body when called too quickly in
-    succession. An empty reply is retried rather than returned as "this alpha has
-    no PnL", because treating throttling as absence silently produces correlation
-    tables that are missing exactly the rows that were fetched fastest.
-
-    ``cache_dir`` keeps a successful fetch for ``max_age_hours``: the series is
-    immutable history, and re-pulling it for every comparison wastes requests.
+    Raw cache files remain date/value maps. A hash-bound metadata sidecar records
+    successful pagination; older cache files have unknown completeness until refreshed.
     """
+    if not isinstance(page_limit, int) or isinstance(page_limit, bool) or page_limit < 1:
+        raise ValueError("page_limit must be a positive integer")
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
+        raise ValueError("attempts must be a positive integer")
+    evidence = {"source": "platform", "complete": False, "pages": 0,
+                "points": 0, "as_of": None, "error": None, "missing_values": 0}
+
+    def publish():
+        if isinstance(report, dict):
+            report.clear()
+            report.update(evidence)
+
     if cache_dir:
         path = Path(cache_dir) / (alpha_id + ".json")
-        if path.is_file():
-            age = time.time() - path.stat().st_mtime
-            if age < max_age_hours * 3600:
-                try:
-                    cached = json.loads(path.read_text(encoding="utf-8"))
-                    if cached:
-                        return {k: float(v) for k, v in cached.items()}
-                except (OSError, ValueError, TypeError):
-                    pass
+        if path.is_file() and time.time() - path.stat().st_mtime < max_age_hours * 3600:
+            try:
+                cached = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(cached, dict) and cached and all(
+                    isinstance(value, (int, float)) and not isinstance(value, bool)
+                    and math.isfinite(value) for value in cached.values()
+                ):
+                    evidence = pnl_cache_status(cache_dir, alpha_id, cached)
+                    if evidence["complete"] is True:
+                        publish()
+                        return {key: float(value) for key, value in cached.items()}
+            except (OSError, ValueError, TypeError):
+                pass
 
+    evidence = {"source": "platform", "complete": False, "pages": 0,
+                "points": 0, "as_of": None, "error": None, "missing_values": 0}
     out = {}
     offset = 0
-    remaining = attempts
-    while True:
-        url = BRAIN_API_URL + "/alphas/" + alpha_id + "/recordsets/daily-pnl"
-        params = {"limit": page_limit, "offset": offset} if offset else {}
-        response = s.get(url, params=params, timeout=_request_timeout(None))
-        if response.status_code != 200 or not response.text.strip():
-            if not out and remaining > 1:
-                remaining -= 1
-                time.sleep(3)
-                continue
-            break
-        try:
-            payload = response.json()
-        except ValueError:
-            break
-        records = payload.get("records") or []
-        for row in records:
-            if not row:
-                continue
-            value = row[1] if len(row) > 1 else None
-            if isinstance(value, (int, float)):
+    total = None
+    seen_pages = set()
+    try:
+        while True:
+            url = BRAIN_API_URL + "/alphas/" + alpha_id + "/recordsets/daily-pnl"
+            for attempt in range(attempts):
+                response = s.get(url, params={"limit": page_limit, "offset": offset},
+                                 timeout=_request_timeout(None))
+                if response.status_code == 200 and response.text.strip():
+                    break
+                if response.status_code in (401, 403):
+                    raise AuthError("session rejected while reading daily PnL")
+                if response.status_code == 404:
+                    raise NotFound("daily PnL is unavailable for %s" % alpha_id)
+                if attempt + 1 < attempts:
+                    time.sleep(3)
+            if response.status_code == 429:
+                raise RateLimited("daily PnL read was rate limited")
+            if response.status_code != 200 or not response.text.strip():
+                raise ServiceError("daily PnL page unavailable (HTTP %s)" % response.status_code)
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise ServiceError("daily PnL page was not JSON") from exc
+            if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+                raise ServiceError("daily PnL page has no record array")
+            records = payload["records"]
+            evidence["pages"] += 1
+            count = payload.get("count")
+            if count is not None:
+                if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                    raise ServiceError("daily PnL page has an invalid count")
+                if total is not None and total != count:
+                    raise ServiceError("daily PnL changed during pagination")
+                total = count
+            more = bool(payload.get("next"))
+            signature = json.dumps(records, sort_keys=True, separators=(",", ":"))
+            if records and signature in seen_pages:
+                raise ServiceError("daily PnL repeated a page")
+            seen_pages.add(signature)
+            for row in records:
+                if not isinstance(row, (list, tuple)) or len(row) < 2 or not isinstance(row[0], str):
+                    raise ServiceError("daily PnL contains a malformed record")
+                value = row[1]
+                if value is None:
+                    evidence["missing_values"] += 1
+                    continue
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ServiceError("daily PnL contains a non-finite or nonnumeric value")
+                if row[0] in out and out[row[0]] != float(value):
+                    raise ServiceError("daily PnL changed within an overlapping page")
                 out[row[0]] = float(value)
-        if len(records) < page_limit:
-            break
-        offset += len(records)
+            offset += len(records)
+            evidence["points"] = len(out)
+            if total is not None:
+                if offset > total:
+                    raise ServiceError("daily PnL exceeded its declared count")
+                if offset == total:
+                    break
+                if not records:
+                    raise ServiceError("daily PnL ended before its declared count")
+            elif not more and len(records) < page_limit:
+                break
+            elif not records:
+                raise ServiceError("daily PnL pagination did not advance")
+    except requests.RequestException as exc:
+        evidence["error"] = "SERVICE_ERROR"
+        publish()
+        raise ServiceError("daily PnL transport failed: %s" % type(exc).__name__) from exc
+    except BrainError as exc:
+        evidence["error"] = exc.code
+        publish()
+        raise
 
-    if cache_dir and out:
+    evidence.update(complete=True, as_of=datetime.now(timezone.utc).isoformat(),
+                    start=min(out) if out else None, end=max(out) if out else None)
+    if cache_dir:
+        path = Path(cache_dir) / (alpha_id + ".json")
+        metadata_path = Path(cache_dir) / ".meta" / (alpha_id + ".json")
+        metadata = {**evidence, "format": "worldquantuser.pnl-evidence", "version": 1,
+                    "alpha_id": alpha_id,
+                    "data_sha256": hashlib.sha256(json.dumps(out, sort_keys=True, separators=(",", ":"),
+                                                              allow_nan=False).encode("utf-8")).hexdigest()}
         try:
-            path = Path(cache_dir) / (alpha_id + ".json")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_suffix(".json.tmp")
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(out, handle)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(tmp, path)
-        except OSError:
-            pass
+            cache_store.write_json_atomic(path, out)
+            cache_store.write_json_atomic(metadata_path, metadata)
+            evidence.update(path=str(path), metadata_path=str(metadata_path), cached=True)
+        except OSError as exc:
+            evidence.update(cached=False, cache_error=type(exc).__name__)
+    publish()
     return out
 
 
@@ -1965,8 +2121,7 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
     if not date_submitted:
         document["reason"] = (
             "accepted for asynchronous evaluation but dateSubmitted is still empty; "
-            "re-submit after the evaluation, or re-read dateSubmitted, before "
-            "counting this as submitted")
+            "reconcile this attempt with read-only status checks before another submission")
     return document
 
 
@@ -1990,8 +2145,9 @@ def list_alphas(s, limit=100, offset=0, order="-is.sharpe", status="UNSUBMITTED"
         "offset": int(offset),
         "order": order,
         "hidden": "true" if hidden else "false",
-        "type!=": alpha_type_not,
     }
+    if alpha_type_not:
+        params["type!="] = alpha_type_not
     if status:
         params["status"] = status
     if region:

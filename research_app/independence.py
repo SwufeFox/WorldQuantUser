@@ -23,7 +23,7 @@ import os
 import alpha_registry
 import research_paths
 
-from . import legs
+from . import book_state, legs
 
 
 def _series(alpha_ids, directory):
@@ -56,7 +56,7 @@ def marginal_report(alpha_id, registry_path=None, pnl_dir=None):
             latest[key] = entry
     directory = pnl_dir or os.path.join(research_paths.ensure_dir(), "pnl")
     book = [aid for aid, entry in latest.items()
-            if str(entry.get("status") or "").upper() in ("ACTIVE", "SUBMITTED")
+            if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES
             and aid != alpha_id]
     series = _series(book + [alpha_id], directory)
     if alpha_id not in series:
@@ -80,6 +80,8 @@ def marginal_report(alpha_id, registry_path=None, pnl_dir=None):
     return {
         "alpha_id": alpha_id,
         "book_members": n,
+        "book": book_state.describe_book(latest, series=series, registry_path=registry_path,
+                                           pnl_dir=directory),
         "window": {"start": dates[0], "end": dates[-1], "days": len(dates)},
         "book_sharpe": round(book_sharpe, 3),
         "candidate_sharpe": round(candidate_sharpe, 3),
@@ -99,7 +101,7 @@ def independence_report(registry_path=None, pnl_dir=None, threshold=0.7):
         if key:
             latest[key] = entry
     book = [aid for aid, entry in latest.items()
-            if str(entry.get("status") or "").upper() in ("ACTIVE", "SUBMITTED")]
+            if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES]
     directory = pnl_dir or os.path.join(research_paths.ensure_dir(), "pnl")
     series = _series(book, directory)
     book = sorted(series)
@@ -155,6 +157,8 @@ def independence_report(registry_path=None, pnl_dir=None, threshold=0.7):
 
     return {
         "book_members": len(book),
+        "book": book_state.describe_book(latest, series=series, registry_path=registry_path,
+                                           pnl_dir=directory),
         "window": {"start": dates[0], "end": dates[-1], "days": len(dates)},
         "stress_days": len(stressed),
         "calm_days": len(calm),

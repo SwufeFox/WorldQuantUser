@@ -198,6 +198,28 @@ class RecoverTests(unittest.TestCase):
         login.assert_not_called()
         self.assertTrue(result["complete"])
 
+    def test_unknown_legacy_scope_cannot_borrow_historical_evidence(self):
+        rows = [{"label": "legacy", "expression": "rank(close)", "train_fitness": None}]
+        with mock.patch.object(ml, "list_alphas") as listing, \
+                mock.patch.object(ml, "fetch_alpha_metrics") as fetch:
+            result = experiments._recover_probe_rows(object(), rows)
+        listing.assert_not_called()
+        fetch.assert_not_called()
+        self.assertEqual(result["still_missing"], ["legacy"])
+
+    def test_legacy_signature_restores_the_exact_settings_without_defaults(self):
+        import json
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batch.json"
+            path.write_text(json.dumps({"rows": [{"label": "legacy", "expression": "rank(close)",
+                "settings_signature": experiments._settings_signature(SETTINGS_B)}]}), encoding="utf-8")
+            _path, document = experiments._load_probe_batch(path)
+        self.assertEqual(document["arms"][0]["settings"], SETTINGS_B)
+        self.assertIsNone(document["started_at"])
+        self.assertEqual(document["execution"]["unknown_submission"], 1)
+
 
 
 class BatchProvenanceTests(unittest.TestCase):

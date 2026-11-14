@@ -239,88 +239,150 @@ def cmd_ledger_coverage(args, _sink):
 
 
 def cmd_ledger_sync(args, _sink):
-    """Reconcile the ledger with the account: record alphas it has never seen.
-
-    The ledger is append-only and only ever grows when something explicitly records an
-    alpha, so the platform and the ledger drift: alphas are created in a sweep, or
-    submitted by hand, and the local book is quietly wrong afterwards. This walks the
-    account, finds ids the ledger has no row for, and records them.
-
-    It does not re-record alphas that already exist: the ledger is append-only and a
-    re-record would add a duplicate row without new information. Use `ledger record`
-    for a deliberate refresh of one alpha.
-    """
-    wanted = [part.strip().upper() for part in str(args.status).split(",") if part.strip()]
+    """Capture a bounded, explicit account scope and report each repair independently."""
+    from datetime import datetime, timezone
+    from . import book_state
+    from .alphas import _platform_entry
+    limit = int(args.limit)
+    pages = int(args.pages)
+    record_limit = int(args.limit_record)
+    if limit <= 0 or pages <= 0 or record_limit < 0:
+        raise CliError("USAGE", "page size/pages must be positive and record limit non-negative")
+    page_size = min(limit, 100)
+    wanted = {part.strip().upper() for part in str(args.status or "").split(",") if part.strip()}
+    status_text = getattr(args, "platform_status", "ACTIVE")
+    statuses = ([part.strip().upper() for part in str(status_text).split(",") if part.strip()]
+                if status_text and str(status_text).upper() not in {"ALL", "NONE"} else [None])
+    hidden = bool(getattr(args, "hidden", False))
+    excluded_type = getattr(args, "alpha_type_not", None)
+    scope = {"statuses": statuses, "hidden": hidden, "alpha_type_not": excluded_type,
+             "record_statuses": sorted(wanted) or None,
+             "order": args.order, "effective_page_size": page_size}
+    registry, entries = _ledger(args)
+    registry = str(registry or getattr(args, "registry", None) or alpha_registry.default_registry_path())
+    latest = {entry["alpha_id"]: entry for entry in entries if entry.get("alpha_id")}
 
     def work(session):
-        platform = {}
-        for page in range(max(1, args.pages)):
-            batch = ml.list_alphas(session, limit=args.limit, offset=page * args.limit,
-                                   order=args.order, status=args.platform_status)
-            for alpha in batch:
-                alpha_id = alpha.get("id")
-                if alpha_id:
-                    platform[alpha_id] = alpha
-            if len(batch) < args.limit:
-                break
-        return platform
+        platform, page_reports, errors = {}, [], []
+        complete = True
+        for status in statuses:
+            exhausted = False
+            seen = set()
+            for page in range(pages):
+                try:
+                    batch = ml.list_alphas(session, limit=page_size, offset=page * page_size,
+                                           order=args.order, status=status, hidden=hidden,
+                                           alpha_type_not=excluded_type)
+                except Exception as exc:
+                    errors.append({"status": status, "offset": page * page_size, "error": str(exc)})
+                    complete = False
+                    break
+                ids = [row.get("id") for row in batch if row.get("id")]
+                duplicate = bool(seen.intersection(ids)) or len(set(ids)) != len(ids)
+                if duplicate or len(ids) != len(batch):
+                    complete = False
+                seen.update(ids)
+                platform.update({row["id"]: row for row in batch if row.get("id")})
+                page_reports.append({"status": status, "offset": page * page_size,
+                                     "count": len(batch), "duplicate_ids": duplicate})
+                if len(batch) < page_size:
+                    exhausted = True
+                    break
+            complete = complete and exhausted
+        as_of = datetime.now(timezone.utc).isoformat()
+        eligible = {alpha_id: row for alpha_id, row in platform.items()
+                    if not wanted or str(row.get("status") or "").upper() in wanted}
+        missing = sorted(set(eligible) - set(latest))
+        drifted = sorted(alpha_id for alpha_id, row in eligible.items()
+                         if alpha_id in latest and str(latest[alpha_id].get("status") or "").upper()
+                         != str(row.get("status") or "").upper())
+        # Absence from a partial/filtered listing is never itself a status change.
+        # A complete capture permits individual reads; only those reads update rows.
+        absent = sorted(alpha_id for alpha_id, row in latest.items()
+                        if complete and alpha_id not in platform
+                        and str(row.get("status") or "").upper() in book_state.BOOK_STATUSES
+                        and (None in statuses or str(row.get("status") or "").upper() in statuses)
+                        and (not wanted or str(row.get("status") or "").upper() in wanted))
+        targets = list(dict.fromkeys(missing + drifted + absent + sorted(eligible)))
+        member_ids = sorted(alpha_id for alpha_id, row in platform.items()
+                            if str(row.get("status") or "").upper() in book_state.BOOK_STATUSES)
+        snapshot = {"as_of": as_of, "scope": scope, "complete": complete,
+                    "member_ids": member_ids, "member_count": len(member_ids),
+                    "member_digest": book_state.member_digest(member_ids),
+                    "listed_ids_digest": book_state.member_digest(platform),
+                    "listed_count": len(platform), "pages": page_reports,
+                    "errors": errors, "invalidated": False,
+                    "coverage": "selected status/hidden/type scope only"}
+        result = {"platform": len(platform), "ledger_ids": len(latest),
+                  "missing": missing, "drifted": drifted, "absent_from_scope": absent,
+                  "snapshot": snapshot, "dry_run": bool(args.dry_run),
+                  "recorded": 0, "rows": [], "skipped_beyond_limit": max(0, len(targets) - record_limit)}
+        if args.dry_run:
+            result.update(membership={"complete": False, "listing_complete": complete,
+                                      "repair_planned": missing + drifted + absent,
+                                      "reason": "read-only preview; no reconciliation performed"},
+                          metadata={"complete": False, "planned": targets[:record_limit]},
+                          pnl={"requested": bool(getattr(args, "pnl", False)), "complete": False,
+                               "reason": "read-only preview"})
+            return result
+        rows, repaired, reverse_drift, changed_during_capture = [], set(), [], []
+        for alpha_id in targets[:record_limit]:
+            try:
+                current = ml.fetch_alpha_metrics(session, alpha_id)
+                if alpha_id in platform and current.get("status") != platform[alpha_id].get("status"):
+                    changed_during_capture.append(alpha_id)
+                entry = _platform_entry(current, alpha_id, latest.get(alpha_id), source="sync")
+                stored, written = alpha_registry.record_entry(entry, registry)
+                rows.append({"alpha_id": alpha_id, "complete": True, "written": written,
+                             "status": stored.get("status")})
+                repaired.add(alpha_id)
+                if alpha_id in absent and str(stored.get("status") or "").upper() not in book_state.BOOK_STATUSES:
+                    reverse_drift.append(alpha_id)
+            except Exception as exc:
+                rows.append({"alpha_id": alpha_id, "complete": False, "error": str(exc)})
+        if changed_during_capture:
+            snapshot.update(invalidated=True, invalidation_reason="status changed during account capture",
+                            changed_during_capture=changed_during_capture)
+        pnl_rows = []
+        pnl_requested = bool(getattr(args, "pnl", False))
+        if pnl_requested:
+            for alpha_id in member_ids[:record_limit]:
+                report = {}
+                try:
+                    series = ml.fetch_daily_pnl(session, alpha_id,
+                                                cache_dir=Path(research_paths.resolve("pnl")),
+                                                max_age_hours=0, report=report)
+                    pnl_rows.append({**report, "alpha_id": alpha_id, "points": len(series or {}),
+                                     "complete": report.get("complete") is True})
+                except Exception as exc:
+                    pnl_rows.append({**report, "alpha_id": alpha_id, "complete": False, "error": str(exc)})
+        membership_targets = set(missing + drifted + absent)
+        membership_complete = (complete and not changed_during_capture
+                               and membership_targets.issubset(repaired))
+        result.update(recorded=sum(row.get("written", False) for row in rows), rows=rows,
+                      reverse_drift=reverse_drift,
+                      membership={"complete": membership_complete, "listing_complete": complete,
+                                  "scope": scope, "unrepaired_ids": sorted(membership_targets - repaired)},
+                      metadata={"complete": complete and len(repaired) == len(targets),
+                                "refreshed": len(repaired), "targets": len(targets),
+                                "unrepaired_ids": sorted(set(targets) - repaired)},
+                      pnl={"requested": pnl_requested,
+                           "complete": pnl_requested and complete and len(pnl_rows) == len(member_ids)
+                                       and all(row["complete"] for row in pnl_rows),
+                           "rows": pnl_rows, "skipped_beyond_limit":
+                               max(0, len(member_ids) - record_limit) if pnl_requested else len(member_ids)})
+        result["fully_reconciled"] = (result["membership"]["complete"] and result["metadata"]["complete"]
+                                      and (not pnl_requested or result["pnl"]["complete"]))
+        snapshot["reconciliation"] = {key: result[key]["complete"]
+                                      for key in ("membership", "metadata", "pnl")}
+        try:
+            book_state.persist_snapshot(snapshot, registry)
+            result["snapshot_persisted"] = True
+        except Exception as exc:
+            result.update(snapshot_persisted=False, snapshot_error=str(exc), fully_reconciled=False)
+        return result
 
-    platform = with_session(args, work)
-    _path, entries = _ledger(args)
-    latest = {}
-    for entry in entries:
-        alpha_id = entry.get("alpha_id")
-        if alpha_id:
-            latest[alpha_id] = entry
-    known = set(latest)
-    missing = [alpha_id for alpha_id in platform if alpha_id not in known]
-    # A submitted alpha can still say COMPLETE locally until its status is refreshed.
-    # Sync status drift so book counts and candidate lists reflect the platform.
-    drifted = [alpha_id for alpha_id in platform
-               if alpha_id in latest
-               and str((latest[alpha_id] or {}).get("status") or "").upper()
-               != str((platform[alpha_id] or {}).get("status") or "").upper()]
-    if wanted:
-        missing = [alpha_id for alpha_id in missing
-                   if str((platform[alpha_id] or {}).get("status") or "").upper() in wanted]
-    missing.sort()
-    drifted.sort()
-    if args.dry_run:
-        return {"platform": len(platform), "ledger_ids": len(known),
-                "missing": missing, "drifted": drifted,
-                "recorded": 0, "dry_run": True}
-
-    def record(session):
-        written = []
-        targets = missing + drifted
-        for alpha_id in targets[: args.limit_record]:
-            current = ml.fetch_alpha_metrics(session, alpha_id)
-            code, _description, _count = ml.regular_expression(current)
-            checks = ml._extract_checks(current)
-            entry = alpha_registry.build_entry(
-                {"alpha_id": alpha_id, "expression": code,
-                 "settings": current.get("settings") or {},
-                 "metrics": current.get("is") or {},
-                 "checks": checks, "status": current.get("status"),
-                 "out_of_sample": {"train": current.get("train") or {},
-                                   "test": current.get("test") or {},
-                                   "test_period": "P1Y"}},
-                verdict=alpha_registry.auto_verdict(
-                    {"status": current.get("status"),
-                     "metrics": current.get("is") or {}, "checks": checks}),
-                note="recorded by `ledger sync`" + (" (status drift)" if alpha_id in drifted else ""),
-                source="sync")
-            stored, was_written = alpha_registry.record_entry(
-                entry, getattr(args, "registry", None))
-            written.append({"alpha_id": alpha_id, "written": was_written,
-                            "status": stored.get("status")})
-        return written
-
-    written = with_session(args, record)
-    return {"platform": len(platform), "ledger_ids": len(known),
-            "missing": missing, "drifted": drifted,
-            "recorded": len(written), "rows": written,
-            "skipped_beyond_limit": max(0, len(missing) + len(drifted) - len(written))}
+    return with_session(args, work)
 
 
 def cmd_ledger_format(args, _sink):

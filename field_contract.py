@@ -26,6 +26,7 @@ The module is pure: it takes raw catalog dicts and never touches the network.
 from __future__ import annotations
 
 import re
+import fastexpr_ast as ast
 
 __all__ = [
     "audit_field",
@@ -251,9 +252,9 @@ def audit_field(raw):
         },
         "historical_target_alignment": {
             "state": "unverified",
-            "lookback": 63,
-            "note": "differencing t against t-63 assumes both observations target the "
-                    "same fiscal period; nothing in the catalog confirms it",
+            "lookback": None,
+            "note": "differencing observations assumes both target the same fiscal "
+                    "period; neither the lookback nor target alignment is declared by the catalog",
         },
     }
 
@@ -266,9 +267,9 @@ def audit_field(raw):
     return {
         "field_id": field_id,
         "description": description,
-        "dataset": dataset.get("id"),
-        "category": (raw.get("category") or {}).get("id"),
-        "subcategory": (raw.get("subcategory") or {}).get("id"),
+        "dataset": dataset.get("id") if isinstance(dataset, dict) else dataset,
+        "category": raw.get("category", {}).get("id") if isinstance(raw.get("category"), dict) else raw.get("category"),
+        "subcategory": raw.get("subcategory", {}).get("id") if isinstance(raw.get("subcategory"), dict) else raw.get("subcategory"),
         "type": raw.get("type"),
         "region": raw.get("region"),
         "delay": {
@@ -343,7 +344,7 @@ def audit_operation(contracts, operation):
                 warnings.append("target_fiscal_alignment_unverified")
                 findings.append(
                     "%s: forecasts are differenced against themselves, but the target "
-                    "fiscal period is unknown, so a 63-day change may cross a fiscal-year "
+                    "fiscal period is unknown, so a change may cross a fiscal-year "
                     "rollover instead of revising one forecast"
                     % contract["field_id"])
             if contract["corporate_action_risk"]["flagged"]:
@@ -424,3 +425,60 @@ def audit_fields(raw_records, operation=None):
                 worst = "needs_review"
         document["verdict"] = worst
     return document
+
+
+def audit_expression(expression, raw_records):
+    """Audit direct AST operations; derived operands retain unknown economics.
+
+    A type-correct operator does not establish fiscal alignment or economic units.
+    These findings are research evidence, never instructions to rewrite a signal.
+    """
+    try:
+        program = ast.parse(expression)
+    except Exception as exc:
+        return {"state": "unknown", "reason": "unparsed_expression", "error": str(exc),
+                "fields": [], "operations": []}
+    records = {row["id"]: row for row in raw_records if row.get("id")}
+    names = sorted(ast.field_names(program))
+    contracts = {name: audit_field(records[name]) for name in names if name in records}
+    operations, bindings = [], {}
+
+    def direct(node):
+        if isinstance(node, ast.Field):
+            return bindings.get(node.name, node.name if node.name in records else None)
+        return None
+
+    def visit(root):
+        for node in root.walk():
+            operation, operands = None, []
+            if isinstance(node, ast.BinOp) and node.op in {"/", "-", "+"}:
+                operation = {"/": "ratio", "-": "difference", "+": "sum"}[node.op]
+                operands = [node.left, node.right]
+            elif isinstance(node, ast.Call):
+                operation = {"divide": "ratio", "subtract": "difference", "add": "sum",
+                             "ts_delta": "ts_difference"}.get(node.name)
+                operands = list(node.args[:1] if operation == "ts_difference" else node.args)
+            if not operation:
+                continue
+            ids = [direct(operand) for operand in operands]
+            if not ids or any(name is None for name in ids):
+                operations.append({"operation": operation, "expression": node.render(),
+                                   "state": "unknown", "reason": "derived_or_unknown_operand",
+                                   "note": "nested transformations do not preserve a declared economic contract"})
+                continue
+            operation_contracts = [audit_field(records[name]) for name in ids]
+            evidence = audit_operation(operation_contracts, operation)
+            operations.append({**evidence, "expression": node.render(),
+                               "state": "reviewed" if evidence["verdict"] == "ready" else "unknown"})
+
+    for name, value in program.assignments:
+        visit(value)
+        bindings[name] = direct(value)
+    if program.signal is not None:
+        visit(program.signal)
+    missing = sorted(set(names) - set(records))
+    unknown = missing or any(row["state"] != "reviewed" for row in operations)
+    unknown = unknown or any(row["verdict"] != "ready" for row in contracts.values())
+    return {"state": "unknown" if unknown else "reviewed", "fields": list(contracts.values()),
+            "missing_fields": missing, "operations": operations,
+            "interpretation": "catalog evidence does not establish signal validity or expected returns"}

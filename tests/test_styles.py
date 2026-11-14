@@ -49,6 +49,19 @@ class StylesTests(unittest.TestCase):
         self.assertEqual(summary["skipped"], ["C"])
         self.assertEqual(summary["rows"][0]["alpha_id"], "A")
 
+    def test_training_fitness_alone_orders_each_comparison_group(self):
+        entries = [{"alpha_id": alpha_id, "expression": "rank(close)",
+                    "metrics": {"fitness": full},
+                    "out_of_sample": {"train": {"fitness": train}}}
+                   for alpha_id, train, full in (("A", 2, -5), ("B", 0, 10),
+                                                 ("C", -1, 20), ("D", None, 99))]
+        self.assertEqual([row["alpha_id"] for row in styles.summarize(list(reversed(entries)))["rows"]],
+                         ["A", "B", "C", "D"])
+        for entry in entries:
+            entry["metrics"]["fitness"] *= -10
+        self.assertEqual([row["alpha_id"] for row in styles.summarize(entries)["rows"]],
+                         ["A", "B", "C", "D"])
+
 
 if __name__ == "__main__":
     unittest.main()
