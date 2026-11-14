@@ -48,7 +48,7 @@ ERROR_CODES = {
 
 METRIC_KEYS = ("sharpe", "fitness", "turnover", "returns", "drawdown", "margin",
                "longCount", "shortCount", "pnl")
-_PROTECTED_OUTPUT_ARGS = ("freeze", "selection", "batch_path", "checkpoint", "resume", "recover")
+_PROTECTED_OUTPUT_ARGS = ("freeze", "selection", "batch_path", "checkpoint", "resume", "recover", "emit")
 
 
 class CliError(Exception):
@@ -82,7 +82,7 @@ def protect_output(args, *paths):
         if path and destination == Path(path).expanduser().resolve():
             raise OutputConflict(
                 "INVALID_INPUT", "--save would overwrite durable research state",
-                "choose a response path distinct from the batch, checkpoint and frozen selection",
+                "choose a response path distinct from the batch, checkpoint, frozen selection and draft spec",
                 details={"protected_path": str(destination)})
 
 
