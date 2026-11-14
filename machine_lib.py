@@ -1208,6 +1208,17 @@ def resolve_settings(overrides=None):
     is passed through: the platform owns that enum, and refusing a value here makes
     "not yet tried" indistinguishable from "cannot be expressed".
     """
+    # JSON uses platform keys, whereas CLI arguments use snake_case internally.
+    # Passing `test_period` through left `testPeriod=P0Y` in the same payload:
+    # the server could accept the request while ignoring the intended split.
+    # Reject alternate spellings of known keys; keep genuinely new platform
+    # settings available rather than turning this client into a second API enum.
+    canonical_keys = {key.replace("_", "").casefold(): key for key in DEFAULT_SETTINGS}
+    for key in overrides or {}:
+        canonical = canonical_keys.get(str(key).replace("_", "").casefold())
+        if canonical and key != canonical:
+            raise ValueError("simulation setting %r must be spelled %r in JSON" %
+                             (key, canonical))
     settings = dict(DEFAULT_SETTINGS)
     for key, value in (overrides or {}).items():
         if value is not None:

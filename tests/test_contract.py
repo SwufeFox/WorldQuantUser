@@ -456,6 +456,20 @@ class ErrorEnvelopeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ml.resolve_settings({"region": "MARS"})
 
+    def test_cli_spellings_cannot_silently_leave_platform_defaults(self):
+        for wrong, right in (("test_period", "testPeriod"),
+                             ("nan_handling", "nanHandling"),
+                             ("instrument_type", "instrumentType"),
+                             ("testperiod", "testPeriod")):
+            with self.subTest(key=wrong), self.assertRaisesRegex(ValueError, right):
+                ml.resolve_settings({wrong: "P1Y"})
+        settings = ml.resolve_settings({"testPeriod": "P1Y", "nanHandling": "OFF"})
+        self.assertEqual(settings["testPeriod"], "P1Y")
+        self.assertEqual(settings["nanHandling"], "OFF")
+
+    def test_new_platform_setting_names_are_still_passed_through(self):
+        self.assertEqual(ml.resolve_settings({"maxTrade": "OFF"})["maxTrade"], "OFF")
+
     def test_well_formed_unknown_neutralization_is_sent(self):
         # The platform owns this enum. Refusing a value locally made "we never
         # tried STATISTICAL" indistinguishable from "the tool cannot say it"
