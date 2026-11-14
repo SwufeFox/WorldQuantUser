@@ -272,22 +272,24 @@ def build_parser():
 
     mine_parser = sub.add_parser(
         "mine",
-        help="Untouched fields whose cadence fits a turnover band, with a spec on demand.",
-        description="Three measured facts decide whether a field is worth a construction: "
-                    "it is untouched, its dataset's realised turnover lands in the band, "
-                    "and its type says how it must be wrapped (VECTOR/EVENT need vec_avg). "
-                    "`--emit` writes a probe spec so the next step is a simulation.")
+        help="Review cached fields, definition gaps and related ledger evidence.",
+        description="Offline screening in the default simulation scope: separate numeric "
+                    "fields from labels and VECTOR/EVENT reductions needing a definition. "
+                    "Show cache provenance, same-description history and train-only dataset "
+                    "turnover. Unused field ids are not new mechanisms. --emit drafts a "
+                    "scan; it does not verify economic meaning, PIT or live availability.")
     mine_parser.add_argument("--dataset", default=None,
                              help="Restrict to one dataset id (default: every dataset).")
     mine_parser.add_argument("--min-coverage", type=float, default=0.3,
                              dest="min_coverage")
     mine_parser.add_argument("--turnover-band", default="0.08,0.25", dest="turnover_band",
-                             help="MIN,MAX of realised turnover that is worth mining.")
+                             help="MIN,MAX for sorting observed dataset train turnover; "
+                                  "not a field cadence estimate.")
     mine_parser.add_argument("--limit", type=int, default=4,
-                             help="Candidate fields to show per dataset.")
+                             help="Rows to show per dataset in each review category.")
     mine_parser.add_argument("--expr", default=None,
                              help="Semicolon-separated sub-expressions to apply --shape to. "
-                                  "Shape-first mining: keep the construction, change the field.")
+                                  "Choose vector reductions explicitly after reviewing their semantics.")
     mine_parser.add_argument("--shape", default="raw",
                              choices=("raw", "centre", "midtier", "change", "ratio_assets"),
                              help="Construction to apply to each --expr.")
@@ -297,7 +299,8 @@ def build_parser():
     mine_parser.add_argument("--arms", type=int, default=8,
                              help="Arms to emit in the spec.")
     mine_parser.add_argument("--emit", default=None, metavar="PATH",
-                             help="Write a probe spec to this path.")
+                             help="Draft a scan of numeric-review fields or explicit --expr; "
+                                  "never silently aggregate vectors or overwrite an existing spec.")
     mine_parser.add_argument("--name", default=None, help="Spec batch name.")
     mine_parser.add_argument("--registry", default=None)
     mine_parser.set_defaults(func=mine.cmd_mine)

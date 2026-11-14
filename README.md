@@ -802,6 +802,37 @@ dataset split lives in one visible constant (`DISCLOSURE_DATASETS`, named for th
 cadence rather than for any judgement about value) instead of being inferred inside the
 linter, so the assumption can be read and argued with.
 
+### Review fields before drafting a scan
+
+```bash
+python research_cli.py mine --dataset fundamental2 --limit 5
+python research_cli.py mine --dataset news18 --expr 'vec_sum(reviewed_event_field)' --emit draft.json
+```
+
+`mine` reads local metadata in the default simulation scope and shows the selected
+cache source, age and freshness. It excludes explicitly different scopes and
+prefers scoped, fresh, newer snapshots deterministically. Unknown legacy scope
+remains marked unknown; this offline review does not verify the current account.
+
+`top` contains numeric MATRIX fields for review. `needs_definition` keeps labels,
+forecast-type codes, dates, vague definitions, VECTOR/EVENT reductions and fields
+sharing a description with an already-used field. Related ledger records are
+shown as evidence, not proof that two fields are interchangeable aliases.
+Numeric counts are not rejected merely because their values are integers.
+
+Unused means absent from parseable latest ledger expressions. The AST excludes
+comments, strings and local variables; parse failures are reported. Older reports
+and unrecorded experiments still need checking before calling a mechanism new.
+Dataset turnover uses only the selected registry's training metrics, with sample
+and missing counts. It describes mixed constructions, not field update cadence
+or a forecast of the next expression's turnover.
+
+Automatic `--emit` drafts only numeric-review fields and never chooses `vec_avg`
+for a vector. Use explicit `--expr` after choosing the economic aggregation.
+Drafts do not overwrite existing specs and are saved atomically. Define units,
+timing/PIT, direction and controls before `probe --dry-run` and online `--check`;
+neither a high coverage nor a numeric type establishes signal validity.
+
 ### Types: five kinds of field, and the operators that accept them
 
 The platform's field filter offers five types — `Matrix`, `Vector`, `Group`, `Universe`,

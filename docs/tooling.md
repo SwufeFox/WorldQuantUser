@@ -166,6 +166,21 @@ seen 与草稿各自原子提交，草稿先于 seen：草稿失败不会把论�
 | 按 PnL 相关聚类（不是按结构） | `python3 tools/cluster_ledger.py` |
 | 记忆索引与条目是否一致 | `python3 tools/memory_index.py --workspace <workspace> --check`；生成链接统一使用 `/`，兼容 Windows 和 POSIX |
 
+### 字段挖掘：先看缺什么定义
+
+```bash
+python3 research_cli.py mine --dataset fundamental2 --limit 5
+python3 research_cli.py mine --dataset news18 --expr 'vec_sum(reviewed_event_field)' --emit draft.json
+```
+
+`mine` 是离线复核，不会登录。`catalog` 展示默认模拟范围、缓存新鲜度及范围不匹配的排除数量；每个字段的 `source` 保留选中快照、年龄和范围状态。旧缓存未声明范围时保持 unknown，不冒充当前账户可用性。
+
+每个数据集的 `top` 是数值 MATRIX 待审线索；`needs_definition` 单列分类编码、日期、缺说明、VECTOR/EVENT 聚合，以及与已用字段同描述的项目。`related_history` 给出对应台账记录；同描述只提示需要复核，不证明 alias 等价。`unused` 只指最新台账可解析表达式没引用过该 id，不含旧报告/未入账实验，更不是新机制数量。字段提取走 AST，不把注释、字符串、局部变量当数据。
+
+换手中位数只用指定 `--registry` 的训练指标，同时给出样本数与缺失训练数量；不拿全窗口补齐，也不把混合表达式的中位数解释成字段更新频率或下一条信号的换手。
+
+自动 `--emit` 不替 VECTOR 选择 `vec_avg`，只生成数值待审项目；经济聚合明确后用 `--expr`。输出仅为探索草稿，原子保存且不覆盖已有 spec；正式实验仍须经济含义/时间/PIT 审计和预注册，再 dry-run、在线 check。不要把草稿的裸 rank 当已确定的经济方向。
+
 ### 构造：族、零件、单元
 
 | 问题 | 命令 |

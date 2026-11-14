@@ -130,6 +130,137 @@ class FeedContractTests(unittest.TestCase):
         self.assertEqual(result["searches"][0]["status"], "failure")
 
 
+class MineContractTests(unittest.TestCase):
+    def seed_workspace(self, directory, fields, entries=()):
+        root = Path(directory)
+        cache = root / "cache" / "metadata" / "datafields"
+        cache.mkdir(parents=True)
+        (cache / "fixture.json").write_text(
+            json.dumps({"payload": fields}), encoding="utf-8")
+        registry = root / "alpha-registry.jsonl"
+        registry.write_text("".join(json.dumps(row) + "\n" for row in entries),
+                            encoding="utf-8")
+        return registry
+
+    def invoke(self, directory, *arguments, registry=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        command = ["mine", "--research-dir", directory,
+                   "--registry", str(registry or Path(directory) / "alpha-registry.jsonl"),
+                   *arguments]
+        with mock.patch.object(sys, "stdout", stdout), \
+                mock.patch.object(sys, "stderr", stderr), \
+                mock.patch.object(ml, "load_session",
+                                  side_effect=AssertionError("mine must remain offline")) as login:
+            code = cli_app.main(command)
+        login.assert_not_called()
+        return code, json.loads(stdout.getvalue()), stderr.getvalue()
+
+    @staticmethod
+    def field(field_id, field_type, description):
+        return {"id": field_id, "dataset": {"id": "fixture"},
+                "type": field_type, "coverage": 0.9, "description": description}
+
+    def test_automatic_mining_emits_only_numeric_measurements(self):
+        fields = [
+            self.field("loss_allowance", "MATRIX",
+                       "Total allowance for doubtful accounts receivable."),
+            self.field("story_age_vec", "VECTOR", "Elapsed days since a similar news event."),
+            self.field("event_price", "EVENT", "Trade price associated with an event."),
+            self.field("forecast_type_flag", "MATRIX", "Forecast type (new or revision)."),
+            self.field("report_currency_code", "MATRIX", "Currency code for the reported amount."),
+            self.field("event_timestamp", "MATRIX", "UTC timestamp when the event begins."),
+            self.field("opaque_measurement", "MATRIX", ""),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            self.seed_workspace(directory, fields)
+            output = Path(directory) / "scan.json"
+            code, document, stderr = self.invoke(directory, "--emit", str(output),
+                                                 "--limit", "20", "--arms", "20")
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(document["ok"])
+            top = [item["id"] for dataset in document["data"]["datasets"]
+                   for item in dataset["top"]]
+            self.assertEqual(top, ["loss_allowance"])
+            spec = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([arm["expression"] for arm in spec["arms"]],
+                             ["rank(loss_allowance)"])
+            self.assertNotIn("vec_avg", output.read_text(encoding="utf-8"))
+
+    def test_automatic_emit_refuses_fields_requiring_a_definition_or_reduction(self):
+        fields = [
+            self.field("story_age_vec", "VECTOR", "Elapsed days since a similar news event."),
+            self.field("event_price", "EVENT", "Trade price associated with an event."),
+            self.field("forecast_type_flag", "MATRIX", "Forecast type (new or revision)."),
+            self.field("event_timestamp", "MATRIX", "UTC timestamp when the event begins."),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            self.seed_workspace(directory, fields)
+            output = Path(directory) / "must-not-exist.json"
+            code, document, _stderr = self.invoke(directory, "--emit", str(output))
+            self.assertEqual(code, 2)
+            self.assertFalse(document["ok"])
+            self.assertEqual(document["error"]["code"], "INVALID_INPUT")
+            self.assertFalse(output.exists())
+
+    def test_explicit_vector_reduction_preserves_the_requested_expression(self):
+        fields = [self.field("story_age_vec", "VECTOR",
+                             "Elapsed days since a similar news event.")]
+        with tempfile.TemporaryDirectory() as directory:
+            self.seed_workspace(directory, fields)
+            output = Path(directory) / "explicit.json"
+            code, document, stderr = self.invoke(directory, "--expr", "vec_sum(story_age_vec)",
+                                                 "--emit", str(output))
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(document["ok"])
+            spec = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual([arm["expression"] for arm in spec["arms"]],
+                             ["rank(vec_sum(story_age_vec))"])
+
+    def test_saved_errors_cannot_replace_the_emit_path_even_when_parsing_fails(self):
+        fields = [self.field("loss_allowance", "MATRIX",
+                             "Total allowance for doubtful accounts receivable.")]
+        with tempfile.TemporaryDirectory() as directory:
+            self.seed_workspace(directory, fields)
+            output = Path(directory) / "reviewed.json"
+            original = b'{"name":"already reviewed", "arms":[{"expression":"rank(assets)"}]}\n'
+            output.write_bytes(original)
+            for extra in ([], ["--not-an-option"]):
+                with self.subTest(extra=extra):
+                    code, document, _stderr = self.invoke(
+                        directory, "--emit", str(output), "--save", str(output), *extra)
+                    self.assertEqual(code, 2)
+                    self.assertFalse(document["ok"])
+                    self.assertEqual(document["error"]["code"], "INVALID_INPUT")
+                    self.assertEqual(output.read_bytes(), original)
+
+    def test_requested_registry_cadence_uses_train_without_full_window_fallback(self):
+        fields = [
+            self.field("assets", "MATRIX", "Total assets."),
+            self.field("loss_allowance", "MATRIX",
+                       "Total allowance for doubtful accounts receivable."),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            self.seed_workspace(directory, fields, [{
+                "alpha_id": "DEFAULT", "expression": "rank(assets)",
+                "metrics": {"turnover": 0.75},
+                "out_of_sample": {"train": {"turnover": 0.04}},
+            }])
+            requested = Path(directory) / "requested.jsonl"
+            entries = [
+                {"alpha_id": "TRAIN", "expression": "rank(assets)",
+                 "metrics": {"turnover": 0.8},
+                 "out_of_sample": {"train": {"turnover": 0.02}}},
+                {"alpha_id": "FULL_ONLY", "expression": "rank(assets)",
+                 "metrics": {"turnover": 0.99}},
+            ]
+            requested.write_text("".join(json.dumps(row) + "\n" for row in entries),
+                                 encoding="utf-8")
+            code, document, stderr = self.invoke(directory, registry=requested)
+            self.assertEqual(code, 0, stderr)
+            self.assertTrue(document["ok"])
+            self.assertEqual(document["data"]["datasets"][0]["median_turnover"], 0.02)
+
+
 class CheckpointConcurrencyTests(unittest.TestCase):
     def test_concurrent_completion_events_preserve_every_record(self):
         import threading
