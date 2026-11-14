@@ -290,6 +290,52 @@ def load_denylist(path=None):
     return entries or {}
 
 
+#: The simulator names the *field type* it refused, e.g. "Operator ts_backfill
+#: does not support event inputs". That is a statement about the input, not a
+#: verdict on the operator: the same operator accepts MATRIX fields happily.
+_INPUT_KIND = re.compile(r"does not support\s+([A-Za-z_]+)\s+inputs", re.I)
+
+
+def rejection_input_kind(message):
+    """The field type named in a rejection message, uppercased, or ``None``."""
+    match = _INPUT_KIND.search(message or "")
+    return match.group(1).upper() if match else None
+
+
+def scoped_denylist_record(record, expression, field_types):
+    """Decide whether a learned rejection binds *this* expression.
+
+    Returns ``(record, reason)`` where ``reason`` is one of ``applies``,
+    ``type_mismatch``, ``type_unknown`` or ``none``.
+
+    A recorded rejection that names an input type only binds expressions that
+    actually read a field of that type. Without this, one EVENT-type mistake
+    turned ``ts_backfill`` into a permanent warning on every MATRIX expression
+    (236 warnings in a single batch, none of them about the arms at hand).
+
+    ``type_unknown`` means the expression was linted without a field table, so
+    the scope cannot be evaluated. A soft (``warn``) record is then not
+    reported at all and the operator is listed under ``denylist_unverified``:
+    a warning whose whole meaning is "this input kind was refused" is not
+    evidence when the input kind is unknown, and repeating it on every use is
+    how a warning banner becomes wallpaper. Hard (``block``) records ignore the
+    scope question entirely and always fire.
+    """
+    if not record:
+        return None, "none"
+    if record.get("severity", "block") == "block":
+        return record, "applies"
+    kind = str(record.get("input_kind") or "").upper()
+    if not kind:
+        return record, "applies"
+    if not field_types:
+        return None, "type_unknown"
+    present = {str(field_types[name]).upper()
+               for name in _IDENT.findall(expression or "")
+               if name in field_types}
+    return (record, "applies") if kind in present else (None, "type_mismatch")
+
+
 def record_rejection(operator, message, context=None, path=None, severity="block"):
     """Persist an operator rejection so future lints flag it immediately.
 
@@ -302,6 +348,10 @@ def record_rejection(operator, message, context=None, path=None, severity="block
     particular input kind (lint warns). Defaulting to ``block`` is deliberate:
     silently downgrading an unknown operator is the failure this module exists
     to prevent.
+
+    For ``warn`` records the field type named in the message is stored as
+    ``input_kind``, so :func:`scoped_denylist_record` can keep the warning off
+    expressions that never touch that type.
     """
     import datetime
 
@@ -309,6 +359,7 @@ def record_rejection(operator, message, context=None, path=None, severity="block
         raise ValueError("severity must be 'block' or 'warn', got %r" % (severity,))
     path = path or default_denylist_path()
     stamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    input_kind = rejection_input_kind(message) if severity == "warn" else None
 
     # Read-modify-write under a lock, and replace atomically. Two concurrent
     # CLI calls used to share one fixed ".tmp" name, which lost the counter bump
@@ -320,6 +371,8 @@ def record_rejection(operator, message, context=None, path=None, severity="block
             existing["count"] = int(existing.get("count", 1)) + 1
             existing["last_seen"] = stamp
             existing["message"] = message
+            if input_kind and existing.get("severity", "block") == "warn":
+                existing["input_kind"] = input_kind
             # A hard rejection outranks a soft one; never soften an existing block.
             if severity == "block":
                 existing["severity"] = "block"
@@ -333,6 +386,8 @@ def record_rejection(operator, message, context=None, path=None, severity="block
                 "last_seen": stamp,
                 "count": 1,
             }
+            if input_kind:
+                entries[operator]["input_kind"] = input_kind
         document = {
             "_comment": "Learned operator denylist. Written by expression_lint."
                         "record_rejection when the simulator rejects an operator.",
@@ -794,13 +849,19 @@ def lint_expression(expression, operator_index=None, denylist=None,
 
     calls = extract_calls(expression)
     used = []
+    unverified = []
     for call in calls:
         name = call["name"]
         used.append(name)
         entry = {"name": name, "arg_count": call["arg_count"],
                  "offset": call["offset"]}
+        record = None
         if denylist and name in denylist:
-            record = denylist[name] or {}
+            record, scope = scoped_denylist_record(denylist[name] or {},
+                                                   expression, field_types)
+            if scope == "type_unknown":
+                unverified.append(name)
+        if record is not None:
             reason = record.get("message") or record.get("reason") or \
                 "previously rejected"
             severity = record.get("severity", "block")
@@ -984,6 +1045,7 @@ def lint_expression(expression, operator_index=None, denylist=None,
         "details": None,
         "errors": errors,
         "warnings": warnings,
+        "denylist_unverified": sorted(set(unverified)),
     }
 
 def lint_all(pairs, operator_index=None, denylist=None, known_fields=None,
