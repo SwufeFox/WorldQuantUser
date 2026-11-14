@@ -410,7 +410,7 @@ class ExpressionLintTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "deny.json")
             expression_lint.record_rejection(
-                "subtract", "Operator subtract does not support event inputs",
+                "subtract", "Operator subtract was rejected for this configuration",
                 path=path, severity="warn")
             denylist = expression_lint.load_denylist(path)
             report = expression_lint.lint_expression(
@@ -426,6 +426,54 @@ class ExpressionLintTests(unittest.TestCase):
             expression_lint.record_rejection("nope", "unknown operator nope", path=path)
             entries = expression_lint.load_denylist(path)
             self.assertEqual(entries["nope"]["count"], 2)
+
+    def test_rejection_input_kind_is_read_from_the_message(self):
+        self.assertEqual(
+            expression_lint.rejection_input_kind(
+                "Operator ts_backfill does not support event inputs."), "EVENT")
+        self.assertIsNone(
+            expression_lint.rejection_input_kind("Operator ts_backfill is unavailable"))
+
+    def test_learned_warning_is_scoped_to_the_named_input_type(self):
+        # One EVENT-field mistake used to warn on every later use of the operator,
+        # MATRIX expressions included (236 warnings in one batch, none of them real).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "deny.json")
+            expression_lint.record_rejection(
+                "ts_backfill", "Operator ts_backfill does not support event inputs",
+                path=path, severity="warn")
+            entries = expression_lint.load_denylist(path)
+            self.assertEqual(entries["ts_backfill"]["input_kind"], "EVENT")
+            types = {"close": "MATRIX", "mat": "MATRIX", "evt": "EVENT"}
+            matrix_only = expression_lint.lint_expression(
+                "rank(ts_backfill(mat, 20))", operator_index=self.index,
+                denylist=entries, field_types=types)
+            self.assertEqual(matrix_only["warnings"], [])
+            with_event = expression_lint.lint_expression(
+                "rank(ts_backfill(evt, 20))", operator_index=self.index,
+                denylist=entries, field_types=types)
+            self.assertEqual(with_event["warnings"][0]["code"], "operator_rejected")
+
+    def test_scoped_warning_is_reported_as_unverified_without_a_field_table(self):
+        # The warning's whole content is "this input kind was refused"; without a
+        # field table that claim cannot be checked, so it is listed once instead of
+        # repeated on every call site.
+        entries = {"ts_backfill": {"severity": "warn", "input_kind": "EVENT",
+                                   "message": "does not support event inputs"}}
+        report = expression_lint.lint_expression(
+            "rank(ts_backfill(close, 20))", operator_index=self.index,
+            denylist=entries)
+        self.assertEqual(report["warnings"], [])
+        self.assertEqual(report["denylist_unverified"], ["ts_backfill"])
+
+    def test_block_records_fire_even_without_a_field_table(self):
+        entries = {"pasteurize": {"severity": "block",
+                                  "message": "unknown operator"}}
+        report = expression_lint.lint_expression(
+            "rank(pasteurize(close))", operator_index=self.index,
+            denylist=entries)
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["errors"][0]["code"], "operator_rejected")
 
     def test_corrupt_denylist_degrades_to_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
