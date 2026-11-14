@@ -37,6 +37,8 @@ RESEARCH_FILE_SPEC = {
         "notes": [
             "A bare object with 'expression' is treated as a single alpha.",
             "settings in the file are overridden by explicit command-line flags.",
+            "Known snake_case setting names normalize to platform keys before "
+            "merging layers; conflicting aliases in one settings object are rejected.",
             "lint and simulate merge repeated --file and --expr inputs; later file "
             "settings override earlier files. Each invocation accepts stdin only once.",
             "ablate requires exactly one composite; its file and --expr inputs are mutually exclusive.",
@@ -59,8 +61,8 @@ class ResearchError(ValueError):
 def parse_research_text(text, source="<text>"):
     """Return ``(settings, alphas)`` from a research file's text.
 
-    Raises :class:`ResearchError` when neither shape applies. Values are left
-    unnormalized; call :func:`build_config` to validate them.
+    Raises :class:`ResearchError` when neither shape applies. Setting names are
+    canonicalized; call :func:`build_config` to validate their values.
     """
     stripped = text.lstrip()
     if stripped.startswith(("{", "[")):
@@ -77,6 +79,10 @@ def parse_research_text(text, source="<text>"):
             settings = payload.get("settings") or {}
             if not isinstance(settings, dict):
                 raise ResearchError("'settings' in %s must be an object" % source)
+            try:
+                settings = ml.normalize_setting_keys(settings)
+            except ValueError as exc:
+                raise ResearchError("settings in %s: %s" % (source, exc)) from exc
             if "alphas" in payload:
                 alphas = payload["alphas"]
                 if not isinstance(alphas, list) or not alphas:

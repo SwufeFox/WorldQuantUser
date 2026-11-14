@@ -322,16 +322,33 @@ class ProbeTests(unittest.TestCase):
         ])
         self.assertEqual([item["settings"] for item in data["results"]], [default, fast])
 
-    def test_wrong_setting_spelling_fails_offline_before_session_or_submit(self):
+    def test_setting_aliases_preserve_spec_arm_and_cli_precedence(self):
         self.spec["settings"]["test_period"] = "P1Y"
+        self.spec["settings"]["nan_handling"] = "OFF"
+        self.spec["arms"][0]["settings"] = {"testPeriod": "P2Y"}
+        self.spec["arms"][1]["settings"] = {"test_period": "P3Y", "nanHandling": "ON"}
+        self._write(self.spec)
+        data = self._run(dry_run=True)
+        self.assertEqual([row["settings"]["testPeriod"] for row in data["results"]],
+                         ["P2Y", "P3Y"])
+        self.assertEqual([row["settings"]["nanHandling"] for row in data["results"]],
+                         ["OFF", "ON"])
+        data = self._run(dry_run=True, test_period="P4Y", nan_handling="OFF")
+        self.assertTrue(all(row["settings"]["testPeriod"] == "P4Y"
+                            and row["settings"]["nanHandling"] == "OFF"
+                            and "test_period" not in row["settings"] for row in data["results"]))
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+
+    def test_conflicting_setting_aliases_fail_before_session_or_submit(self):
+        self.spec["settings"].update({"test_period": "P1Y", "testPeriod": "P2Y"})
         self._write(self.spec)
         with self.assertRaisesRegex(cli_runtime.CliError, "testPeriod"):
             self._run(dry_run=True)
         self.load_session.assert_not_called()
         self.assertEqual(self.fake.calls, [])
         self.spec["settings"].pop("test_period")
-        self.spec["settings"]["testPeriod"] = "P1Y"
-        self.spec["arms"][0]["settings"] = {"nan_handling": "OFF"}
+        self.spec["arms"][0]["settings"] = {"nan_handling": "OFF", "nanHandling": "ON"}
         self._write(self.spec)
         with self.assertRaisesRegex(cli_runtime.CliError, "nanHandling"):
             self._run(dry_run=True)

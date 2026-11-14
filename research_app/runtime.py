@@ -181,7 +181,10 @@ def collect_alphas(args, metadata=None):
 
 def merge_settings(file_settings, args):
     """CLI flags win over the file, which wins over machine_lib defaults."""
-    overrides = dict(file_settings)
+    try:
+        overrides = ml.normalize_setting_keys(file_settings)
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc)) from exc
     for key, value in {
         "region": getattr(args, "region", None),
         "universe": getattr(args, "universe", None),

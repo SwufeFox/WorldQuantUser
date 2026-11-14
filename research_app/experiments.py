@@ -792,6 +792,11 @@ def _load_probe_spec(path):
              % (", ".join(unknown), ", ".join(sorted(known))))
     if "settings" in spec and not isinstance(spec["settings"], dict):
         raise CliError("INVALID_INPUT", "spec settings must be an object")
+    if "settings" in spec:
+        try:
+            spec["settings"] = ml.normalize_setting_keys(spec["settings"])
+        except ValueError as exc:
+            raise CliError("INVALID_INPUT", "spec settings: %s" % exc) from exc
     for index, arm in enumerate(arms, 1):
         if not isinstance(arm, dict) or not isinstance(arm.get("expression"), str) \
                 or not arm["expression"].strip():
@@ -800,6 +805,11 @@ def _load_probe_spec(path):
                            "\"settings\": {...} (optional)}")
         if "settings" in arm and not isinstance(arm["settings"], dict):
             raise CliError("INVALID_INPUT", "arm %d settings must be an object" % index)
+        if "settings" in arm:
+            try:
+                arm["settings"] = ml.normalize_setting_keys(arm["settings"])
+            except ValueError as exc:
+                raise CliError("INVALID_INPUT", "arm %d settings: %s" % (index, exc)) from exc
         arm.setdefault("label", "arm%d" % index)
     return spec
 

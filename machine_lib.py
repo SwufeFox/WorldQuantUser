@@ -1199,6 +1199,27 @@ def fetch_alpha_metrics(s, alpha_id, on_event=None, deadline=None):
         )
 
 
+def normalize_setting_keys(overrides=None):
+    """Canonicalize known key spellings within one input layer, without defaults.
+
+    This must run before merging files, arms or CLI flags: spelling must not
+    decide which layer wins. Unknown platform extensions remain untouched.
+    """
+    canonical_keys = {key.replace("_", "").casefold(): key for key in DEFAULT_SETTINGS}
+    settings, origins = {}, {}
+    for key, value in (overrides or {}).items():
+        canonical = canonical_keys.get(str(key).replace("_", "").casefold(), key)
+        if canonical in settings:
+            previous = settings[canonical]
+            if value is None and previous is not None:
+                continue
+            if previous is not None and value is not None and previous != value:
+                raise ValueError("conflicting settings %r and %r for %r" %
+                                 (origins[canonical], key, canonical))
+        settings[canonical], origins[canonical] = value, key
+    return settings
+
+
 def resolve_settings(overrides=None):
     """Merge ``overrides`` onto :data:`DEFAULT_SETTINGS` and validate the result.
 
@@ -1208,19 +1229,8 @@ def resolve_settings(overrides=None):
     is passed through: the platform owns that enum, and refusing a value here makes
     "not yet tried" indistinguishable from "cannot be expressed".
     """
-    # JSON uses platform keys, whereas CLI arguments use snake_case internally.
-    # Passing `test_period` through left `testPeriod=P0Y` in the same payload:
-    # the server could accept the request while ignoring the intended split.
-    # Reject alternate spellings of known keys; keep genuinely new platform
-    # settings available rather than turning this client into a second API enum.
-    canonical_keys = {key.replace("_", "").casefold(): key for key in DEFAULT_SETTINGS}
-    for key in overrides or {}:
-        canonical = canonical_keys.get(str(key).replace("_", "").casefold())
-        if canonical and key != canonical:
-            raise ValueError("simulation setting %r must be spelled %r in JSON" %
-                             (key, canonical))
     settings = dict(DEFAULT_SETTINGS)
-    for key, value in (overrides or {}).items():
+    for key, value in normalize_setting_keys(overrides).items():
         if value is not None:
             settings[key] = value
     if settings["region"] not in REGIONS:

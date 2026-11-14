@@ -456,16 +456,22 @@ class ErrorEnvelopeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ml.resolve_settings({"region": "MARS"})
 
-    def test_cli_spellings_cannot_silently_leave_platform_defaults(self):
-        for wrong, right in (("test_period", "testPeriod"),
-                             ("nan_handling", "nanHandling"),
-                             ("instrument_type", "instrumentType"),
-                             ("testperiod", "testPeriod")):
-            with self.subTest(key=wrong), self.assertRaisesRegex(ValueError, right):
-                ml.resolve_settings({wrong: "P1Y"})
-        settings = ml.resolve_settings({"testPeriod": "P1Y", "nanHandling": "OFF"})
+    def test_cli_spellings_normalize_before_platform_defaults(self):
+        settings = ml.resolve_settings({"test_period": "P1Y", "nan_handling": "OFF",
+                                        "instrument_type": "EQUITY"})
         self.assertEqual(settings["testPeriod"], "P1Y")
         self.assertEqual(settings["nanHandling"], "OFF")
+        self.assertEqual(settings["instrumentType"], "EQUITY")
+        self.assertNotIn("test_period", settings)
+        self.assertNotIn("nan_handling", settings)
+
+    def test_conflicting_aliases_in_one_input_layer_fail(self):
+        with self.assertRaisesRegex(ValueError, "conflicting.*testPeriod"):
+            ml.resolve_settings({"testPeriod": "P1Y", "test_period": "P2Y"})
+        self.assertEqual(ml.normalize_setting_keys({"testPeriod": "P1Y", "test_period": "P1Y"}),
+                         {"testPeriod": "P1Y"})
+        self.assertEqual(ml.normalize_setting_keys({"testPeriod": None, "test_period": "P1Y"}),
+                         {"testPeriod": "P1Y"})
 
     def test_new_platform_setting_names_are_still_passed_through(self):
         self.assertEqual(ml.resolve_settings({"maxTrade": "OFF"})["maxTrade"], "OFF")
@@ -528,6 +534,25 @@ class DryRunTests(unittest.TestCase):
             proc = run_cli("simulate", str(path), "--decay", "2", "--dry-run")
             data = parse(proc)["data"]
             self.assertEqual(data["settings"]["decay"], 2)
+
+    def test_setting_aliases_keep_file_and_flag_precedence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "first.json", Path(tmp) / "second.json"
+            first.write_text(json.dumps({"settings": {"test_period": "P1Y",
+                "nan_handling": "OFF"}, "alphas": ["rank(cap)"]}))
+            second.write_text(json.dumps({"settings": {"testPeriod": "P2Y"},
+                "alphas": ["rank(assets)"]}))
+            proc = run_cli("simulate", "--file", str(first), "--file", str(second), "--dry-run")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(parse(proc)["data"]["settings"]["testPeriod"], "P2Y")
+            proc = run_cli("simulate", "--file", str(first), "--file", str(second),
+                           "--test-period", "P3Y", "--dry-run")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            data = parse(proc)["data"]
+            self.assertEqual(data["settings"]["testPeriod"], "P3Y")
+            self.assertEqual(data["settings"]["nanHandling"], "OFF")
+            self.assertTrue(all("test_period" not in row["payload"]["settings"]
+                                for row in data["results"]))
 
     def test_per_alpha_decay_survives(self):
         with tempfile.TemporaryDirectory() as tmp:
