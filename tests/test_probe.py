@@ -322,6 +322,21 @@ class ProbeTests(unittest.TestCase):
         ])
         self.assertEqual([item["settings"] for item in data["results"]], [default, fast])
 
+    def test_wrong_setting_spelling_fails_offline_before_session_or_submit(self):
+        self.spec["settings"]["test_period"] = "P1Y"
+        self._write(self.spec)
+        with self.assertRaisesRegex(cli_runtime.CliError, "testPeriod"):
+            self._run(dry_run=True)
+        self.load_session.assert_not_called()
+        self.assertEqual(self.fake.calls, [])
+        self.spec["settings"].pop("test_period")
+        self.spec["settings"]["testPeriod"] = "P1Y"
+        self.spec["arms"][0]["settings"] = {"nan_handling": "OFF"}
+        self._write(self.spec)
+        with self.assertRaisesRegex(cli_runtime.CliError, "nanHandling"):
+            self._run(dry_run=True)
+        self.load_session.assert_not_called()
+
     def test_dry_run_reuses_structural_lint_and_learned_denylist(self):
         self.spec["arms"] = [
             {"label": "denied", "expression": "rank(close)"},
