@@ -387,11 +387,20 @@ DATA_NEEDS = (
 )
 
 
+def _has_keyword(text, phrase):
+    """Match a reading cue as words, allowing a simple plural at the end.
+
+    Substrings made technology *adoption* look like *option* research and
+    *steps* look like *EPS*. These hints must not attach unrelated ledger work.
+    """
+    return re.search(r"(?<!\w)" + re.escape(phrase) + r"(?:s|es)?(?!\w)", text) is not None
+
+
 def data_fit(paper, field_scope=None):
     """Separate inferred reading needs from explicitly named field availability."""
     text = ("%s %s" % (paper.get("title") or "", paper.get("abstract") or "")).lower()
     needs = [{"need": need, "state": "inferred", "verdict": "unknown", "basis": "title_abstract_keywords"}
-             for phrases, need in DATA_NEEDS if any(phrase in text for phrase in phrases)]
+             for phrases, need in DATA_NEEDS if any(_has_keyword(text, phrase) for phrase in phrases)]
     supplied = paper.get("required_fields")
     valid = supplied is None or (isinstance(supplied, list) and all(isinstance(item, str) and item.strip() for item in supplied))
     required = sorted({item.strip() for item in supplied}) if valid and supplied else []
@@ -556,7 +565,7 @@ def guess_block(paper):
     """The block a paper most looks like, from its title and abstract."""
     text = ((paper.get("title") or "") + " " + (paper.get("abstract") or "")).lower()
     for block, words in BLOCK_KEYWORDS:
-        if any(word in text for word in words):
+        if any(_has_keyword(text, word) for word in words):
             return block
     return None
 

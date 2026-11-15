@@ -48,6 +48,15 @@ class FeedTests(unittest.TestCase):
             command = feed.cmd_feed_action if action else feed.cmd_feed
             return command(args or self.args(), None)
 
+    def test_action_does_not_route_adoption_papers_to_option_priors(self):
+        paper = self.paper("Experience and Technology Adoption",
+                           abstract="Steps toward adoption of production technology.")
+        result = self.run_feed([paper], action=True)
+        row = result["papers"][0]
+        self.assertIsNone(row["block_guess"])
+        self.assertIsNone(row["prior_trials"]["count"])
+        self.assertEqual(row["data_fit"]["needs"], [])
+
     def test_questions_accept_documented_tags_and_legacy_bold_headings(self):
         path = self.write_file("open-threads.md", """# Open
 - [open] **Supplier network pricing** — evidence; next check
@@ -591,3 +600,16 @@ class DataFitTests(unittest.TestCase):
                              "abstract": "Accounting practice in Renaissance Italy."})
         self.assertEqual(fit["verdict"], "unknown")
         self.assertEqual(fit["needs"], [])
+
+    def test_technology_adoption_does_not_attach_options_or_eps_evidence(self):
+        paper = {"title": "Experience and Technology Adoption",
+                 "abstract": "Steps toward adoption of production technology."}
+        self.assertEqual(feed.data_fit(paper)["needs"], [])
+        self.assertIsNone(feed.guess_block(paper))
+
+    def test_reading_cues_keep_plurals_and_complete_phrases(self):
+        paper = {"title": "Options and analyst forecasts",
+                 "abstract": "Patents, implied volatility and earnings estimates."}
+        needs = {row["need"] for row in feed.data_fit(paper)["needs"]}
+        self.assertTrue({"options", "analyst estimates", "patent data"} <= needs)
+        self.assertEqual(feed.guess_block(paper), "analyst_dispersion")
