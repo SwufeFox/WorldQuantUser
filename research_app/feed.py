@@ -205,7 +205,7 @@ def topics_file_queries(path):
 
 
 def score(paper):
-    """Rank what to read first: recent and cited, with a floor for relevance by year."""
+    """Legacy citation/year score; provider relevance order determines selection."""
     citations = paper.get("citations") or 0
     year = paper.get("year") or 0
     return citations + max(0, year - 1990) * 3
@@ -264,6 +264,7 @@ def _search_topics(topics, args):
 
 
 def _select_papers(outcomes, seen, total, register):
+    """Balance topics without replacing each provider's relevance order."""
     candidates, buckets, reports, repeats = {}, [], [], set()
     for topic, rows, error in outcomes:
         report = {"query": topic, "status": "failure" if error else "success" if rows else "empty",
@@ -275,7 +276,7 @@ def _select_papers(outcomes, seen, total, register):
         bucket = []
         buckets.append(bucket)
         bucket_keys = set()
-        for paper in rows:
+        for provider_rank, paper in enumerate(rows, 1):
             if not isinstance(paper, dict):
                 report["invalid"] += 1
                 continue
@@ -296,14 +297,15 @@ def _select_papers(outcomes, seen, total, register):
             if key not in candidates:
                 candidates[key] = {**paper, "query": topic, "queries": [], "key": key,
                                    "rank": rank, "abstract": abstract[:600],
+                                   "provider_ranks": [],
                                    "closure_cautions": _closure_cautions(paper, register)}
             candidate = candidates[key]
             if topic not in candidate["queries"]:
                 candidate["queries"].append(topic)
+                candidate["provider_ranks"].append({"query": topic, "rank": provider_rank})
             if key not in bucket_keys:
                 bucket_keys.add(key)
                 bucket.append(candidate)
-        bucket.sort(key=lambda row: -row["rank"])
         report["eligible"] = len(bucket)
 
     picked, picked_keys = [], set()
@@ -531,11 +533,13 @@ def cmd_feed(args, _sink):
                             "match_basis": "exact declared family only"},
         "papers": [{**{k: paper.get(k) for k in
                      ("title", "year", "journal", "doi", "url", "landing_page_url", "pdf_url",
-                      "abstract", "family", "citations", "query", "queries", "rank", "closure_cautions", "required_fields")},
+                      "abstract", "family", "citations", "query", "queries", "rank", "provider_ranks",
+                      "closure_cautions", "required_fields")},
                     "data_fit": data_fit(paper, scope)}
                    for paper in picked],
         "next_actions": _next_actions(args, reports, unresolved, deferred, picked, seen_path),
-        "note": ("Picks take turns across queries, ranked within each query. Closure "
+        "note": ("Picks take turns across queries, preserving provider relevance order within each query. "
+                 "provider_ranks gives original query positions; rank is a legacy citation/year score. Closure "
                  "cautions require a declared family; no title or relevance filter applies. "
                  "Dry-run leaves seen and draft files unchanged; search caching may write. "
                  "Drafts require a falsification condition and closest family before promotion. "

@@ -289,6 +289,10 @@ python research_cli.py feed --topic "analyst revisions" --topic "earnings qualit
 
 `--workers` bounds concurrent queries (1–8, default 4); `--timeout` bounds each network
 request. Output retains topic order and balanced picks regardless of completion order.
+Within each topic, picks retain the provider's relevance order; citation counts and
+publication years do not reorder the results. `provider_ranks` records each paper's
+original position for every matching query. `rank` remains a legacy citation/year
+score for compatibility, not the selection order.
 `next_actions` supplies bounded, evidence-linked retries, deferred searches, source reviews
 and contrasts. Its `argv` lists are arguments for `research_cli.py`, not shell strings.
 Threads may state an authored query with `; query: ...`, including after a Chinese heading.

@@ -138,6 +138,8 @@ python3 research_cli.py feed --topic "analyst forecast dispersion" --topic "earn
 `--workers` 为 1–8，默认 4；它限制同时请求的主题数，`--timeout` 是单次网络请求的
 超时秒数。检索完成后仍按原主题顺序均衡选取，完成先后不会改变排序。网络调用在锁外；
 多个 feed 提交结果前会锁住状态并重新读取已读集合，避免按旧快照重复选中论文。
+每个主题保留检索器的相关性顺序，不再按引用量或年份重排。`provider_ranks` 记录论文在各查询
+原始结果中的位置；兼容字段 `rank` 仍是旧引用量/年份分数，不代表最终选取顺序。
 
 OpenAlex 使用 `<research>/cache/papers/`；网页搜索使用 `<research>/search-cache/`。
 缓存键包含实际请求选项，全文开关、原问题和结果数量不同会分别保存。相同请求并发未命中时

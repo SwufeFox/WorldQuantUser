@@ -157,13 +157,38 @@ class FeedTests(unittest.TestCase):
         outcomes = {"alpha": {"papers": [second, first]}, "beta": {"papers": [first, later]}}
         with mock.patch("paper_search.search_papers", side_effect=lambda topic, **_: outcomes[topic]):
             result = feed.cmd_feed(self.args(topic=["alpha", "beta"], total=2), None)
-        self.assertEqual([row["title"] for row in result["papers"]], ["First", "Later"])
-        self.assertEqual(result["papers"][0]["queries"], ["alpha", "beta"])
+        self.assertEqual([row["title"] for row in result["papers"]], ["Second", "First"])
+        self.assertEqual(result["papers"][1]["queries"], ["alpha", "beta"])
+        self.assertEqual(result["papers"][1]["provider_ranks"], [
+            {"query": "alpha", "rank": 2}, {"query": "beta", "rank": 1}])
         self.assertEqual([row["picked"] for row in result["searches"]], [1, 1])
-        self.assertEqual(feed.load_seen(result["seen"]), {feed.paper_key(first), feed.paper_key(later)})
+        self.assertEqual(feed.load_seen(result["seen"]), {feed.paper_key(first), feed.paper_key(second)})
         again = self.run_feed([first, second, later])
-        self.assertEqual([row["title"] for row in again["papers"]], ["Second"])
+        self.assertEqual([row["title"] for row in again["papers"]], ["Later"])
         self.assertEqual(again["seen_before"], 2)
+
+    def test_citation_count_and_year_do_not_override_provider_relevance(self):
+        focused = self.paper("Purchase obligations", citations=2, year=2006)
+        broad = self.paper("Stock market wealth", citations=20000, year=2026)
+        result = self.run_feed([focused, broad], self.args(total=1))
+        self.assertEqual([row["title"] for row in result["papers"]], [focused["title"]])
+        self.assertEqual(result["papers"][0]["provider_ranks"], [
+            {"query": "receivables", "rank": 1}])
+
+    def test_provider_positions_survive_seen_invalid_and_duplicate_records(self):
+        old = self.paper("Already read")
+        self.run_feed([old])
+        focused = self.paper("Focused")
+        broad = self.paper("Broad", citations=10000)
+        result = self.run_feed([old, None, focused, focused, broad])
+        self.assertEqual([row["title"] for row in result["papers"]], ["Focused", "Broad"])
+        self.assertEqual(result["papers"][0]["provider_ranks"], [
+            {"query": "receivables", "rank": 3}])
+        self.assertEqual(result["papers"][1]["provider_ranks"], [
+            {"query": "receivables", "rank": 5}])
+        self.assertEqual(result["searches"][0]["seen_before"], 1)
+        self.assertEqual(result["searches"][0]["invalid"], 1)
+        self.assertEqual(result["searches"][0]["eligible"], 2)
 
     def test_titles_and_absent_relevance_keywords_never_suppress_papers(self):
         papers = [self.paper("PEAD placebo tests"),
