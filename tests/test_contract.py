@@ -980,6 +980,49 @@ class CredentialTests(unittest.TestCase):
                 self.assertEqual(os.environ["BRAIN_USERNAME"], "from-env")
                 self.assertEqual(os.environ["BRAIN_PASSWORD"], "from-file")
 
+    def test_concurrent_credentials_wait_for_dotenv_to_finish_loading(self):
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+        import threading
+
+        read_started = threading.Event()
+        release_read = threading.Event()
+        second_started = threading.Event()
+        original_read = Path.read_text
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / ".env"
+            env_path.write_text("BRAIN_USERNAME=test-user\nBRAIN_PASSWORD=test-pass\n")
+            ml._DOTENV_LOADED = False
+            for key in ("BRAIN_USERNAME", "BRAIN_PASSWORD"):
+                os.environ.pop(key, None)
+
+            def delayed_read(path, *args, **kwargs):
+                if path == env_path:
+                    read_started.set()
+                    if not release_read.wait(5):
+                        raise AssertionError("test did not release the dotenv read")
+                return original_read(path, *args, **kwargs)
+
+            def second_reader():
+                second_started.set()
+                return ml.get_credentials()
+
+            with mock.patch.object(ml, "__file__", str(Path(tmp) / "machine_lib.py")), \
+                    mock.patch.object(Path, "read_text", delayed_read), \
+                    ThreadPoolExecutor(max_workers=2) as pool:
+                first = pool.submit(ml.get_credentials)
+                try:
+                    self.assertTrue(read_started.wait(2))
+                    second = pool.submit(second_reader)
+                    self.assertTrue(second_started.wait(2))
+                    with self.assertRaises(TimeoutError):
+                        second.result(timeout=0.05)
+                finally:
+                    release_read.set()
+                expected = ("test-user", "test-pass")
+                self.assertEqual(first.result(timeout=2), expected)
+                self.assertEqual(second.result(timeout=2), expected)
+
 
 class PrivacyTests(unittest.TestCase):
     """The repo must never carry credentials or session cookies."""

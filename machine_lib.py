@@ -42,6 +42,7 @@ import os
 import pickle
 import random
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
@@ -204,38 +205,40 @@ UNIVERSES = [
 
 
 _DOTENV_LOADED = False
+_DOTENV_LOCK = threading.Lock()
 
 
 def _load_dotenv(path=None):
     """Load KEY=VALUE pairs from a .env file into os.environ.
 
-    Runs once per process. Real environment variables always win over .env,
-    so CI/shell configuration is never silently overridden.
+    Runs once per process. Concurrent callers wait for the complete file to
+    load. Real environment variables always win over .env, so CI/shell
+    configuration is never silently overridden.
     """
     global _DOTENV_LOADED
     if _DOTENV_LOADED:
         return
-    _DOTENV_LOADED = True
-
-    env_path = Path(__file__).resolve().parent / ".env" if path is None else Path(path)
-    if not env_path.is_file():
-        return
-
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export "):].lstrip()
-        if "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        if key and key not in environ:
-            environ[key] = value
+    with _DOTENV_LOCK:
+        if _DOTENV_LOADED:
+            return
+        env_path = Path(__file__).resolve().parent / ".env" if path is None else Path(path)
+        if env_path.is_file():
+            for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                if "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                    value = value[1:-1]
+                if key and key not in environ:
+                    environ[key] = value
+        _DOTENV_LOADED = True
 
 
 def get_credentials(prefix="BRAIN"):
