@@ -186,6 +186,38 @@ python3 research_cli.py mine --dataset news18 --expr 'vec_sum(reviewed_event_fie
 
 自动 `--emit` 不替 VECTOR 选择 `vec_avg`，只生成数值待审项目；经济聚合明确后用 `--expr`。输出仅为探索草稿，原子保存且不覆盖已有 spec；正式实验仍须经济含义/时间/PIT 审计和预注册，再 dry-run、在线 check。不要把草稿的裸 rank 当已确定的经济方向。
 
+### 滚动极值：先查原生算子，再组合
+
+目录没有 `ts_max` 时，若当前账户的 `max` 明确支持多个输入，可把窗口内的延迟值传给它。
+下面计算含当日在内、连续 21 个观察值的最大收益；先用默认 `filter=false` 的 `add` 检查完整窗口，
+缺一个观察值就保留 NaN，不把剩余值的最大值当成完整窗口结果。
+
+```text
+r1 = ts_delay(returns, 1); r2 = ts_delay(returns, 2);
+r3 = ts_delay(returns, 3); r4 = ts_delay(returns, 4);
+r5 = ts_delay(returns, 5); r6 = ts_delay(returns, 6);
+r7 = ts_delay(returns, 7); r8 = ts_delay(returns, 8);
+r9 = ts_delay(returns, 9); r10 = ts_delay(returns, 10);
+r11 = ts_delay(returns, 11); r12 = ts_delay(returns, 12);
+r13 = ts_delay(returns, 13); r14 = ts_delay(returns, 14);
+r15 = ts_delay(returns, 15); r16 = ts_delay(returns, 16);
+r17 = ts_delay(returns, 17); r18 = ts_delay(returns, 18);
+r19 = ts_delay(returns, 19); r20 = ts_delay(returns, 20);
+s = add(returns, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10,
+        r11, r12, r13, r14, r15, r16, r17, r18, r19, r20);
+m = max(returns, r1, r2, r3, r4, r5, r6, r7, r8, r9, r10,
+        r11, r12, r13, r14, r15, r16, r17, r18, r19, r20);
+if_else(is_nan(s), s, m)
+```
+
+长窗口可以分块：将上述 21 日极值按 0、21、42、……、231 日延迟，再取 `max`，
+恰好覆盖 0 至 251 日；完整窗口的 NaN 检查也须覆盖相同分块。用 `min` 可构造对应最小值，
+仍须核验当前算子签名。观察值窗口不等于自然月或自然年。
+
+多项求和可优先用原生 `add(a,b,c,...)`，避免长串二元 `+` 消耗预检的运算数量预算；
+不要打开 `filter=true` 改写缺失语义。各臂只保留最终结果实际读取的变量，随后仍走 lint 和 dry-run。
+这一配方只补表达能力，不证明任何极值信号有预测能力。
+
 ### 构造：族、零件、单元
 
 | 问题 | 命令 |
