@@ -56,8 +56,9 @@ _LITERALS = frozenset({"true", "false", "nan", "inf", "null", "none"})
 # simulation round because the offline lint had no way to know.
 #: Names the simulator refuses as variables, learned from its own errors. The catalogue
 #: documents none of them, and each one costs a submission to discover, so they accumulate
-#: here: `eps` from a four-expression batch, `sales` from a value-lens batch.
-_RESERVED_IDENTIFIERS = frozenset({"eps", "sales"})
+#: here: `eps` from a four-expression batch, `sales` from a value-lens batch,
+#: and `tail` from the persistent-left-tail probe.
+_RESERVED_IDENTIFIERS = frozenset({"eps", "sales", "tail"})
 
 _ASSIGNMENT_TARGET = re.compile(
     r"(?:^|;)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)"

@@ -253,6 +253,17 @@ class ExpressionLintTests(unittest.TestCase):
             [e["code"] for e in report["errors"] if e["code"] == "reserved_identifier"],
             [])
 
+    def test_confirmed_tail_binding_is_blocked_but_renamed_signal_is_allowed(self):
+        rejected = expression_lint.lint_expression(
+            "tail = ts_mean(returns,21); rank(tail)")
+        self.assertEqual([e["identifier"] for e in rejected["errors"]
+                          if e["code"] == "reserved_identifier"], ["tail"])
+        for expression in ("tail_loss = ts_mean(returns,21); rank(tail_loss)",
+                           "rank(returns, tail=0.05)"):
+            report = expression_lint.lint_expression(expression)
+            self.assertFalse(any(e["code"] == "reserved_identifier"
+                                 for e in report["errors"]))
+
     def test_commas_inside_strings_are_ignored(self):
         calls = expression_lint.extract_calls(
             'group_neutralize(x, bucket(rank(cap), range="0.1,1,0.1"))')
