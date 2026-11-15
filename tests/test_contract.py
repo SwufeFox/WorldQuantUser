@@ -98,6 +98,46 @@ class TriageContractTests(unittest.TestCase):
                 self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
 
 
+class PromoteContractTests(unittest.TestCase):
+    def test_schema_exposes_promotion_defaults_and_common_options(self):
+        proc = run_cli("schema", "promote")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        command = parse(proc)["data"]["command"]
+        self.assertEqual(command["command"], "promote")
+        options = {flag: item for item in command["options"] for flag in item["flags"]}
+        for flag in ("--save", "--compact", "--quiet", "--research-dir", "--note",
+                     "--cost-bps", "--freeze", "--buffer", "--dry-run"):
+            self.assertIn(flag, options)
+        self.assertEqual(options["--retention-floor"]["default"], 0.2)
+        self.assertTrue(options["alpha_id"]["required"])
+
+    def test_failure_keeps_one_saved_envelope_with_completed_evidence(self):
+        from research_app import alphas, triage
+
+        with tempfile.TemporaryDirectory() as directory:
+            frozen = Path(directory) / "choice.json"
+            saved = Path(directory) / "response.json"
+            stdout, stderr = io.StringIO(), io.StringIO()
+            evidence = {"selection_id": "frozen-choice", "rows": [{"alpha_id": "A1"}]}
+            with mock.patch.object(triage, "cmd_triage", side_effect=[
+                    evidence, cli_runtime.CliError("INVALID_INPUT", "validation failed")]), \
+                    mock.patch.object(alphas, "cmd_alpha_check") as check, \
+                    mock.patch.object(ml, "load_session", side_effect=AssertionError("offline")), \
+                    contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                code = cli_app.main(["promote", "A1", "--research-dir", directory,
+                                     "--freeze", str(frozen), "--save", str(saved), "--compact"])
+            document = json.loads(stdout.getvalue())
+            self.assertEqual(code, 2)
+            self.assertFalse(document["ok"])
+            self.assertEqual(document["command"], "promote")
+            self.assertEqual(document["error"]["code"], "INVALID_INPUT")
+            self.assertEqual(document["data"]["steps"]["freeze"]["evidence"], evidence)
+            self.assertEqual(document["data"]["failed_step"], "validate")
+            self.assertEqual(json.loads(saved.read_text()), document)
+            self.assertEqual(len(stdout.getvalue().splitlines()), 1)
+            check.assert_not_called()
+
+
 class FeedContractTests(unittest.TestCase):
     def test_missing_topics_is_a_local_input_error_without_creating_state(self):
         with tempfile.TemporaryDirectory() as directory:

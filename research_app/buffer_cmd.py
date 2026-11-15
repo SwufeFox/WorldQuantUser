@@ -195,7 +195,7 @@ def _checks_summary(checks):
             "pending": sorted(pending), "warned": sorted(warned)}
 
 
-def cmd_buffer_add(args, _sink):
+def cmd_buffer_add(args, _sink, *, checked=None):
     """Run the checks on a finished alpha and put it on the shelf without submitting."""
     def work(session):
         payload = ml.fetch_alpha_metrics(session, args.alpha_id)
@@ -206,8 +206,8 @@ def cmd_buffer_add(args, _sink):
         # computes it. Shelving on the snapshot would record a NULL where the whole
         # point of the shelf is that number.
         wait = getattr(args, "max_wait", None)
-        computed = ml.fetch_alpha_checks(session, args.alpha_id,
-                                         max_wait_seconds=60 if wait is None else wait)
+        computed = checked if checked is not None else ml.fetch_alpha_checks(
+            session, args.alpha_id, max_wait_seconds=60 if wait is None else wait)
         checks = computed.get("checks") or {}
         split = ml.extract_split(payload) or {}
         train = split.get("train") or {}

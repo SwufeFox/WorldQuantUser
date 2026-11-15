@@ -78,6 +78,9 @@ def protect_output(args, *paths):
         return
     destination = Path(target).expanduser().resolve()
     protected = (*paths, *(getattr(args, name, None) for name in _PROTECTED_OUTPUT_ARGS))
+    if getattr(args, "command", None) == "promote":
+        from .buffer_cmd import buffer_path
+        protected = (*protected, buffer_path(args))
     for path in protected:
         if path and destination == Path(path).expanduser().resolve():
             raise OutputConflict(

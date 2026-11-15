@@ -74,6 +74,8 @@ def main(argv=None):
             save_allowed = not isinstance(exc, runtime.OutputConflict)
             payload = {"ok": False, "command": getattr(exc, "command", options.command),
                        "error": _error_body(exc)}
+            if getattr(exc, "data", None) is not None:
+                payload["data"] = exc.data
             code = exc.exit_code
         except ml.BrainError as exc:
             error_code = getattr(exc, "code", "SERVICE_ERROR")

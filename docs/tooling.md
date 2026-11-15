@@ -110,6 +110,35 @@ CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、
 `--internal` 依赖测试期校准，必须搭配该验证流程；`--train-end` 不能越过记录中的测试起点。
 训练证据缺失时保持 unknown，不用全窗口数字补齐。
 
+### 候选冻结、验证、检查与入库一次完成
+
+```bash
+python3 research_cli.py promote ALPHA_ID --note "冻结后验证通过" --cost-bps 5 10 20
+python3 research_cli.py promote ALPHA_ID --retention-floor 0.2 --dry-run
+```
+
+最接近的现有入口是 `triage`，但它负责选择与验证，不负责平台检查或写入候选架。
+`promote` 只串联现有的四步实现，解决每个候选都要等待并手工衔接的问题：
+先 `triage --ids --freeze`，再 `triage --selection --show-test`，然后 `alpha check`，
+最后满足条件时调用 `buffer add`。冻结时就保存本次 retention floor 和 cost scenarios，
+验证沿用同一标准；入库复用第三步的实时检查结果，避免重复等待检查接口。
+
+仅当检查全部 resolved、没有 FAIL/ERROR（WARNING 允许）、`test_sharpe > 0` 且
+`retention >= retention_floor` 才入库；floor 默认 0.2，缺失指标不算通过。
+不满足条件返回 `ok: true`、`outcome: rejected`、`buffered: false` 和 `reasons`，退出 0。
+默认冻结文件为研究目录下 `promote-freeze-<ID>-<UTC timestamp>.json`；
+可用 `--freeze PATH` 和 `--buffer PATH` 指定位置，冻结文件保持原有不可变规则。
+
+回执包含 `alpha_id`、`freeze_path`、`validate` 的训练/测试 Sharpe、retention、
+rho_book、max_member_rho，以及完整 `checks`、`buffered`、`outcome`、`reasons`。
+`steps` 保存各步状态和已完成的冻结、验证及入库证据。任何执行异常立即停止，
+返回 `ok: false`、现有类型的 `error` 和退出码，同时在 `data` 保留已完成证据及 `failed_step`；
+`--save PATH` 保存完全相同的回执，且不能覆盖冻结文件或候选架。
+
+`--dry-run` 仍会写冻结文件、读取测试期并执行实时平台检查；通过时返回
+`outcome: would_buffer`，第四步标记 `would_buffer`，但不写候选架；不通过仍为 `rejected`。
+该命令只入候选架，不提交 alpha。
+
 ### 用现有问题文件交接
 
 `<research>/open-threads.md` 是跨会话的当前问题清单，不另建一份状态摘要。

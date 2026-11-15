@@ -13,7 +13,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, benchmark, feed, independence, triage, legs, mine, pairs, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import account, alphas, benchmark, feed, independence, triage, legs, mine, pairs, promote, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -366,6 +366,23 @@ def build_parser():
     _add_selection_args(triage_parser)
     _add_cost_args(triage_parser)
     triage_parser.set_defaults(func=triage.cmd_triage)
+
+    promote_parser = sub.add_parser(
+        "promote", help="Freeze, validate, check and shelve one candidate.",
+        description="Run triage freeze, frozen validation, alpha check and buffer add in order. "
+                    "Keep every completed step's evidence; stop on an operational failure. "
+                    "Dry runs still freeze, validate and check, but do not write the shelf.")
+    promote_parser.add_argument("alpha_id", metavar="ALPHA_ID")
+    promote_parser.add_argument("--note", default=None)
+    promote_parser.add_argument("--retention-floor", type=float, default=0.2)
+    promote_parser.add_argument("--freeze", default=None, metavar="PATH",
+                                help="Frozen selection path (default: promote-freeze-ID-timestamp.json in research dir).")
+    promote_parser.add_argument("--buffer", default=None, metavar="PATH",
+                                help="Shelf file (default: in research dir).")
+    promote_parser.add_argument("--dry-run", action="store_true",
+                                help="Run freeze, validation and checks; report would_buffer if eligible.")
+    _add_cost_args(promote_parser)
+    promote_parser.set_defaults(func=promote.cmd_promote)
 
     feed_parser = sub.add_parser(
         "feed",
@@ -1417,6 +1434,8 @@ _COMMAND_EXAMPLES = {
                 'compare --match "sample-batch*.json" --latest --sort none'],
     "triage": ["triage --batch BATCH.json --freeze choice.json",
                "triage --show-test --selection choice.json"],
+    "promote": ['promote ALPHA_ID --note "frozen validation passed" --cost-bps 5 10 20',
+                "promote ALPHA_ID --dry-run"],
     "brief": ["brief", "brief --days 7 --top 5"],
     "ask": ["ask --by neutralization --stat n,median:sharpe,floor_share",
             "ask --where status=ACTIVE --list"],
