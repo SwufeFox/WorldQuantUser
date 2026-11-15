@@ -489,14 +489,75 @@ def submit_workflow(session, args, shelf_entry=None):
         return run()
 
 
+def _alpha_list_page(session, args):
+    """Merge both hidden scopes before applying the requested global offset.
+
+    BRAIN's hidden=true is a selector, not an include-hidden flag. Each sorted
+    source contributes its prefix, including earlier pages when offset is nonzero;
+    otherwise a globally earlier hidden record would shift every later page.
+    """
+    limit, offset = min(args.limit, 100), args.offset
+    if limit < 1 or offset < 0:
+        raise CliError("USAGE", "--limit must be positive and --offset non-negative")
+    filters = dict(order=args.order, status=args.status, region=args.region,
+                   universe=args.universe, min_sharpe=args.min_sharpe,
+                   min_fitness=args.min_fitness, search=args.search,
+                   alpha_type_not="" if args.all else "SUPER")
+    scope = {"hidden": [False, True] if args.all else [False],
+             "alpha_type_not": None if args.all else "SUPER",
+             "status": args.status, "order": args.order,
+             "complete_listing": False}
+    if not args.all:
+        return ml.list_alphas(session, limit=limit, offset=offset,
+                              hidden=False, **filters), scope
+
+    order = args.order or ""
+    field = order.lstrip("-")
+    if not field or not all(part.isidentifier() for part in field.split(".")):
+        raise CliError("USAGE", "--all requires one sortable --order field",
+                       "use e.g. -is.sharpe, is.fitness, or -dateCreated")
+    prefix = offset + limit
+    records, counts = {}, {}
+    for hidden in (False, True):
+        fetched = 0
+        while fetched < prefix:
+            page_size = min(100, prefix - fetched)
+            page = ml.list_alphas(session, limit=page_size, offset=fetched,
+                                  hidden=hidden, **filters)
+            for row in page:
+                alpha_id = row.get("id")
+                if not isinstance(alpha_id, str) or not alpha_id:
+                    raise ml.ServiceError("alpha listing returned a record without an id")
+                records.setdefault(alpha_id, row)
+            fetched += len(page)
+            if len(page) < page_size:
+                break
+        counts["hidden" if hidden else "visible"] = fetched
+
+    def value(row):
+        result = row
+        for part in field.split("."):
+            result = result.get(part) if isinstance(result, dict) else None
+        return result
+
+    # Preserve each API prefix's tie order, visible before hidden. Sorting tied
+    # records by id here could pull an unfetched later record ahead of the prefix.
+    # Absent sort values are always last.
+    ordered = list(records.values())
+    present = [row for row in ordered if value(row) is not None]
+    try:
+        present.sort(key=value, reverse=order.startswith("-"))
+    except TypeError as exc:
+        raise ml.ServiceError("alpha listing returned incomparable sort values") from exc
+    ordered = present + [row for row in ordered if value(row) is None]
+    scope["source_prefix_counts"] = counts
+    scope["pagination"] = "global offset after sorted visible/hidden union; prefixes only"
+    return ordered[offset:offset + limit], scope
+
+
 def cmd_alpha_list(args, _sink):
     """List platform alphas matching filters such as status, region, universe or minimum Sharpe."""
-    alphas = with_session(args, lambda s: ml.list_alphas(
-        s, limit=args.limit, offset=args.offset, order=args.order,
-        status=args.status, region=args.region, universe=args.universe,
-        min_sharpe=args.min_sharpe, min_fitness=args.min_fitness, search=args.search,
-        hidden=args.all, alpha_type_not="" if args.all else "SUPER",
-    ))
+    alphas, scope = with_session(args, lambda s: _alpha_list_page(s, args))
     compact = []
     for alpha in alphas:
         in_sample = alpha.get("is") or {}
@@ -517,7 +578,8 @@ def cmd_alpha_list(args, _sink):
             "grade": alpha.get("grade"),
             "date_created": alpha.get("dateCreated"),
         })
-    document = {"count": len(compact), "offset": args.offset, "alphas": compact}
+    document = {"count": len(compact), "offset": args.offset, "alphas": compact,
+                "scope": scope}
 
     return document
 

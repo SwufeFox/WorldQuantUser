@@ -996,7 +996,8 @@ def build_parser():
     a_list.add_argument("--min-fitness", type=float)
     a_list.add_argument("--search")
     a_list.add_argument("--all", action="store_true",
-                        help="Include hidden and SUPER alphas.")
+                        help="Merge visible and hidden alphas, including SUPER; "
+                             "offset/limit apply to the combined sorted page.")
     _add_session_args(a_list)
 
     a_list.set_defaults(func=alphas.cmd_alpha_list)
