@@ -314,8 +314,12 @@ missing from a verified scope, or unknown; none of those states establishes a si
 python research_cli.py auth check
 ```
 
-Returns `user_id`, `permissions` and the regions that actually have data. A
-`TUTORIAL` account only sees `USA` — every other region returns zero datasets.
+Returns `user_id`, `permissions` and `data_regions` verified by live catalog probes.
+The current account's `OPTIONS /simulations` supplies allowed equity regions,
+universes and delays; the check samples one advertised combination per region.
+`data_scope_evidence` distinguishes available, empty and unknown probes and reports
+the limited coverage. An error, stale fallback or unprobed combination never proves
+that a region has no data. Authentication failures remain errors.
 
 ### Browse metadata (quota-free)
 

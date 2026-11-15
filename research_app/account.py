@@ -11,25 +11,118 @@ from .runtime import with_session
 
 
 
+def _choice_values(spec, context):
+    """Resolve native dependent choices without inventing allowed settings."""
+    choices = spec.get("choices") if isinstance(spec, dict) else None
+    while isinstance(choices, dict):
+        keys = [key for key in context if key in choices]
+        if len(keys) != 1 or not isinstance(choices[keys[0]], dict):
+            return []
+        key = keys[0]
+        branches = choices[key]
+        choices = branches.get(str(context[key]), branches.get(context[key]))
+    if not isinstance(choices, list):
+        return []
+    values = [row.get("value") if isinstance(row, dict) else row for row in choices]
+    return list(dict.fromkeys(value for value in values if type(value) in (str, int)))
+
+
+def _equity_scope_samples(options):
+    """Choose one native-advertised universe/delay per equity region."""
+    fields = options
+    for key in ("actions", "POST", "settings", "children"):
+        fields = fields.get(key) if isinstance(fields, dict) else None
+    evidence = {"state": "unknown", "source": "live OPTIONS /simulations",
+                "instrument_type": "EQUITY", "advertised_regions": [], "issues": []}
+    if not isinstance(fields, dict) or not _choice_values(fields.get("instrumentType"), {}):
+        evidence["issues"].append("instrument_type_choices_unavailable")
+        return [], evidence
+    if "EQUITY" not in _choice_values(fields["instrumentType"], {}):
+        evidence.update(state="verified", equity_supported=False)
+        return [], evidence
+    regions = _choice_values(fields.get("region"), {"instrumentType": "EQUITY"})
+    regions = [value for value in regions if isinstance(value, str) and value]
+    evidence["advertised_regions"] = regions
+    if not regions:
+        evidence["issues"].append("equity_region_choices_unavailable")
+    scopes = []
+    for region in regions:
+        context = {"instrumentType": "EQUITY", "region": region}
+        delays = [int(value) for value in _choice_values(fields.get("delay"), context)
+                  if value in (0, 1, "0", "1")]
+        if not delays:
+            evidence["issues"].append({"region": region, "reason": "delay_choices_unavailable"})
+            continue
+        delay = ml.DEFAULT_SETTINGS["delay"]
+        context["delay"] = delay if delay in delays else delays[0]
+        universes = [value for value in _choice_values(fields.get("universe"), context)
+                     if isinstance(value, str) and value]
+        if not universes:
+            evidence["issues"].append({"region": region, "reason": "universe_choices_unavailable"})
+            continue
+        universe = ml.DEFAULT_SETTINGS["universe"]
+        scopes.append({**context, "universe": universe if universe in universes else universes[0]})
+    evidence["state"] = "verified" if not evidence["issues"] else "unknown"
+    return scopes, evidence
+
+
+def _data_access(session):
+    """Keep live sampled access, empty catalogs and unavailable evidence distinct."""
+    result = {"state": "unknown", "regions": [], "probes": [],
+              "coverage": "one advertised equity universe/delay per advertised region; not all combinations"}
+    try:
+        options = ml.request_json(session, "OPTIONS", "/simulations")
+    except ml.AuthError:
+        raise
+    except ml.BrainError as exc:
+        result["settings"] = {"state": "unknown", "error": {"code": exc.code, "message": str(exc)}}
+        return result
+    scopes, evidence = _equity_scope_samples(options)
+    result["settings"] = evidence
+    for scope in scopes:
+        cache = {}
+        row = {"scope": scope, "state": "unknown"}
+        try:
+            records = ml.get_datasets(session, instrument_type=scope["instrumentType"],
+                                      region=scope["region"], universe=scope["universe"],
+                                      delay=scope["delay"], limit=1, refresh=True, report=cache)
+            fresh = cache.get("hit") is False and not any(
+                cache.get(key) for key in ("stale", "degraded", "error"))
+            valid = isinstance(records, list) and all(
+                isinstance(record, dict) and isinstance(record.get("id"), str) and record["id"]
+                for record in records)
+            # One live dataset proves existence even if limit=1 stops paging.
+            # An empty prefix only proves absence when enumeration completed.
+            if fresh and valid and (records or cache.get("complete") is True):
+                row["state"] = "available" if records else "empty"
+                row["dataset_count_lower_bound"] = len(records or [])
+                if records:
+                    result["regions"].append(scope["region"])
+        except ml.AuthError:
+            raise
+        except ml.BrainError as exc:
+            row["error"] = {"code": exc.code, "message": str(exc)}
+        row["metadata"] = cache
+        result["probes"].append(row)
+    if evidence["state"] == "verified" and all(row["state"] != "unknown" for row in result["probes"]):
+        result["state"] = "verified"
+    return result
+
+
 def cmd_auth_check(args, _sink):
     """Verify BRAIN credentials, report permissions, session cache state and accessible data regions."""
     meta = {}
     session = ml.load_session(use_cache=not args.no_cache, refresh=args.relogin,
                               meta=meta)
     info = ml.session_status()
-    regions = []
-    for region in ml.REGIONS:
-        try:
-            if ml.get_datasets(session, region=region, delay=1, limit=1):
-                regions.append(region)
-        except ml.BrainError:
-            continue
+    access = _data_access(session)
     return {
         "authenticated": True,
         "user_id": info.get("user_id"),
         "permissions": info.get("permissions"),
         "token_lifetime_seconds": info.get("expires_in_seconds"),
-        "data_regions": regions,
+        "data_regions": access["regions"],
+        "data_scope_evidence": access,
         "session": {
             "cached": meta.get("cached"),
             "reason": meta.get("reason"),
@@ -42,7 +135,7 @@ def cmd_auth_check(args, _sink):
             "migrated_from": meta.get("migrated_from"),
         },
         "metadata_cache": ml.metadata_cache_policy(),
-        "note": "regions outside data_regions return no datasets for this account",
+        "note": "data_regions confirms only sampled live equity scopes; empty, unknown and unprobed scopes are distinct",
     }
 
 

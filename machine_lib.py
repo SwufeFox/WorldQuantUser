@@ -657,9 +657,9 @@ def get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
                  universe="TOP3000", limit=None, refresh=None, report=None):
     """List datasets available for a region/universe/delay as ``list[dict]``.
 
-    Quota-free and cached (see :func:`cached_metadata`). Returns ``[]`` when the
-    account has no data for that combination, which is what a TUTORIAL account
-    sees outside USA.
+    Quota-free and cached (see :func:`cached_metadata`). An empty result concerns
+    this exact combination; it does not establish access for other universes or
+    delays, or distinguish an unsupported combination from an empty catalog.
     """
     params = {"instrumentType": instrument_type, "region": region,
               "delay": delay, "universe": universe, "limit": limit}
@@ -674,8 +674,7 @@ def _get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
                  universe="TOP3000", limit=None):
     """List datasets available for a region/universe/delay as ``list[dict]``.
 
-    Quota-free. Returns ``[]`` when the account has no data for that
-    combination (which is what a TUTORIAL account sees outside USA).
+    Quota-free. An empty result concerns only this exact combination.
     """
     results = []
     params = {"instrumentType": instrument_type, "region": region,
