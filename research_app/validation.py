@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import expression_lint
 import expression_units
+import fastexpr_ast
 import field_contract
 import machine_lib as ml
 import research_config as config_io
@@ -14,7 +15,7 @@ from .runtime import CliError, collect_alphas, merge_settings, with_session
 
 
 def _preflight_lint(session, pairs, settings, args):
-    """Require complete scoped metadata before spending simulation quota."""
+    """Require live metadata for all used fields before spending simulation quota."""
     operator_index = None
     operator_evidence = {"state": "unknown", "complete": False}
     fields = capabilities.field_scope([], {
@@ -32,7 +33,14 @@ def _preflight_lint(session, pairs, settings, args):
     except Exception as exc:  # noqa: BLE001 - preserve failed metadata evidence
         operator_evidence.update(state="unknown", complete=False, error=str(exc))
     try:
-        fields = _field_scope(session, settings)
+        required = set()
+        try:
+            for pair in pairs:
+                expression = pair[0] if isinstance(pair, (tuple, list)) else pair
+                required.update(fastexpr_ast.field_names(fastexpr_ast.parse(expression)))
+        except fastexpr_ast.ParseError:
+            required = None  # Keep the full syntax/metadata diagnostics below.
+        fields = _field_scope(session, settings, required_fields=required)
     except Exception as exc:  # noqa: BLE001 - a failure must never become a green light
         fields["evidence"]["error"] = str(exc)
     report = expression_lint.lint_all(
@@ -90,10 +98,12 @@ def _operator_index_from_catalog(session):
     return expression_lint.build_operator_index(ml.fetch_operators(session))
 
 
-def _field_scope(session, settings):
+def _field_scope(session, settings, required_fields=None):
     scope = capabilities.scope_settings(settings)
     evidence = {}
     try:
+        if required_fields:
+            return capabilities.required_field_scope(session, settings, required_fields)
         records = capabilities.fetch_fields(
             session, region=scope["region"], universe=scope["universe"],
             delay=scope["delay"], instrument_type=scope["instrumentType"],

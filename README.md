@@ -877,6 +877,12 @@ error envelope carries every finding under `error.details`.
 Online `lint` and simulation preflight derive names and types from one exact field scope.
 Both reject a raw VECTOR passed to `rank`; use `rank(vec_avg(vector_field))` when the
 catalog confirms VECTOR input. Complete captures save private account-bound snapshots.
+Simulation preflight extracts used fields from the AST and uses matching private
+snapshots only to locate their datasets. It refreshes those catalogs live; unrelated
+dataset failures cannot invalidate freshly verified used fields. Receipts distinguish
+`required_fields_only` verification from full catalog completeness, and partial proofs
+never overwrite complete offline snapshots. Unknown or moved fields trigger full
+discovery; stale, cached, degraded or incomplete evidence for used fields still blocks.
 Offline lint uses only a matching fresh, complete snapshot and performs no authentication
 or network access; stale, partial, legacy or mismatched metadata stays unknown.
 `tools.guarded_sim` uses the same core field enumerator.

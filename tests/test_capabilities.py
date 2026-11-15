@@ -109,6 +109,155 @@ class ScopedCacheTests(unittest.TestCase):
             capabilities.fetch_fields(self.session, report=evidence)
         self.assertEqual(evidence["state"], "unknown")
 
+    def test_preflight_routes_ast_fields_and_refreshes_only_used_datasets(self):
+        path = self.capture()
+        before = Path(path).read_bytes()
+
+        def fields(session, **kwargs):
+            self.assertIs(session, self.session)
+            self.assertEqual(kwargs["dataset_id"], "sample_dataset")
+            self.assertTrue(kwargs["refresh"])
+            self.assertEqual(kwargs["universe"], SETTINGS["universe"])
+            kwargs["report"].update(complete=True)
+            return FIELDS
+
+        def operators(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"name": "rank"}]
+
+        with mock.patch.object(ml, "get_datasets", side_effect=AssertionError("unrelated discovery")), \
+                mock.patch.object(ml, "get_datafields", side_effect=fields) as fetched, \
+                mock.patch.object(ml, "fetch_operators", side_effect=operators):
+            report = validation._preflight_lint(
+                self.session, [("x = sample_matrix; rank(x) /* unrelated_news_field */", 0)],
+                SETTINGS, SimpleNamespace(allow_lint_errors=False))
+        self.assertTrue(report["ok"])
+        self.assertEqual(fetched.call_count, 1)
+        evidence = report["field_catalog"]
+        self.assertEqual(evidence["required_fields"]["ids"], ["sample_matrix"])
+        self.assertEqual(evidence["verification"], "required_fields_only")
+        self.assertFalse(evidence["coverage"]["complete"])
+        self.assertFalse(evidence["coverage"]["full_scope"])
+        self.assertTrue(report["field_contracts"][0]["fields"])
+        self.assertEqual(Path(path).read_bytes(), before)
+
+    def test_stale_routes_are_hints_and_never_replace_live_required_evidence(self):
+        path = self.capture()
+        payload = cache_store.read_entry(path)["payload"]
+        cache_store.write_json_atomic(path, cache_store.build_entry(
+            "scoped-capabilities", payload, ttl=3600,
+            now=cache_store.utc_now() - timedelta(hours=2)))
+        for flags in ({"hit": True}, {"stale": True}, {"degraded": True},
+                      {"error": "RATE_LIMITED"}, {"complete": False}):
+            with self.subTest(flags=flags):
+                def fields(session, **kwargs):
+                    kwargs["report"].update({"complete": True, **flags})
+                    return FIELDS
+                with mock.patch.object(ml, "get_datafields", side_effect=fields), \
+                        mock.patch.object(ml, "get_datasets", side_effect=AssertionError("discovery")):
+                    result = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"})
+                self.assertEqual(result["evidence"]["state"], "unknown")
+                self.assertEqual(result["evidence"]["required_fields"]["unverified_ids"], ["sample_matrix"])
+                self.assertIsNone(result["known_fields"])
+
+    def test_discovery_failure_in_unused_dataset_keeps_required_live_proof(self):
+        def datasets(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"id": "sample_dataset"}, {"id": "unrelated_news"}]
+
+        def fields(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            if kwargs["dataset_id"] == "unrelated_news":
+                kwargs["report"].update(hit=True, stale=True, degraded=True, error="RATE_LIMITED")
+                return [{"id": "news_field", "dataset": "unrelated_news", "type": "VECTOR"}]
+            return FIELDS
+
+        with mock.patch.object(ml, "get_datasets", side_effect=datasets), \
+                mock.patch.object(ml, "get_datafields", side_effect=fields):
+            result = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"})
+        self.assertEqual(result["evidence"]["state"], "verified")
+        self.assertEqual(result["evidence"]["freshness"]["state"], "unknown")
+        self.assertFalse(result["evidence"]["coverage"]["complete"])
+        self.assertNotIn("news_field", result["known_fields"])
+        self.assertIsNone(validation.cached_field_scope(SETTINGS)["known_fields"])
+
+    def test_unverified_used_dataset_blocks_preflight_despite_cached_field(self):
+        self.capture()
+
+        def fields(session, **kwargs):
+            kwargs["report"].update(complete=True, stale=True, error="RATE_LIMITED")
+            return FIELDS
+
+        def operators(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"name": "rank"}]
+
+        with mock.patch.object(ml, "get_datafields", side_effect=fields), \
+                mock.patch.object(ml, "fetch_operators", side_effect=operators):
+            with self.assertRaises(CliError) as caught:
+                validation._preflight_lint(self.session, [("rank(sample_matrix)", 0)],
+                                           SETTINGS, SimpleNamespace(allow_lint_errors=False))
+        self.assertEqual(caught.exception.details["coverage"]["fields"], "unknown")
+
+    def test_account_and_scope_switch_do_not_reuse_routes(self):
+        self.capture()
+
+        def datasets(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"id": "new_dataset"}]
+
+        def fields(session, **kwargs):
+            self.assertEqual(kwargs["dataset_id"], "new_dataset")
+            kwargs["report"].update(complete=True)
+            return [{"id": "sample_matrix", "dataset": "new_dataset", "type": "MATRIX"}]
+
+        cases = [(SimpleNamespace(auth=("other-account", "placeholder")), SETTINGS),
+                 (self.session, {**SETTINGS, "universe": "TOP500"})]
+        for session, settings in cases:
+            with self.subTest(settings=settings, account=session.auth[0]), \
+                    mock.patch.object(ml, "get_datasets", side_effect=datasets) as discovery, \
+                    mock.patch.object(ml, "get_datafields", side_effect=fields):
+                result = capabilities.required_field_scope(session, settings, {"sample_matrix"})
+            self.assertTrue(discovery.called)
+            self.assertEqual(result["evidence"]["required_fields"]["routing_source"], "full_discovery")
+            self.assertEqual(result["evidence"]["scope"], settings)
+
+    def test_field_moving_from_cached_dataset_triggers_live_discovery(self):
+        self.capture()
+
+        def datasets(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"id": "new_dataset"}]
+
+        def fields(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            if kwargs["dataset_id"] == "sample_dataset":
+                return []
+            return [{"id": "sample_matrix", "dataset": "new_dataset", "type": "MATRIX"}]
+
+        with mock.patch.object(ml, "get_datasets", side_effect=datasets) as discovery, \
+                mock.patch.object(ml, "get_datafields", side_effect=fields):
+            result = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"})
+        discovery.assert_called_once()
+        self.assertEqual(result["evidence"]["state"], "verified")
+        self.assertIn("routing_retry", result["evidence"])
+
+    def test_unknown_id_in_partial_discovery_is_not_admitted_or_declared_absent(self):
+        def datasets(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"id": "sample_dataset"}]
+
+        def fields(session, **kwargs):
+            kwargs["report"].update(complete=False)
+            return FIELDS
+
+        with mock.patch.object(ml, "get_datasets", side_effect=datasets), \
+                mock.patch.object(ml, "get_datafields", side_effect=fields):
+            result = capabilities.required_field_scope(self.session, SETTINGS, {"unknown_field"})
+        self.assertEqual(result["evidence"]["state"], "unknown")
+        self.assertEqual(result["evidence"]["required_fields"]["unverified_ids"], ["unknown_field"])
+        self.assertIsNone(result["known_fields"])
+
 
 class PreflightEvidenceTests(unittest.TestCase):
     def test_catalog_failure_blocks_before_submission(self):
