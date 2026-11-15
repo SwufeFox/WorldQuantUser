@@ -24,21 +24,30 @@ from .runtime import CliError, protect_output
 #: Types that arithmetic and time-series operators reject outright.
 AGGREGATED_TYPES = frozenset({"VECTOR", "EVENT"})
 
-#: Types that are labels, not measurements. A sector code or a type index has no
-#: cross-section to rank; emitting an arm for one wastes a simulation and looks silly.
+#: Labels need a reviewed categorical use; their numerical order alone is not a
+#: financial measurement. Do not emit a directional rank of an identifier.
 LABEL_TYPES = frozenset({"GROUP", "SYMBOL"})
 
 #: Descriptions that mark a label dressed up as a field.
 LABEL_WORDS = ("grouping field", "type ind", "iso code", "zone code", "currency code",
                "categories of instrument", "index vector", "identifier", "forecast type",
-               "pricing currency", "city code", "country code", "zip code")
+               "pricing currency", "city code", "country code", "zip code",
+               "postal code", "technical code", "sic code", "classification code")
+
+# Some MATRIX fields describe a location without calling it a "code".
+# State tax expenses and counts of cities remain numerical measurements.
+LOCATION_LABEL = re.compile(
+    r"\b(?:city|country|state|province)\s+(?:where|in which|of)\b"
+    r"[^.;]{0,100}\b(?:company|headquarters|head office|home office)\b"
+)
 
 
 def is_label(meta):
     if (meta.get("type") or "").upper() in LABEL_TYPES:
         return True
     description = (meta.get("description") or "").lower()
-    return any(word in description for word in LABEL_WORDS)
+    return (any(word in description for word in LABEL_WORDS)
+            or bool(LOCATION_LABEL.search(description)))
 
 
 def _scope():

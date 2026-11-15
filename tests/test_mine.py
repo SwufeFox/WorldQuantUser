@@ -108,6 +108,50 @@ class MineTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, "INVALID_INPUT")
         self.assertFalse(os.path.exists(emitted))
 
+    def test_matrix_location_labels_and_technical_codes_are_not_auto_ranked(self):
+        fields = [
+            self._field("technical", "nonimportant technical code"),
+            self._field("headquarters_city", "the city where a company's corporate headquarters or home office is located"),
+            self._field("incorporation", "identifies the country in which the company is incorporated or legally registered"),
+            self._field("state", "integer for identifying the state of the company"),
+            self._field("postal", "Postal code for the company's headquarters"),
+            self._field("tax_value", "Deferred Taxes - State"),
+            self._field("city_count", "Number of cities with company offices"),
+        ]
+        tmp, registry = self._workspace(fields)
+        emitted = os.path.join(tmp, "spec.json")
+        with mock.patch.object(research_paths, "metadata_root", return_value=tmp):
+            data = mine.cmd_mine(self._args(registry, emit=emitted), None)
+        row = data["datasets"][0]
+        self.assertEqual({item["id"] for item in row["top"]},
+                         {"tax_value", "city_count"})
+        review = {item["id"]: item for item in row["needs_definition"]}
+        self.assertEqual(set(review),
+                         {"technical", "headquarters_city", "incorporation", "state", "postal"})
+        for item in review.values():
+            self.assertIn("categorical_or_identifier", item["reasons"])
+        with open(emitted, encoding="utf-8") as handle:
+            spec = json.load(handle)
+        self.assertEqual({arm["expression"] for arm in spec["arms"]},
+                         {"rank(tax_value)", "rank(city_count)"})
+
+    def test_reviewed_categorical_grouping_expression_is_preserved(self):
+        tmp, registry = self._workspace([
+            self._field("headquarters_city", "the city where a company's headquarters is located"),
+            self._field("returns", "Daily stock return"),
+        ])
+        emitted = os.path.join(tmp, "explicit.json")
+        expression = 'group_mean(returns, 1, bucket(rank(headquarters_city), range="0,1,0.00001"))'
+        with mock.patch.object(research_paths, "metadata_root", return_value=tmp):
+            data = mine.cmd_mine(
+                self._args(registry, emit=emitted, expr=expression), None)
+        with open(emitted, encoding="utf-8") as handle:
+            spec = json.load(handle)
+        self.assertEqual([arm["expression"] for arm in spec["arms"]],
+                         ["rank(" + expression + ")"])
+        review = data["datasets"][0]["needs_definition"]
+        self.assertEqual([item["id"] for item in review], ["headquarters_city"])
+
     def test_emitting_refuses_to_replace_a_previously_reviewed_spec(self):
         tmp, registry = self._workspace([
             self._field("numeric_value", "Annual sales revenue in reporting currency"),
