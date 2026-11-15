@@ -145,6 +145,10 @@ def build_operator_index(operator_records):
     """Index ``GET /operators`` records by name with parsed arity.
 
     Returns ``{name: {category, signature, min_arity, max_arity}}``.
+
+    Some arithmetic records omit the variadic marker from their signature but
+    explicitly describe "two or more inputs" (notably ``add``). Honour that
+    declaration without relaxing fixed signatures or the two-input minimum.
     """
     index = {}
     for record in operator_records or []:
@@ -152,6 +156,10 @@ def build_operator_index(operator_records):
         if not name:
             continue
         min_arity, max_arity, signature = _parse_signature(record.get("definition"))
+        if (min_arity == 2 and record.get("category") == "Arithmetic"
+                and re.search(r"\b(?:two|2)\s+or\s+more\s+inputs?\b",
+                              str(record.get("description") or ""), re.I)):
+            max_arity = None
         index[name] = {
             "category": record.get("category"),
             "signature": signature,

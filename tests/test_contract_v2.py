@@ -64,7 +64,8 @@ OPERATORS = [
     {"name": "ts_delta", "category": "Time Series", "definition": "ts_delta(x, d)"},
     {"name": "ts_backfill", "category": "Time Series",
      "definition": "ts_backfill(x, lookback = d, k = 1, ignore = \"NAN\")"},
-    {"name": "add", "category": "Arithmetic", "definition": "add(x, y, filter = false)"},
+    {"name": "add", "category": "Arithmetic", "definition": "add(x, y, filter = false)",
+     "description": "Adds two or more inputs element wise. Set filter=true to treat NaNs as 0 before summing."},
     {"name": "subtract", "category": "Arithmetic", "definition": "subtract(x, y, filter = false)"},
     {"name": "vec_sum", "category": "Vector", "definition": "vec_sum(x)"},
     {"name": "bucket", "category": "Group",
@@ -290,6 +291,43 @@ class ExpressionLintTests(unittest.TestCase):
             [{"name": "max", "definition": "max(x, y, ...)"}])
         self.assertEqual(index["max"]["min_arity"], 2)
         self.assertIsNone(index["max"]["max_arity"])
+
+    def test_variadic_arithmetic_description_overrides_short_signature(self):
+        # The real add signature omits an ellipsis although its description
+        # explicitly allows more inputs. A full rolling-window sum is legal.
+        expression = "add(" + ", ".join(["close"] * 21) + ", filter=false)"
+        report = expression_lint.lint_expression(
+            expression, operator_index=self.index)
+        self.assertNotIn("arity_suspicious",
+                         [w["code"] for w in report["warnings"]])
+        self.assertEqual(self.index["add"]["min_arity"], 2)
+        self.assertIsNone(self.index["add"]["max_arity"])
+
+    def test_variadic_description_preserves_minimum_inputs(self):
+        report = expression_lint.lint_expression(
+            "add(close)", operator_index=self.index)
+        self.assertIn("arity_suspicious",
+                      [w["code"] for w in report["warnings"]])
+
+    def test_short_signature_without_variadic_description_keeps_upper_bound(self):
+        index = expression_lint.build_operator_index([
+            {"name": "add", "category": "Arithmetic",
+             "definition": "add(x, y, filter = false)"}])
+        report = expression_lint.lint_expression(
+            "add(close, open, high, low)", operator_index=index)
+        self.assertIn("arity_suspicious",
+                      [w["code"] for w in report["warnings"]])
+        report = expression_lint.lint_expression(
+            "subtract(close, open, high, low)", operator_index=self.index)
+        self.assertIn("arity_suspicious",
+                      [w["code"] for w in report["warnings"]])
+
+    def test_variadic_prose_does_not_relax_non_arithmetic_signature(self):
+        index = expression_lint.build_operator_index([
+            {"name": "rank", "category": "Cross Sectional",
+             "definition": "rank(x, rate=2)",
+             "description": "Compare two or more inputs in a cross section."}])
+        self.assertEqual(index["rank"]["max_arity"], 2)
 
     def test_signature_parsing_marks_optional_parameters(self):
         index = expression_lint.build_operator_index(
