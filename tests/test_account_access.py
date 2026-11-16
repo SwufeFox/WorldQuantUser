@@ -175,6 +175,26 @@ class AccountAccessTests(unittest.TestCase):
         self.assertEqual(result["regions"], [])
         self.assertEqual(result["probes"][0]["state"], "unknown")
 
+    def test_new_region_universe_and_delay_are_discovered_without_historical_lists(self):
+        schema = options(("NEWREGION",), {"NEWREGION": ["NEWUNIVERSE"]}, {"NEWREGION": [5]})
+        with mock.patch.object(ml, "request_json", return_value=schema), \
+                mock.patch.object(ml, "get_datasets", side_effect=self.fresh) as datasets:
+            result = account._data_access(object())
+        self.assertEqual(result["regions"], ["NEWREGION"])
+        self.assertEqual(datasets.call_args.kwargs["delay"], 5)
+        self.assertEqual(datasets.call_args.kwargs["universe"], "NEWUNIVERSE")
+        self.assertEqual(result["capabilities"]["concurrency"]["state"], "unknown")
+
+    def test_advertised_empty_instruments_are_distinct_from_unpublished(self):
+        schema = options()
+        schema["actions"]["POST"]["settings"]["children"]["instrumentType"]["choices"] = []
+        with mock.patch.object(ml, "request_json", return_value=schema), \
+                mock.patch.object(ml, "get_datasets") as datasets:
+            result = account._data_access(object())
+        datasets.assert_not_called()
+        self.assertEqual(result["state"], "verified")
+        self.assertFalse(result["settings"]["equity_supported"])
+
 
 if __name__ == "__main__":
     unittest.main()

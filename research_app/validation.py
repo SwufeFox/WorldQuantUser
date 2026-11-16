@@ -8,19 +8,43 @@ import fastexpr_ast
 import field_contract
 import machine_lib as ml
 import research_config as config_io
+import copy
+import simulation_capabilities
 
 from . import capabilities
 from .capabilities import cached_field_scope
 from .runtime import CliError, collect_alphas, merge_settings, with_session
 
 
-def _preflight_lint(session, pairs, settings, args):
-    """Require live metadata for all used fields before spending simulation quota."""
+def _preflight_lint(session, pairs, settings, args, capability_snapshot=None):
+    """Require fresh field proofs and check supplied or cached settings evidence."""
+    settings = ml.resolve_settings(settings)
+    pairs = [[pair[0], pair[1]] if isinstance(pair, (tuple, list))
+             else [pair, settings["decay"]] for pair in pairs]
+    snapshot = capability_snapshot if capability_snapshot is not None else getattr(args, "capability_snapshot", None)
+    if snapshot is None:
+        snapshot = simulation_capabilities.cached()
+    account = simulation_capabilities.account_provenance(session)
+    if (not account.get("fingerprint") or not isinstance(snapshot.get("account"), dict)
+            or snapshot["account"].get("fingerprint") != account.get("fingerprint")):
+        snapshot = {**snapshot, "state": "unknown", "reasons": ["account_mismatch"]}
+    requests = [simulation_capabilities.settings_evidence({**settings, "decay": pair[1]}, snapshot)
+                for pair in pairs]
+    settings_report = simulation_capabilities.settings_evidence(settings, snapshot) if not requests else {
+        **requests[0],
+        "state": "unsupported" if any(row["unsupported"] for row in requests) else
+                 "unknown" if any(row["state"] == "unknown" for row in requests) else "verified",
+        "checked": sorted({key for row in requests for key in row["checked"]}),
+        "unsupported": [{**item, "pair_index": index} for index, row in enumerate(requests)
+                        for item in row["unsupported"]],
+        "unknown": [{**item, "pair_index": index} for index, row in enumerate(requests)
+                    for item in row["unknown"]],
+        "requests": requests}
     operator_index = None
     operator_evidence = {"state": "unknown", "complete": False}
     fields = capabilities.field_scope([], {
         "state": "unknown", "scope": capabilities.scope_settings(settings),
-        "account": capabilities.account_provenance(session),
+        "account": account,
         "coverage": {"complete": False}, "freshness": {"state": "unknown"}})
     try:
         records = ml.fetch_operators(session, refresh=True, report=operator_evidence)
@@ -53,6 +77,11 @@ def _preflight_lint(session, pairs, settings, args):
     report["operator_catalog_size"] = len(operator_index or {})
     report["operator_catalog"] = operator_evidence
     report["field_catalog"] = fields["evidence"]
+    report["settings_capabilities"] = settings_report
+    report["capability_snapshot"] = copy.deepcopy(snapshot)
+    report["checked_requests"] = {"settings": copy.deepcopy(settings), "pairs": copy.deepcopy(pairs)}
+    for unsupported in settings_report["unsupported"]:
+        report["errors"].append({"code": "unsupported_setting", **unsupported})
     report["coverage"] = {"operators": operator_evidence["state"],
                           "fields": fields["evidence"]["state"]}
     for catalog, state in report["coverage"].items():
@@ -61,10 +90,10 @@ def _preflight_lint(session, pairs, settings, args):
                                      "message": "required %s catalog is unavailable, empty, stale or incomplete" % catalog})
     report["ok"] = not report["errors"]
     report["allow_lint_errors"] = bool(getattr(args, "allow_lint_errors", False))
-    if report["ok"] or report["allow_lint_errors"]:
+    if report["ok"] or (report["allow_lint_errors"] and not settings_report["unsupported"]):
         return report
-    raise CliError("INVALID_INPUT", "expression preflight failed; nothing was submitted",
-                   "refresh the required catalogs and fix expression errors; --allow-lint-errors explicitly overrides this guard",
+    raise CliError("INVALID_INPUT", "simulation preflight failed; nothing was submitted",
+                   "refresh required catalogs and fix expression or advertised setting errors; --allow-lint-errors overrides lint only",
                    details=report)
 
 

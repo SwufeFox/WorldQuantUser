@@ -42,8 +42,8 @@ CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、
 这些是内部模块，入口仍是 `research_cli.py`；改命令时直接修改、测试所属模块。
 
 字段枚举统一走 `field_index.fetch_all_fields`。`validation.py` 的在线 lint 和
-模拟预检从一次查询同时生成字段名、类型及市场/披露分类，避免两条路径给出
-不同诊断；`tools.guarded_sim` 复用同一枚举。基础安装只需 `requests`，
+模拟预检从一次查询同时生成字段名、类型及市场/披露分类。原生批次把预检报告交给
+`tools.guarded_sim`，只有完整设置与表达式完全相同才复用，避免再次枚举。基础安装只需 `requests`，
 `pandas` 在调用 `fields_to_df()` 时按需加载，DataFrame 用户再单独安装。
 
 
@@ -57,6 +57,17 @@ CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、
 合法股票池和 delay 查询目录，不再给所有地区套美股默认股票池。`data_scope_evidence`
 保留实际查询范围、目录时效及 available / empty / unknown；它只证明抽查的组合。
 错误、旧目录回退和未查询组合不能作为“该地区无数据”的证据。
+
+账户设置证据由核心模块 `simulation_capabilities.py` 统一管理，保留原生 schema、账户指纹、
+来源、时效和 capability ID；每次在线模拟/核验刷新一次，批次内复用。`schema` 的
+`settings_hints` 只是常见值，地区、delay、字段类型等不再受旧列表限制。字段目录保留完整性，
+完整的空目录可以替换旧字段；缺失、过期和未公布的能力仍是 unknown。
+
+平台增加设置时可以直接写入文件 `settings`，或重复使用 `--setting NAME=VALUE`。
+值支持 JSON 或普通文本，例如 `--setting visualization=true`；对象、布尔值和扩展键的
+显式 null 都保留。通用参数与明确的命名参数冲突时拒绝。离线预览只检查结构；
+当前平台证据明确不支持的设置不能用 `--allow-lint-errors` 绕过。
+
 
 | 阶段 | 现在需要的信息 | 留下什么 |
 | --- | --- | --- |
@@ -289,11 +300,11 @@ if_else(is_nan(s), s, m)
 都相同的已完成结果。所有组先通过本地校验，等效设置合并，整批复用会话。输入支持 UTF-8 BOM。
 
 ```bash
-python3 research_cli.py probe sample-batch.spec.json --batch-path sample-batch.json --save sample-response.json
-python3 research_cli.py probe --recover sample-batch.json --max-wait-seconds 60
-python3 research_cli.py probe --resume sample-batch.json --dry-run
-python3 research_cli.py probe --resume sample-batch.json --max-wait-seconds 60
-python3 research_cli.py resume checkpoint.json --max-wait-seconds 60
+python3 research_cli.py probe sample-batch.spec.json --batch-size 6 --summary --batch-path sample-batch.json --save sample-response.json
+python3 research_cli.py probe --recover sample-batch.json --max-wait-seconds 60 --summary
+python3 research_cli.py probe --resume sample-batch.json --dry-run --summary
+python3 research_cli.py probe --resume sample-batch.json --batch-size 6 --max-wait-seconds 60 --summary
+python3 research_cli.py resume checkpoint.json --batch-size 6 --max-wait-seconds 60
 ```
 
 示例文件放在研究目录；从该目录运行或传绝对路径。`--batch-path` 是持久批次，`--save` 是
@@ -302,11 +313,27 @@ python3 research_cli.py resume checkpoint.json --max-wait-seconds 60
 `--save` 与批次、checkpoint、恢复输入或冻结选择同路径时会在执行前拒绝；错误回执也不会
 写入受保护文件。读取保存回执恢复时，同样保护其指向的实际批次。
 
+`probe --summary` 返回训练期表格：label、role、执行状态、S/F、换手、margin_bps、
+两段训练 Sharpe 和 alpha_id。展示和预检明细最多 20 条，并给出总数、略去数量与完整批次路径。
+缺失显示 `-`，真实的零保留为零；完整批次不截断。读取旧结果可用
+`compare sample-batch.json --summary --format markdown`，表格仍装在单个 JSON 回执里。
+
+臂可声明 `role: "candidate"` 或 `role: "diagnostic"`，与实验 `design` 分开。
+diagnostic 保留用于归因，但不能进入候选冻结、候选架、晋级或新提交；恢复和刷新不抹掉角色。
+旧记录没有声明时保持 unspecified，不从 C1 之类的标签或备注猜测。
+
 每个 POST 之前保存提交意图，拿到任务身份后立即保存。没有身份的未知提交不会自动重发。
 `--max-wait-seconds` 默认 300；前组未完成时后组保持排队。`--recover` 只读平台并幂等补账，
 接受批次或保存的回执；`--resume` 才显式继续已知排队/已接受任务，支持离线预览。
 执行失败、未完成和证据缺失列为 deferred，不自动判成研究失败；旧批次的记账策略不明时
 不会推测为允许记账。同批次运行/恢复互斥，`--force` 不能覆盖正在运行的批次。
+
+模拟并发统一使用 `--batch-size N`，不再硬编码上限 3。已验证的账户上限会约束请求；
+平台没有公布上限时，默认 3 只是有来源标记的保守本地策略，可显式提高请求预算，
+但工具不会把配置当成已获授权的并发。`scheduling` 保留 requested/effective/platform_limit。
+`simulation_slots.py` 在同账户、同研究目录内共享持久占位；接受或结果不明的提交不按时间过期，
+只有确认完成或拒绝才释放。不同研究目录及工具外启动的任务不共享这份占位。
+恢复可调整并发而不改变研究请求指纹；权限收缩时先取回已接受任务，再核验新启动的请求。
 
 目录检查携带账户、region/universe/delay/instrumentType、完整性和时效证据。缺失、过期、
 不完整目录不能冒充预检通过；显式覆盖仍保留错误。字段类型按 AST 检查，经济口径不明则提示
@@ -327,6 +354,7 @@ python3 research_cli.py compare --match "**/sample-batch*.json" --latest --sort 
 python3 research_cli.py compare --match "sample-batch-a.json" --match "**/sample-batch-b*.json" --latest 2
 python3 research_cli.py compare sample-batch.json --freeze choice.json --cost-bps 5 10 20 --summary
 python3 research_cli.py compare --frozen --selection choice.json --summary
+python3 research_cli.py compare sample-batch.json --summary --format markdown
 python3 research_cli.py alpha check ALPHA_A ALPHA_B --workers 2 --max-wait 300
 ```
 

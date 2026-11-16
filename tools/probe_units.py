@@ -122,8 +122,7 @@ def main(argv=None):
         return 0
 
     session = ml.load_session() or ml.authenticate()
-    settings = dict(ml.DEFAULT_SETTINGS, universe="TOP3000", region="USA", delay=1,
-                    neutralization="SUBINDUSTRY", truncation=0.08)
+    settings = dict(ml.DEFAULT_SETTINGS)
 
     measured, undetermined = {}, []
     chunk_size = max(1, args.chunk)
@@ -131,7 +130,6 @@ def main(argv=None):
         window = fields[start:start + chunk_size]
         pairs = [(probe_expression(name), 4) for name in window]
         records = ml.simulate_alphas(session, pairs, settings=settings,
-                                     batch_size=min(3, len(pairs)),
                                      max_wait_seconds=args.max_wait)
         # Match by expression rather than by position: the records carry their own
         # expression, so a dropped or reordered record cannot silently attach one

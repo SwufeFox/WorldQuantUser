@@ -487,14 +487,15 @@ class ErrorEnvelopeTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(parse(proc)["error"]["code"], "USAGE")
 
-    def test_unknown_region_is_invalid_input(self):
-        proc = run_cli("simulate", "--expr", "rank(cap)", "--region", "MARS")
+    def test_malformed_region_is_invalid_input(self):
+        proc = run_cli("simulate", "--expr", "rank(cap)", "--region", "BAD REGION", "--dry-run")
         self.assertEqual(proc.returncode, 2)
-        self.assertEqual(parse(proc)["error"]["code"], "USAGE")  # argparse choices
+        self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
 
-    def test_region_validation_comes_from_machine_lib(self):
+    def test_region_validation_is_structural(self):
+        self.assertEqual(ml.resolve_settings({"region": "FUTURE_REGION"})["region"], "FUTURE_REGION")
         with self.assertRaises(ValueError):
-            ml.resolve_settings({"region": "MARS"})
+            ml.resolve_settings({"region": "bad token"})
 
     def test_cli_spellings_normalize_before_platform_defaults(self):
         settings = ml.resolve_settings({"test_period": "P1Y", "nan_handling": "OFF",
@@ -563,6 +564,44 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(parse(proc)["data"]["settings"]["neutralization"],
                          "STATISTICAL")
+
+    def test_future_settings_and_larger_budget_reach_offline_payload(self):
+        proc = run_cli("simulate", "--expr", "rank(cap)", "--dry-run",
+                       "--region", "future_region", "--delay", "4", "--batch-size", "8",
+                       "--pasteurization", "future_mode", "--nan-handling", "future_mode",
+                       "--setting", "futureObject={\"enabled\":true,\"values\":[0,2]}",
+                       "--setting", "futureNullable=null", "--setting", "visualization=true")
+        self.assertEqual(proc.returncode, 0, proc.stderr + proc.stdout)
+        data = parse(proc)["data"]
+        settings = data["results"][0]["payload"]["settings"]
+        self.assertEqual(settings["region"], "FUTURE_REGION")
+        self.assertEqual(settings["delay"], 4)
+        self.assertEqual(settings["pasteurization"], "FUTURE_MODE")
+        self.assertEqual(settings["nanHandling"], "FUTURE_MODE")
+        self.assertEqual(settings["futureObject"], {"enabled": True, "values": [0, 2]})
+        self.assertIn("futureNullable", settings)
+        self.assertIsNone(settings["futureNullable"])
+        self.assertIs(settings["visualization"], True)
+        self.assertEqual(data["scheduling"]["effective"], 8)
+        self.assertIsNone(data["scheduling"]["platform_limit"])
+
+    def test_conflicting_generic_flags_fail_before_authentication(self):
+        for extra in (["--test-period", "P1Y", "--setting", "test_period=P2Y"],
+                      ["--setting", "futureFlag=true", "--setting", "futureFlag=false"],
+                      ["--setting", "futureFlag=true", "--setting", "futureFlag=1"],
+                      ["--setting", "futureFlag={\"x\":true}", "--setting", "futureFlag={\"x\":1}"]):
+            with self.subTest(extra=extra):
+                proc = run_cli("simulate", "--expr", "rank(cap)", *extra)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
+
+    def test_invalid_json_settings_fail_before_authentication(self):
+        for value in ("=missing_name", "missing_equals", "option={broken}",
+                      "option=NaN", "option=1e999", "option=[1e999]"):
+            with self.subTest(value=value):
+                proc = run_cli("simulate", "--expr", "rank(cap)", "--setting", value)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(parse(proc)["error"]["code"], "USAGE")
 
     def test_cli_flags_override_research_file_settings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1459,6 +1498,11 @@ class SimulationResumeTests(unittest.TestCase):
         sleep.assert_not_called()
 
     def test_cli_checkpoint_can_be_resumed_without_new_submission(self):
+        capabilities = mock.patch.object(cli_experiments.simulation_capabilities, "fetch", return_value={
+            "state": "unknown", "account": {"state": "unknown"},
+            "concurrency": {"state": "unknown", "limit": None}})
+        capabilities.start()
+        self.addCleanup(capabilities.stop)
         original_directory = Path.cwd()
         with tempfile.TemporaryDirectory() as temporary_directory:
             os.chdir(temporary_directory)

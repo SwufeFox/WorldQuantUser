@@ -132,6 +132,7 @@ def _score(alpha_id, entry, series, dates, criteria):
 
     row = {
         "alpha_id": alpha_id,
+        "role": alpha_registry.evidence_role(entry),
         "sharpe": metrics.get("sharpe"),
         "fitness": metrics.get("fitness"),
         "train_sharpe": train,
@@ -229,6 +230,8 @@ def _score(alpha_id, entry, series, dates, criteria):
 
 
 def _verdict(row, criteria):
+    if row.get("role") == "diagnostic":
+        return "diagnostic", "attribution evidence; not eligible for candidate selection"
     if row.get("member"):
         if not row["delta"]:
             return "member", "no measurable contribution"
@@ -262,7 +265,7 @@ def _verdict(row, criteria):
 def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
            retention_floor=None, internal=False, whole_book=False, criteria=None,
            show_test=False, train_end=None, freeze_path=None, selection_path=None,
-           cost_bps=None):
+           cost_bps=None, roles=None, source_files=None):
     """Freeze training decisions and join validation evidence without reranking."""
     from datetime import date
     from .book_state import describe_book
@@ -362,6 +365,8 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
     rows = []
     for alpha_id in targets:
         entry = latest.get(alpha_id)
+        if entry is not None and roles and alpha_id in roles:
+            entry = {**entry, "role": alpha_registry.evidence_role(entry, {"role": roles[alpha_id]})}
         if entry is None:
             if not manifest:
                 rows.append({"alpha_id": alpha_id, "verdict": "unknown", "missing": True,
@@ -392,6 +397,7 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
                                     inputs={"registry_path": os.path.abspath(os.path.expanduser(os.fspath(
                                                 registry_path or alpha_registry.default_registry_path()))),
                                             "pnl_dir": directory, "whole_book": bool(whole_book),
+                                            "files": source_files or [],
                                             "book_state": book_state})
     if manifest:
         result["selection_id"] = manifest["selection_id"]
@@ -416,6 +422,7 @@ def cmd_triage(args, _sink):
 
 def _cmd_triage(args):
     ids = list(getattr(args, "ids", None) or [])
+    roles = {}
     if getattr(args, "batch", None):
         path = os.path.expanduser(args.batch)
         try:
@@ -423,6 +430,22 @@ def _cmd_triage(args):
                 document = json.load(handle)
         except (OSError, ValueError) as exc:
             raise ValueError("cannot read batch file %s: %s" % (path, exc))
+        while isinstance(document, dict) and isinstance(document.get("data"), dict):
+            document = document["data"]
+        evidence = []
+        for key in ("rows", "records", "results"):
+            source_rows = document.get(key) or []
+            arms = document.get("arms")
+            for index, row in enumerate(source_rows):
+                arm = arms[index] if isinstance(arms, list) and len(arms) == len(source_rows) else {}
+                role = alpha_registry.evidence_role(row, arm)
+                evidence.append({**row, "role": role})
+                if row.get("alpha_id"):
+                    roles[row["alpha_id"]] = alpha_registry.evidence_role(
+                        {"role": roles.get(row["alpha_id"])}, {"role": role})
+        if getattr(args, "freeze", None) or getattr(args, "selection", None):
+            alpha_registry.require_candidate_eligible(evidence,
+                                                     registry_path=getattr(args, "registry", None))
         ids.extend(row.get("alpha_id") for row in document.get("rows") or []
                    if row.get("alpha_id"))
     ids = [alpha_id for alpha_id in dict.fromkeys(ids) if alpha_id and alpha_id != "None"]
@@ -436,5 +459,6 @@ def _cmd_triage(args):
                     train_end=getattr(args, "train_end", None),
                     freeze_path=getattr(args, "freeze", None),
                     selection_path=getattr(args, "selection", None),
-                    cost_bps=getattr(args, "cost_bps", None))
+                    cost_bps=getattr(args, "cost_bps", None), roles=roles,
+                    source_files=[os.path.abspath(path)] if getattr(args, "batch", None) else None)
     return result

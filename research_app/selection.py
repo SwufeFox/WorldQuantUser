@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timezone
 
 import cache_store
+import alpha_registry
 
 FORMAT = "research.train-selection"
 VERSION = 1
@@ -44,6 +45,46 @@ def _identities(rows):
     return identities
 
 
+def _require_eligible(manifest):
+    """Consult durable source intent as well as the frozen copy and current ledger."""
+    rows = manifest["rows"]
+    inputs = manifest.get("inputs") or {}
+    evidence = list(alpha_registry.load_entries(inputs.get("registry_path")))
+    paths = list(inputs.get("files") or []) + [row["source_file"] for row in rows if row.get("source_file")]
+    visited = set()
+    while paths:
+        path = os.path.abspath(os.path.expanduser(os.fspath(paths.pop())))
+        if path in visited:
+            continue
+        visited.add(path)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        while isinstance(document, dict) and isinstance(document.get("data"), dict):
+            document = document["data"]
+        if isinstance(document, list):
+            evidence.extend(row for row in document if isinstance(row, dict))
+            continue
+        if not isinstance(document, dict):
+            continue
+        if document.get("path"):
+            destination = os.path.expanduser(os.fspath(document["path"]))
+            paths.append(destination if os.path.isabs(destination) else os.path.join(os.path.dirname(path), destination))
+        for key in ("rows", "results", "records"):
+            source_rows = document.get(key)
+            if not isinstance(source_rows, list):
+                continue
+            arms = document.get("arms")
+            for index, row in enumerate(source_rows):
+                if not isinstance(row, dict):
+                    continue
+                arm = arms[index] if isinstance(arms, list) and len(arms) == len(source_rows) else {}
+                evidence.append({**row, "role": alpha_registry.evidence_role(row, arm)})
+    alpha_registry.require_candidate_eligible(rows, entries=evidence)
+
+
 def _validate(manifest, source=None):
     if not isinstance(manifest, dict) or manifest.get("format") != FORMAT or manifest.get("version") != VERSION:
         raise ValueError("unsupported selection manifest")
@@ -55,6 +96,7 @@ def _validate(manifest, source=None):
         if not isinstance(manifest.get(key), dict):
             raise ValueError("selection %s must be an object" % key)
     identities = _identities(manifest.get("rows"))
+    _require_eligible(manifest)
     if identities != manifest.get("identities"):
         raise ValueError("selection identities or order were modified")
     try:
@@ -75,6 +117,7 @@ def _validate(manifest, source=None):
 
 def freeze(path, *, source, rows, criteria=None, inputs=None, window=None):
     """Atomically persist a choice, allowing only identical idempotent writes."""
+    alpha_registry.require_candidate_eligible(rows)
     content = {"format": FORMAT, "version": VERSION, "source": source,
                "rows": rows, "identities": _identities(rows),
                "criteria": criteria or {}, "inputs": inputs or {}, "window": window or {}}
@@ -110,6 +153,9 @@ def ordered_rows(manifest, rows):
     _validate(manifest)
     wanted = set(manifest["identities"])
     wanted_ids = {row["alpha_id"] for row in manifest["rows"]}
+    alpha_registry.require_candidate_eligible(
+        [row for row in rows if isinstance(row, dict) and row.get("alpha_id") in wanted_ids],
+        entries=rows)
     current = {}
     for row in rows:
         if not isinstance(row, dict) or row.get("alpha_id") not in wanted_ids:
@@ -126,5 +172,7 @@ def ordered_rows(manifest, rows):
         if row is None:
             row = {**json.loads(identity), "missing": True,
                    "evidence_state": "missing", "missing_reason": "frozen candidate absent from current evidence"}
+        frozen = manifest["rows"][len(ordered)]
+        row = {**row, "role": alpha_registry.evidence_role(frozen, row)}
         ordered.append(dict(row))
     return ordered

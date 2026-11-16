@@ -20,6 +20,8 @@ import expression_lint
 import machine_lib as ml
 import research_config as config_io
 import research_paths
+import simulation_capabilities
+import simulation_slots
 from tools import guarded_sim
 
 from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, protect_output, with_session
@@ -136,8 +138,10 @@ def _simulation_checkpoint_callback(path, checkpoint, sink):
             if kind in {"submitting", "submitted", "pending", "completed", "failed", "deferred"}:
                 index = payload.get("index")
                 if isinstance(index, int) and 0 <= index < len(checkpoint["records"]):
+                    previous = checkpoint["records"][index]
                     checkpoint["records"][index] = {
-                        key: value for key, value in payload.items() if key != "index"
+                        **previous, **{key: value for key, value in payload.items() if key != "index"},
+                        "role": alpha_registry.evidence_role(previous, payload),
                     }
                     _write_simulation_checkpoint(path, checkpoint)
             if sink:
@@ -177,7 +181,7 @@ def _simulation_result(records, settings, checkpoint_path=None, dry_run=False):
 
 
 def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg,
-                            labels=None, families=None, candidates=None, metadata=None):
+                            labels=None, families=None, candidates=None, metadata=None, roles=None):
     if checkpoint_arg:
         path = Path(checkpoint_arg).expanduser().resolve()
         if path.exists():
@@ -196,11 +200,13 @@ def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg,
     labels = labels or [None] * len(pairs)
     families = families or [None] * len(pairs)
     candidates = candidates or [None] * len(pairs)
+    roles = roles or [None] * len(pairs)
     records = [
         {
             "expression": expression,
             "decay": decay,
             "candidate_id": candidates[index],
+            "role": roles[index],
             "mechanism": labels[index],
             "family": families[index],
             "alpha_id": None,
@@ -215,7 +221,7 @@ def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg,
         "format": "worldquantuser.simulation-checkpoint",
         "version": 1,
         "settings": settings,
-        "batch_size": batch_size,
+        "concurrency": batch_size,
         "records": records,
     }
     if metadata:
@@ -225,10 +231,13 @@ def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg,
 
 
 def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, explicit):
+    for record, previous in zip(records, checkpoint["records"]):
+        record["role"] = alpha_registry.evidence_role(previous, record)
     checkpoint["records"] = [dict(record) for record in records]
     _write_simulation_checkpoint(checkpoint_path, checkpoint)
     has_unfinished = any(
         record.get("progress_url")
+        or record.get("metrics_pending")
         or record.get("status") in {"PENDING", "QUEUED", "UNKNOWN_SUBMISSION"}
         for record in records
     )
@@ -257,6 +266,8 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
         )
     result = _simulation_result(every, settings, checkpoint_path)
     result["results"] = display
+    result.update({key: checkpoint[key] for key in ("concurrency", "scheduling", "capability_snapshot")
+                   if key in checkpoint})
     result["unknown_submission"] = [index for index, record in enumerate(every)
                                     if record.get("status") == "UNKNOWN_SUBMISSION"]
     result["results_total"] = len(every)
@@ -520,6 +531,10 @@ def _compare_document(path, payload):
     else:
         raise CliError("INVALID_INPUT", "%s is not a simulate or probe result document" % path)
 
+    if isinstance(payload, dict) and isinstance(payload.get("arms"), list) and len(payload["arms"]) == len(records):
+        records = [{**record, "role": alpha_registry.evidence_role(record, arm)}
+                   for record, arm in zip(records, payload["arms"])]
+
     if not probe:
         if any(any(key in record for key in ("sharpe", "fitness", "train_sharpe", "train_fitness"))
                and not any(key in record for key in ("metrics", "out_of_sample")) for record in records):
@@ -563,6 +578,7 @@ def _compare_document(path, payload):
     if not records:
         # Row-only snapshots still provide explicit train evidence for ablation.
         records = [{"candidate_id": row.get("candidate_id"), "alpha_id": row.get("alpha_id"),
+                    "role": row.get("role"),
                     "metrics": {key: row.get(key) for key in ("sharpe", "fitness", "turnover", "returns")},
                     "out_of_sample": {"train": {key: row.get("train_" + key)
                                                 for key in ("sharpe", "fitness", "turnover", "returns")}}}
@@ -576,6 +592,7 @@ def _compare_row(record, display, path, frozen):
     halves = record.get("half_sharpes") or (None, None)
     row = {key: record[key] if record.get(key) is not None else display.get(key)
            for key in ("candidate_id", "alpha_id", "decay", "status")}
+    row["role"] = alpha_registry.evidence_role(record, display)
     row.update({"label": display.get("label") or record.get("label") or record.get("mechanism"),
                 "source_file": path,
                 "source_expression": record.get("expression") or display.get("expression"),
@@ -610,6 +627,103 @@ def _selection_call(function, *args, **kwargs):
     except (ValueError, OSError) as exc:
         raise CliError("INVALID_INPUT", str(exc)) from exc
 
+
+
+def _train_table(rows):
+    columns = (("label", "label"), ("role", "role"), ("state", "status"),
+               ("train S", "train_sharpe"), ("train F", "train_fitness"),
+               ("turnover", "train_turnover"), ("margin_bps", "margin_bps"),
+               ("half 1 S", "train_sharpe_h1"), ("half 2 S", "train_sharpe_h2"),
+               ("alpha_id", "alpha_id"))
+
+    def cell(row, key):
+        value = row.get(key)
+        if key == "role" and value is None:
+            value = "unspecified"
+        if key == "margin_bps":
+            value = (row.get("cost_evidence") or {}).get("margin_bps")
+        return "-" if value is None else str(value).replace("|", "\\|").replace("\n", " ")
+
+    lines = ["| " + " | ".join(title for title, _ in columns) + " |",
+             "| " + " | ".join("---" for _ in columns) + " |"]
+    lines.extend("| " + " | ".join(cell(row, key) for _, key in columns) + " |" for row in rows)
+    return "\n".join(lines)
+
+
+def _probe_summary(response):
+    rows = response.get("rows", response.get("results", []))
+    fields = ("train_sharpe", "train_fitness", "train_turnover", "train_margin",
+              "train_sharpe_h1", "train_sharpe_h2")
+    return {"path": response.get("path"), "run_id": response.get("run_id"),
+            "request_fingerprint": response.get("request_fingerprint"), "view": "train",
+            "total_count": (response.get("execution") or {}).get("total", response.get("arms", len(rows))),
+            "displayed_count": min(20, len(rows)), "rows_omitted": max(0, len(rows) - 20),
+            "execution": response.get("execution"), "recording": response.get("recording"),
+            "roles": {role: sum((row.get("role") or "unspecified") == role for row in rows)
+                      for role in ("candidate", "diagnostic", "unspecified")},
+            "missing_evidence_count": sum(any(row.get(key) is None for key in fields) for row in rows),
+            "missing_evidence": [{"label": row.get("label"),
+                                  "fields": [key for key in fields if row.get(key) is None]}
+                                 for row in rows[:20] if any(row.get(key) is None for key in fields)],
+            "next_actions": response.get("next_actions", []), "table": _train_table(rows[:20])}
+
+
+def _compact_preflight(report):
+    if not isinstance(report, dict):
+        return {"state": "unavailable"}
+    result = {key: report[key] for key in ("ok", "preflight_complete", "operator_catalog_checked",
+              "field_catalog_checked", "capability_id") if key in report}
+    for key in ("errors", "warnings", "results", "checked_requests"):
+        items = report.get(key)
+        if isinstance(items, list):
+            result[key + "_count"] = len(items)
+            visible = items[:20] if key in ("errors", "warnings") else []
+            result[key + "_omitted"] = len(items) - len(visible)
+            if visible:
+                result[key] = visible
+    return result
+
+
+def _summarize_probe_response(response):
+    response["summary"] = _probe_summary(response)
+    for key in ("rows", "results", "incomplete", "comparisons", "arm_order", "preflight"):
+        items = response.get(key)
+        if isinstance(items, list):
+            response[key + "_total"] = len(items)
+            response[key + "_omitted"] = max(0, len(items) - 20)
+            response[key] = [_compact_preflight(item) for item in items[:20]] if key == "preflight" else items[:20]
+    if isinstance(response.get("lint"), dict):
+        lint = response["lint"]
+        response["lint"] = _compact_preflight(lint)
+        response["lint"]["groups_count"] = len(lint.get("groups") or [])
+    snapshot = response.get("capability_snapshot")
+    if isinstance(snapshot, dict):
+        response["capability_snapshot"] = {key: snapshot[key] for key in (
+            "state", "account", "source", "as_of", "age_seconds", "capability_id", "concurrency") if key in snapshot}
+    return response
+
+
+def _requested_concurrency(args, saved=None):
+    requested = getattr(args, "concurrency", None)
+    if requested is None:
+        requested = getattr(args, "batch_size", None)
+    if requested is None and saved:
+        requested = saved.get("concurrency", saved.get("batch_size"))
+    if requested is not None and (isinstance(requested, bool) or not isinstance(requested, int) or requested < 1):
+        raise CliError("INVALID_INPUT", "--batch-size must be a positive integer")
+    return requested
+
+
+def _invocation_capabilities(session, args):
+    snapshot = getattr(args, "capability_snapshot", None)
+    current = simulation_capabilities.account_provenance(session)
+    prior_account = (snapshot or {}).get("account") or {}
+    changed = (current.get("fingerprint") and prior_account.get("fingerprint")
+               and current["fingerprint"] != prior_account["fingerprint"])
+    if snapshot is None or changed:
+        snapshot = simulation_capabilities.fetch(session, refresh=True)
+        args.capability_snapshot = snapshot
+    return snapshot
 
 
 def cmd_compare(args, _sink):
@@ -666,6 +780,12 @@ def cmd_compare(args, _sink):
         inputs.append((path, payload, file_records))
         rows.extend(_compare_row(record, display, path, frozen) for record, display in aligned)
 
+    total_rows = len(rows)
+    diagnostic_ids = {row.get("alpha_id") for row in rows
+                      if row.get("role") == "diagnostic" and row.get("alpha_id")}
+    for row in rows:
+        if row.get("alpha_id") in diagnostic_ids:
+            row["role"] = "diagnostic"
     if not rows and not frozen:
         raise CliError("NOT_FOUND", "no result records in the given files",
                        "the file must come from `simulate` or `probe`")
@@ -695,6 +815,7 @@ def cmd_compare(args, _sink):
                                      for key in ("source_expression", "source_settings", "train_period")
                                      if not row.get("missing") and saved.get(key) != row.get(key)}
     data = {"files": paths, "selection": provenance, "count": len(rows),
+            "total_count": total_rows, "filtered_count": total_rows - len(rows),
             "view": "frozen" if frozen else "train", "rows": rows,
             "missing_evidence": [{"alpha_id": row.get("alpha_id"), "source_file": row.get("source_file"),
                 "train_missing": [key for key in ("sharpe", "fitness", "turnover", "margin")
@@ -763,6 +884,8 @@ def cmd_compare(args, _sink):
     if getattr(args, "summary", False):
         data["rows"] = rows[:20]
         data["rows_omitted"] = max(0, len(rows) - 20)
+    if getattr(args, "format", None) == "markdown":
+        data["table"] = _train_table(data["rows"])
 
     return data
 
@@ -798,6 +921,8 @@ def _load_probe_spec(path):
         except ValueError as exc:
             raise CliError("INVALID_INPUT", "spec settings: %s" % exc) from exc
     for index, arm in enumerate(arms, 1):
+        if isinstance(arm, dict):
+            _selection_call(alpha_registry.evidence_role, arm)
         if not isinstance(arm, dict) or not isinstance(arm.get("expression"), str) \
                 or not arm["expression"].strip():
             raise CliError("INVALID_INPUT", "arm %d has no expression" % index,
@@ -1034,6 +1159,7 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
                         "settings_signature": _settings_signature(row.get("settings"))})
             row.pop("metrics_pending", None)
             raw = {"alpha_id": alpha_id, "status": row["status"],
+                   "role": row.get("role"),
                    "expression": row.get("expression"), "settings": row.get("settings") or {},
                    "metrics": payload.get("is"), "out_of_sample": split,
                    "checks": ml._extract_checks(payload), "error": None,
@@ -1095,6 +1221,7 @@ def _load_probe_batch(value):
             if settings is not None and not isinstance(settings, dict):
                 raise CliError("INVALID_INPUT", "probe arm settings must be an object")
             arms.append({"label": row.get("label", "arm%d" % (index + 1)),
+                "role": alpha_registry.evidence_role(row, record),
                 "expression": row.get("expression") or record.get("expression") or "",
                 "settings": settings or {}, "arm_index": index, "ops": row.get("ops"),
                 "design": row.get("design"), "proxy_of": row.get("proxy_of")})
@@ -1109,8 +1236,11 @@ def _load_probe_batch(value):
     for index, (arm, row, record) in enumerate(zip(arms, rows, saved)):
         arm["arm_index"] = index
         arm.setdefault("ops", row.get("ops"))
+        role = _selection_call(alpha_registry.evidence_role, arm, row, record)
+        arm["role"] = role
         record = {**record, "expression": arm["expression"], "settings": arm["settings"],
                   "decay": arm["settings"].get("decay"), "mechanism": arm["label"]}
+        record["role"] = role
         for key in ("alpha_id", "status", "progress_url", "next_poll_at", "submission_attempted", "error"):
             if key not in record and key in row:
                 record[key] = row[key]
@@ -1163,6 +1293,7 @@ def _recover_probe_batch(args, path):
                 record.pop(key, None)
         if raw is not None:
             record.pop("metrics_pending", None)
+        simulation_slots.reconcile_record(record)
         _probe_document_update(document, path)
         cache_store.write_json_atomic(path, document, indent=1)
 
@@ -1182,7 +1313,7 @@ def _recover_probe_batch(args, path):
     _probe_reconcile(document)
     _probe_document_update(document, path)
     cache_store.write_json_atomic(path, document, indent=1)
-    result = _probe_response(document, path, show_test, manifest)
+    result = _probe_response(document, path, show_test, manifest, summary=getattr(args, "summary", False))
     if show_test:
         research_paths.log_view("probe-recover", "test", [row.get("alpha_id") for row in result["rows"]],
                                 note={"selection_id": manifest["selection_id"], "batch_path": str(path)})
@@ -1347,7 +1478,15 @@ def _request_fingerprint(arms):
                                      ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def cmd_probe(args, _sink):
+def cmd_probe(args, sink):
+    _requested_concurrency(args)
+    result = _cmd_probe(args, sink)
+    if getattr(args, "summary", False):
+        _summarize_probe_response(result)
+    return result
+
+
+def _cmd_probe(args, _sink):
     """Prepare exact requests before checking, executing or continuing a batch."""
     recover = getattr(args, "recover", None)
     resume = getattr(args, "resume", None)
@@ -1358,6 +1497,7 @@ def cmd_probe(args, _sink):
     if getattr(args, "show_test", False) and (not recover or not getattr(args, "selection", None)):
         raise CliError("USAGE", "--show-test requires --recover and --selection; it cannot start simulations")
     if recover:
+        _reject_saved_overrides(args)
         return _cmd_probe_recover(args)
     if resume:
         return _cmd_probe_resume(args)
@@ -1368,6 +1508,7 @@ def cmd_probe(args, _sink):
     base = {"name": name, **context, "path": str(target), "arms": len(arms),
             "groups": len(groups), "design": design, "arm_order": [arm["label"] for arm in arms],
             "request_fingerprint": _request_fingerprint(arms),
+            "concurrency": _requested_concurrency(args),
             "settings": [group["settings"] for group in groups.values()]}
     gate_blocking = [{"code": "exact_repeat", "label": arm["label"],
                       "evidence_keys": verdict["exact_repeat_keys"]}
@@ -1384,11 +1525,16 @@ def cmd_probe(args, _sink):
                 strict_fields=scoped.get("known_fields") is not None)
             attach_field_contracts(report, scoped)
             reports.append({**report, "scope": scoped.get("evidence")})
+            scheduling = {}
             preview = ml.simulate_alphas(None, group["pairs"], settings=group["settings"],
-                                        labels=[arm["label"] for arm in group["arms"]], dry_run=True)
+                labels=[arm["label"] for arm in group["arms"]], dry_run=True,
+                concurrency=base["concurrency"], scheduling_report=scheduling,
+                capability_snapshot=getattr(args, "capability_snapshot", None))
+            reports[-1]["scheduling"] = scheduling
             for record, arm in zip(preview, group["arms"]):
                 index = arm["arm_index"]
                 results[index] = {**record, "label": arm["label"], "arm_index": index,
+                    "role": arm.get("role"),
                     "design": arm.get("design"), "proxy_of": arm.get("proxy_of"),
                     "settings": arm["settings"], "gate": gate[index],
                     "turnover_band": _turnover_band(arm["expression"])}
@@ -1407,9 +1553,11 @@ def cmd_probe(args, _sink):
         raise CliError("INVALID_INPUT", "exact finished requests repeat under --strict-gate",
                        details={"gate_blocking": gate_blocking})
     if check:
-        reports = with_session(args, lambda session: [
-            _preflight_lint(session, group["pairs"], group["settings"], args)
-            for group in groups.values()])
+        def check_groups(session):
+            base["capability_snapshot"] = _invocation_capabilities(session, args)
+            return [_preflight_lint(session, group["pairs"], group["settings"], args)
+                    for group in groups.values()]
+        reports = with_session(args, check_groups)
         return {**base, "check": True, "preflight": reports,
                 "preflight_complete": all(bool(report) and report.get("ok", False) for report in reports),
                 "run_id": None, "started_at": None,
@@ -1427,6 +1575,7 @@ def cmd_probe(args, _sink):
 def _probe_row(record, arm, gate, show_test):
     train = _train_metrics(record)
     row = {"label": arm["label"], "alpha_id": record.get("alpha_id"),
+           "role": alpha_registry.evidence_role(arm, record),
            "design": arm.get("design"), "proxy_of": arm.get("proxy_of"),
            "expression": arm["expression"], "decay": record.get("decay"),
            "settings": dict(record["settings"]),
@@ -1434,6 +1583,7 @@ def _probe_row(record, arm, gate, show_test):
            "status": record.get("status"), "error": record.get("error"),
            "train_sharpe": train.get("sharpe"), "train_fitness": train.get("fitness"),
            "train_turnover": train.get("turnover"), "train_returns": train.get("returns"),
+           "train_margin": train.get("margin"),
            "train_sharpe_h1": (record.get("half_sharpes") or (None, None))[0],
            "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
            "ops": arm["ops"], "gate": gate}
@@ -1480,12 +1630,15 @@ def _probe_document_update(document, target):
     if document.get("recording_policy", {}).get("enabled") and not document.get("recording"):
         actions.append({"action": "recover", "batch_path": str(target), "reason": "reconcile_recording"})
     document["next_actions"] = actions
+    for action in actions:
+        action["argv"] = ["python", "research_cli.py", "probe", "--" + action["action"], str(target)]
 
 
-def _probe_response(document, path, show_test=False, manifest=None):
+def _probe_response(document, path, show_test=False, manifest=None, summary=False):
     keys = ("name", "idea", "mechanism", "note", "run_id", "started_at", "request_fingerprint",
             "arm_order", "design", "complete", "incomplete", "all_empty", "comparisons",
-            "execution", "recording", "recording_policy", "next_actions", "preflight")
+            "execution", "recording", "recording_policy", "next_actions", "preflight",
+            "concurrency", "scheduling", "capability_snapshot")
     rows = [_probe_visible_row(row, show_test) for row in document["rows"]]
     if manifest is not None:
         sources = {row.get("source_file") for row in manifest["rows"] if row.get("source_file")}
@@ -1510,6 +1663,8 @@ def _probe_response(document, path, show_test=False, manifest=None):
         response["registry"] = document["recording"]
     if manifest:
         response["selection_id"] = manifest["selection_id"]
+    if summary:
+        response["summary"] = _probe_summary(response)
     return response
 
 
@@ -1561,6 +1716,7 @@ def _execute_probe(args, document, target, groups):
         arm = document["arms"][index]
         merged.update({"settings": dict(arm["settings"]), "expression": arm["expression"],
                        "mechanism": arm["label"], "decay": arm["settings"]["decay"]})
+        merged["role"] = alpha_registry.evidence_role(arm, records[index], payload)
         if kind == "submitting":
             merged.update({"submission_attempted": True, "status": "UNKNOWN_SUBMISSION"})
         if merged.get("alpha_id") or merged.get("progress_url"):
@@ -1581,35 +1737,50 @@ def _execute_probe(args, document, target, groups):
         note("  %s" % kind)
 
     def work(session):
-        document["preflight"] = [_preflight_lint(session, group["pairs"], group["settings"], args)
-                                 for group in groups.values()]
+        document["capability_snapshot"] = _invocation_capabilities(session, args)
+        document.setdefault("preflight", [])
         save()
         deadline = time.monotonic() + getattr(args, "max_wait_seconds", 300.0)
-        for group in groups.values():
+        ordered = sorted(groups.values(), key=lambda group: any(
+            _submission_state(records[arm["arm_index"]]) == "not_submitted" for arm in group["arms"]))
+        for group in ordered:
             indices = [arm["arm_index"] for arm in group["arms"]]
+            launching = any(_submission_state(records[index]) == "not_submitted" for index in indices)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
-            produced = guarded_sim.simulate([expression for expression, _ in group["pairs"]],
-                group["settings"], labels=[arm["label"] for arm in group["arms"]], session=session,
-                force=getattr(args, "allow_lint_errors", False),
-                initial_records=[records[index] for index in indices], max_wait_seconds=remaining,
+            scheduling = {}
+            document.setdefault("scheduling", []).append(scheduling)
+            options = dict(labels=[arm["label"] for arm in group["arms"]],
+                concurrency=document["concurrency"], capability_snapshot=document["capability_snapshot"],
+                scheduling_report=scheduling, initial_records=[records[index] for index in indices],
+                max_wait_seconds=remaining,
                 on_event=lambda kind, payload, positions=indices: progress(positions, kind, payload))
+            if launching:
+                preflight = _preflight_lint(session, group["pairs"], group["settings"], args)
+                document["preflight"].append(preflight)
+                save()
+                produced = guarded_sim.simulate([expression for expression, _ in group["pairs"]],
+                    group["settings"], session=session, preflight=preflight,
+                    force=getattr(args, "allow_lint_errors", False), **options)
+            else:
+                produced = ml.simulate_alphas(session, group["pairs"], settings=group["settings"], **options)
             with state_lock:
                 for index, record in zip(indices, produced):
                     update(index, record)
                 save()
-            if any(record.get("progress_url") or record.get("metrics_pending")
+            if launching and any(record.get("progress_url") or record.get("metrics_pending")
                    or record.get("status") in {"PENDING", "QUEUED", "UNKNOWN_SUBMISSION"} for record in produced):
                 break
         _probe_halves(session, records)
 
+    document["concurrency"] = _requested_concurrency(args, document)
     save()
     if groups:
         with_session(args, work)
     _probe_reconcile(document)
     save()
-    return _probe_response(document, target)
+    return _probe_response(document, target, summary=getattr(args, "summary", False))
 
 
 def _run_probe(args, spec, name, groups, design, gate, target):
@@ -1623,11 +1794,20 @@ def _run_probe(args, spec, name, groups, design, gate, target):
             "registry": str(Path(getattr(args, "registry", None) or alpha_registry.default_registry_path()).resolve())},
         "records": [{"expression": arm["expression"], "decay": arm["settings"]["decay"],
                      "settings": dict(arm["settings"]), "mechanism": arm["label"], "status": "QUEUED",
+                     "role": arm.get("role"),
                      "alpha_id": None, "metrics": None, "submission_attempted": False} for arm in arms]}
     return _execute_probe(args, document, target, groups)
 
 
+def _reject_saved_overrides(args):
+    changing = ("setting", "region", "universe", "instrument_type", "neutralization",
+                "decay", "delay", "truncation", "pasteurization", "nan_handling", "test_period")
+    if any(getattr(args, key, None) is not None for key in changing):
+        raise CliError("USAGE", "resume/recover uses saved settings; explicit overrides are not allowed")
+
+
 def _cmd_probe_resume(args):
+    _reject_saved_overrides(args)
     changing = ("spec", "name", "batch_path", "registry", "cost_bps", "region", "universe",
                 "instrument_type", "neutralization", "decay", "delay", "truncation",
                 "pasteurization", "nan_handling", "test_period", "force", "no_record")
@@ -1645,16 +1825,17 @@ def _cmd_probe_resume(args):
                 raise CliError("INVALID_INPUT", "legacy batch lacks exact requests; cannot resume")
             if _submission_state(record) == "not_submitted" and ml.resolve_settings(arm["settings"]) != arm["settings"]:
                 raise CliError("INVALID_INPUT", "legacy batch lacks complete resolved settings; cannot start a new POST")
-            group = groups.setdefault(_settings_signature(arm["settings"]),
+            group = groups.setdefault((_settings_signature(arm["settings"]), _submission_state(record)),
                                       {"settings": arm["settings"], "arms": [], "pairs": []})
             group["arms"].append(arm)
             group["pairs"].append((arm["expression"], arm["settings"].get("decay")))
         return groups
 
     if getattr(args, "dry_run", False):
+        document["concurrency"] = _requested_concurrency(args, document)
         groups = groups_for(document)
         _probe_document_update(document, path)
-        return {**_probe_response(document, path), "dry_run": True, "resume": True,
+        return {**_probe_response(document, path, summary=getattr(args, "summary", False)), "dry_run": True, "resume": True,
                 "continuing": [arm["label"] for group in groups.values() for arm in group["arms"]],
                 "blocked_unknown": [arm["label"] for arm, record in zip(document["arms"], document["records"])
                                     if _submission_state(record) == "unknown_submission"]}
@@ -1668,8 +1849,7 @@ def _cmd_probe_resume(args):
 
 def cmd_simulate(args, sink):
     """Simulate a batch of expressions, or dry-run exact payloads offline."""
-    if not 1 <= args.batch_size <= 3:
-        raise CliError("INVALID_INPUT", "--batch-size must be between 1 and 3")
+    concurrency = _requested_concurrency(args)
     metadata = {}
     file_settings, alphas = collect_alphas(args, metadata=metadata)
     settings = merge_settings(file_settings, args)
@@ -1680,12 +1860,19 @@ def cmd_simulate(args, sink):
     labels = ml.alpha_labels(alphas, len(pairs))
     families = ml.alpha_families(alphas, len(pairs))
     candidates = ml.alpha_candidate_ids(alphas, len(pairs))
+    roles = [_selection_call(alpha_registry.evidence_role, alpha) if isinstance(alpha, dict) else None
+             for alpha in alphas]
 
     if args.dry_run:
+        scheduling = {}
         records = ml.simulate_alphas(
             None, pairs, settings=settings, dry_run=True, labels=labels,
             families=families, candidates=candidates,
+            concurrency=concurrency, capability_snapshot=getattr(args, "capability_snapshot", None),
+            scheduling_report=scheduling,
         )
+        for record, role in zip(records, roles):
+            record["role"] = role
         # Offline lint: catches structural problems and learned rejections. The
         # authoritative operator check needs the catalog, so it runs on `lint`
         # and on a real submission below, not here.
@@ -1697,6 +1884,7 @@ def cmd_simulate(args, sink):
             "status": "DRY_RUN",
             "dry_run": True,
             "settings": settings,
+            "concurrency": concurrency, "scheduling": scheduling,
             "summary": {"total": len(records), "payloads": len(records)},
             "lint": {
                 "operator_catalog_checked": False,
@@ -1712,12 +1900,20 @@ def cmd_simulate(args, sink):
     # Real submission: lint against the operator catalog first. An unknown
     # operator would otherwise burn a submission slot and a polling wait before
     # BRAIN rejected it -- exactly how `regression_neut` cost a round trip.
-    with_session(args, lambda s: _preflight_lint(s, pairs, settings, args))
+    def preflight(session):
+        _invocation_capabilities(session, args)
+        return _preflight_lint(session, pairs, settings, args)
+    with_session(args, preflight)
 
     checkpoint_path, checkpoint = _prepare_simulation_run(
-        settings, pairs, args.batch_size, args.checkpoint,
-        labels=labels, families=families, candidates=candidates, metadata=metadata,
+        settings, pairs, concurrency, args.checkpoint,
+        labels=labels, families=families, candidates=candidates, metadata=metadata, roles=roles,
     )
+    checkpoint["capability_snapshot"] = args.capability_snapshot
+    checkpoint["scheduling"] = {}
+    checkpoint["recording_policy"] = {key: getattr(args, key, None)
+        for key in ("record", "registry", "idea", "mechanism", "family", "note")}
+    _write_simulation_checkpoint(checkpoint_path, checkpoint)
     on_event = _simulation_checkpoint_callback(checkpoint_path, checkpoint, sink)
     records = with_session(
         args,
@@ -1725,7 +1921,8 @@ def cmd_simulate(args, sink):
             s,
             pairs,
             settings=settings,
-            batch_size=args.batch_size,
+            concurrency=concurrency, capability_snapshot=checkpoint["capability_snapshot"],
+            scheduling_report=checkpoint["scheduling"],
             on_event=on_event,
             max_wait_seconds=args.max_wait_seconds,
             initial_records=checkpoint["records"],
@@ -1746,6 +1943,7 @@ def cmd_simulate(args, sink):
 
 def cmd_resume(args, sink):
     """Resume pending, queued or unpolled simulations from an atomic checkpoint file."""
+    _reject_saved_overrides(args)
     path = Path(args.checkpoint).expanduser().resolve()
     try:
         with cache_store.file_lock(str(path) + ".lock", timeout=0):
@@ -1786,7 +1984,15 @@ def _resume_simulation(args, sink, path):
         for record in records
     ]
     settings = checkpoint.get("settings") or ml.default_settings()
-    batch_size = checkpoint.get("batch_size", 3)
+    concurrency = _requested_concurrency(args, checkpoint)
+    checkpoint["concurrency"] = concurrency
+    policy = checkpoint.get("recording_policy")
+    if isinstance(policy, dict):
+        for key, value in policy.items():
+            requested = getattr(args, key, None)
+            if requested is not None and requested is not False and requested != value:
+                raise CliError("USAGE", "resume uses the saved recording policy; %s cannot change" % key)
+            setattr(args, key, value)
     if not any(
         record.get("progress_url")
         or record.get("metrics_pending")
@@ -1798,20 +2004,14 @@ def _resume_simulation(args, sink, path):
             records, settings, args, path, checkpoint, explicit=True
         )
     on_event = _simulation_checkpoint_callback(path, checkpoint, sink)
-    records = with_session(
-        args,
-        lambda s: ml.simulate_alphas(
-            s,
-            pairs,
-            settings=settings,
-            batch_size=batch_size,
-            on_event=on_event,
-            max_wait_seconds=args.max_wait_seconds,
-            initial_records=checkpoint["records"],
-            labels=labels,
-            candidates=candidates,
-        ),
-    )
+    checkpoint["scheduling"] = {}
+    def resume(session):
+        checkpoint["capability_snapshot"] = _invocation_capabilities(session, args)
+        return ml.simulate_alphas(session, pairs, settings=settings, concurrency=concurrency,
+            capability_snapshot=checkpoint["capability_snapshot"], scheduling_report=checkpoint["scheduling"],
+            on_event=on_event, max_wait_seconds=args.max_wait_seconds,
+            initial_records=checkpoint["records"], labels=labels, candidates=candidates)
+    records = with_session(args, resume)
     return _finalize_simulation(
         records,
         settings,

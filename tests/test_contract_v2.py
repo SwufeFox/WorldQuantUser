@@ -671,6 +671,33 @@ class CatalogValidationTests(unittest.TestCase):
                          {"type_mismatch"})
         self.assertTrue(report["results"][1]["ok"])
 
+    def test_guarded_reuse_is_bound_to_exact_settings_and_expressions(self):
+        expression = "rank(vec_avg(catalog_vector))"
+        settings = machine_lib.resolve_settings({"decay": 4})
+        report = cli_validation._preflight_lint(
+            self.session, [(expression, 4)], settings, self.args(expression))
+        self.fields.reset_mock()
+        with mock.patch.object(guarded_sim, "check", side_effect=AssertionError("duplicate catalog enumeration")):
+            rows = guarded_sim.simulate([expression], settings, session=self.session,
+                                        preflight=report, dry_run=True)
+            self.assertEqual(rows[0]["payload"]["regular"], expression)
+            self.assertEqual(rows[0]["payload"]["settings"], settings)
+            for expressions, changed in ((["rank(close)"], settings),
+                                         ([expression], {**settings, "decay": 5}),
+                                         ([expression], {**settings, "futureOption": True})):
+                with self.subTest(settings=changed), self.assertRaises(guarded_sim.UnknownNameError):
+                    guarded_sim.simulate(expressions, changed, session=self.session,
+                                         preflight=report, force=True, dry_run=True)
+        self.fields.assert_not_called()
+
+    def test_guarded_force_cannot_bypass_authoritative_setting_rejection(self):
+        settings = machine_lib.resolve_settings({"decay": 4})
+        report = {"checked_requests": {"settings": settings, "pairs": [["rank(close)", 4]]},
+                  "errors": [{"code": "unsupported_setting", "setting": "decay"}]}
+        with self.assertRaises(guarded_sim.UnknownNameError):
+            guarded_sim.simulate(["rank(close)"], settings, session=self.session,
+                                 preflight=report, force=True, dry_run=True)
+
 
 class AlphaRegistryTests(unittest.TestCase):
     def _alpha(self, alpha_id="ABC123", expression="rank(close)", sharpe=1.4,

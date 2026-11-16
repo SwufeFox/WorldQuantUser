@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+
 
 import cache_store
 import machine_lib as ml
+import simulation_capabilities
 
 DISCLOSURE_DATASETS = frozenset({"fundamental2", "fundamental6", "analyst4"})
 
@@ -18,35 +19,27 @@ def scope_settings(settings):
             for key in ("region", "universe", "delay", "instrumentType")}
 
 
-def account_provenance(session=None):
-    """Hash local identity evidence without logging in or storing credentials."""
-    auth = getattr(session, "auth", None)
-    username = auth[0] if isinstance(auth, (tuple, list)) and auth else os.environ.get("BRAIN_USERNAME")
-    identity = {}
-    if isinstance(username, str) and username.strip():
-        identity["username"] = username.strip().casefold()
-    entry = cache_store.read_entry(ml.session_cache_path())
-    payload = entry.get("payload")
-    if entry.get("fresh") and isinstance(payload, dict) and payload.get("user_id"):
-        matches = session is None
-        if session is not None:
-            cookies = getattr(session, "cookies", None)
-            matches = hasattr(cookies, "get_dict") and cookies.get_dict() == payload.get("cookies")
-        if matches:
-            identity["user_id"] = str(payload["user_id"])
-    if not identity:
-        return {"state": "unknown", "fingerprint": None, "sources": []}
-    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
-    return {"state": "known", "fingerprint": digest, "sources": sorted(identity)}
 
 
 def snapshot_path(scope, account):
     return ml.metadata_cache_path("capabilities", {"scope": scope, "account": account.get("fingerprint")})
 
 
+def _identify_evidence(records, evidence):
+    freshness = evidence.get("freshness") or {}
+    evidence["as_of"] = freshness.get("as_of")
+    evidence["age_seconds"] = freshness.get("age_seconds", 0.0 if freshness.get("state") == "fresh" else None)
+    identity = {"account": (evidence.get("account") or {}).get("fingerprint"), "scope": evidence.get("scope"),
+                "coverage": evidence.get("coverage"), "records": records}
+    evidence["capability_id"] = hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return evidence
+
+
 def field_scope(records, evidence):
     verified = evidence.get("state") == "verified"
     evidence = dict(evidence)
+    _identify_evidence(records, evidence)
     evidence["type_coverage"] = {
         "known_count": sum(bool(row.get("type")) for row in records) if verified else 0,
         "unknown_fields": sorted(row["id"] for row in records if row.get("id") and not row.get("type")) if verified else None,
@@ -66,8 +59,10 @@ def field_scope(records, evidence):
 
 def save_snapshot(session, settings, records, coverage):
     """Persist only a complete live scope; unidentified accounts remain unknown offline."""
-    scope, account = scope_settings(settings), account_provenance(session)
-    if not coverage.get("complete") or not records or account["state"] != "known":
+    scope, account = scope_settings(settings), simulation_capabilities.account_provenance(session)
+    if (coverage.get("complete") is not True or coverage.get("full_scope") is not True
+            or not isinstance(records, list) or coverage.get("field_count") != len(records)
+            or account["state"] != "known"):
         return None
     payload = {"version": 1, "scope": scope, "account": account,
                "coverage": coverage, "records": records}
@@ -87,10 +82,19 @@ def fetch_fields(session, region="USA", universe="TOP3000", delay=1,
     import field_index
 
     evidence = report if report is not None else {}
-    evidence["account"] = account_provenance(session)
+    evidence["account"] = simulation_capabilities.account_provenance(session)
     records = field_index.fetch_all_fields(
         session, region=region, universe=universe, delay=delay,
         instrument_type=instrument_type, dataset_ids=dataset_ids, report=evidence, refresh=refresh)
+    catalogs = evidence.get("catalogs") or []
+    coverage = evidence.get("coverage") or {}
+    if (coverage.get("full_scope") is True and catalogs
+            and all(row.get("complete") is True and not any(
+                row.get(key) for key in ("hit", "stale", "degraded", "error")) for row in catalogs)):
+        # Successful full enumeration can authoritatively advertise zero fields.
+        coverage["complete"] = True
+        evidence["state"] = "verified"
+    _identify_evidence(records, evidence)
     if evidence.get("coverage", {}).get("complete"):
         try:
             evidence["snapshot"] = save_snapshot(session, evidence["scope"], records, evidence["coverage"])
@@ -107,7 +111,7 @@ def required_field_scope(session, settings, required_fields):
     session. Unrelated catalog failures cannot invalidate that narrower proof,
     and a partial proof is never saved as a complete offline capability scope.
     """
-    scope, account = scope_settings(settings), account_provenance(session)
+    scope, account = scope_settings(settings), simulation_capabilities.account_provenance(session)
     required = set(required_fields or ())
     entry = cache_store.read_entry(snapshot_path(scope, account))
     payload = entry.get("payload")
@@ -117,7 +121,8 @@ def required_field_scope(session, settings, required_fields):
     routes = {}
     if (required and account.get("state") == "known"
             and entry.get("kind") == "scoped-capabilities" and payload.get("version") == 1
-            and payload.get("scope") == scope and payload.get("account") == account
+            and payload.get("scope") == scope and isinstance(payload.get("account"), dict)
+            and payload["account"].get("fingerprint") == account.get("fingerprint")
             and isinstance(coverage, dict) and coverage.get("complete") is True
             and coverage.get("full_scope") is True and isinstance(records, list)
             and coverage.get("field_count") == len(records)):
@@ -175,7 +180,7 @@ def required_field_scope(session, settings, required_fields):
 
 def cached_field_scope(settings, max_age_seconds=None):
     """Read exactly one scope/account snapshot; unknown metadata is never verified."""
-    scope, account = scope_settings(settings), account_provenance()
+    scope, account = scope_settings(settings), simulation_capabilities.account_provenance()
     maximum = ml.metadata_cache_policy()["max_age"] if max_age_seconds is None else float(max_age_seconds)
     entry = cache_store.read_entry(snapshot_path(scope, account))
     payload = entry.get("payload")
@@ -183,7 +188,7 @@ def cached_field_scope(settings, max_age_seconds=None):
     age = entry.get("age_seconds")
     fresh = bool(entry.get("fresh") and age is not None and 0 <= age <= maximum)
     records = payload.get("records")
-    records_valid = isinstance(records, list) and bool(records) and all(
+    records_valid = isinstance(records, list) and all(
         isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"] for row in records)
     coverage = payload.get("coverage") or {}
     reasons = []
@@ -191,13 +196,14 @@ def cached_field_scope(settings, max_age_seconds=None):
         reasons.append("account_unknown")
     if not entry.get("present"):
         reasons.append("snapshot_missing_or_invalid")
-    if payload.get("scope") != scope or payload.get("account") != account:
+    if (payload.get("scope") != scope or not isinstance(payload.get("account"), dict)
+            or payload["account"].get("fingerprint") != account.get("fingerprint")):
         reasons.append("scope_or_account_mismatch")
     if not fresh:
         reasons.append("freshness_unverified")
     if (payload.get("version") != 1 or entry.get("kind") != "scoped-capabilities"
             or not isinstance(coverage, dict) or coverage.get("complete") is not True
-            or coverage.get("full_scope") is not True or not coverage.get("dataset_ids")
+            or coverage.get("full_scope") is not True or not isinstance(coverage.get("dataset_ids"), list)
             or not records_valid or coverage.get("field_count") != len(records)):
         reasons.append("coverage_incomplete")
     evidence = {"state": "unknown" if reasons else "verified", "source": "private_snapshot",

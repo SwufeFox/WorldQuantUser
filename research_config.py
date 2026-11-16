@@ -44,6 +44,8 @@ RESEARCH_FILE_SPEC = {
             "ablate requires exactly one composite; its file and --expr inputs are mutually exclusive.",
             "alphas entries may be plain strings, {expression, decay} objects, or "
             "[expression, decay] pairs.",
+            "Optional role is candidate or diagnostic. Diagnostic evidence is kept for attribution, not candidate promotion.",
+            "Additional setting keys remain available through settings or --setting NAME=VALUE; live account metadata determines support.",
         ],
     },
     "plain_text": {
@@ -128,9 +130,8 @@ def load_research_file(path):
 def build_config(settings=None, alphas=None):
     """Validate and return ``(resolved_settings, [(expression, decay), ...])``.
 
-    Raises :class:`ResearchError` for unknown regions/neutralizations, bad
-    decays or empty expressions -- i.e. everything worth catching before
-    spending simulation quota.
+    Raises :class:`ResearchError` for malformed settings, invalid decays or empty
+    expressions. Account availability is checked separately against live metadata.
     """
     try:
         resolved = ml.resolve_settings(settings or {})

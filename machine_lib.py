@@ -301,6 +301,7 @@ def authenticate():
         "token_expiry": (token or {}).get("expiry") if isinstance(token, dict)
         else payload.get("tokenExpiry"),
     }
+    session._brain_account_id = info["user_id"]
     return session, info
 
 
@@ -338,9 +339,12 @@ def legacy_session_cache_path():
 
 
 def _session_payload(session, info):
+    auth = getattr(session, "auth", None)
+    username = auth[0] if isinstance(auth, (tuple, list)) and auth else None
     return {
         "cookies": requests.utils.dict_from_cookiejar(session.cookies),
         "user_id": (info or {}).get("user_id"),
+        "username": username.strip().casefold() if isinstance(username, str) else None,
         "permissions": (info or {}).get("permissions"),
         "token_expiry": (info or {}).get("token_expiry"),
     }
@@ -415,6 +419,7 @@ def _session_from_entry(payload):
     session = requests.Session()
     session.auth = get_credentials()
     session.cookies.update(payload.get("cookies") or {})
+    session._brain_account_id = payload.get("user_id")
     return session
 
 
@@ -1223,30 +1228,23 @@ def normalize_setting_keys(overrides=None):
 
 
 def resolve_settings(overrides=None):
-    """Merge ``overrides`` onto :data:`DEFAULT_SETTINGS` and validate the result.
+    """Merge defaults and validate structure, leaving platform support to evidence.
 
-    Returns a fresh dict. Raises ``ValueError`` on an unknown region, a malformed
-    neutralization or a bad delay so callers fail before spending quota. A
-    well-formed neutralization that is merely missing from :data:`NEUTRALIZATIONS`
-    is passed through: the platform owns that enum, and refusing a value here makes
-    "not yet tried" indistinguishable from "cannot be expressed".
+    Observed enum lists are hints, not permission gates. Explicit null extension
+    values are retained; null known settings retain their historical default.
     """
     settings = dict(DEFAULT_SETTINGS)
     for key, value in normalize_setting_keys(overrides).items():
-        if value is not None:
+        if value is not None or key not in DEFAULT_SETTINGS:
             settings[key] = value
-    if settings["region"] not in REGIONS:
-        raise ValueError(
-            "unknown region %r (known: %s)" % (settings["region"], ", ".join(REGIONS))
-        )
-    neutralization = str(settings["neutralization"])
-    if neutralization not in NEUTRALIZATIONS and not _SETTING_TOKEN.match(neutralization):
-        raise ValueError(
-            "unknown neutralization %r (known: %s)"
-            % (settings["neutralization"], ", ".join(NEUTRALIZATIONS))
-        )
-    if settings["delay"] not in (0, 1):
-        raise ValueError("delay must be 0 or 1, got %r" % (settings["delay"],))
+    for key in ("region", "instrumentType", "universe", "neutralization",
+                "pasteurization", "nanHandling"):
+        value = settings.get(key)
+        if not isinstance(value, str) or not _SETTING_TOKEN.fullmatch(value):
+            raise ValueError("%s must be a well-formed settings token, got %r" % (key, value))
+    delay = settings["delay"]
+    if isinstance(delay, bool) or not isinstance(delay, int) or delay < 0:
+        raise ValueError("delay must be a non-negative integer, got %r" % (delay,))
     return settings
 
 
@@ -1265,7 +1263,7 @@ def _single_simulation_data(expression, decay, settings):
 #: unknown key turns a wasted experiment into a message.
 _ALPHA_ENTRY_KEYS = frozenset({
     "expression", "decay", "mechanism", "label", "name",
-    "family", "candidate_id", "idea", "hypothesis", "note",
+    "family", "candidate_id", "idea", "hypothesis", "note", "role",
 })
 
 
@@ -1291,6 +1289,9 @@ def normalize_alphas(alphas, settings):
                        ", ".join(sorted(_ALPHA_ENTRY_KEYS))))
             expression = item.get("expression")
             decay = item.get("decay", default_decay)
+            if "role" in item and (not isinstance(item["role"], str)
+                                   or item["role"] not in {"candidate", "diagnostic"}):
+                raise ValueError("alphas[%d] role must be candidate or diagnostic" % index)
         elif isinstance(item, (list, tuple)) and item:
             expression, decay = item[0], (item[1] if len(item) > 1 else default_decay)
         else:
@@ -1355,11 +1356,49 @@ def alpha_labels(alphas, count):
     return labels
 
 
+# Local fallback policy only; the platform's unpublished capacity stays unknown.
+DEFAULT_LOCAL_CONCURRENCY = 3
+
+
+def concurrency_plan(session, requested=None, capability_snapshot=None):
+    """Resolve an invocation budget from supplied/cached account evidence.
+
+    Never discovers capabilities online. Three is a conservative local default,
+    not a platform allowance; any explicit positive integer budget is valid.
+    Only a verified capacity bound to the current account can clamp the budget.
+    """
+    import simulation_capabilities
+
+    if requested is not None and (
+        isinstance(requested, bool) or not isinstance(requested, int) or requested < 1
+    ):
+        raise ValueError("concurrency must be a positive integer")
+    evidence = capability_snapshot if capability_snapshot is not None else simulation_capabilities.cached()
+    account = simulation_capabilities.account_provenance(session) if session is not None else evidence.get("account", {})
+    capacity = evidence.get("concurrency") or {}
+    evidence_account = evidence.get("account") or {}
+    matched = bool(account.get("fingerprint")) and account.get("fingerprint") == evidence_account.get("fingerprint")
+    limit = capacity.get("limit")
+    verified = (evidence.get("state") == "verified" and capacity.get("state") == "verified"
+                and matched and isinstance(limit, int) and not isinstance(limit, bool) and limit >= 0)
+    budget = requested if requested is not None else (limit if verified else DEFAULT_LOCAL_CONCURRENCY)
+    return {
+        "requested": requested,
+        "effective": min(budget, limit) if verified else budget,
+        "platform_limit": limit if verified else None,
+        "source": ("explicit_local_budget" if requested is not None else
+                   "verified_platform_limit" if verified else "conservative_local_default"),
+        "platform_source": capacity.get("source") if verified else None,
+        "account": account,
+        "capability_id": evidence.get("capability_id"),
+    }
+
+
 def simulate_alphas(
     s,
     alphas,
     settings=None,
-    batch_size=3,
+    batch_size=None,
     dry_run=False,
     on_event=None,
     max_wait_seconds=None,
@@ -1367,6 +1406,9 @@ def simulate_alphas(
     labels=None,
     families=None,
     candidates=None,
+    concurrency=None,
+    capability_snapshot=None,
+    scheduling_report=None,
 ):
     """Simulate a list of alphas and return one record per expression.
 
@@ -1384,11 +1426,15 @@ def simulate_alphas(
     (and requires no credentials). ``on_event(kind, payload)`` receives
     ``submitted`` / ``polling`` / ``rate_limited`` / ``completed`` events.
     Feeding it the result of ``resolve_settings`` is the caller's job.
+    ``concurrency`` (or the legacy ``batch_size`` argument) is a positive local
+    budget, clamped only by verified account capacity. A full shared workspace
+    journal leaves work queued. Reservations survive interruptions and are
+    reconciled by ``simulation_slots.reconcile_record``; other workspaces and
+    unidentified accounts cannot share these reservations.
     """
     settings = resolve_settings(settings)
-    pairs = alphas if alphas and isinstance(alphas[0], tuple) else normalize_alphas(
-        alphas, settings
-    )
+    pairs = normalize_alphas(alphas, settings)
+    roles = [item.get("role") if isinstance(item, dict) else None for item in alphas]
     if labels is None:
         labels = alpha_labels(alphas, len(pairs))
     elif len(labels) != len(pairs):
@@ -1400,8 +1446,21 @@ def simulate_alphas(
     elif len(families) != len(pairs):
         families = [None] * len(pairs)
 
-    if batch_size < 1 or batch_size > 3:
-        raise ValueError("batch_size must be between 1 and 3")
+    if concurrency is not None and batch_size is not None and concurrency != batch_size:
+        raise ValueError("concurrency and batch_size specify conflicting budgets")
+    requested = concurrency if concurrency is not None else batch_size
+    import simulation_capabilities
+
+    if capability_snapshot is None and not dry_run:
+        capability_snapshot = simulation_capabilities.cached()
+    plan = concurrency_plan(None if dry_run else s, requested,
+                            (capability_snapshot or {}) if dry_run else capability_snapshot)
+    batch_size = max(1, plan["effective"])
+    if scheduling_report is not None:
+        scheduling_report.update(plan)
+        scheduling_report["shared_slots"] = {
+            "state": "dry_run", "scope": "not_reserved", "cross_workspace_coordinated": False,
+        }
     if max_wait_seconds is not None and (
         not math.isfinite(max_wait_seconds) or max_wait_seconds < 0
     ):
@@ -1415,6 +1474,7 @@ def simulate_alphas(
                 "candidate_id": candidates[index],
                 "mechanism": labels[index],
                 "family": families[index],
+                **({"role": roles[index]} if roles[index] is not None else {}),
                 "alpha_id": None,
                 "status": "DRY_RUN",
                 "metrics": None,
@@ -1433,6 +1493,7 @@ def simulate_alphas(
                 "candidate_id": candidates[index],
                 "mechanism": labels[index],
                 "family": families[index],
+                **({"role": roles[index]} if roles[index] is not None else {}),
                 "alpha_id": None,
                 "status": "QUEUED",
                 "submission_attempted": False,
@@ -1446,6 +1507,22 @@ def simulate_alphas(
         records = [dict(record) for record in initial_records]
         if len(records) != len(pairs):
             raise ValueError("initial_records must match the number of alphas")
+        for index, record in enumerate(records):
+            if "role" not in record and roles[index] is not None:
+                record["role"] = roles[index]
+
+    import simulation_slots
+
+    for record in records:
+        simulation_slots.reconcile_record(record, plan["account"])
+
+    def shared_state():
+        state = simulation_slots.snapshot(plan["account"], plan["effective"])
+        if scheduling_report is not None:
+            scheduling_report["shared_slots"] = state
+        return state
+
+    shared_state()
 
     deadline = (
         time.monotonic() + max_wait_seconds
@@ -1555,6 +1632,13 @@ def simulate_alphas(
 
             record["status"] = progress.get("status") or "UNKNOWN"
             record["alpha_id"] = progress.get("alpha")
+            if not record["alpha_id"] and record["status"] not in simulation_slots.TERMINAL_STATUSES:
+                record["status"] = "PENDING"
+                record["progress_url"] = progress_url
+                emit("pending", index, record)
+                return
+            simulation_slots.reconcile_record(record, plan["account"], outcome="terminal")
+            shared_state()
             if progress.get("status") == "ERROR" or progress.get("message"):
                 record["error"] = progress.get("message") or "simulation error"
                 note_operator_rejection(record.get("expression"), record["error"])
@@ -1618,6 +1702,7 @@ def simulate_alphas(
     # Resume accepted jobs first. An unresolved job still occupies one of the
     # platform's limited active slots, so do not submit the next batch yet.
     poll_many(range(len(records)))
+    shared_state()
     if any(
         record.get("progress_url") or record.get("metrics_pending")
         or record.get("status") == "UNKNOWN_SUBMISSION"
@@ -1625,9 +1710,20 @@ def simulate_alphas(
     ):
         return records
 
+    if not plan["effective"]:
+        return records
+
+    snapshot_account = (capability_snapshot or {}).get("account") or {}
+    settings_snapshot = capability_snapshot if (
+        plan["account"].get("fingerprint")
+        and plan["account"]["fingerprint"] == snapshot_account.get("fingerprint")
+    ) else {}
+    settings_checks = {}
+
     for start in range(0, len(pairs), batch_size):
         batch = pairs[start:start + batch_size]
         submitted = []
+        slots_blocked = False
         for offset, (expression, decay) in enumerate(batch):
             index = start + offset
             record = {
@@ -1643,6 +1739,29 @@ def simulate_alphas(
                 return records
             if deadline is not None and deadline - time.monotonic() <= 0:
                 break
+            if decay not in settings_checks:
+                settings_checks[decay] = simulation_capabilities.settings_evidence(
+                    {**settings, "decay": decay}, settings_snapshot)
+            capability_check = settings_checks[decay]
+            if capability_check["unsupported"]:
+                record.update(status="FAILED", submission_attempted=False,
+                              error="settings are unsupported by current account metadata",
+                              settings_capabilities=capability_check)
+                records[index] = record
+                emit("failed", index, record)
+                continue
+            identity, slots = simulation_slots.reserve(plan["account"], plan["effective"])
+            if scheduling_report is not None:
+                scheduling_report["shared_slots"] = slots
+            if identity is None and slots["available"] == 0:
+                slots_blocked = True
+                record["error"] = "shared simulation slots are occupied; reconcile or resume existing attempts"
+                records[index] = record
+                emit("deferred", index, record)
+                break
+            if identity is not None:
+                record["slot_reservation"] = identity
+                record["slot_reservation_state"] = "submitting"
             record["submission_attempted"] = True
             record["status"] = "UNKNOWN_SUBMISSION"
             records[index] = record
@@ -1654,6 +1773,7 @@ def simulate_alphas(
                     deadline=deadline,
                 )
             except RateLimited as exc:
+                simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
                 record["status"] = "QUEUED"
                 record["submission_attempted"] = False
                 record["error"] = "%s: %s" % (exc.code, exc)
@@ -1661,6 +1781,8 @@ def simulate_alphas(
                 emit("deferred", index, record)
                 break
             except AuthError as exc:
+                simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
+                shared_state()
                 record.update(status="QUEUED", submission_attempted=False, error=str(exc))
                 records[index] = record
                 emit("deferred", index, record)
@@ -1671,18 +1793,19 @@ def simulate_alphas(
                 emit("pending", index, record)
                 break
             except BrainError as exc:
-                record["status"] = "FAILED"
+                record["status"] = "UNKNOWN_SUBMISSION"
                 record["error"] = "%s: %s" % (exc.code, exc)
-                note_operator_rejection(record.get("expression"), record["error"])
                 records[index] = record
-                emit("failed", index, record)
-                continue
+                emit("pending", index, record)
+                break
             except requests.HTTPError as exc:
                 status_code = getattr(exc.response, "status_code", None)
                 refused = status_code is not None and 400 <= status_code < 500
                 record["status"] = "FAILED" if refused else "UNKNOWN_SUBMISSION"
                 record["error"] = "submit failed: %s" % exc
                 if refused:
+                    simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
+                    record["status"] = "FAILED"
                     note_operator_rejection(record.get("expression"), record["error"])
                 records[index] = record
                 emit("failed" if refused else "pending", index, record)
@@ -1697,11 +1820,15 @@ def simulate_alphas(
             record["status"] = "PENDING"
             record["progress_url"] = location
             record["error"] = None
+            simulation_slots.reconcile_record(record, plan["account"], outcome="accepted")
             records[index] = record
             emit("submitted", index, record)
             submitted.append(index)
 
         poll_many(submitted)
+        shared_state()
+        if slots_blocked:
+            return records
         if any(record.get("status") == "UNKNOWN_SUBMISSION" for record in records):
             break
         if any(

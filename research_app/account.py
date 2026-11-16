@@ -6,25 +6,12 @@ import cache_store
 import machine_lib as ml
 import os
 import research_paths
+import simulation_capabilities
 
 from .runtime import with_session
 
 
 
-def _choice_values(spec, context):
-    """Resolve native dependent choices without inventing allowed settings."""
-    choices = spec.get("choices") if isinstance(spec, dict) else None
-    while isinstance(choices, dict):
-        keys = [key for key in context if key in choices]
-        if len(keys) != 1 or not isinstance(choices[keys[0]], dict):
-            return []
-        key = keys[0]
-        branches = choices[key]
-        choices = branches.get(str(context[key]), branches.get(context[key]))
-    if not isinstance(choices, list):
-        return []
-    values = [row.get("value") if isinstance(row, dict) else row for row in choices]
-    return list(dict.fromkeys(value for value in values if type(value) in (str, int)))
 
 
 def _equity_scope_samples(options):
@@ -34,28 +21,34 @@ def _equity_scope_samples(options):
         fields = fields.get(key) if isinstance(fields, dict) else None
     evidence = {"state": "unknown", "source": "live OPTIONS /simulations",
                 "instrument_type": "EQUITY", "advertised_regions": [], "issues": []}
-    if not isinstance(fields, dict) or not _choice_values(fields.get("instrumentType"), {}):
+    instruments = simulation_capabilities.choice_values(fields.get("instrumentType"), {}) if isinstance(fields, dict) else None
+    if instruments is None:
         evidence["issues"].append("instrument_type_choices_unavailable")
         return [], evidence
-    if "EQUITY" not in _choice_values(fields["instrumentType"], {}):
+    if "EQUITY" not in instruments:
         evidence.update(state="verified", equity_supported=False)
         return [], evidence
-    regions = _choice_values(fields.get("region"), {"instrumentType": "EQUITY"})
-    regions = [value for value in regions if isinstance(value, str) and value]
+    regions = simulation_capabilities.choice_values(fields.get("region"), {"instrumentType": "EQUITY"})
+    if regions == []:
+        evidence.update(state="verified", equity_supported=True)
+        return [], evidence
+    regions = [value for value in (regions or []) if isinstance(value, str) and value]
     evidence["advertised_regions"] = regions
     if not regions:
         evidence["issues"].append("equity_region_choices_unavailable")
     scopes = []
     for region in regions:
         context = {"instrumentType": "EQUITY", "region": region}
-        delays = [int(value) for value in _choice_values(fields.get("delay"), context)
-                  if value in (0, 1, "0", "1")]
+        advertised_delays = simulation_capabilities.choice_values(fields.get("delay"), context)
+        delays = [int(value) for value in (advertised_delays or [])
+                  if (type(value) is int and value >= 0)
+                  or (isinstance(value, str) and value.isdecimal())]
         if not delays:
             evidence["issues"].append({"region": region, "reason": "delay_choices_unavailable"})
             continue
         delay = ml.DEFAULT_SETTINGS["delay"]
         context["delay"] = delay if delay in delays else delays[0]
-        universes = [value for value in _choice_values(fields.get("universe"), context)
+        universes = [value for value in (simulation_capabilities.choice_values(fields.get("universe"), context) or [])
                      if isinstance(value, str) and value]
         if not universes:
             evidence["issues"].append({"region": region, "reason": "universe_choices_unavailable"})
@@ -71,13 +64,18 @@ def _data_access(session):
     result = {"state": "unknown", "regions": [], "probes": [],
               "coverage": "one advertised equity universe/delay per advertised region; not all combinations"}
     try:
-        options = ml.request_json(session, "OPTIONS", "/simulations")
+        snapshot = simulation_capabilities.fetch(session, refresh=True)
     except ml.AuthError:
         raise
     except ml.BrainError as exc:
         result["settings"] = {"state": "unknown", "error": {"code": exc.code, "message": str(exc)}}
         return result
-    scopes, evidence = _equity_scope_samples(options)
+    result["capabilities"] = snapshot
+    if snapshot.get("error"):
+        result["settings"] = {"state": "unknown", "error": snapshot["error"]}
+        return result
+    scopes, evidence = _equity_scope_samples(
+        {"actions": {"POST": {"settings": {"children": snapshot["settings_schema"]}}}})
     result["settings"] = evidence
     for scope in scopes:
         cache = {}

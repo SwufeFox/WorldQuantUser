@@ -197,6 +197,9 @@ def _checks_summary(checks):
 
 def cmd_buffer_add(args, _sink, *, checked=None):
     """Run the checks on a finished alpha and put it on the shelf without submitting."""
+    from .alphas import _candidate_role, _selection_id
+    role = _candidate_role(args)
+    selection_id = _selection_id(args)
     def work(session):
         payload = ml.fetch_alpha_metrics(session, args.alpha_id)
         if str(payload.get("status") or "").upper() in {"ACTIVE", "SUBMITTED"}:
@@ -226,6 +229,7 @@ def cmd_buffer_add(args, _sink, *, checked=None):
         eligible = bool(computed.get("complete") and checks and not summary["pending"]
                         and not summary["failed"] and self_corr is not None)
         return {"event": "shelved", "alpha_id": args.alpha_id,
+                "role": role,
                 "expression": code,
                 "name": payload.get("name"), "category": payload.get("category"),
                 "status": payload.get("status"),
@@ -235,7 +239,7 @@ def cmd_buffer_add(args, _sink, *, checked=None):
                 "checks": summary, "checks_complete": bool(computed.get("complete")),
                 "eligible": eligible,
                 "eligibility": "eligible" if eligible else "unknown",
-                "selection_id": _selection_id(args),
+                "selection_id": selection_id,
                 "costs": costs.evidence(train, "train", getattr(args, "cost_bps", None)),
                 "book": _book_evidence(args),
                 "self_correlation": self_corr,

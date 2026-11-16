@@ -13,6 +13,7 @@ import expression_lint
 import field_contract
 import field_index
 import machine_lib as ml
+import simulation_capabilities
 from research_app import capabilities, feed, validation
 from research_app.runtime import CliError
 
@@ -258,13 +259,62 @@ class ScopedCacheTests(unittest.TestCase):
         self.assertEqual(result["evidence"]["required_fields"]["unverified_ids"], ["unknown_field"])
         self.assertIsNone(result["known_fields"])
 
+    def test_new_field_discovery_replaces_cached_catalog_without_historical_gate(self):
+        self.capture()
+
+        def datasets(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"id": "new_dataset"}]
+
+        def fields(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"id": "new_field", "type": "NEW_TYPE", "dataset": "new_dataset"}]
+
+        with mock.patch.object(ml, "get_datasets", side_effect=datasets), \
+                mock.patch.object(ml, "get_datafields", side_effect=fields):
+            result = capabilities.required_field_scope(self.session, SETTINGS, {"new_field"})
+        self.assertEqual(result["evidence"]["state"], "verified")
+        self.assertEqual(result["field_types"], {"new_field": "NEW_TYPE"})
+        self.assertEqual(validation.cached_field_scope(SETTINGS)["known_fields"], {"new_field"})
+        self.assertNotIn("sample_matrix", result["known_fields"])
+        for key in ("account", "scope", "source", "as_of", "age_seconds", "capability_id"):
+            self.assertIsNotNone(result["evidence"][key])
+
+    def test_complete_empty_discovery_replaces_removed_field_snapshot(self):
+        self.capture()
+
+        def datasets(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return []
+
+        def fields(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return []
+
+        with mock.patch.object(ml, "get_datasets", side_effect=datasets), \
+                mock.patch.object(ml, "get_datafields", side_effect=fields):
+            result = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"})
+        self.assertEqual(result["known_fields"], set())
+        self.assertEqual(result["evidence"]["state"], "verified")
+        self.assertEqual(result["evidence"]["required_fields"]["state"], "unknown")
+        cached = validation.cached_field_scope(SETTINGS)
+        self.assertEqual(cached["known_fields"], set())
+        self.assertTrue(cached["evidence"]["coverage"]["complete"])
+
+    def test_field_snapshot_matches_principal_despite_source_description_change(self):
+        path = self.capture()
+        payload = cache_store.read_entry(path)["payload"]
+        payload["account"]["sources"] = ["other-confirmation-of-same-principal"]
+        cache_store.write_json_atomic(path, cache_store.build_entry("scoped-capabilities", payload, ttl=3600))
+        self.assertEqual(validation.cached_field_scope(SETTINGS)["evidence"]["state"], "verified")
+
 
 class PreflightEvidenceTests(unittest.TestCase):
     def test_catalog_failure_blocks_before_submission(self):
         session = mock.Mock()
         with mock.patch.object(ml, "fetch_operators", side_effect=RuntimeError("metadata unavailable")), \
                 mock.patch.object(field_index, "fetch_all_fields", side_effect=RuntimeError("metadata unavailable")), \
-                mock.patch.object(capabilities, "account_provenance", return_value={"state": "unknown"}):
+                mock.patch.object(simulation_capabilities, "account_provenance", return_value={"state": "unknown"}):
             with self.assertRaises(CliError) as caught:
                 validation._preflight_lint(session, [("rank(sample_matrix)", 0)], SETTINGS, SimpleNamespace(allow_lint_errors=False))
             report = validation._preflight_lint(session, [("rank(sample_matrix)", 0)], SETTINGS, SimpleNamespace(allow_lint_errors=True))
@@ -280,7 +330,7 @@ class PreflightEvidenceTests(unittest.TestCase):
             return []
         with mock.patch.object(ml, "fetch_operators", return_value=[{"name": "rank"}]), \
                 mock.patch.object(field_index, "fetch_all_fields", side_effect=empty_fields), \
-                mock.patch.object(capabilities, "account_provenance", return_value={"state": "unknown"}):
+                mock.patch.object(simulation_capabilities, "account_provenance", return_value={"state": "unknown"}):
             with self.assertRaises(CliError):
                 validation._preflight_lint(mock.Mock(), [("rank(sample_matrix)", 0)], SETTINGS, SimpleNamespace())
 
@@ -325,7 +375,7 @@ class VerifiedPreflightTests(unittest.TestCase):
 
         with mock.patch.object(ml, "fetch_operators", side_effect=operators), \
                 mock.patch.object(field_index, "fetch_all_fields", side_effect=fields), \
-                mock.patch.object(capabilities, "account_provenance", return_value={"state": "unknown"}):
+                mock.patch.object(simulation_capabilities, "account_provenance", return_value={"state": "unknown"}):
             args = SimpleNamespace(allow_lint_errors=False)
             with self.assertRaises(CliError):
                 validation._preflight_lint(mock.Mock(), [("rank(sample_vector)", 0)], SETTINGS, args)

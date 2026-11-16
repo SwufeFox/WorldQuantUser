@@ -62,6 +62,11 @@ class FakeGuard(types.ModuleType):
 
 class ProbeTests(unittest.TestCase):
     def setUp(self):
+        capability = mock.patch.object(cli_experiments.simulation_capabilities, "fetch", return_value={
+            "state": "unknown", "account": {"state": "unknown"},
+            "concurrency": {"state": "unknown", "limit": None}})
+        capability.start()
+        self.addCleanup(capability.stop)
         self.tmp = tempfile.mkdtemp()
         self.spec_path = os.path.join(self.tmp, "spec.json")
         self.output_dir = tempfile.mkdtemp()
@@ -389,9 +394,9 @@ class ProbeTests(unittest.TestCase):
 
     def test_invalid_later_group_never_authenticates_or_spends_quota(self):
         invalid_arms = [
-            {"expression": "rank(volume)", "settings": {"region": "INVALID"}},
+            {"expression": "rank(volume)", "settings": {"region": "BAD REGION"}},
             {"expression": "rank(volume)", "settings": {"neutralization": "BAD SCHEME"}},
-            {"expression": "rank(volume)", "settings": {"delay": 2}},
+            {"expression": "rank(volume)", "settings": {"delay": -1}},
             {"expression": "rank(volume)", "settings": {"decay": -1}},
             {"expression": "rank(volume)", "decay": True},
             {"expression": "rank(volume)", "decay": 1.5},

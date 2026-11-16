@@ -43,6 +43,11 @@ class ProbeWorkflowTests(unittest.TestCase):
             patch = mock.patch.object(app, target, value)
             patch.start()
             self.addCleanup(patch.stop)
+        patch = mock.patch.object(app.simulation_capabilities, "fetch", return_value={
+            "state": "unknown", "account": {"state": "unknown"},
+            "concurrency": {"state": "unknown", "limit": None}})
+        patch.start()
+        self.addCleanup(patch.stop)
         patch = mock.patch.object(app.research_paths, "views_log_path", return_value=str(self.root / "views.jsonl"))
         patch.start()
         self.addCleanup(patch.stop)
@@ -194,7 +199,7 @@ class ProbeWorkflowTests(unittest.TestCase):
     def test_resume_keeps_accepted_job_identity(self):
         def accepted(expressions, settings, **kw):
             record = {"status": "PENDING", "submission_attempted": True,
-                      "progress_url": "https://example.invalid/simulations/synthetic"}
+                      "progress_url": "https://api.worldquantbrain.com/simulations/synthetic"}
             kw["on_event"]("submitted", {"index": 0, **record})
             raise KeyboardInterrupt
         with mock.patch.object(app.guarded_sim, "simulate", side_effect=accepted):
@@ -204,10 +209,17 @@ class ProbeWorkflowTests(unittest.TestCase):
         def resume(expressions, settings, **kw):
             captured.extend(kw["initial_records"])
             return self.simulator(expressions, settings, **kw)
-        with mock.patch.object(app.guarded_sim, "simulate", side_effect=resume):
+        with mock.patch.object(app.guarded_sim, "simulate", side_effect=resume), \
+                mock.patch.object(ml, "poll_simulation", return_value={
+                    "status": "COMPLETE", "alpha": "SYNTHETIC_first"}) as poll, \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value={
+                    "is": {"fitness": 1.1}, "train": {"fitness": 1.0}}), \
+                mock.patch.object(ml, "submit_single_simulation", side_effect=AssertionError("accepted job reposted")):
             result = app.cmd_probe(arguments(resume=str(self.batch)), None)
-        first = next(record for record in captured if record.get("mechanism") == "first")
-        self.assertEqual(first["progress_url"], "https://example.invalid/simulations/synthetic")
+        self.assertEqual(poll.call_args.args[1], "https://api.worldquantbrain.com/simulations/synthetic")
+        self.assertFalse(any(record.get("mechanism") == "first" for record in captured))
+        first = next(row for row in result["rows"] if row["label"] == "first")
+        self.assertEqual(first["alpha_id"], "SYNTHETIC_first")
         self.assertTrue(result["complete"])
 
     def test_incomplete_pnl_does_not_produce_train_halves(self):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+import json
 import math
 import os
 
@@ -145,9 +146,52 @@ def _positive_seconds(value):
     return seconds
 
 
+def _non_negative_integer(value):
+    try:
+        number = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be zero or greater")
+    return number
+
+
+def _positive_count(value):
+    number = _non_negative_integer(value)
+    if number == 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return number
+
+
+def _setting_assignment(value):
+    key, separator, raw = value.partition("=")
+    if not separator or not key.strip():
+        raise argparse.ArgumentTypeError("expected NAME=VALUE")
+
+    def invalid_constant(token):
+        raise ValueError("non-finite JSON constant %s" % token)
+
+    try:
+        parsed = json.loads(raw, parse_constant=invalid_constant)
+        json.dumps(parsed, allow_nan=False)
+    except json.JSONDecodeError as exc:
+        if raw.lstrip().startswith(("{", "[", '"')):
+            raise argparse.ArgumentTypeError("invalid JSON setting value") from exc
+        parsed = raw
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    return key.strip(), parsed
+
+
+def _add_concurrency_args(parser):
+    parser.add_argument("--batch-size", dest="concurrency", type=_positive_count, default=None,
+                        help="Requested simulation concurrency. Published account limits take precedence; "
+                             "unpublished capacity uses a reported local policy, not a claimed platform allowance.")
+
+
 def _add_settings_args(parser):
-    parser.add_argument("--region", type=str.upper, choices=ml.REGIONS,
-                        help="BRAIN region.")
+    parser.add_argument("--region", type=str.upper,
+                        help="BRAIN region token; live account metadata determines availability.")
     parser.add_argument("--universe", type=str.upper, help="Universe, e.g. TOP3000.")
     parser.add_argument("--instrument-type", type=str.upper,
                         help="BRAIN instrument type.")
@@ -155,13 +199,16 @@ def _add_settings_args(parser):
                         help="Neutralization token; validated by machine_lib, with availability decided by BRAIN.")
     parser.add_argument("--decay", type=int,
                         help="Default decay for alphas that do not set their own.")
-    parser.add_argument("--delay", type=int, choices=[0, 1],
-                        help="Data delay (0 or 1).")
+    parser.add_argument("--delay", type=_non_negative_integer,
+                        help="Non-negative delay; allowed values come from the current account.")
     parser.add_argument("--truncation", type=float,
                         help="Truncation, e.g. 0.08.")
-    parser.add_argument("--pasteurization", type=str.upper, choices=["ON", "OFF"])
-    parser.add_argument("--nan-handling", type=str.upper, choices=["ON", "OFF", "VERIFY"])
+    parser.add_argument("--pasteurization", type=str.upper)
+    parser.add_argument("--nan-handling", type=str.upper)
     parser.add_argument("--test-period", type=str.upper, help="e.g. P0Y, P1Y, P2Y.")
+    parser.add_argument("--setting", action="append", type=_setting_assignment, default=None,
+                        metavar="NAME=VALUE", help="Additional platform setting; repeatable. "
+                        "Values accept JSON or unquoted text. Conflicting explicit flags are rejected.")
 
 
 def build_parser():
@@ -417,10 +464,10 @@ def build_parser():
                              help="Add declared book exposure and prior-trial context; unknown is not unexplored.")
     feed_parser.add_argument("--dry-run", action="store_true", dest="dry_run",
                              help="Report only; do not update the seen store.")
-    feed_parser.add_argument("--region", type=str.upper, choices=ml.REGIONS,
+    feed_parser.add_argument("--region", type=str.upper,
                              default=ml.DEFAULT_SETTINGS["region"])
     feed_parser.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
-    feed_parser.add_argument("--delay", type=int, choices=(0, 1), default=ml.DEFAULT_SETTINGS["delay"])
+    feed_parser.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
     feed_parser.add_argument("--instrument-type", type=str.upper,
                              default=ml.DEFAULT_SETTINGS["instrumentType"])
     feed_parser.add_argument("--meta-max-age", type=_non_negative_seconds, default=None,
@@ -477,9 +524,9 @@ def build_parser():
 
     cat_ds = cat.add_parser("datasets", help="Datasets for a region/universe/delay.")
     cat_ds.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
-    cat_ds.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_ds.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
     cat_ds.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
-    cat_ds.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_ds.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
     cat_ds.add_argument("--limit", type=int, default=None)
 
     _add_session_args(cat_ds)
@@ -494,9 +541,9 @@ def build_parser():
                           help="Drop fields whose coverage is below this.")
     cat_find.add_argument("--fuzzy", action="store_true")
     cat_find.add_argument("--any-term", action="store_true", dest="any_term")
-    cat_find.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_find.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
     cat_find.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
-    cat_find.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_find.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
     cat_find.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
     cat_find.add_argument("--limit", type=int, default=25)
     _add_session_args(cat_find)
@@ -512,12 +559,12 @@ def build_parser():
 
     cat_f = cat.add_parser("fields", help="Datafields of one dataset.")
     cat_f.add_argument("--dataset", required=True, help="Dataset id, e.g. fundamental6.")
-    cat_f.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_f.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
     cat_f.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
-    cat_f.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_f.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
     cat_f.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
-    cat_f.add_argument("--type", dest="field_type", type=str.upper, choices=["MATRIX", "VECTOR", "GROUP"],
-                       help="Keep only this BRAIN field type.")
+    cat_f.add_argument("--type", dest="field_type", type=str.upper,
+                       help="Keep a native BRAIN field type, including types newly exposed by this account.")
     cat_f.add_argument("--search", default="",
                        help="Ranked local search. Multi-word queries are AND; "
                             "prefix '-word' excludes; see --fuzzy and --any-term.")
@@ -537,12 +584,11 @@ def build_parser():
         help="Group fields by concept and show variants side by side.")
     cat_cc.add_argument("--dataset", default=None,
                         help="Limit to one dataset id, e.g. analyst4.")
-    cat_cc.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_cc.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
     cat_cc.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
-    cat_cc.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_cc.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
     cat_cc.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
     cat_cc.add_argument("--type", dest="field_type", type=str.upper,
-                        choices=["MATRIX", "VECTOR", "GROUP"],
                         help="Keep only this BRAIN field type.")
     cat_cc.add_argument("--tail-tokens", type=int, default=2,
                         help="Compare only the trailing N tokens, i.e. treat leading "
@@ -573,9 +619,9 @@ def build_parser():
         help="Check field ids against the live catalog (catches typed-from-memory names).")
     cat_vf.add_argument("--fields", nargs="+", default=[],
                         help="Field ids, comma or space separated.")
-    cat_vf.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_vf.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
     cat_vf.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
-    cat_vf.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_vf.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
     cat_vf.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
     cat_vf.add_argument("--strict", action="store_true",
                         help="Exit with INVALID_INPUT when any name is unknown.")
@@ -584,9 +630,9 @@ def build_parser():
     cat_vf.set_defaults(func=catalog.cmd_catalog_verify)
 
     cat_c = cat.add_parser("categories", help="Data categories with crowding stats.")
-    cat_c.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_c.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
     cat_c.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
-    cat_c.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_c.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
 
     _add_session_args(cat_c)
     cat_c.set_defaults(func=catalog.cmd_catalog_categories)
@@ -605,9 +651,9 @@ def build_parser():
                                 "verdict.")
     cat_audit.add_argument("--search", default="")
     cat_audit.add_argument("--limit", type=int, default=None)
-    cat_audit.add_argument("--region", type=str.upper, choices=ml.REGIONS, default=ml.DEFAULT_SETTINGS["region"])
+    cat_audit.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
     cat_audit.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
-    cat_audit.add_argument("--delay", type=int, default=ml.DEFAULT_SETTINGS["delay"], choices=[0, 1])
+    cat_audit.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
     cat_audit.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
 
     _add_session_args(cat_audit)
@@ -685,8 +731,7 @@ def build_parser():
                      help="Additional research file or - for stdin; repeat to merge expressions. "
                           "Later file settings override earlier files.")
     _add_settings_args(sim)
-    sim.add_argument("--batch-size", type=int, default=3,
-                     help="Concurrent submissions per batch (BRAIN allows 3).")
+    _add_concurrency_args(sim)
     sim.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
                      help="Maximum wall time per invocation; longer Retry-After waits "
                           "are saved as pending work (default: 300).")
@@ -726,6 +771,7 @@ def build_parser():
     resume = sub.add_parser(
         "resume", help="Resume pending/queued simulations from a checkpoint.")
     resume.add_argument("checkpoint", help="Checkpoint JSON produced by simulate/resume.")
+    _add_concurrency_args(resume)
     resume.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
                         help="Maximum wall time for this resume invocation (default: 300).")
     resume.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
@@ -788,6 +834,8 @@ def build_parser():
     _add_cost_args(cmp_)
     cmp_.add_argument("--summary", action="store_true",
                       help="Show bounded evidence rows with run identity, scope and missing evidence.")
+    cmp_.add_argument("--format", choices=("json", "markdown"), default="json",
+                      help="Include a Markdown table inside the JSON result; missing evidence stays unknown.")
 
     cmp_.set_defaults(func=experiments.cmd_compare)
 
@@ -875,6 +923,7 @@ def build_parser():
                             "Omitted with --recover or --resume.")
     _add_settings_args(probe)
     _add_session_args(probe)
+    _add_concurrency_args(probe)
     probe.add_argument("--name", default=None,
                        help="Batch name for the output file (default: the spec's name).")
     probe_mode = probe.add_mutually_exclusive_group()
@@ -884,6 +933,8 @@ def build_parser():
                             help="Validate this spec against live scoped metadata without simulating.")
     probe.add_argument("--batch-path", default=None, metavar="PATH",
                        help="Durable batch/checkpoint path; distinct from the final --save response.")
+    probe.add_argument("--summary", action="store_true",
+                       help="Return a bounded train summary with a table, execution state and saved evidence paths.")
     probe.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
                        help="Simulation wait budget across settings groups; accepted jobs remain recoverable.")
     probe.add_argument("--show-test", action="store_true",
@@ -1585,11 +1636,17 @@ def cmd_schema(args, _sink):
         "error_codes": ERROR_CODES,
         "research_file": config_io.RESEARCH_FILE_SPEC,
         "settings_defaults": ml.DEFAULT_SETTINGS,
-        "settings_choices": {
+        "settings_hints": {
             "region": ml.REGIONS,
             "neutralization": ml.NEUTRALIZATIONS,
             "universe": ml.UNIVERSES,
-            "delay": [0, 1],
+        },
+        "settings_validation": {
+            "offline": "structural validation only; descriptive hints are not permission limits",
+            "online_source": "authenticated OPTIONS /simulations",
+            "discovery": "auth check",
+            "extensions": "--setting NAME=VALUE or settings in a research file",
+            "unknown": "unpublished or stale capability evidence does not prove availability",
         },
         "credentials": {
             "env": ["BRAIN_USERNAME", "BRAIN_PASSWORD"],

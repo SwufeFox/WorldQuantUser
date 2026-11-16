@@ -188,7 +188,7 @@ def merge_settings(file_settings, args):
         overrides = ml.normalize_setting_keys(file_settings)
     except ValueError as exc:
         raise CliError("INVALID_INPUT", str(exc)) from exc
-    for key, value in {
+    named = {
         "region": getattr(args, "region", None),
         "universe": getattr(args, "universe", None),
         "instrumentType": getattr(args, "instrument_type", None),
@@ -199,9 +199,19 @@ def merge_settings(file_settings, args):
         "pasteurization": getattr(args, "pasteurization", None),
         "nanHandling": getattr(args, "nan_handling", None),
         "testPeriod": getattr(args, "test_period", None),
-    }.items():
-        if value is not None:
-            overrides[key] = value
+    }
+    explicit = {key: value for key, value in named.items() if value is not None}
+    for key, value in getattr(args, "setting", None) or ():
+        try:
+            normalized = ml.normalize_setting_keys({key: value})
+        except ValueError as exc:
+            raise CliError("INVALID_INPUT", str(exc)) from exc
+        for canonical, item in normalized.items():
+            if canonical in explicit and json.dumps(explicit[canonical], sort_keys=True) != json.dumps(item, sort_keys=True):
+                raise CliError("INVALID_INPUT", "conflicting explicit values for setting %r" % canonical,
+                               "use one value across --setting and named setting flags")
+            explicit[canonical] = item
+    overrides.update(explicit)
     try:
         return ml.resolve_settings(overrides)
     except ValueError as exc:

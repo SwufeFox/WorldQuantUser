@@ -32,6 +32,8 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `research_app/literature.py` | Web literature search and OpenAlex paper discovery. |
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and research scripts. |
 | `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
+| `simulation_capabilities.py` | Account identity and current settings evidence; unknown capabilities remain explicit. |
+| `simulation_slots.py` | Durable simulation reservations shared by the same account and research workspace. |
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
 | `expression_types.py` | Five field types, operator signatures, and the mismatches they imply. |
 | `field_index.py` | Live field-name verification and vocabulary-free variant grouping. |
@@ -325,6 +327,19 @@ universes and delays; the check samples one advertised combination per region.
 the limited coverage. An error, stale fallback or unprobed combination never proves
 that a region has no data. Authentication failures remain errors.
 
+`data_scope_evidence.capabilities` retains the native settings schema, account fingerprint,
+source, freshness and capability ID. Each online simulation/probe invocation refreshes it
+once and reuses it across groups. Expanded or reduced choices therefore do not depend on
+a historical local whitelist. The full `schema` exposes `settings_hints` for familiar values;
+those hints are not permission limits. Missing, stale or unpublished evidence stays unknown.
+
+New settings can be supplied in a research file or through repeated `--setting NAME=VALUE`.
+Values accept JSON (including booleans, objects and explicit extension `null`) or unquoted
+text, for example `--setting visualization=true`. Explicit generic settings override file
+settings; conflicting generic/named flags are rejected. Dry-run checks structure without
+claiming account availability. Published unsupported values block new submissions even
+with `--allow-lint-errors`.
+
 ### Browse metadata (quota-free)
 
 ```bash
@@ -410,6 +425,19 @@ before submitting queued work. Each POST first saves its intent; a transport fai
 without a job identity remains `UNKNOWN_SUBMISSION` and is never silently reposted.
 `--max-wait-seconds` adjusts the budget for either command.
 
+`--batch-size N` sets the requested concurrency on `simulate`, `probe` and `resume`, with no
+fixed upper bound of three. A verified account limit clamps the request. When capacity is
+unpublished, the default is `machine_lib.DEFAULT_LOCAL_CONCURRENCY` (currently 3), explicitly
+labelled as local policy; a larger explicit budget is not proof of platform permission.
+`scheduling` reports the request, effective budget, platform evidence and shared-slot state.
+
+Invocations for the same identified account and research workspace share durable reservations
+under `simulation-slots/`. Accepted and uncertain attempts keep their slots across interruption;
+age alone never frees them. Observed completion or definite refusal releases a slot. Other
+workspaces and jobs launched outside this tool are not coordinated. Resume may change
+`--batch-size` without changing the saved expressions, settings or research fingerprint;
+accepted jobs can still be recovered after launch permissions shrink.
+
 A failed expression is reported in its own record instead of aborting the run;
 the command only fails outright when *every* expression failed.
 
@@ -430,10 +458,16 @@ explicit arm decay. A scan declares `"design": "explore"` at the spec's top leve
            "settings": {"neutralization": "INDUSTRY"}}]}
 ```
 
+An arm may declare `"role": "candidate"` or `"role": "diagnostic"`, independently of
+`design`. Diagnostic arms remain visible for attribution but cannot enter candidate freezes,
+the shelf, promotion or new submissions through that evidence. Refresh/recovery preserves
+the role. Legacy records without a declaration remain `unspecified`; labels and notes do
+not assign roles automatically.
+
 ```bash
 python research_cli.py probe sample-batch.spec.json --dry-run
 python research_cli.py probe sample-batch.spec.json --check
-python research_cli.py probe sample-batch.spec.json --batch-path sample-batch.json --save sample-response.json
+python research_cli.py probe sample-batch.spec.json --batch-size 6 --summary --batch-path sample-batch.json --save sample-response.json
 ```
 
 `probe --dry-run` is a fully offline preview: it loads no session or credentials,
@@ -448,7 +482,8 @@ catalogs block execution unless explicitly overridden with `--allow-lint-errors`
 an override preserves the errors and cannot make `preflight_complete` true.
 
 A real probe validates every group locally before loading a session or submitting
-anything, then runs the existing catalog guard for each simulation group. Arms
+anything, then checks current capabilities and required catalogs. The guarded launch reuses
+that report only when its complete settings and expressions match exactly. Arms
 with equivalent resolved settings and decay share a group. Results and ledger
 entries retain each arm's actual settings and decay. The table and `rows` show
 train-period metrics by default. Validation requires an existing frozen selection:
@@ -474,6 +509,14 @@ original `arm_order`, per-arm submission states, `execution`, `recording` and
 response envelope. Keep those files distinct and keep both under `research_dir`.
 `--save` cannot overwrite the batch, checkpoint, recovery input or frozen selection.
 Conflicts fail before execution; even the error envelope is kept off the protected file.
+
+`probe --summary` adds a train-only table showing label, role, state, Sharpe, fitness,
+turnover, margin in basis points, both train-half Sharpes and alpha ID. The response bounds
+rows and preflight detail to 20, with total/omitted counts and the canonical evidence path;
+the durable batch remains complete. Missing values render as `-`; measured zero stays zero.
+For stored batches, use `compare sample-batch.json --summary --format markdown`. The table
+is a field inside the same JSON envelope, so neither tailing stdout nor a parsing script
+is needed to assemble it.
 
 Probe batches save each arm's intent before POST and its accepted job identity before
 waiting. `--max-wait-seconds` bounds simulation waiting across groups (default 300).

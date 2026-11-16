@@ -67,8 +67,8 @@ def cmd_catalog_datasets(args, _sink):
         "count": len(datasets), "datasets": datasets, "cache": cache_report,
     }
     if not datasets:
-        data["hint"] = ("no datasets for this combination; the account may lack "
-                        "permission (a TUTORIAL account only sees USA)")
+        data["hint"] = ("no datasets were returned for this scope; inspect cache freshness and "
+                        "enumeration completeness before drawing an access conclusion")
 
     return data
 
@@ -130,7 +130,7 @@ def cmd_catalog_fields(args, _sink):
         "delay": args.delay, "count": len(fields), "scanned": len(everything),
         "type_counts": {
             kind: len([f for f in fields if f.get("type") == kind])
-            for kind in ("MATRIX", "VECTOR", "GROUP")
+            for kind in sorted({f.get("type") for f in fields if isinstance(f.get("type"), str)})
         },
         "fields": fields, "cache": cache_report,
     }
@@ -168,15 +168,24 @@ def cmd_catalog_find(args, _sink):
                        % (args.region, args.universe, args.delay))
 
     rows, scanned = [], 0
+    catalogs = []
     for dataset in datasets:
         dataset_id = dataset.get("id")
+        metadata = {}
         try:
             fields = with_session(args, lambda s, d=dataset_id: ml.get_datafields(
                 s, instrument_type=args.instrument_type, region=args.region,
                 delay=args.delay, universe=args.universe, dataset_id=d,
-                search="", field_type=None, limit=None))
-        except Exception:  # noqa: BLE001 - one unreadable dataset must not sink the search
+                search="", field_type=None, limit=None, report=metadata))
+        except ml.AuthError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - retain unavailable discovery evidence
+            catalogs.append({"dataset": dataset_id, "state": "unknown", "error": str(exc)})
             continue
+        fresh = metadata.get("complete") is True and not any(
+            metadata.get(key) for key in ("hit", "stale", "degraded", "error"))
+        catalogs.append({"dataset": dataset_id, "state": "verified" if fresh else "unknown",
+                         "metadata": metadata})
         scanned += len(fields)
         hits = field_search.search_records(
             fields, args.query, limit=None, fuzzy=args.fuzzy,
@@ -201,6 +210,11 @@ def cmd_catalog_find(args, _sink):
             "fields_scanned": scanned, "count": len(rows), "fields": limited,
             "cache": cache_report,
             "ranking": "exact id, then coverage, then id"}
+    discovery_complete = cache_report.get("complete") is True and not any(
+        cache_report.get(key) for key in ("hit", "stale", "degraded", "error"))
+    data["discovery"] = {"state": "verified" if discovery_complete and all(
+        row["state"] == "verified" for row in catalogs) else "unknown",
+        "full_scope": not bool(wanted), "catalogs": catalogs}
     if not rows:
         data["hint"] = ("nothing matched across %d datasets; try --fuzzy or --any-term"
                         % len(datasets))

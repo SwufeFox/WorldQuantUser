@@ -23,6 +23,7 @@ def _finite(value):
 def cmd_promote(args, sink):
     """Compose existing commands; operational failures carry the completed evidence."""
     alpha_id = args.alpha_id
+    alphas._candidate_role(args)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", alpha_id)
     freeze = Path(args.freeze or research_paths.resolve(

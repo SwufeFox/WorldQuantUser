@@ -66,16 +66,26 @@ def check(expressions, settings=None, session=None):
     )
 
 
-def simulate(expressions, settings=None, labels=None, force=False, session=None, **kwargs):
-    """Lint first, then simulate. ``force=True`` downgrades unknown names to a warning."""
-    settings = dict(settings or {})
-    session = session or ml.login()
-    report = check(expressions, settings, session=session)
-    blocking = [e for e in report["errors"]
-                if e["code"] in {"unknown_operator", "unknown_identifier",
-                                 "unused_variable", "operator_arg_constraint",
-                                 "signal_type", "undefined_variable"}]
-    if blocking and not force:
+def simulate(expressions, settings=None, labels=None, force=False, session=None,
+             preflight=None, **kwargs):
+    """Validate once, reusing only a report bound to these exact resolved requests."""
+    settings = ml.resolve_settings(settings or {})
+    if preflight is not None:
+        expected = {"settings": settings,
+                    "pairs": [list(pair) for pair in ml.normalize_alphas(expressions, settings)]}
+        if (not isinstance(preflight, dict) or preflight.get("checked_requests") != expected
+                or not isinstance(preflight.get("errors"), list)):
+            raise UnknownNameError("preflight does not match the exact simulation requests")
+        report = preflight
+        blocking = report["errors"]
+    else:
+        session = session or ml.login()
+        report = check(expressions, settings, session=session)
+        blocking = [e for e in report["errors"]
+                    if e["code"] in {"unknown_operator", "unknown_identifier",
+                                     "unused_variable", "operator_arg_constraint",
+                                     "signal_type", "undefined_variable"}]
+    if blocking and (not force or any(e.get("code") == "unsupported_setting" for e in blocking)):
         lines = []
         for item in blocking:
             subject = item.get("identifier") or item.get("operator") or item["code"]
@@ -91,6 +101,7 @@ def simulate(expressions, settings=None, labels=None, force=False, session=None,
             "refusing to spend a simulation: %d blocking finding(s)\n%s"
             % (len(blocking), "\n".join(lines))
         )
+    session = session or ml.login()
     return ml.simulate_alphas(
         session,
         expressions,

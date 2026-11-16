@@ -64,6 +64,25 @@ VERDICTS = ("candidate", "watch", "rejected", "falsified", "no_go")
 #: and in the ledger.
 FINISHED_STATUSES = frozenset({"COMPLETE", "WARNING"})
 
+def evidence_role(*evidence):
+    """Merge explicit intent conservatively; absent legacy intent stays unspecified."""
+    roles = [item.get("role") for item in evidence if isinstance(item, dict)]
+    if any(role is not None and role not in ("candidate", "diagnostic") for role in roles):
+        raise ValueError("role must be candidate or diagnostic")
+    return "diagnostic" if "diagnostic" in roles else "candidate" if "candidate" in roles else None
+
+
+def require_candidate_eligible(rows, entries=None, registry_path=None):
+    """Reject diagnostic evidence, including a stale selection of a known alpha."""
+    entries = load_entries(registry_path) if entries is None else entries
+    diagnostic_ids = {entry.get("alpha_id") for entry in entries
+                      if evidence_role(entry) == "diagnostic" and entry.get("alpha_id")}
+    for row in rows:
+        if evidence_role(row) == "diagnostic" or row.get("alpha_id") in diagnostic_ids:
+            raise ValueError("diagnostic evidence cannot be selected, promoted, shelved or submitted: %s"
+                             % (row.get("alpha_id") or row.get("label") or "unspecified"))
+    return rows
+
 # Second-level grouping: which return source an alpha draws on. ``mechanism``
 # is deliberately specific (one label per construction), so counting labels
 # overstates diversity when several constructions draw on the same return source.
@@ -256,6 +275,7 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
         # formula at a different universe or decay overwrote the earlier one.
         "key": alpha_id or placeholder_key(expression, settings),
         "alpha_id": alpha_id,
+        "role": evidence_role(alpha),
         "idea": idea,
         "mechanism": mechanism,
         "family": family,
@@ -325,6 +345,7 @@ def load_entries(path=None):
         key = entry.get("key") or entry.get("alpha_id") or \
             expression_hash(entry.get("expression") or "")
         entry.setdefault("key", key)
+        entry["role"] = evidence_role(by_key.get(key), entry)
         if key not in by_key:
             order.append(key)
         by_key[key] = entry
@@ -390,6 +411,7 @@ def record_entry(entry, path=None, skip_unchanged=True, allow_metrics_loss=False
     with cache_store.file_lock(path + ".lock", timeout=30):
         existing = {item["key"]: item for item in load_entries(path)}
         current = existing.get(entry.get("key"))
+        entry["role"] = evidence_role(current, entry)
         if current is not None and not allow_metrics_loss:
             had = bool(current.get("metrics"))
             has = bool(entry.get("metrics"))
@@ -462,6 +484,7 @@ def _inherit_judgement(entry, previous, pinned_verdict=False):
     # `batch` belongs here too: a re-record without a batch name is a refresh of an
     # existing row, not evidence that the row came from nowhere.
     manual_fields = set(previous.get("manual_fields") or [])
+    entry["role"] = evidence_role(previous, entry)
     if previous.get("source") == "relabel":
         manual_fields.update(("family", "mechanism", "idea", "note"))
     for field in ("family", "mechanism", "idea", "note", "parent", "op", "legs", "batch"):
@@ -528,6 +551,7 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
         entry = build_entry(
             {
                 "alpha_id": key,
+                "role": record.get("role"),
                 "expression": record.get("expression"),
                 "decay": record.get("decay"),
                 "settings": record.get("settings") or settings,
@@ -706,8 +730,8 @@ def render_markdown(entries, title="Alpha registry"):
                        for name, count in summary["by_verdict"].items() if count)
     lines.append("%d alphas recorded (%s)." % (summary["total"], counts or "none"))
     lines.append("")
-    lines.append("| alpha | sharpe | fitness | turnover | idea | verdict | note |")
-    lines.append("| --- | --- | --- | --- | --- | --- | --- |")
+    lines.append("| alpha | role | sharpe | fitness | turnover | idea | verdict | note |")
+    lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
     for entry in sorted(
         entries,
         key=lambda item: (item.get("metrics") or {}).get("sharpe") or float("-inf"),
@@ -717,8 +741,9 @@ def render_markdown(entries, title="Alpha registry"):
         note = (entry.get("note") or "").replace("|", "/").replace("\n", " ")
         if len(note) > 80:
             note = note[:77] + "..."
-        lines.append("| %s | %s | %s | %s | %s | %s | %s |" % (
+        lines.append("| %s | %s | %s | %s | %s | %s | %s | %s |" % (
             entry.get("alpha_id") or "—",
+            entry.get("role") or "unspecified",
             fmt(metrics.get("sharpe")),
             fmt(metrics.get("fitness")),
             fmt(metrics.get("turnover"), 3),

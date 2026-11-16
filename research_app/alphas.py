@@ -242,6 +242,17 @@ def cmd_alpha_submit(args, _sink):
     return with_session(args, lambda session: submit_workflow(session, args))
 
 
+def _candidate_role(args, evidence=None):
+    entries = alpha_registry.load_entries(getattr(args, "registry", None))
+    matching = [row for row in entries if row.get("alpha_id") == args.alpha_id]
+    supplied = evidence or {"alpha_id": args.alpha_id}
+    try:
+        alpha_registry.require_candidate_eligible([supplied], entries=entries)
+        return alpha_registry.evidence_role(supplied, *matching)
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc)) from exc
+
+
 def _selection_id(args, required=False):
     path = getattr(args, "selection", None)
     if not path:
@@ -257,6 +268,9 @@ def _selection_id(args, required=False):
     if not any(row.get("alpha_id") == args.alpha_id for row in manifest.get("rows", [])):
         raise CliError("INVALID_INPUT", "alpha is absent from the frozen selection",
                        "submit a candidate included in the training selection")
+    for row in manifest["rows"]:
+        if row.get("alpha_id") == args.alpha_id:
+            _candidate_role(args, row)
     return manifest["selection_id"]
 
 
@@ -283,6 +297,7 @@ def _platform_entry(current, alpha_id, existing=None, selection_id=None, source=
     if selection_id:
         extra["selection_id"] = selection_id
     facts = {"alpha_id": alpha_id, "expression": code,
+             "role": alpha_registry.evidence_role(existing),
              "settings": current.get("settings") or {},
              "metrics": current.get("is") or {}, "checks": checks,
              "status": current.get("status"),
@@ -400,6 +415,7 @@ def submit_workflow(session, args, shelf_entry=None):
                           repair_actions=["read platform status again with this command"])
             return result
         if not confirmed:
+            _candidate_role(args, shelf_entry)
             selection_id = _selection_id(args, required=True)
             missing = [field for field in ("name", "category") if not current.get(field)]
             if missing:
