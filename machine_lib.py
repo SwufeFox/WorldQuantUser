@@ -1248,9 +1248,18 @@ def resolve_settings(overrides=None):
     return settings
 
 
+#: Settings the OPTIONS schema advertises as required but the POST contract
+#: rejects for ``type=REGULAR`` ("Selection handling ... is not allowed for
+#: simulation type REGULAR"). They belong to a selection simulation type this
+#: account's REGULAR flow never uses, so specs may carry them (the preflight
+#: requires them) and the request drops them.
+_REGULAR_UNSENT_SETTINGS = ("selectionHandling", "selectionLimit")
+
+
 def _single_simulation_data(expression, decay, settings):
     """Build one ``POST /simulations`` payload from a resolved settings dict."""
-    body = dict(settings)
+    body = {key: value for key, value in settings.items()
+            if key not in _REGULAR_UNSENT_SETTINGS}
     body["decay"] = decay
     return {"type": "REGULAR", "settings": body, "regular": expression}
 
