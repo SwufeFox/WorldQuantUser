@@ -133,9 +133,8 @@ def _preflight_lint(session, pairs, settings, args, capability_snapshot=None):
     if (not account.get("fingerprint") or not isinstance(snapshot.get("account"), dict)
             or snapshot["account"].get("fingerprint") != account.get("fingerprint")):
         snapshot = {**snapshot, "state": "unknown", "reasons": ["account_mismatch"]}
-    check_settings = ml.regular_settings_evidence if python else simulation_capabilities.settings_evidence
-    requests = [check_settings({**settings, "decay": pair[1]}, snapshot) for pair in pairs]
-    settings_report = check_settings(settings, snapshot) if not requests else {
+    requests = [ml.regular_settings_evidence({**settings, "decay": pair[1]}, snapshot) for pair in pairs]
+    settings_report = ml.regular_settings_evidence(settings, snapshot) if not requests else {
         **requests[0],
         "state": "unsupported" if any(row["unsupported"] for row in requests) else
                  "unknown" if any(row["state"] == "unknown" for row in requests) else "verified",
@@ -183,16 +182,22 @@ def _preflight_lint(session, pairs, settings, args, capability_snapshot=None):
             operator_evidence["complete"] = bool(operator_index)
         except Exception as exc:  # noqa: BLE001 - preserve failed metadata evidence
             operator_evidence.update(state="unknown", complete=False, error=str(exc))
-        try:
-            required = set()
+        required = set()
+        for expression, _ in pairs:
             try:
-                for expression, _ in pairs:
-                    required.update(fastexpr_ast.field_names(fastexpr_ast.parse(expression)))
+                required.update(fastexpr_ast.field_names(fastexpr_ast.parse(expression)))
             except fastexpr_ast.ParseError:
-                required = None  # Keep the full syntax/metadata diagnostics below.
-            fields = _field_scope(session, settings, required_fields=required)
-        except Exception as exc:  # noqa: BLE001 - a failure must never become a green light
-            fields["evidence"]["error"] = str(exc)
+                # The linter reports syntax errors without a catalog lookup.
+                continue
+        if required:
+            try:
+                fields = _field_scope(session, settings, required_fields=required)
+            except ml.AuthError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - retain failed capability evidence
+                fields["evidence"]["error"] = str(exc)
+        else:
+            fields["evidence"]["state"] = "not_applicable"
         report = expression_lint.lint_all(
             pairs, operator_index=operator_index,
             denylist=expression_lint.load_denylist(),
@@ -264,6 +269,8 @@ def _field_scope(session, settings, required_fields=None):
             session, region=scope["region"], universe=scope["universe"],
             delay=scope["delay"], instrument_type=scope["instrumentType"],
             refresh=True, report=evidence)
+    except ml.AuthError:
+        raise
     except Exception as exc:
         evidence.update(state="unknown", error=str(exc))
         evidence.setdefault("scope", scope)

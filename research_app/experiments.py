@@ -1930,15 +1930,21 @@ def _execute_probe(args, document, target, groups):
         note("  %s" % kind)
 
     def work(session):
+        deadline = time.monotonic() + getattr(args, "max_wait_seconds", 300.0)
         document["capability_snapshot"] = _invocation_capabilities(session, args)
         document.setdefault("preflight", [])
         save()
-        deadline = time.monotonic() + getattr(args, "max_wait_seconds", 300.0)
         ordered = sorted(groups.values(), key=lambda group: any(
             _submission_state(records[arm["arm_index"]]) == "not_submitted" for arm in group["arms"]))
         for group in ordered:
             indices = [arm["arm_index"] for arm in group["arms"]]
             launching = any(_submission_state(records[index]) == "not_submitted" for index in indices)
+            if time.monotonic() >= deadline:
+                break
+            if launching:
+                preflight = _preflight_lint(session, group["pairs"], group["settings"], args)
+                document["preflight"].append(preflight)
+                save()
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 break
@@ -1950,9 +1956,6 @@ def _execute_probe(args, document, target, groups):
                 max_wait_seconds=remaining,
                 on_event=lambda kind, payload, positions=indices: progress(positions, kind, payload))
             if launching:
-                preflight = _preflight_lint(session, group["pairs"], group["settings"], args)
-                document["preflight"].append(preflight)
-                save()
                 produced = guarded_sim.simulate([expression for expression, _ in group["pairs"]],
                     group["settings"], session=session, preflight=preflight,
                     force=getattr(args, "allow_lint_errors", False), **options)

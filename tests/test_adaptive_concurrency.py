@@ -184,6 +184,28 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertEqual(simulation_slots.snapshot(ACCOUNT, 1)["active"], 1)
 
+    def test_completed_wave_retries_queued_work_after_shared_slot_contention(self):
+        external, _ = simulation_slots.reserve(ACCOUNT, 2)
+        expressions = ["rank(field_%d)" % index for index in range(4)]
+        posts = []
+
+        def submit(session, body, **kwargs):
+            posts.append(body["regular"])
+            return "https://api.worldquantbrain.com/simulations/%d" % len(posts)
+
+        def poll(session, url, **kwargs):
+            return {"status": "COMPLETE", "alpha": "offline-" + url.rsplit("/", 1)[-1]}
+
+        with mock.patch.object(ml, "submit_single_simulation", side_effect=submit), \
+                mock.patch.object(ml, "poll_simulation", side_effect=poll), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {}}):
+            rows = self.simulate(expressions, concurrency=2)
+
+        self.assertEqual(posts, expressions)
+        self.assertEqual([row["status"] for row in rows], ["COMPLETE"] * len(expressions))
+        self.assertEqual(simulation_slots.snapshot(ACCOUNT, 2)["active"], 1)
+        simulation_slots.reconcile_record({"slot_reservation": external}, ACCOUNT, outcome="terminal")
+
     def test_atomic_reservations_across_contenders(self):
         barrier = threading.Barrier(8)
         def contend():

@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AQP 相关度战略图</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #172943;
+      --muted: #53647a;
+      --line: #d4dfec;
+      --paper: #fff;
+      --wash: #f4f7fb;
+      --blue: #23539c;
+      --orange: #a84416;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--wash);
+      color: var(--ink);
+      font: 15px/1.55 "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    }
+    main { max-width: 1510px; margin: 0 auto; padding: 28px clamp(14px, 3vw, 42px) 32px; }
+    header { padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+    h1 { margin: 3px 0; font-size: clamp(23px, 4vw, 35px); letter-spacing: -.035em; }
+    h2 { margin: 0 0 10px; font-size: 18px; }
+    p { margin: 7px 0; }
+    nav { display: flex; justify-content: space-between; align-items: center; gap: 15px; }
+    a { color: var(--blue); text-underline-offset: 3px; }
+    .muted, #scope, #counts { color: var(--muted); }
+    .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 17px; margin: 13px 0; }
+    .filters label { font-weight: 650; }
+    input { max-width: 46vw; accent-color: var(--blue); }
+    output { min-width: 42px; font-variant-numeric: tabular-nums; }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(250px, 300px); gap: 17px; align-items: start; }
+    .matrix, aside { background: var(--paper); border: 1px solid var(--line); border-radius: 10px; }
+    .matrix { min-width: 0; }
+    aside { padding: 15px 18px; position: sticky; top: 12px; }
+    .plot { max-height: min(72vh, 1060px); overflow: auto; padding: 8px; }
+    canvas { display: block; background: #fff; cursor: crosshair; }
+    canvas:focus-visible { outline: 2px solid #386ec0; outline-offset: 1px; }
+    .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 8px 13px; border-bottom: 1px solid var(--line); }
+    .legend > span { white-space: nowrap; }
+    .dot { display: inline-block; width: 12px; height: 12px; border: 1px solid #9baaba; vertical-align: -1px; margin-right: 5px; }
+    .neg { background: #b55223; }
+    .zero { background: #fafaf8; }
+    .pos { background: #23539c; }
+    .unknown { background: #bcc6d2; }
+    .cross { background: #fff; border: 2px solid #18283c; }
+    .pairs { padding: 9px 13px 11px; border-top: 1px solid var(--line); }
+    .metric { font-size: 21px; font-weight: 720; font-variant-numeric: tabular-nums; }
+    .participant { padding: 11px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+    .participant strong { font-variant-numeric: tabular-nums; }
+    .participant p { margin: 4px 0; }
+    .note { font-size: 13px; color: var(--muted); }
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: minmax(0, 1fr); }
+      aside { order: -1; position: static; }
+      .plot { max-height: 68vh; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <nav><h1>相关度战略图</h1><a id="theme-page" href="aqp-theme-map.html">查看主题战略图 →</a></nav>
+      <p id="scope"></p>
+    </header>
+    <div class="filters">
+      <label for="threshold">拥挤阈值 |r| ≥</label>
+      <input id="threshold" type="range" min="0" max="1" step="0.01" value="0.70">
+      <output id="cut" for="threshold"></output>
+      <span id="counts" aria-live="polite"></span>
+    </div>
+    <div class="layout">
+      <section class="matrix" aria-label="Alpha 收益相关矩阵">
+        <div class="legend">
+          <span><i class="dot neg"></i>负相关</span>
+          <span><i class="dot zero"></i>近零</span>
+          <span><i class="dot pos"></i>正相关</span>
+          <span><i class="dot unknown"></i>数据未知</span>
+          <span><i class="dot cross"></i>高相关边</span>
+        </div>
+        <div class="plot" id="plot">
+          <canvas id="heatmap" tabindex="0" aria-label="相关矩阵。点选单元格，或用方向键移动以查看配对详情。"></canvas>
+        </div>
+        <div class="pairs note">
+          色深表示带符号的 Pearson r。完全链接组内每对 Alpha 都达到当前阈值。点选单元格或用方向键查看详情。
+        </div>
+      </section>
+      <aside aria-live="polite">
+        <h2>配对详情</h2>
+        <div id="pair-panel"></div>
+        <p class="note">相关值来自两条 Alpha 各自训练窗口中重叠交易日的日频 PnL。<span id="overlap-note"></span>
+          BRAIN 的平台生产相关及 AQP 评分有各自口径。</p>
+      </aside>
+    </div>
+  </main>
+  <!--MAP_DATA-->
+  <script>
+    "use strict";
+    (() => {
+      const byId = (id) => document.getElementById(id);
+      const text = (id, value) => { byId(id).textContent = value; };
+      const add = (parent, tag, value, className) => {
+        const element = document.createElement(tag);
+        if (className) element.className = className;
+        element.textContent = value;
+        parent.append(element);
+        return element;
+      };
+      const number = (value, places = 0) => Number.isFinite(value) ? value.toFixed(places) : "未知";
+      const countText = (value) => Number.isFinite(value) ? value.toLocaleString("zh-CN") : "未知";
+      const pairKey = (a, b) => a < b ? JSON.stringify([a, b]) : JSON.stringify([b, a]);
+      const hasR = (row) => Number.isFinite(row?.r);
+      const dataSource = byId("map-data");
+      if (!dataSource) {
+        text("scope", "请使用研究脚本生成带数据的相关度战略图。");
+        byId("threshold").disabled = true;
+        return;
+      }
+      const data = JSON.parse(dataSource.textContent);
+      const alphas = new Map(data.alphas.map((row) => [row.id, row]));
+      const pairwise = data.pairwise;
+      const pairs = new Map(pairwise.pairs.map((row) => [pairKey(row.a, row.b), row]));
+      const measured = pairwise.pairs.filter(hasR);
+      const measuredIds = new Set(measured.flatMap((row) => [row.a, row.b]));
+      const unknownLabels = {
+        missing_train_boundary: "训练边界未知",
+        missing_train_pnl: "至少一条缺可用的训练期 PnL",
+        missing_train_window: "训练窗口未知",
+        missing_pnl: "缺日频 PnL",
+        unverified_pnl_coverage: "PnL 覆盖未验证",
+        insufficient_overlap: "重叠交易日不足",
+        short_overlap: "重叠交易日不足",
+        undefined: "常数序列或相关未定义",
+        undefined_correlation: "常数序列或相关未定义"
+      };
+      const themeLink = data.links?.theme || "aqp-theme-map.html";
+      byId("theme-page").href = themeLink;
+      const cohort = data.cohort;
+      text("scope", `${cohort.cycle || "AQP"} · ${countText(cohort.count)} 条 Alpha · ${cohort.source || "账本范围"} · 数据生成 ${data.generated_at || "未知"}`);
+      if (Number.isFinite(pairwise.min_overlap)) {
+        text("overlap-note", `每对至少需要 ${countText(pairwise.min_overlap)} 个重叠交易日。`);
+      }
+      const slider = byId("threshold");
+      slider.value = pairwise.default_threshold;
+      const canvas = byId("heatmap");
+      const context = canvas.getContext("2d");
+      const plot = byId("plot");
+      const panel = byId("pair-panel");
+      const cell = 14;
+      const axis = 89;
+      const strongest = measured.reduce((best, row) =>
+        !best || Math.abs(row.r) > Math.abs(best.r) ? row : best, null);
+      let order = [];
+      let cuts = [];
+      let selected = strongest ? [strongest.a, strongest.b] : [];
+      let threshold = Number(slider.value);
+      let logicalSize = 0;
+
+      function leaves(node) {
+        if (node.id) return alphas.has(node.id) ? [node.id] : [];
+        return node.children.flatMap(leaves);
+      }
+
+      function cut(node) {
+        if (node.id || node.strength >= threshold) return [leaves(node)];
+        return node.children.flatMap(cut);
+      }
+
+      function cellColor(value) {
+        if (value === null) return "#bcc6d2";
+        const neutral = [250, 250, 248];
+        const endpoint = value < 0 ? [181, 82, 35] : [35, 83, 156];
+        return "rgb(" + neutral.map((component, index) =>
+          Math.round(component + (endpoint[index] - component) * Math.abs(value))).join(",") + ")";
+      }
+
+      function updateOrder() {
+        const seen = new Set();
+        const groups = pairwise.forest.flatMap(cut).map((members) => members.filter((id) => {
+          if (seen.has(id)) return false;
+          seen.add(id);
+          return true;
+        })).filter((members) => members.length);
+        for (const id of alphas.keys()) if (!seen.has(id)) groups.push([id]);
+        order = groups.flat();
+        cuts = [];
+        let cursor = 0;
+        for (const group of groups) {
+          cursor += group.length;
+          if (cursor < order.length) cuts.push(cursor);
+        }
+        const strong = measured.filter((row) => Math.abs(row.r) >= threshold).length;
+        const clusters = groups.filter((group) => group.length > 1).length;
+        text("cut", threshold.toFixed(2));
+        text("counts", `已测 ${countText(pairwise.measured)} 对 · 未知 ${countText(pairwise.unknown)} 对 · 高相关边 ${strong} 条 · 多成员分组 ${clusters} 个`);
+        if (!selected.length && order.length) selected = [order[0], order[1] || order[0]];
+      }
+
+      function prepareCanvas() {
+        logicalSize = axis + cell * order.length + 5;
+        const scale = Math.min(window.devicePixelRatio || 1, 2);
+        canvas.width = Math.round(logicalSize * scale);
+        canvas.height = Math.round(logicalSize * scale);
+        canvas.style.width = logicalSize + "px";
+        canvas.style.height = logicalSize + "px";
+        context.setTransform(scale, 0, 0, scale, 0, 0);
+      }
+
+      function draw() {
+        context.clearRect(0, 0, logicalSize, logicalSize);
+        context.font = "10px ui-monospace, monospace";
+        context.textBaseline = "middle";
+        order.forEach((a, i) => {
+          const y = axis + i * cell;
+          context.fillStyle = measuredIds.has(a) ? "#233852" : "#697c90";
+          context.textAlign = "right";
+          context.fillText(a, axis - 5, y + cell / 2, axis - 12);
+          context.save();
+          context.translate(y + cell / 2, axis - 5);
+          context.rotate(-Math.PI / 2);
+          context.textAlign = "left";
+          context.fillText(a, 0, 0, axis - 12);
+          context.restore();
+          order.forEach((b, j) => {
+            const x = axis + j * cell;
+            const row = pairs.get(pairKey(a, b));
+            const value = hasR(row) ? row.r : null;
+            context.fillStyle = i === j ? "#e9eff6" : cellColor(value);
+            context.fillRect(x, y, cell - 0.45, cell - 0.45);
+            if (i !== j && value !== null && Math.abs(value) >= threshold) {
+              context.strokeStyle = "#18283c";
+              context.lineWidth = 1;
+              context.strokeRect(x + 0.9, y + 0.9, cell - 2.2, cell - 2.2);
+            }
+          });
+        });
+        const edge = axis + order.length * cell;
+        context.strokeStyle = "#9fb0c5";
+        context.lineWidth = 0.75;
+        context.beginPath();
+        for (const index of cuts) {
+          const offset = axis + index * cell;
+          context.moveTo(axis, offset);
+          context.lineTo(edge, offset);
+          context.moveTo(offset, axis);
+          context.lineTo(offset, edge);
+        }
+        context.stroke();
+        if (selected.length) {
+          const x = axis + order.indexOf(selected[1]) * cell;
+          const y = axis + order.indexOf(selected[0]) * cell;
+          context.strokeStyle = "#fff";
+          context.lineWidth = 3.5;
+          context.strokeRect(x + 1, y + 1, cell - 2, cell - 2);
+          context.strokeStyle = "#0b1526";
+          context.lineWidth = 1.6;
+          context.strokeRect(x + 1, y + 1, cell - 2, cell - 2);
+        }
+      }
+
+      function showPair() {
+        panel.replaceChildren();
+        if (!selected.length) {
+          add(panel, "p", "当前没有可展示的 Alpha。", "muted");
+          return;
+        }
+        const [a, b] = selected;
+        const row = pairs.get(pairKey(a, b));
+        add(panel, "p", a + (a === b ? "" : " × " + b), "metric");
+        if (a === b) {
+          add(panel, "p", "对角线对应同一条 Alpha。", "muted");
+        } else if (hasR(row)) {
+          add(panel, "p", `r = ${number(row.r, 4)} · ${countText(row.n)} 个重叠交易日`);
+          add(panel, "p", Math.abs(row.r) >= threshold ? "达到当前高相关阈值" : "低于当前高相关阈值", "muted");
+        } else {
+          add(panel, "p", "相关未知 · " + (unknownLabels[row?.reason] || "缺少可比证据"), "muted");
+          if (Number.isFinite(row?.n)) add(panel, "p", `重叠交易日 ${countText(row.n)}`);
+        }
+        for (const id of new Set([a, b])) {
+          const alpha = alphas.get(id);
+          const block = add(panel, "div", "", "participant");
+          add(block, "strong", id);
+          add(block, "p", [alpha.family, alpha.block, alpha.universe].filter(Boolean).join(" · ") || "分组未知");
+          if (alpha.mechanism) add(block, "p", alpha.mechanism);
+          add(block, "p", `训练 Sharpe ${number(alpha.train_sharpe, 3)} · Fitness ${number(alpha.train_fitness, 3)}`, "note");
+          add(block, "p", `训练窗 ${alpha.train_start || "未知"} 至 ${alpha.train_end || "未知"}`, "note");
+          const link = add(block, "a", "转到主题图中的这条 Alpha");
+          link.href = themeLink + "#" + encodeURIComponent(id);
+        }
+      }
+
+      function select(row, column, followFocus = false) {
+        if (row < 0 || column < 0 || row >= order.length || column >= order.length) return;
+        selected = [order[row], order[column]];
+        draw();
+        showPair();
+        if (followFocus) {
+          const left = canvas.offsetLeft - plot.offsetLeft + axis + column * cell;
+          const top = canvas.offsetTop - plot.offsetTop + axis + row * cell;
+          if (left < plot.scrollLeft) plot.scrollLeft = left;
+          else if (left + cell > plot.scrollLeft + plot.clientWidth) plot.scrollLeft = left + cell - plot.clientWidth;
+          if (top < plot.scrollTop) plot.scrollTop = top;
+          else if (top + cell > plot.scrollTop + plot.clientHeight) plot.scrollTop = top + cell - plot.clientHeight;
+        }
+      }
+
+      slider.addEventListener("input", () => {
+        threshold = Number(slider.value);
+        updateOrder();
+        draw();
+        showPair();
+      });
+      canvas.addEventListener("click", (event) => {
+        const bounds = canvas.getBoundingClientRect();
+        const row = Math.floor((event.clientY - bounds.top - axis) / cell);
+        const column = Math.floor((event.clientX - bounds.left - axis) / cell);
+        select(row, column);
+      });
+      canvas.addEventListener("keydown", (event) => {
+        const movement = { ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1] }[event.key];
+        if (!movement || !selected.length) return;
+        event.preventDefault();
+        const clip = (value) => Math.min(order.length - 1, Math.max(0, value));
+        select(clip(order.indexOf(selected[0]) + movement[0]),
+               clip(order.indexOf(selected[1]) + movement[1]), true);
+      });
+      let focusId = null;
+      try { focusId = decodeURIComponent(window.location.hash.slice(1)); } catch { /* ignore invalid hashes */ }
+      if (focusId && alphas.has(focusId)) {
+        const peer = measured.filter((row) => row.a === focusId || row.b === focusId)
+          .sort((a, b) => Math.abs(b.r) - Math.abs(a.r))[0];
+        selected = [focusId, peer ? (peer.a === focusId ? peer.b : peer.a) : focusId];
+      }
+      updateOrder();
+      prepareCanvas();
+      draw();
+      showPair();
+      if (focusId && alphas.has(focusId)) select(order.indexOf(selected[0]), order.indexOf(selected[1]), true);
+    })();
+  </script>
+</body>
+</html>

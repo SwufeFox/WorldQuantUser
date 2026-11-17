@@ -86,6 +86,24 @@ class ProbeWorkflowTests(unittest.TestCase):
         simulate.assert_not_called()
         self.assertFalse(self.batch.exists())
 
+    def test_preflight_spends_time_from_the_probe_deadline(self):
+        clock = mock.Mock(wraps=app.time)
+        clock.monotonic.return_value = 0
+
+        def preflight(*_):
+            clock.monotonic.return_value = 31
+            return {"ok": True}
+
+        with mock.patch.object(app, "time", clock), \
+                mock.patch.object(app, "_preflight_lint", side_effect=preflight), \
+                mock.patch.object(app.guarded_sim, "simulate") as simulate:
+            result = self.run_probe(no_record=True)
+        simulate.assert_not_called()
+        self.assertEqual(result["execution"]["not_submitted"], 3)
+        stored = json.loads(self.batch.read_text(encoding="utf-8"))
+        self.assertEqual(stored["preflight"], [{"ok": True}])
+        self.assertTrue(any(action["action"] == "resume" for action in result["next_actions"]))
+
     def test_groups_preserve_original_order_and_recover_deduplicates_recording(self):
         with mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator):
             result = self.run_probe()

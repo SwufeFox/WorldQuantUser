@@ -563,8 +563,13 @@ class CatalogValidationTests(unittest.TestCase):
                 kwargs["report"].update(complete=True)
             return operators
 
+        def search(_session, field, _scope, **kwargs):
+            return {"matches": [row for row in records if row["id"] == field],
+                    "returned_count": len(records), "reported_count": len(records), "complete": True}
+
         patches = {
             "fields": mock.patch.object(field_index, "fetch_all_fields", side_effect=fields),
+            "search": mock.patch.object(machine_lib, "search_datafield", side_effect=search),
             "operators": mock.patch.object(machine_lib, "fetch_operators", side_effect=catalog),
             "denylist": mock.patch.object(expression_lint, "load_denylist", return_value={}),
             "units": mock.patch.object(expression_units, "load_field_units", return_value={}),
@@ -600,9 +605,11 @@ class CatalogValidationTests(unittest.TestCase):
                 self.fields.assert_called_once()
                 self.assertEqual(document["known_field_count"], 4)
                 self.fields.reset_mock()
+                self.search.reset_mock()
                 preflight = cli_validation._preflight_lint(
                     self.session, [(expression, 4)], document["settings"], args)
-                self.fields.assert_called_once()
+                self.fields.assert_not_called()
+                self.search.assert_called_once()
                 result = document["results"][0]
                 self.assertEqual(result["errors"], preflight["results"][0]["errors"])
                 self.assertEqual(result["warnings"], preflight["results"][0]["warnings"])
@@ -615,7 +622,9 @@ class CatalogValidationTests(unittest.TestCase):
     def test_offline_lint_never_opens_a_session_or_fetches_metadata(self):
         args = self.args("rank(catalog_vector)", offline=True,
                          strict_fields=True, denylist="chosen-denylist.json")
-        with mock.patch.object(machine_lib, "load_session") as load_session, \
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(machine_lib.research_paths, "metadata_root", return_value=directory), \
+                mock.patch.object(machine_lib, "load_session") as load_session, \
                 mock.patch.object(machine_lib, "login") as login:
             document = cli_validation.cmd_lint(args, None)
         self.assertTrue(document["ok"])
@@ -625,6 +634,7 @@ class CatalogValidationTests(unittest.TestCase):
         load_session.assert_not_called()
         login.assert_not_called()
         self.fields.assert_not_called()
+        self.search.assert_not_called()
         self.operators.assert_not_called()
 
     def test_unknown_fields_still_follow_strict_mode(self):
@@ -645,7 +655,7 @@ class CatalogValidationTests(unittest.TestCase):
         report = cli_validation._preflight_lint(
             self.session, [("rank(catalog_vector)", 4)], {}, args)
         self.assertFalse(report["ok"])
-        self.fields.side_effect = RuntimeError("field metadata unavailable")
+        self.search.side_effect = machine_lib.ServiceError("field metadata unavailable")
         self.operators.side_effect = RuntimeError("operator metadata unavailable")
         args.allow_lint_errors = False
         with self.assertRaises(cli_validation.CliError) as failure:

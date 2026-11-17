@@ -1,0 +1,327 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AQP 主题地图</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #f7f7f4;
+      --panel: #fff;
+      --ink: #1b2524;
+      --secondary: #4f605b;
+      --rule: #d7dfda;
+      --accent: #185649;
+      --accent-light: #eaf4ef;
+      font-family: Inter, system-ui, -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--paper); color: var(--ink); line-height: 1.55; }
+    button, input { font: inherit; }
+    button, a, summary { -webkit-tap-highlight-color: transparent; }
+    button:focus-visible, a:focus-visible, summary:focus-visible, input:focus-visible {
+      outline: 2px solid var(--accent); outline-offset: 3px;
+    }
+    a { color: var(--accent); text-underline-offset: .2em; }
+    [hidden] { display: none !important; }
+    .shell { max-width: 1280px; margin: auto; padding: 2rem clamp(1rem, 4vw, 3rem) 3rem; }
+    .masthead { display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; }
+    h1 { margin: 0 0 .35rem; font-size: clamp(1.8rem, 4vw, 2.55rem); letter-spacing: -.055em; }
+    h2 { margin: 0 0 .65rem; font-size: 1.15rem; }
+    p { margin: 0; }
+    .muted { color: var(--secondary); font-size: .9rem; }
+    .cycle { font-variant-numeric: tabular-nums; }
+    .map-link { flex: 0 0 auto; padding: .45rem .75rem; background: var(--accent-light); border-radius: .4rem; }
+    .toolbar { margin: 1.5rem 0 .75rem; display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; }
+    .choices { display: inline-flex; border: 1px solid var(--rule); border-radius: .55rem; padding: .2rem; background: var(--panel); gap: .2rem; }
+    .choices button { cursor: pointer; border: 0; color: var(--secondary); background: transparent; border-radius: .35rem; padding: .38rem .7rem; }
+    .choices button[aria-pressed="true"] { color: var(--ink); background: var(--accent-light); font-weight: 650; }
+    .search { flex: 1 1 18rem; display: flex; gap: .55rem; align-items: center; font-size: .9rem; color: var(--secondary); }
+    input[type="search"] { width: 100%; min-width: 0; padding: .5rem .65rem; border: 1px solid var(--rule); border-radius: .45rem; background: var(--panel); color: var(--ink); }
+    .map-info { margin: .75rem 0 1rem; display: flex; flex-wrap: wrap; justify-content: space-between; gap: .4rem 1rem; }
+    .workspace { display: grid; grid-template-columns: minmax(0, 1fr) minmax(17rem, .37fr); gap: 1.2rem; align-items: start; }
+    .groups { display: grid; gap: .5rem; }
+    .group { border: 1px solid var(--rule); border-radius: .55rem; background: var(--panel); }
+    .group summary { cursor: pointer; padding: .72rem .85rem; display: grid; gap: .6rem; align-items: center; grid-template-columns: 1rem minmax(7rem, .7fr) minmax(4rem, 1fr) 3.2rem; list-style: none; }
+    .group summary::-webkit-details-marker { display: none; }
+    .group summary::before { content: "›"; color: var(--secondary); display: inline-block; font-size: 1.15rem; line-height: 1; }
+    .group[open] summary::before { transform: rotate(90deg); }
+    .group summary:hover { color: var(--accent); }
+    .group-name { font-weight: 640; overflow-wrap: anywhere; }
+    .track { height: .55rem; background: #edf1ee; border-radius: 2rem; overflow: hidden; display: block; }
+    .track span { height: 100%; display: block; border-radius: 2rem; background: var(--group-color, var(--accent)); }
+    .count { text-align: right; color: var(--secondary); font-variant-numeric: tabular-nums; font-size: .86rem; }
+    .group-body { border-top: 1px solid var(--rule); padding: .8rem .85rem .95rem 2.45rem; }
+    .mechanism + .mechanism { margin-top: .65rem; }
+    .mechanism-title { margin-bottom: .3rem; color: var(--secondary); font-size: .88rem; overflow-wrap: anywhere; }
+    .members { display: flex; gap: .35rem; flex-wrap: wrap; }
+    .member { padding: .26rem .55rem; cursor: pointer; border: 1px solid var(--rule); border-radius: .35rem; background: var(--panel); color: var(--ink); font-family: ui-monospace, monospace; font-size: .82rem; }
+    .member:hover, .member[aria-pressed="true"] { background: var(--accent-light); border-color: var(--accent); color: var(--accent); }
+    .detail { border: 1px solid var(--rule); background: var(--panel); border-radius: .55rem; padding: 1rem; position: sticky; top: 1rem; overflow-wrap: anywhere; }
+    .detail dl { display: grid; grid-template-columns: minmax(5rem, 1fr) minmax(0, 1.6fr); margin: .75rem 0; font-size: .88rem; }
+    .detail dt, .detail dd { margin: 0; padding: .38rem .25rem; border-bottom: 1px solid #edf0ed; }
+    .detail dt { color: var(--secondary); }
+    .detail dd { font-variant-numeric: tabular-nums; }
+    .detail .note { margin: .7rem 0; white-space: pre-wrap; }
+    .empty { padding: .95rem; border: 1px solid var(--rule); border-radius: .5rem; background: var(--panel); }
+    @media (max-width: 720px) {
+      .workspace { grid-template-columns: 1fr; }
+      .detail { position: static; }
+    }
+    @media (max-width: 420px) {
+      .masthead { flex-wrap: wrap; }
+      .group summary { grid-template-columns: .6rem minmax(5.5rem, .9fr) minmax(2rem, 1fr) 2.6rem; gap: .4rem; }
+      .group-body { padding-left: 1rem; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="masthead">
+      <div>
+        <h1>AQP 主题地图</h1>
+        <p id="scope" class="muted cycle"></p>
+      </div>
+      <a id="switch-map" class="map-link" href="aqp-correlation-map.html">查看相关度地图</a>
+    </header>
+    <div class="toolbar">
+      <div class="choices" role="group" aria-label="主题口径">
+        <button type="button" data-mode="family" aria-pressed="true">经济族群</button>
+        <button type="button" data-mode="native" aria-pressed="false">平台 Theme</button>
+      </div>
+      <label class="search" for="search">搜索 <input id="search" type="search" placeholder="Alpha ID、机制或备注" autocomplete="off"></label>
+    </div>
+    <div class="map-info">
+      <p id="basis" class="muted"></p>
+      <p id="result-count" class="muted" role="status"></p>
+    </div>
+    <div class="workspace">
+      <section id="groups" class="groups" aria-label="Alpha 主题分布"></section>
+      <aside id="detail" class="detail" aria-label="Alpha 详情" aria-live="polite">
+        <p class="muted">选择一个 Alpha 查看机制和证据。</p>
+      </aside>
+    </div>
+    <noscript><p class="empty">此地图需要在浏览器中启用 JavaScript。</p></noscript>
+  </main>
+  <!--MAP_DATA-->
+  <script>
+  (() => {
+    "use strict";
+    const byId = (id) => document.getElementById(id);
+    const groups = byId("groups");
+    const detail = byId("detail");
+    const search = byId("search");
+    const tabButtons = [...document.querySelectorAll("[data-mode]")];
+    const familyNames = new Map(Object.entries({
+      quality: "基本面质量", analyst: "分析师预期", event: "事件与信息",
+      oi: "隔夜／日内", other: "其他", leverage: "杠杆与负债", option: "期权",
+    }));
+    const blockNames = new Map(Object.entries({
+      derivative_pricing: "衍生品定价", analyst_dispersion: "分析师分歧", analyst_yield: "分析师预期水平",
+      analyst_coverage: "分析师覆盖", turnover_structure: "换手结构", volatility_structure: "波动结构",
+      price_path: "价格路径", debt_structure: "负债结构", value_quality: "价值与质量", news_sentiment: "新闻情绪", other: "其他",
+    }));
+    const themeStates = new Map(Object.entries({
+      matched: "回执 PASS，主题名缺失", not_matched: "平台报告未匹配",
+      warning: "回执 WARNING，主题未确认", pending: "回执 PENDING，主题待确认", unknown: "缺平台主题证据",
+    }));
+    const datasetStates = new Map(Object.entries({verified: "字段映射齐全", partial: "部分字段已映射", unknown: "目录证据缺失"}));
+    const palette = ["#357165", "#386980", "#726095", "#a56539", "#92773c", "#885d73", "#567e4e", "#687775"];
+    const countFormat = new Intl.NumberFormat("zh-CN");
+    const metricFormat = new Intl.NumberFormat("zh-CN", {minimumFractionDigits: 2, maximumFractionDigits: 3});
+
+    function element(tag, content, className) {
+      const node = document.createElement(tag);
+      if (content !== undefined) node.textContent = content;
+      if (className) node.className = className;
+      return node;
+    }
+    function list(value) {
+      return Array.isArray(value) ? [...new Set(value.filter((item) => typeof item === "string" && item.trim()))] : [];
+    }
+    function familyName(value) {
+      return value ? familyNames.get(value) || value : "未标注经济族群";
+    }
+    function metric(value) {
+      return typeof value === "number" && Number.isFinite(value) ? metricFormat.format(value) : "—";
+    }
+    function themeLabel(value) {
+      const state = themeStates.has(value?.state) ? value.state : "unknown";
+      const names = list(value?.names);
+      return names.length ? names.join("、") : themeStates.get(state);
+    }
+    function correlationHref(alphaId) {
+      return correlationLink + (alphaId ? "#" + encodeURIComponent(alphaId) : "");
+    }
+    function entriesFor(alpha, mode) {
+      if (mode === "family") {
+        const family = alpha.family || null;
+        return [{key: JSON.stringify(["family", family]), label: familyName(family), unknown: !family}];
+      }
+      const state = themeStates.has(alpha.theme?.state) ? alpha.theme.state : "unknown";
+      const names = list(alpha.theme?.names);
+      return names.length
+        ? names.map((name) => ({key: JSON.stringify(["native", name]), label: name, unknown: false}))
+        : [{key: JSON.stringify(["state", state]), label: themeStates.get(state), unknown: state !== "not_matched"}];
+    }
+    function grouped(alphas, mode) {
+      const mapped = new Map();
+      for (const alpha of alphas) {
+        for (const entry of entriesFor(alpha, mode)) {
+          if (!mapped.has(entry.key)) mapped.set(entry.key, {...entry, members: []});
+          mapped.get(entry.key).members.push(alpha);
+        }
+      }
+      return [...mapped.values()].sort((a, b) => Number(a.unknown) - Number(b.unknown) || b.members.length - a.members.length || a.label.localeCompare(b.label, "zh-CN"));
+    }
+
+    let data;
+    try {
+      data = JSON.parse(byId("map-data").textContent);
+      if (!Array.isArray(data.alphas)) throw new Error("missing alphas");
+    } catch {
+      groups.append(element("p", "地图数据无法读取。", "empty"));
+      return;
+    }
+    const alphas = data.alphas.filter((alpha) => typeof alpha?.id === "string" && alpha.id);
+    const lookup = new Map(alphas.map((alpha) => [alpha.id, alpha]));
+    const correlationLink = typeof data.links?.correlation === "string" && /^aqp-correlation-map\.html$/.test(data.links.correlation)
+      ? data.links.correlation : "aqp-correlation-map.html";
+    const cohort = data.cohort || {};
+    const snapshot = typeof data.generated_at === "string" ? data.generated_at : "";
+    byId("scope").textContent = [cohort.cycle, cohort.source, snapshot].filter((value) => typeof value === "string" && value).join(" · ");
+
+    let mode = "family";
+    let selected = null;
+    const expanded = new Set();
+    let hasInitialGroup = false;
+    try { selected = lookup.get(decodeURIComponent(location.hash.slice(1))) || null; } catch { /* ignore invalid hashes */ }
+
+    function showDetail() {
+      byId("switch-map").href = correlationHref(selected?.id);
+      if (!selected) return;
+      const alpha = selected;
+      detail.replaceChildren(element("h2", alpha.id));
+      const rows = [
+        ["经济族群", familyName(alpha.family)],
+        ["台账机制", alpha.mechanism || "未标注"],
+        ["结构归类", alpha.block ? blockNames.get(alpha.block) || alpha.block : "—"],
+        ["结构 ID", alpha.structure_id || "—"],
+        ["数据集", list(alpha.datasets).join("、") || "—"],
+        ["目录覆盖", datasetStates.get(alpha.dataset_coverage) || "目录证据缺失"],
+        ["平台 Theme", themeLabel(alpha.theme)],
+        ["主题检查回执", list(alpha.theme?.check_results).join(" / ") || "—"],
+        ["选股范围", alpha.universe || "—"],
+        ["延迟", Number.isInteger(alpha.delay) ? "D" + alpha.delay : "—"],
+        ["训练 Sharpe", metric(alpha.train_sharpe)],
+        ["训练 Fitness", metric(alpha.train_fitness)],
+        ["AQP 标签", list(alpha.aqp_tags).join("、") || (alpha.tags_known === true ? "无" : "—")],
+      ];
+      const fields = element("dl");
+      for (const [name, value] of rows) fields.append(element("dt", name), element("dd", value));
+      detail.append(fields);
+      if (typeof alpha.note === "string" && alpha.note.trim()) detail.append(element("p", alpha.note, "muted note"));
+      const link = element("a", "查看该 Alpha 的相关度");
+      link.href = correlationHref(alpha.id);
+      detail.append(link);
+    }
+    function selectAlpha(alpha) {
+      selected = alpha;
+      history.replaceState(null, "", "#" + encodeURIComponent(alpha.id));
+      for (const button of groups.querySelectorAll("[data-alpha]")) {
+        button.setAttribute("aria-pressed", String(button.dataset.alpha === alpha.id));
+      }
+      showDetail();
+      if (matchMedia("(max-width: 720px)").matches) detail.scrollIntoView({block: "nearest"});
+    }
+
+    function render() {
+      const terms = search.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+      const filtered = alphas.filter((alpha) => {
+        const text = [alpha.id, alpha.family, familyName(alpha.family), alpha.mechanism, alpha.block,
+                      alpha.note, alpha.universe, themeLabel(alpha.theme), ...list(alpha.datasets),
+                      ...list(alpha.theme?.check_results), ...list(alpha.aqp_tags)]
+          .filter(Boolean).join(" ").toLocaleLowerCase();
+        return terms.every((term) => text.includes(term));
+      });
+      const allGroups = grouped(alphas, mode);
+      const visible = grouped(filtered, mode);
+      const cohortSize = Math.max(1, alphas.length);
+      const colors = new Map(allGroups.map((group, index) => [group.key, palette[index % palette.length]]));
+      byId("result-count").textContent = countFormat.format(filtered.length) + " / " + countFormat.format(alphas.length) + " 条 Alpha";
+      byId("basis").textContent = mode === "family"
+        ? "按台账经济族群归组，横条显示占总数的比例。"
+        : "横条显示占总数的比例，多主题 Alpha 会出现在对应主题下。";
+      groups.replaceChildren();
+      if (!visible.length) {
+        groups.append(element("p", "没有符合搜索条件的 Alpha。", "empty"));
+        return;
+      }
+      if (!hasInitialGroup && !selected) {
+        expanded.add(visible[0].key);
+        hasInitialGroup = true;
+      }
+      for (const group of visible) {
+        const panel = element("details", undefined, "group");
+        panel.style.setProperty("--group-color", group.unknown ? "#737d78" : colors.get(group.key));
+        panel.open = terms.length > 0 || expanded.has(group.key) || group.members.some((alpha) => alpha.id === selected?.id);
+        panel.addEventListener("toggle", () => {
+          if (!terms.length && panel.isConnected) {
+            if (panel.open) expanded.add(group.key);
+            else expanded.delete(group.key);
+          }
+        });
+        const summary = element("summary");
+        const track = element("span", undefined, "track");
+        track.setAttribute("aria-hidden", "true");
+        const fill = element("span");
+        fill.style.width = (100 * group.members.length / cohortSize) + "%";
+        track.append(fill);
+        summary.append(element("span", group.label, "group-name"), track,
+                       element("span", countFormat.format(group.members.length) + " 条", "count"));
+        const body = element("div", undefined, "group-body");
+        const mechanisms = new Map();
+        for (const alpha of group.members) {
+          const mechanism = alpha.mechanism || "未标注机制";
+          if (!mechanisms.has(mechanism)) mechanisms.set(mechanism, []);
+          mechanisms.get(mechanism).push(alpha);
+        }
+        for (const [mechanism, members] of [...mechanisms.entries()].sort((a, b) => b[1].length - a[1].length || a[0].localeCompare(b[0], "zh-CN"))) {
+          const cluster = element("div", undefined, "mechanism");
+          const buttons = element("div", undefined, "members");
+          for (const alpha of members.sort((a, b) => a.id.localeCompare(b.id))) {
+            const button = element("button", alpha.id, "member");
+            button.type = "button";
+            button.dataset.alpha = alpha.id;
+            button.setAttribute("aria-pressed", String(alpha.id === selected?.id));
+            button.addEventListener("click", () => selectAlpha(alpha));
+            buttons.append(button);
+          }
+          cluster.append(element("p", mechanism, "mechanism-title"), buttons);
+          body.append(cluster);
+        }
+        panel.append(summary, body);
+        groups.append(panel);
+      }
+    }
+
+    search.addEventListener("input", render);
+    for (const button of tabButtons) button.addEventListener("click", () => {
+      mode = button.dataset.mode;
+      hasInitialGroup = false;
+      for (const tab of tabButtons) tab.setAttribute("aria-pressed", String(tab === button));
+      render();
+    });
+    window.addEventListener("hashchange", () => {
+      try { selected = lookup.get(decodeURIComponent(location.hash.slice(1))) || null; } catch { selected = null; }
+      if (!selected) detail.replaceChildren(element("p", "选择一个 Alpha 查看机制和证据。", "muted"));
+      render();
+      showDetail();
+    });
+    render();
+    showDetail();
+  })();
+  </script>
+</body>
+</html>

@@ -566,9 +566,12 @@ def turnover_findings(expression, market_fields=None):
     datasets are slow, which is the assumption this project keeps out of the code. When the
     set is absent the check is silent, because it has nothing to compare against.
     """
-    if not market_fields:
+    if market_fields is None:
         return []
-    referenced = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", expression or ""))
+    try:
+        referenced = set(fastexpr_ast.field_names(fastexpr_ast.parse(expression or "")))
+    except fastexpr_ast.ParseError:
+        return []
     if referenced & set(market_fields):
         return []
     # An expression with no field at all (a constant ladder) is not what this is about.

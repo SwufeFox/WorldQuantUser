@@ -206,6 +206,40 @@ class SimulationCapabilityTests(unittest.TestCase):
         self.assertEqual(report["settings_capabilities"]["unsupported"], [])
         self.assertIsNone(report["checked_requests"]["settings"]["futureOption"])
 
+    def test_regular_preflight_and_dispatch_check_the_wire_settings(self):
+        snapshot = self.fetch({
+            "decay": {"type": "integer", "max_value": 2},
+            "selectionHandling": {"type": "string", "required": True},
+            "selection_limit": {"type": "integer", "required": True},
+        })
+        settings = ml.resolve_settings({"selection_handling": "NON_NAN", "selectionLimit": 1000})
+        pairs = [("rank(sample_field)", 1)]
+        args = SimpleNamespace(allow_lint_errors=True, capability_snapshot=snapshot)
+        self.session.post = mock.Mock(return_value=SimpleNamespace(
+            status_code=201, headers={"Location": "/simulations/accepted"}, raise_for_status=lambda: None))
+
+        with mock.patch.object(ml, "fetch_operators", side_effect=RuntimeError("metadata unavailable")), \
+                mock.patch.object(validation, "_field_scope", side_effect=RuntimeError("metadata unavailable")):
+            preflight = validation._preflight_lint(self.session, pairs, settings, args)
+        self.assertEqual(preflight["settings_capabilities"]["unsupported"], [])
+        self.assertEqual(preflight["settings_capabilities"]["omitted_from_payload"],
+                         ["selection_handling", "selectionLimit"])
+        self.assertEqual(preflight["checked_requests"]["settings"], settings)
+        self.assertIn("selectionHandling", preflight["capability_snapshot"]["settings_schema"])
+
+        with mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(self.root)}), \
+                mock.patch.object(ml, "poll_simulation", return_value={"status": "COMPLETE", "alpha": "A1"}), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {}}):
+            records = ml.simulate_alphas(self.session, pairs + [("rank(close)", 3)], settings=settings,
+                                         capability_snapshot=snapshot, concurrency=1)
+        self.session.post.assert_called_once()
+        payload = self.session.post.call_args.kwargs["json"]
+        self.assertEqual(payload, {"type": "REGULAR", "regular": "rank(sample_field)",
+                                   "settings": {**ml.DEFAULT_SETTINGS, "decay": 1}})
+        self.assertEqual(records[0]["alpha_id"], "A1")
+        self.assertEqual(records[1]["settings_capabilities"]["unsupported"],
+                         [{"setting": "decay", "value": 3, "reasons": ["max_value"]}])
+
     def test_snapshot_accepts_changed_provenance_sources_for_same_principal(self):
         live = self.fetch()
         path = ml.metadata_cache_path("simulation-capabilities", {

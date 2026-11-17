@@ -909,6 +909,22 @@ def _get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
     return fields
 
 
+def search_datafield(s, field, scope, *, deadline):
+    """Read one scoped catalog search page for an exact field ID, without caching."""
+    params = {key: scope[key] for key in ("instrumentType", "region", "delay", "universe")}
+    params.update(search=field, limit=50, offset=0)
+    payload = request_json(s, "GET", "/data-fields", params=params, max_retries=1, deadline=deadline)
+    rows = payload.get("results") if isinstance(payload, dict) else None
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ServiceError("field search returned no valid results page")
+    count = payload.get("count")
+    if type(count) is not int or count < len(rows):
+        count = None
+    return {"matches": [row for row in rows if row.get("id") == field],
+            "returned_count": len(rows), "reported_count": count,
+            "complete": count == len(rows) and not bool(payload.get("next"))}
+
+
 def field_ids(fields, field_type=None, search=""):
     """Return the ``id`` of each field, optionally filtered by type/substring."""
     return [
@@ -1041,7 +1057,7 @@ def _retry_after_seconds(response, cap_error_wait=True):
     return max(seconds, 0.0)
 
 
-def request_json(s, method, path, params=None, json_body=None, max_retries=4):
+def request_json(s, method, path, params=None, json_body=None, max_retries=4, *, deadline=None):
     """Call BRAIN and return decoded JSON, translating failures into typed errors.
 
     The single HTTP choke point, so every caller sees the same behaviour:
@@ -1051,8 +1067,10 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4):
     url = path if path.startswith("http") else BRAIN_API_URL + path
     last = None
     for attempt in range(1, max_retries + 1):
+        if deadline is not None and time.monotonic() >= deadline:
+            raise last or ServiceError("request wait budget expired for %s %s" % (method, url))
         response = s.request(method, url, params=params, json=json_body,
-                             timeout=_request_timeout(None))
+                             timeout=_request_timeout(deadline))
         if response.status_code in (401, 403):
             raise AuthError(
                 "BRAIN rejected the session (HTTP %s) for %s %s"
@@ -1063,7 +1081,7 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4):
         if response.status_code == 429:
             wait = _retry_after_seconds(response) or min(60.0, 5.0 * attempt)
             last = RateLimited("%s %s is rate limited" % (method, url))
-            if attempt < max_retries:
+            if attempt < max_retries and (deadline is None or wait < deadline - time.monotonic()):
                 sleep(wait)
                 continue
             raise last
@@ -1293,8 +1311,8 @@ def resolve_settings(overrides=None):
 #: Settings the OPTIONS schema advertises as required but the POST contract
 #: rejects for ``type=REGULAR`` ("Selection handling ... is not allowed for
 #: simulation type REGULAR"). They belong to a selection simulation type this
-#: REGULAR path never sends, even if legacy specs include them. Python
-#: preflight checks the actual REGULAR payload against the account schema.
+#: REGULAR path never sends, even if legacy specs include them. Preflight and
+#: dispatch check the actual REGULAR settings against the account schema.
 _REGULAR_UNSENT_SETTINGS = ("selectionHandling", "selectionLimit")
 #: The native schema advertises these FASTEXPR controls, but the Python
 #: REGULAR endpoint rejects them. Keep the original settings in the spec and
@@ -1308,10 +1326,15 @@ def _regular_unsent_settings(settings):
     return _REGULAR_UNSENT_SETTINGS
 
 
+def _omit_regular_settings(mapping, excluded):
+    spellings = {name.casefold() for name in excluded}
+    return {key: value for key, value in mapping.items()
+            if str(key).replace("_", "").casefold() not in spellings}
+
+
 def regular_wire_settings(settings):
     """Return the writable settings present in a REGULAR simulation request."""
-    excluded = _regular_unsent_settings(settings)
-    return {key: value for key, value in settings.items() if key not in excluded}
+    return _omit_regular_settings(settings, _regular_unsent_settings(settings))
 
 
 def _single_simulation_data(expression, decay, settings):
@@ -1327,12 +1350,11 @@ def regular_settings_evidence(settings, snapshot):
 
     wire = regular_wire_settings(settings)
     schema = snapshot.get("settings_schema")
-    excluded = _regular_unsent_settings(settings)
     if isinstance(schema, dict):
-        snapshot = {**snapshot, "settings_schema": {
-            key: value for key, value in schema.items() if key not in excluded}}
+        snapshot = {**snapshot, "settings_schema":
+                    _omit_regular_settings(schema, _regular_unsent_settings(settings))}
     report = settings_evidence(wire, snapshot)
-    report["omitted_from_payload"] = [key for key in excluded if key in settings]
+    report["omitted_from_payload"] = [key for key in settings if key not in wire]
     return report
 
 
@@ -1513,7 +1535,8 @@ def simulate_alphas(
     Feeding it the result of ``resolve_settings`` is the caller's job.
     ``concurrency`` (or the legacy ``batch_size`` argument) is a positive local
     budget, clamped only by verified account capacity. A full shared workspace
-    journal leaves work queued. Reservations survive interruptions and are
+    journal leaves work queued until the current wave can release a slot.
+    Reservations survive interruptions and are
     reconciled by ``simulation_slots.reconcile_record``; other workspaces and
     unidentified accounts cannot share these reservations.
     """
@@ -1818,12 +1841,14 @@ def simulate_alphas(
     ) else {}
     settings_checks = {}
 
-    for start in range(0, len(pairs), batch_size):
-        batch = pairs[start:start + batch_size]
+    start = 0
+    while start < len(pairs):
+        end = min(len(pairs), start + batch_size)
         submitted = []
         submission_blocked = False
-        for offset, (expression, decay) in enumerate(batch):
-            index = start + offset
+        contended_index = None
+        for index in range(start, end):
+            expression, decay = pairs[index]
             record = {
                 **records[index],
             }
@@ -1844,9 +1869,7 @@ def simulate_alphas(
                 emit("deferred", index, record)
                 break
             if decay not in settings_checks:
-                check_settings = (regular_settings_evidence if is_python_language(settings.get("language"))
-                                  else simulation_capabilities.settings_evidence)
-                settings_checks[decay] = check_settings(
+                settings_checks[decay] = regular_settings_evidence(
                     {**settings, "decay": decay}, settings_snapshot)
             capability_check = settings_checks[decay]
             if capability_check["unsupported"]:
@@ -1860,7 +1883,7 @@ def simulate_alphas(
             if scheduling_report is not None:
                 scheduling_report["shared_slots"] = slots
             if identity is None and slots["available"] == 0:
-                submission_blocked = True
+                contended_index = index
                 record["error"] = "shared simulation slots are occupied; reconcile or resume existing attempts"
                 records[index] = record
                 emit("deferred", index, record)
@@ -1937,7 +1960,7 @@ def simulate_alphas(
             submitted.append(index)
 
         poll_many(submitted)
-        shared_state()
+        slots = shared_state()
         if submission_blocked:
             return records
         if any(record.get("status") == "UNKNOWN_SUBMISSION" for record in records):
@@ -1949,6 +1972,14 @@ def simulate_alphas(
         ):
             # Avoid exceeding the platform's concurrent simulation limit.
             break
+        if contended_index is not None:
+            # A full journal can include this wave's own reservations. After
+            # polling these to completion, retry only the unsent part of the wave.
+            if not submitted or slots["available"] == 0:
+                break
+            start = contended_index
+        else:
+            start = end
 
     return records
 

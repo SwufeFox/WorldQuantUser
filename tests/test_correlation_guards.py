@@ -135,18 +135,20 @@ class CorrCommandTests(unittest.TestCase):
 
 class PreflightSettingsTests(unittest.TestCase):
     def test_preflight_checks_fields_in_the_requested_universe(self):
-        def fields(session, **scope):
-            scope["report"].update(state="verified", coverage={"complete": True})
-            return ([{"id": "scoped_field", "type": "MATRIX"}]
-                    if scope["universe"] == "TOP500" else [])
+        settings = {"region": "USA", "universe": "TOP500", "delay": 1,
+                    "instrumentType": "EQUITY"}
+
+        def search_field(session, field, scope, *, deadline):
+            self.assertEqual(field, "scoped_field")
+            self.assertEqual(scope, settings)
+            return {"matches": [{"id": field, "type": "MATRIX"}],
+                    "returned_count": 1, "reported_count": 1, "complete": True}
 
         def operators(session, **kwargs):
             kwargs["report"].update(complete=True)
             return [{"name": "rank"}]
 
-        settings = {"region": "USA", "universe": "TOP500", "delay": 1,
-                    "instrumentType": "EQUITY"}
-        with mock.patch.object(cli_validation.capabilities, "fetch_fields", side_effect=fields), \
+        with mock.patch.object(ml, "search_datafield", side_effect=search_field), \
                 mock.patch.object(ml, "fetch_operators", side_effect=operators), \
                 mock.patch.object(cli_validation.expression_lint, "load_denylist", return_value={}):
             report = cli_validation._preflight_lint(

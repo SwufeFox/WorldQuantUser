@@ -73,6 +73,26 @@ SSO 后的论坛和 Help Center 读取使用公开文档化的 Zendesk API，运
 [Zendesk 搜索 API](https://developer.zendesk.com/api-reference/help_center/help-center-api/help_center_search/)
 
 
+## 生成 AQP 战略地图
+
+```bash
+python3 tools/aqp_strategy_maps.py --cycle 202611 --output-dir /path/to/research/aqp/202611
+python3 tools/aqp_strategy_maps.py --cycle 202611 --output-dir /path/to/another-view \
+  --roster /path/to/research/aqp/202611/aqp-roster.json
+```
+
+第一次读取账户可见的已提交 ACTIVE USA Fast Expression Regular Alpha，保留 D0 和 D1。
+两张图共用这份名单，按 Alpha ID 连接本地台账和已有 PnL 缓存。带旧周期标签的条目仍可在地图上
+比较。名单快照与图输出到指定的研究目录。使用 `--roster` 时，按快照及本地缓存离线重算。
+
+主题图按台账家族和机制标签分组，并能查看平台原生 Theme 回执。台账分类、表达式结构和
+目录字段是不同证据。只有平台明确命中才归入原生 Theme。没有明确归类的条目保留其证据状态。
+
+相关图逐对取各 Alpha 的训练窗内日频 PnL，按共同交易日对齐，计算带符号的 Pearson 相关。
+默认至少重叠 200 日。聚类采用完全链接，按两簇之间最弱的一对绝对相关决定能否合并。
+筛选阈值默认 0.70，可在图上调整。灰格表示未测量，相关簇及单条高相关边分别计数。
+图中结果是训练期收益的关系，平台生产相关、持仓相似度和 AQP 评分需要各自的证据。
+
 ## 给 AI 的信息按阶段进入
 
 常驻入口是 `AGENTS.md`；它只保留启动方法、研究原则和执行约束。
@@ -611,7 +631,8 @@ FASTEXPR 算子目录、结构匹配、换手估计和自动消融均不适用�
 热身阶段行数可能更少。源码负责处理 NaN、原生 dtype、热身与返回形状。
 REGULAR 请求统一省略 `selectionHandling` 和 `selectionLimit`，Python 还省略
 `unitHandling` 和 `nanHandling`。核对实际请求看预览的 `payload.settings`，
-在线证据的 `settings_capabilities.omitted_from_payload` 会列出 Python 请求中涉及的省略项。
+在线预检与执行器都按实际发送的设置验证。`settings_capabilities.omitted_from_payload`
+会列出输入中被省略的设置。
 
 持久批次与 checkpoint 保存当时的源码，恢复沿用该版本。源文件路径只保留在本地批次中，
 平台请求的 `regular` 字段包含源码。`--save` 和 `--batch-path` 不能覆盖 Probe 引用的源码文件。
@@ -673,7 +694,8 @@ diagnostic 保留用于归因，但不能进入候选冻结、候选架、晋级
 旧记录没有声明时保持 unspecified，不从 C1 之类的标签或备注猜测。
 
 每个 POST 之前保存提交意图，拿到任务身份后立即保存。没有身份的未知提交不会自动重发。
-`--max-wait-seconds` 默认 300；前组未完成时后组保持排队。`--recover` 只读平台并幂等补账，
+`--max-wait-seconds` 默认 300。每组预检完成后按剩余时间启动仿真，预算耗尽的请求保留排队状态。
+前组未完成时后组保持排队。`--recover` 只读平台并幂等补账，
 接受批次或保存的回执；`--resume` 才显式继续已知排队/已接受任务，支持离线预览。
 执行失败、未完成和证据缺失列为 deferred，不自动判成研究失败；旧批次的记账策略不明时
 不会推测为允许记账。同批次运行/恢复互斥，`--force` 不能覆盖正在运行的批次。
@@ -716,10 +738,10 @@ QUEUED 与恢复点；429 不会导致跳到后面的批次继续提交。短期
 `feed` 的关键词只产生阅读线索。提供了明确字段后，才与当前作用域目录核对可用性。
 
 FASTEXPR 从 AST 提取用到的字段与类型，Python 则使用 `@alpha` 的字段声明。
-两者先用同账户、同作用域的私有快照定位数据集，再实时刷新所需目录。
-过期快照只作定位提示。所用字段的证据缺失、过期或不完整时，预检无法确认可用性。
-回执分别保留 `required_fields_only` 核验与全目录完整性。局部核验不覆盖离线用的完整快照。
-字段未知或数据集迁移时回到全目录发现。
+预检在当前账户和作用域下为每个所需字段搜索一页平台目录，单次搜索最多等待 8 秒，
+同组字段合计最多等待 30 秒。只有唯一的精确 ID 命中可证实字段存在。
+无精确命中、多个精确命中或搜索出错时，未核验字段保留为 `unknown`。
+回执以 `required_fields_only` 记录这次核验，离线所用的完整快照由独立的目录检查维护。
 
 
 ### 合并已有结果与读取实时检查
