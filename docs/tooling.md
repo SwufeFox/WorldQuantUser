@@ -175,11 +175,12 @@ python3 research_cli.py feed --from-threads --workers 4 --timeout 30 --dry-run
 python3 research_cli.py feed --topic "analyst forecast dispersion" --topic "earnings quality" --action
 ```
 
-`--workers` 为 1–8，默认 4；它限制同时请求的主题数，`--timeout` 是单次网络请求的
-超时秒数。检索完成后仍按原主题顺序均衡选取，完成先后不会改变排序。网络调用在锁外；
-多个 feed 提交结果前会锁住状态并重新读取已读集合，避免按旧快照重复选中论文。
-每个主题保留检索器的相关性顺序，不再按引用量或年份重排。`provider_ranks` 记录论文在各查询
-原始结果中的位置；兼容字段 `rank` 仍是旧引用量/年份分数，不代表最终选取顺序。
+`--workers` 为 1–8，默认 4；`--max-topics` 限制关键词与种子扩展的任务总数，
+`--timeout` 是单次网络请求的超时秒数。检索后按输入顺序轮流选取，完成先后不会改变结果。
+网络调用在锁外；提交结果前会锁住状态并重读 seen，避免并发重复选中。
+关键词保留相关性顺序；引用图的顺序、来源和覆盖范围另记在 `retrievals`。
+`--min-citations` 默认 0，让新论文保留资格；引用量不替代相关性或经济解释。
+`provider_ranks` 记录各查询中的原始位置；兼容字段 `rank` 仍是旧分数，不代表选取顺序。
 
 OpenAlex 使用 `<research>/cache/papers/`；网页搜索使用 `<research>/search-cache/`。
 缓存键包含实际请求选项，全文开关、原问题和结果数量不同会分别保存。相同请求并发未命中时
@@ -190,6 +191,46 @@ OpenAlex 使用 `<research>/cache/papers/`；网页搜索使用 `<research>/sear
 无法推导查询的问题给原文件位置，已获得的论文给来源阅读和反例对照任务。
 `argv` 是传给 `research_cli.py` 的参数列表，不是可以直接拼接进 shell 的字符串。
 中文问题可以保留中文标题，并显式写 `; query: ...`；系统不自动编造翻译。
+摘要用 `reference_count` 显示参考文献数量，完整 ID 列表留在单篇记录；同一论文的 DOI 和
+OpenAlex ID 会共同参与去重，旧的无 DOI 标题记录继续有效。
+
+### 从发现走到可核对的阅读证据
+
+```bash
+python3 research_cli.py feed --topic "analyst revisions information diffusion" --dry-run
+python3 research_cli.py paper --id W2741809807
+python3 research_cli.py paper --id W2741809807 --full-text --max-chars 12000
+python3 research_cli.py feed --seed W2741809807 --follow references --from-year 0 --dry-run
+python3 research_cli.py feed --seed W2741809807 --follow citations --dry-run
+```
+
+示例 ID 用于演示接口，实际使用 feed 返回的 ID 和 `next_actions`。先用短摘要判断是否值得读，
+再读取单篇完整记录、按需读取正文。正文超过窗口时执行返回的下一段命令，不重新抓取全文。
+参考文献扩展用于追溯概念和识别设计；后续引用用于寻找延伸、复核与争议。引用边本身不表示
+支持或反对。`--from-year 0` 可在追溯基础文献时解除默认年份门槛。
+
+feed 保留 `openalex_id`、来源、阅读状态、摘要原长度与截断标记；正文始终由显式命令读取。
+`paper --id` 复用检索时保存的完整记录。参考文献一次最多核对 100 个已公布 ID，后续引用只取
+有界的一页，`coverage` 显示尚未取回、无法解析及被筛选的范围，不把局部阅读冒充穷尽调查。
+DOI 的常见前缀形式会统一，已有 seen 历史继续用于去重。
+
+正文使用 OpenAlex 已公布的 GROBID TEI，解压和解析均在本地完成，完整提取文本保存在研究目录。
+默认每次返回 12000 字符，上限 100000；下一段带明确 offset。没有摘要、只有 PDF 链接、
+没有 TEI、服务访问失败是不同状态。TEI 仍可能漏掉表格、公式或原 PDF 内容，阅读后要核对
+样本、识别策略、经济解释和反例，再写研究假设；草稿不会自动填上这些判断。
+
+| 开源工具 | 适用能力 | 本仓库的选择 |
+| --- | --- | --- |
+| [PyAlex](https://github.com/J535D165/pyalex) | OpenAlex 单篇、筛选、引用及 PDF/TEI 获取 | 沿用现有客户端，接入对应稳定接口与记录缓存 |
+| [paperscraper](https://github.com/jannisborn/paperscraper) | 多预印本来源、DOI 到文件的获取流程 | 借鉴“元数据发现与正文获取分开”；当前不引入生物医学数据转储依赖 |
+| [semanticscholar](https://github.com/danielnsilva/semanticscholar) | 学术图、推荐与异步分页 | 可作另一个来源；当前改进沿用已有 OpenAlex 证据与缓存 |
+| [GROBID](https://github.com/grobidOrg/grobid) | PDF 转结构化 TEI、引文解析 | 使用 OpenAlex 提供的解析结果；无需本机部署 Java/模型服务，官方不保证原生 Windows 支持 |
+
+访问政策以 [OpenAlex 当前认证文档](https://github.com/ourresearch/openalex-help/blob/main/content/api/authentication.md)
+和 [全文文档](https://github.com/ourresearch/openalex-help/blob/main/content/access/fulltext.md) 为准。
+目前基础查询可不带 key，正文下载需要 key。`OPENALEX_API_KEY` 可从环境或私有 `.env` 读取，
+不会进入缓存和回执；不自动注册账户、不自动下载整库，也不把网页或摘要当成已经读过的正文。
+
 
 论文的输入需求和台账块提示按完整词或短语匹配，保留简单复数。`technology adoption`
 不会因含有 `option` 子串而接上期权实验，`steps` 也不会被当作 EPS；这些提示仍须人工复核。

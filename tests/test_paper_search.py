@@ -207,5 +207,219 @@ class PaperCacheTests(unittest.TestCase):
         self.urlopen.assert_called_once()
 
 
+class AcquisitionTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        patch = mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": directory.name})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.key = mock.patch.object(ps, "_api_key", return_value="test-secret")
+        self.key_mock = self.key.start()
+        self.addCleanup(self.key.stop)
+        transport = mock.patch.object(ps.urllib.request, "urlopen")
+        self.urlopen = transport.start()
+        self.addCleanup(transport.stop)
+
+    def work(self, key="W1", **extra):
+        return {"id": "https://openalex.org/" + key, "title": "A paper " + key,
+                "doi": "https://doi.org/10.1234/" + key.lower(),
+                "publication_year": 2025, "cited_by_count": 0,
+                "referenced_works": [], "has_content": {"pdf": True, "grobid_xml": True},
+                "abstract_inverted_index": {"Full": [0], "abstract": [1]}, **extra}
+
+    def response(self, value):
+        if not isinstance(value, bytes):
+            return _Response(value)
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.side_effect = lambda size=-1: value if size < 0 else value[:size]
+        return response
+
+    def test_identifier_aliases_and_invalid_inputs(self):
+        for value in ("w123", "W123", "https://openalex.org/W123"):
+            self.assertEqual(ps.normalize_identifier(value), "W123")
+        for value in ("10.1234/ABC", "doi:10.1234/ABC", "https://doi.org/10.1234/ABC"):
+            self.assertEqual(ps.normalize_identifier(value), "10.1234/abc")
+        for value in ("A1", "W1?api_key=secret", "https://evil.org/W1",
+                      "https://openalex.org/W1?api_key=secret", "https://secret@doi.org/10.1234/a",
+                      "https://doi.org/W1", "10.1/a", "https://openalex.org/10.1234/a"):
+            with self.subTest(value=value), self.assertRaises(ps.PaperError):
+                ps.normalize_identifier(value)
+        self.urlopen.assert_not_called()
+
+    def test_singleton_cache_reuses_canonical_and_doi_identifiers(self):
+        self.urlopen.return_value = self.response(self.work())
+        first = ps.get_paper("doi:10.1234/W1")
+        self.assertFalse(first["cached"])
+        self.assertEqual(first["paper"]["abstract"], "Full abstract")
+        self.assertTrue(ps.get_paper("https://openalex.org/W1")["cached"])
+        self.assertTrue(ps.get_paper("https://doi.org/10.1234/w1")["cached"])
+        self.urlopen.assert_called_once()
+
+    def test_wrong_work_identity_is_not_cached_as_alias(self):
+        self.urlopen.return_value = self.response(self.work("W2"))
+        for identifier in ("W1", "10.1234/w1"):
+            with self.assertRaises(ps.PaperError) as failure:
+                ps.get_paper(identifier)
+            self.assertEqual(failure.exception.code, "SERVICE_ERROR")
+            self.assertIsNone(ps._lookup_record(identifier))
+
+    def test_secondary_doi_requires_location_evidence(self):
+        work = self.work(locations=[{"doi": "https://doi.org/10.1234/preprint"}])
+        self.urlopen.return_value = self.response(work)
+        ps.get_paper("10.1234/preprint")
+        self.assertTrue(ps.get_paper("10.1234/preprint")["cached"])
+        self.assertTrue(ps.get_paper("W1")["cached"])
+
+    def test_search_seeds_record_cache_without_content_fetch(self):
+        self.urlopen.return_value = self.response({"results": [self.work()], "meta": {"count": 1}})
+        ps.search_papers("a paper")
+        self.assertTrue(ps.get_paper("W1")["cached"])
+        self.urlopen.assert_called_once()
+
+    def test_missing_metadata_remains_unknown(self):
+        self.urlopen.return_value = self.response({"id": "https://openalex.org/W1"})
+        paper = ps.get_paper("W1")["paper"]
+        self.assertIsNone(paper["open_access"])
+        self.assertIsNone(paper["referenced_works"])
+        self.assertIsNone(paper["reading"]["grobid_xml"])
+        self.assertEqual(ps.read_content("W1")["content"]["state"], "unknown")
+        result = ps.related_papers("W1")
+        self.assertIsNone(result["total_available"])
+        self.assertFalse(result["coverage"]["references_known"])
+        self.urlopen.assert_called_once()
+
+    def test_legacy_search_cache_does_not_claim_singleton_metadata(self):
+        result = {"query": "old", "source": "openalex", "papers": [{"title": "old"}], "returned": 1}
+        ps._save_cache(ps._cache_path("old", 10, None, None), "papers", result)
+        self.urlopen.return_value = self.response(self.work())
+        self.assertTrue(ps.search_papers("old")["cached"])
+        self.assertFalse(ps.get_paper("W1")["cached"])
+        self.urlopen.assert_called_once()
+
+    def test_record_write_failure_keeps_search_success(self):
+        self.urlopen.return_value = self.response({"results": [self.work()]})
+        with mock.patch.object(ps.cache_store, "write_json_atomic", side_effect=PermissionError):
+            result = ps.search_papers("query")
+        self.assertEqual(result["returned"], 1)
+
+    def test_references_are_bounded_and_reordered_to_seed_order(self):
+        references = ["https://openalex.org/W%d" % number for number in range(2, 110)]
+        self.urlopen.side_effect = [self.response(self.work(referenced_works=references)),
+                                  self.response({"results": [self.work("W3"), self.work("W2")]})]
+        result = ps.related_papers("W1", limit=1)
+        self.assertEqual([paper["openalex_id"] for paper in result["papers"]], ["W2"])
+        self.assertEqual(result["total_available"], 108)
+        self.assertEqual(result["coverage"]["requested_candidates"], 100)
+        self.assertEqual(result["coverage"]["unfetched_candidates"], 8)
+        self.assertTrue(result["coverage"]["truncated"])
+        self.assertEqual(result["coverage"]["ordering"], "referenced_works_order")
+        self.assertTrue(ps.related_papers("W1", limit=1)["cached"])
+        self.assertEqual(self.urlopen.call_count, 2)
+        query = ps.urllib.parse.parse_qs(ps.urllib.parse.urlsplit(self.urlopen.call_args.args[0].full_url).query)
+        self.assertEqual(len(query["filter"][0].split("|")), 100)
+
+    def test_citations_preserve_provider_order_and_filters(self):
+        self.urlopen.side_effect = [self.response(self.work()), self.response({
+            "results": [self.work("W9", cited_by_count=20), self.work("W2", cited_by_count=30)],
+            "meta": {"count": 23}})]
+        result = ps.related_papers("W1", "citations", limit=2, from_year=2020, min_citations=10)
+        self.assertEqual([paper["openalex_id"] for paper in result["papers"]], ["W9", "W2"])
+        self.assertEqual(result["coverage"]["ordering"], "provider_order")
+        query = ps.urllib.parse.parse_qs(ps.urllib.parse.urlsplit(self.urlopen.call_args.args[0].full_url).query)
+        self.assertEqual(query["filter"], ["cites:W1,from_publication_date:2020-01-01,cited_by_count:>9"])
+        self.assertEqual(query["per-page"], ["2"])
+
+    def test_auth_headers_and_errors_never_expose_key(self):
+        for status, code in ((401, "AUTH_FAILED"), (403, "AUTH_FAILED"), (429, "RATE_LIMITED"),
+                             (404, "NOT_FOUND"), (500, "SERVICE_ERROR")):
+            self.urlopen.side_effect = ps.urllib.error.HTTPError(
+                "https://api.openalex.org/?api_key=test-secret", status, "test-secret", {}, None)
+            with self.assertRaises(ps.PaperError) as failure:
+                ps.get_paper("W1")
+            self.assertEqual(failure.exception.code, code)
+            self.assertNotIn("test-secret", str(failure.exception))
+            request = self.urlopen.call_args.args[0]
+            self.assertEqual(request.get_header("Authorization"), "Bearer test-secret")
+            self.assertNotIn("test-secret", request.full_url)
+
+    def test_content_windows_reuse_full_text_without_key(self):
+        xml = b'<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body><div><head>Results</head><p>A <hi>real</hi> result.</p></div></body></text></TEI>'
+        self.urlopen.side_effect = [self.response(self.work()), self.response(ps.gzip.compress(xml))]
+        first = ps.read_content("W1", max_chars=7)["content"]
+        self.assertEqual(first["state"], "read")
+        self.assertEqual(first["text"], "Results")
+        self.assertEqual(first["next_offset"], 7)
+        self.key_mock.return_value = ""
+        second = ps.read_content("10.1234/w1", offset=7, max_chars=100)["content"]
+        self.assertEqual(second["text"], "\n\nA real result.")
+        self.assertTrue(second["cached"])
+        self.assertIsNone(second["next_offset"])
+        self.assertEqual(self.urlopen.call_count, 2)
+        cached = Path(first["cache_path"]).read_text(encoding="utf-8")
+        self.assertNotIn("test-secret", cached)
+
+    def test_legacy_tei_shape_and_malformed_content(self):
+        legacy = b'<html><body><tei><text><div><head>Legacy</head><p>Actual text</p></div></text></tei></body></html>'
+        self.urlopen.side_effect = [self.response(self.work()), self.response(legacy)]
+        self.assertEqual(ps.read_content("W1")["content"]["text"], "Legacy\n\nActual text")
+        for number, data in enumerate((b"<html>Not scholarly text</html>", b"<TEI", b'<!DOCTYPE TEI><TEI/>'), start=2):
+            key = "W%d" % number
+            self.urlopen.side_effect = [self.response(self.work(key)), self.response(data)]
+            with self.assertRaises(ps.PaperError):
+                ps.read_content(key)
+            self.assertIsNone(ps._read_cache(ps._record_path(key, "content"), "paper_content"))
+
+    def test_content_unavailable_or_missing_key_is_explicit(self):
+        self.urlopen.return_value = self.response(self.work(has_content={"pdf": True, "grobid_xml": False}))
+        result = ps.read_content("W1")
+        self.assertEqual(result["content"]["state"], "unavailable")
+        self.assertIsNone(result["content"]["text"])
+        self.urlopen.assert_called_once()
+        self.urlopen.return_value = self.response(self.work("W2"))
+        self.key_mock.return_value = ""
+        with self.assertRaises(ps.PaperError) as failure:
+            ps.read_content("W2")
+        self.assertEqual(failure.exception.code, "AUTH_MISSING")
+
+    def test_content_size_window_and_wrong_host_bounds(self):
+        work = self.work(content_urls={"grobid_xml": "https://evil.org/file?api_key=test-secret"})
+        self.urlopen.side_effect = [self.response(work), self.response(b"x" * 101)]
+        with mock.patch.object(ps, "MAX_CONTENT_BYTES", 100), self.assertRaises(ps.PaperError):
+            ps.read_content("W1")
+        self.assertEqual(self.urlopen.call_args.args[0].full_url, ps.CONTENT_BASE + "W1.grobid-xml")
+        for kwargs in ({"offset": -1}, {"max_chars": 0}, {"max_chars": 100001}):
+            with self.assertRaises(ps.PaperError):
+                ps.read_content("W1", **kwargs)
+
+
+    def test_empty_tei_and_missing_download_do_not_fabricate_text(self):
+        self.urlopen.side_effect = [self.response(self.work()), self.response(b"<TEI><text/></TEI>")]
+        content = ps.read_content("W1")["content"]
+        self.assertEqual(content["state"], "unavailable")
+        self.assertIsNone(content["text"])
+        self.urlopen.side_effect = [self.response(self.work("W2")),
+            ps.urllib.error.HTTPError("https://content.openalex.org/secret", 404, "secret", {}, None)]
+        content = ps.read_content("W2")["content"]
+        self.assertEqual(content["state"], "unavailable")
+        self.assertNotIn("secret", json.dumps(content))
+
+    def test_compressed_expansion_is_bounded(self):
+        self.urlopen.side_effect = [self.response(self.work()),
+            self.response(ps.gzip.compress(b"<TEI><text><p>" + b"a" * 1000 + b"</p></text></TEI>"))]
+        with mock.patch.object(ps, "MAX_CONTENT_BYTES", 100), self.assertRaises(ps.PaperError):
+            ps.read_content("W1")
+        self.assertIsNone(ps._read_cache(ps._record_path("W1", "content"), "paper_content"))
+
+    def test_alias_cache_cannot_return_different_work(self):
+        ps._store_record(self.work("W2"))
+        ps._save_cache(ps._record_path("10.1234/w1"), "paper_alias", {
+            "identifier": "10.1234/w1", "openalex_id": "W2"})
+        self.urlopen.return_value = self.response(self.work())
+        result = ps.get_paper("10.1234/w1")
+        self.assertEqual(result["paper"]["openalex_id"], "W1")
+        self.assertFalse(result["cached"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -170,6 +170,110 @@ class FeedContractTests(unittest.TestCase):
         self.assertEqual(result["searches"][0]["status"], "failure")
 
 
+class PaperReadingContractTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.directory = Path(directory.name)
+
+    def invoke(self, *arguments):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+            code = cli_app.main(["--research-dir", str(self.directory), "--quiet", *arguments])
+        return code, json.loads(stdout.getvalue())
+
+    @staticmethod
+    def response(payload, content_type="application/json"):
+        body = payload if isinstance(payload, bytes) else json.dumps(payload).encode("utf-8")
+        response = io.BytesIO(body)
+        response.headers = {"Content-Type": content_type}
+        response.status = 200
+        return response
+
+    def test_reading_mode_conflicts_are_rejected_before_network(self):
+        cases = [("paper",), ("paper", "earnings", "--id", "W1"),
+                 ("paper", "earnings", "--related", "references"),
+                 ("paper", "--id", "W1", "--related", "citations", "--full-text"),
+                 ("paper", "earnings", "--offset", "0"),
+                 ("paper", "--id", "W1", "--max-chars", "100"),
+                 ("paper", "--id", "W1", "--from-year", "2020")]
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("unexpected network")):
+            for arguments in cases:
+                with self.subTest(arguments=arguments):
+                    code, document = self.invoke(*arguments)
+                    self.assertEqual(code, 2)
+                    self.assertIn(document["error"]["code"], {"USAGE", "INVALID_INPUT"})
+
+    def test_feed_keeps_new_papers_and_links_to_complete_cached_record(self):
+        abstract = " ".join("evidence%d" % index for index in range(100))
+        work = {"id": "https://openalex.org/W1", "title": "Recent earnings evidence",
+                "doi": "https://doi.org/10.1234/recent", "publication_year": 2026,
+                "cited_by_count": 0, "referenced_works": [], "has_content": {"grobid_xml": False},
+                "abstract_inverted_index": {word: [index] for index, word in enumerate(abstract.split())}}
+        with mock.patch("urllib.request.urlopen", return_value=self.response({
+                "meta": {"count": 1}, "results": [work]})):
+            code, document = self.invoke("feed", "--topic", "earnings revisions", "--dry-run")
+        self.assertEqual(code, 0, document)
+        self.assertEqual(document["data"]["count"], 1)
+        row = document["data"]["papers"][0]
+        self.assertEqual(row["citations"], 0)
+        self.assertEqual(row["abstract"], abstract[:600])
+        action = next(action for action in document["data"]["next_actions"]
+                      if "--id" in action.get("argv", []) and "--full-text" not in action["argv"])
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("cached record was refetched")):
+            read_code, reading = self.invoke(*action["argv"])
+        self.assertEqual(read_code, 0, reading)
+        self.assertEqual(reading["data"]["paper"]["abstract"], abstract)
+        self.assertTrue(reading["data"]["cached"])
+        self.assertFalse((self.directory / "inspiration" / "seen.jsonl").exists())
+
+    def test_provider_auth_failure_does_not_expose_key_or_request_url(self):
+        import urllib.error
+
+        secret = "synthetic-openalex-secret"
+        failure = urllib.error.HTTPError("https://api.openalex.org/works?api_key=" + secret,
+                                         401, "rejected " + secret, {}, None)
+        with mock.patch.dict(os.environ, {"OPENALEX_API_KEY": secret}), \
+                mock.patch("urllib.request.urlopen", side_effect=failure):
+            code, document = self.invoke("paper", "earnings revisions")
+        self.assertEqual(code, 3, document)
+        self.assertIn(document["error"]["code"], {"AUTH_MISSING", "AUTH_FAILED"})
+        self.assertNotIn(secret, json.dumps(document))
+        self.assertNotIn("api_key=", json.dumps(document))
+
+
+    def test_full_text_actions_continue_from_cache_without_refetching(self):
+        work = {"id": "https://openalex.org/W1", "title": "Synthetic reading example",
+                "referenced_works": [], "has_content": {"grobid_xml": True, "pdf": False},
+                "content_urls": {"grobid_xml": "https://content.openalex.org/works/W1.grobid-xml"}}
+        xml = (b'<TEI xmlns="http://www.tei-c.org/ns/1.0"><text><body><div>'
+               b'<head>Mechanism</head><p>Forecast revisions reveal new information.</p>'
+               b'<p>A placebo separates this explanation from price momentum.</p>'
+               b'</div></body></text></TEI>')
+        with mock.patch.dict(os.environ, {"OPENALEX_API_KEY": "synthetic-content-key"}), \
+                mock.patch("urllib.request.urlopen", side_effect=[
+                    self.response(work), self.response(xml, "application/tei+xml")]):
+            code, document = self.invoke("paper", "--id", "W1", "--full-text", "--max-chars", "17")
+        self.assertEqual(code, 0, document)
+        content = document["data"]["content"]
+        self.assertEqual(content["state"], "read")
+        self.assertEqual(content["returned_chars"], 17)
+        self.assertTrue(content["truncated"])
+        self.assertTrue(Path(content["cache_path"]).is_file())
+        pieces = [content["text"]]
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("cached content was refetched")):
+            while document["data"]["content"].get("next_offset") is not None:
+                previous_offset = document["data"]["content"]["offset"]
+                code, document = self.invoke(*document["data"]["next_actions"][0]["argv"])
+                self.assertEqual(code, 0, document)
+                self.assertGreater(document["data"]["content"]["offset"], previous_offset)
+                pieces.append(document["data"]["content"]["text"])
+        text = "".join(pieces)
+        self.assertEqual(len(text), content["total_chars"])
+        self.assertIn("Forecast revisions reveal new information.", text)
+        self.assertIn("A placebo separates this explanation from price momentum.", text)
+
+
 class MineContractTests(unittest.TestCase):
     def seed_workspace(self, directory, fields, entries=()):
         root = Path(directory)

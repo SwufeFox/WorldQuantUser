@@ -55,7 +55,11 @@ def _seen_keys(content):
             continue
         key = record.get("key") if isinstance(record, dict) else None
         if isinstance(key, str) and key:
-            seen.add(key)
+            seen.add(_canonical_key(key))
+        aliases = record.get("aliases") if isinstance(record, dict) else None
+        if isinstance(aliases, list):
+            seen.update(_canonical_key(alias) for alias in aliases
+                        if isinstance(alias, str) and alias.strip())
     return seen
 
 
@@ -93,18 +97,55 @@ def _append_jsonl_atomic(path, records, previous=None):
             os.unlink(temporary)
 
 
-def paper_key(paper):
-    """A key that survives punctuation drift between mirror records.
+def _canonical_key(value):
+    """Fold DOI spellings while retaining unrecognized historical keys."""
+    value = value.strip()
+    doi = re.sub(r"^(?:doi:\s*|https?://(?:dx\.)?doi\.org/)", "", value,
+                 flags=re.IGNORECASE)
+    if re.match(r"^10\.\d+/\S+$", doi, re.IGNORECASE):
+        return doi.lower()
+    match = re.fullmatch(r"(?:https://openalex\.org/)?[wW](\d+)", value)
+    return "W" + match.group(1) if match else value
 
-    The same paper came back twice with titles differing only in leading dots
-    ("… and the Cross-Section" vs ". . . and the Cross-Section"), so the title is folded
-    to letters and digits before it is used as a key.
-    """
-    doi = (paper.get("doi") or "").strip().lower()
+
+def _title_key(paper):
+    return re.sub(r"[^a-z0-9]+", "", (paper.get("title") or "").lower())
+
+
+def paper_key(paper):
+    """Prefer a canonical identifier; only unidentified works use title folding."""
+    doi = (paper.get("doi") or "").strip()
     if doi:
-        return doi
-    title = re.sub(r"[^a-z0-9]+", "", (paper.get("title") or "").lower())
+        return _canonical_key(doi).lower()
+    identifier = paper.get("openalex_id")
+    if identifier:
+        return _canonical_key(identifier)
+    title = _title_key(paper)
     return title or (paper.get("url") or "").strip().lower()
+
+
+def _paper_keys(paper):
+    keys = [paper_key(paper)]
+    identifier = paper.get("openalex_id")
+    if isinstance(identifier, str):
+        identifier = _canonical_key(identifier)
+        if re.fullmatch(r"W\d+", identifier) and identifier not in keys:
+            keys.append(identifier)
+    return keys
+
+
+def _paper_identifier(paper):
+    """Only validated provider identifiers become executable reading arguments."""
+    import paper_search
+
+    for value in (paper.get("openalex_id"), paper.get("doi")):
+        if not isinstance(value, str) or not value.strip():
+            continue
+        try:
+            return paper_search.normalize_identifier(_canonical_key(value))
+        except (ValueError, paper_search.PaperError):
+            continue
+    return None
 
 
 #: An optional hand-written English query on a thread line:
@@ -232,22 +273,45 @@ def _closure_cautions(paper, register):
     return cautions
 
 
+def _retrieval_job(value):
+    if isinstance(value, dict):
+        return dict(value)
+    return {"kind": "query", "query": value, "source": "openalex",
+            "ordering_basis": "provider relevance"}
+
+
 def _search_topics(topics, args):
-    """Overlap provider I/O and keep outcomes in input order, without shared sessions."""
+    """Overlap bounded query/graph jobs and retain their deterministic input order."""
     import paper_search
 
-    def search(topic):
+    def search(value):
+        job = _retrieval_job(value)
         try:
-            found = paper_search.search_papers(
-                topic, limit=args.limit, from_year=args.from_year,
-                min_citations=args.min_citations, timeout=getattr(args, "timeout", 30))
+            options = dict(limit=args.limit, from_year=args.from_year,
+                           min_citations=args.min_citations, timeout=getattr(args, "timeout", 30))
+            if job["kind"] == "seed":
+                found = paper_search.related_papers(job["seed"], relation=job["relation"], **options)
+            else:
+                found = paper_search.search_papers(job["query"], **options)
             rows = found.get("papers") if isinstance(found, dict) else found
             if not isinstance(rows, list):
-                return topic, [], {"code": "INVALID_RESPONSE"}
-            return topic, rows, None
-        except Exception as error:  # noqa: BLE001 - one provider failure must not cancel peers
-            # Messages may contain request URLs, credentials or response bodies.
-            return topic, [], {"code": "SEARCH_FAILED", "type": type(error).__name__}
+                return job, [], {"code": "INVALID_RESPONSE"}
+            if isinstance(found, dict):
+                for key in ("source", "seed", "relation", "coverage", "cached", "total_available",
+                            "ordering_basis"):
+                    if key in found:
+                        job[key] = found[key]
+                if job["kind"] == "seed":
+                    job["query"] = found.get("query") or job["query"]
+                    coverage = job.get("coverage") or {}
+                    job["ordering_basis"] = coverage.get("ordering") or job["ordering_basis"]
+            return job, rows, None
+        except Exception as error:  # noqa: BLE001 - a failed job must not cancel peers
+            # Never relay provider messages: they can contain request credentials.
+            if isinstance(error, paper_search.PaperError):
+                return job, [], {"code": error.code, "hint": error.hint,
+                                 "type": type(error).__name__}
+            return job, [], {"code": "SEARCH_FAILED", "type": type(error).__name__}
 
     if not topics:
         return []
@@ -264,10 +328,12 @@ def _search_topics(topics, args):
 
 
 def _select_papers(outcomes, seen, total, register):
-    """Balance topics without replacing each provider's relevance order."""
-    candidates, buckets, reports, repeats = {}, [], [], set()
-    for topic, rows, error in outcomes:
-        report = {"query": topic, "status": "failure" if error else "success" if rows else "empty",
+    """Balance retrieval jobs without replacing the provider's order."""
+    candidates, identities, buckets, reports, repeats = {}, {}, [], [], set()
+    for value, rows, error in outcomes:
+        job = _retrieval_job(value)
+        topic = job["query"]
+        report = {**job, "status": "failure" if error else "success" if rows else "empty",
                   "returned": len(rows), "eligible": 0, "seen_before": 0,
                   "invalid": 0, "picked": 0}
         if error:
@@ -281,7 +347,8 @@ def _select_papers(outcomes, seen, total, register):
                 report["invalid"] += 1
                 continue
             try:
-                key = paper_key(paper)
+                keys = _paper_keys(paper)
+                key = keys[0]
                 rank = score(paper)
                 abstract = paper.get("abstract") or ""
                 valid = bool(key) and math.isfinite(rank) and isinstance(abstract, str)
@@ -290,20 +357,36 @@ def _select_papers(outcomes, seen, total, register):
             if not valid:
                 report["invalid"] += 1
                 continue
-            if key in seen:
-                repeats.add(key)
+            if any(alias in seen for alias in keys) or (
+                not paper.get("doi") and _title_key(paper) in seen
+            ):
+                repeats.add(keys[-1])
                 report["seen_before"] += 1
                 continue
+            key = next((identities[alias] for alias in keys if alias in identities), key)
             if key not in candidates:
-                candidates[key] = {**paper, "query": topic, "queries": [], "key": key,
+                candidates[key] = {**paper, "source": paper.get("source") or job["source"],
+                                   "query": topic, "queries": [], "key": key,
                                    "rank": rank, "abstract": abstract[:600],
-                                   "provider_ranks": [],
+                                   "abstract_chars": len(abstract),
+                                   "abstract_truncated": len(abstract) > 600,
+                                   "reference_count": len(paper["referenced_works"])
+                                   if isinstance(paper.get("referenced_works"), list) else None,
+                                   "aliases": [],
+                                   "abstract_available": bool(abstract),
+                                   "reading": paper.get("reading"), "full_text_read": False,
+                                   "provider_ranks": [], "retrievals": [],
                                    "closure_cautions": _closure_cautions(paper, register)}
             candidate = candidates[key]
-            if topic not in candidate["queries"]:
+            for alias in keys:
+                identities[alias] = key
+                if alias != key and alias not in candidate["aliases"]:
+                    candidate["aliases"].append(alias)
+            if job["kind"] == "query" and topic not in candidate["queries"]:
                 candidate["queries"].append(topic)
                 candidate["provider_ranks"].append({"query": topic, "rank": provider_rank})
             if key not in bucket_keys:
+                candidate["retrievals"].append({**job, "position": provider_rank})
                 bucket_keys.add(key)
                 bucket.append(candidate)
         report["eligible"] = len(bucket)
@@ -335,20 +418,33 @@ def _draft_card(paper):
         "mechanism_id": None,
         "status": "DRAFT",
         "source": {**{key: paper.get(key) for key in
-                      ("title", "doi", "url", "landing_page_url", "pdf_url", "journal", "year")},
+                      ("title", "doi", "openalex_id", "source", "url", "landing_page_url",
+                       "pdf_url", "journal", "year", "reference_count", "cited_by_api_url")},
                    "verified": False},
         "hypothesis": {"economic_mechanism": None, "falsification": None},
         "implementation": {"conceptual_fields": [], "verified_brain_fields": []},
         "novelty": {"closest_existing_family": None},
         "abstract": paper.get("abstract"),
+        "abstract_chars": paper.get("abstract_chars"),
+        "abstract_truncated": paper.get("abstract_truncated"),
+        "abstract_available": paper.get("abstract_available"),
+        "reading": paper.get("reading"),
+        "full_text_read": False,
+        "queries": paper.get("queries"),
+        "retrievals": paper.get("retrievals"),
     }
 
 
 def _feed_argv(args, topics, seen_path):
     """Exact CLI arguments for a bounded retry using this invocation's research context."""
     argv = ["--research-dir", os.fspath(research_paths.research_dir()), "feed"]
-    for topic in topics:
-        argv.extend(("--topic", topic))
+    jobs = [_retrieval_job(topic) for topic in topics]
+    for job in jobs:
+        argv.extend(("--seed", job["seed"]) if job["kind"] == "seed"
+                    else ("--topic", job["query"]))
+    relations = [job["relation"] for job in jobs if job["kind"] == "seed"]
+    if relations:
+        argv.extend(("--follow", relations[0]))
     for option, value in (("--limit", args.limit), ("--total", args.total),
                           ("--max-topics", len(topics)), ("--from-year", args.from_year),
                           ("--min-citations", args.min_citations),
@@ -425,26 +521,43 @@ def data_fit(paper, field_scope=None):
 
 
 def _next_actions(args, reports, unresolved, deferred, papers, seen_path):
-    """At most eleven evidence-based actions; the action view may add one ledger contrast."""
+    """Bound recovery/review actions; each source has at most three reading steps."""
     actions = []
     for report in [row for row in reports if row["status"] == "failure"][:3]:
         actions.append({"kind": "retry_search", "query": report["query"],
+                        "retrieval": {key: report[key] for key in
+                                      ("kind", "source", "seed", "relation") if key in report},
                         "error": report["error"],
-                        "argv": _feed_argv(args, [report["query"]], seen_path)})
+                        "argv": _feed_argv(args, [report], seen_path)})
     for question in unresolved[:3]:
         actions.append({"kind": "supply_query", **question,
                         "instruction": "Add '; query:' followed by your own English search "
                                        "terms to this open-thread line."})
     if deferred:
-        actions.append({"kind": "search_deferred", "queries": deferred[:3],
-                        "remaining": max(0, len(deferred) - 3),
-                        "argv": _feed_argv(args, deferred[:3], seen_path)})
+        jobs = [_retrieval_job(value) for value in deferred[:3]]
+        actions.append({"kind": "search_deferred",
+                        "queries": [job["query"] for job in jobs if job["kind"] == "query"],
+                        "retrievals": jobs, "remaining": max(0, len(deferred) - 3),
+                        "argv": _feed_argv(args, jobs, seen_path)})
     for index, paper in enumerate(papers[:3]):
-        actions.append({"kind": "review_source", "paper_index": index,
-                        "sources": {key: paper.get(key) for key in
-                                    ("doi", "url", "landing_page_url", "pdf_url")},
-                        "instruction": "Read the source; record its sample, identification "
-                                       "strategy and falsification evidence before drafting a mechanism."})
+        action = {"kind": "review_source", "paper_index": index,
+                  "sources": {key: paper.get(key) for key in
+                              ("doi", "openalex_id", "url", "landing_page_url", "pdf_url")},
+                  "instruction": "Read the source; record its sample, identification "
+                                 "strategy and falsification evidence before drafting a mechanism."}
+        identifier = _paper_identifier(paper)
+        if identifier:
+            argv = ["--research-dir", os.fspath(research_paths.research_dir()),
+                    "paper", "--id", identifier, "--timeout", str(getattr(args, "timeout", 30))]
+            action["argv"] = argv
+            action["next_actions"] = [{"kind": "expand_references", "argv":
+                _feed_argv(args, [{"kind": "seed", "seed": identifier,
+                                  "relation": "references"}], seen_path)}]
+            reading = paper.get("reading") or {}
+            if reading.get("grobid_xml") is True:
+                action["next_actions"].insert(0, {"kind": "read_full_text",
+                    "argv": argv + ["--full-text", "--offset", "0", "--max-chars", "12000"]})
+        actions.append(action)
     if len(papers) > 1:
         actions.append({"kind": "contrast_sources", "paper_indices": [0, 1],
                         "instruction": "Compare these sources' samples, identification and "
@@ -455,6 +568,7 @@ def _next_actions(args, reports, unresolved, deferred, papers, seen_path):
 def cmd_feed(args, _sink):
     """Search concurrently, then select against the latest locked seen state."""
     import closed_families
+    import paper_search
 
     seen_path = os.path.realpath(_seen_path(args))
     draft_path = os.path.realpath(args.draft_cards) if args.draft_cards else None
@@ -483,10 +597,26 @@ def cmd_feed(args, _sink):
         if query:
             distinct.setdefault(query.casefold(), query)
     topics = list(distinct.values())
-    if not topics and not unresolved:
+    seeds = []
+    for value in getattr(args, "seed", None) or []:
+        try:
+            seed = paper_search.normalize_identifier(_canonical_key(value))
+        except (ValueError, paper_search.PaperError) as error:
+            raise CliError("INVALID_INPUT", "Invalid feed seed identifier.",
+                           hint="Use an OpenAlex W identifier or DOI.") from error
+        if seed not in seeds:
+            seeds.append(seed)
+    relation = getattr(args, "follow", "references")
+    if relation not in ("references", "citations"):
+        raise CliError("INVALID_INPUT", "Follow must be references or citations.")
+    jobs = [_retrieval_job(topic) for topic in topics] + [
+        {"kind": "seed", "seed": seed, "relation": relation, "source": "openalex",
+         "query": "%s of %s" % (relation, seed), "ordering_basis": "provider order"}
+        for seed in seeds]
+    if not jobs and not unresolved:
         raise CliError("INVALID_INPUT",
-                       "nothing to search: pass --topic, --topics or --from-threads")
-    selected = topics[:max(0, args.max_topics)]
+                       "nothing to search: pass --topic, --topics, --from-threads or --seed")
+    selected = jobs[:max(0, args.max_topics)]
     outcomes = _search_topics(selected, args)
     try:
         if getattr(args, "dry_run", False) or not any(rows for _, rows, _ in outcomes):
@@ -506,7 +636,8 @@ def cmd_feed(args, _sink):
                     if draft_path:
                         _append_jsonl_atomic(draft_path, (_draft_card(paper) for paper in picked))
                     _append_jsonl_atomic(seen_path, (
-                        {"key": paper["key"], "title": paper.get("title"), "query": paper.get("query")}
+                        {"key": paper["key"], "title": paper.get("title"), "query": paper.get("query"),
+                         **({"aliases": paper["aliases"]} if paper["aliases"] else {})}
                         for paper in picked), previous=previous)
     except (OSError, cache_store.LockTimeout) as error:
         raise CliError("INVALID_INPUT", "Could not read or commit feed state.",
@@ -515,13 +646,15 @@ def cmd_feed(args, _sink):
                        details={"seen": seen_path, "draft_cards": draft_path,
                                 "type": type(error).__name__}) from error
 
-    deferred = topics[len(selected):]
+    deferred = jobs[len(selected):]
     settings = {"region": getattr(args, "region", None), "universe": getattr(args, "universe", None),
                 "delay": getattr(args, "delay", None), "instrumentType": getattr(args, "instrument_type", None)}
     scope = cached_field_scope(settings, getattr(args, "meta_max_age", None))
     return {
-        "topics": selected,
-        "unsearched_topics": deferred,
+        "topics": [job["query"] for job in selected if job["kind"] == "query"],
+        "seeds": [job["seed"] for job in selected if job["kind"] == "seed"],
+        "unsearched_topics": [job["query"] for job in deferred if job["kind"] == "query"],
+        "unsearched_retrievals": [{**job, "status": "unsearched"} for job in deferred],
         "questions_without_query": unresolved,
         "searches": reports,
         "seen_before": repeats,
@@ -534,11 +667,15 @@ def cmd_feed(args, _sink):
         "papers": [{**{k: paper.get(k) for k in
                      ("title", "year", "journal", "doi", "url", "landing_page_url", "pdf_url",
                       "abstract", "family", "citations", "query", "queries", "rank", "provider_ranks",
-                      "closure_cautions", "required_fields")},
+                      "closure_cautions", "required_fields", "openalex_id", "source", "retrievals",
+                      "reference_count", "cited_by_api_url", "reading", "full_text_read",
+                      "abstract_chars", "abstract_truncated", "abstract_available")},
                     "data_fit": data_fit(paper, scope)}
                    for paper in picked],
         "next_actions": _next_actions(args, reports, unresolved, deferred, picked, seen_path),
-        "note": ("Picks take turns across queries, preserving provider relevance order within each query. "
+        "note": ("Picks take turns across retrieval jobs, preserving each provider's order. "
+                 "Queries retain relevance order; graph ordering and coverage are reported per job. "
+                 "Graph edges establish neither support nor contradiction. No full text is fetched by feed. "
                  "provider_ranks gives original query positions; rank is a legacy citation/year score. Closure "
                  "cautions require a declared family; no title or relevance filter applies. "
                  "Dry-run leaves seen and draft files unchanged; search caching may write. "

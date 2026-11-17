@@ -439,6 +439,10 @@ def build_parser():
                     "Optional DRAFT cards still require deliberate research judgement.")
     feed_parser.add_argument("--topic", action="append", default=None,
                              help="Search this instead of deriving from open-threads.")
+    feed_parser.add_argument("--seed", action="append", default=None, metavar="ID",
+                             help="Expand references/citations of a known OpenAlex ID or DOI; repeatable.")
+    feed_parser.add_argument("--follow", choices=("references", "citations"), default="references",
+                             help="Citation direction for --seed; an edge is a reading lead, not evidence of agreement.")
     feed_parser.add_argument("--from-threads", action="store_true", dest="from_threads",
                              help="Derive queries from open-threads.md.")
     feed_parser.add_argument("--topics", action="store_true",
@@ -449,14 +453,15 @@ def build_parser():
                              help="Papers per query.")
     feed_parser.add_argument("--total", type=int, default=10,
                              help="Papers in the digest.")
-    feed_parser.add_argument("--max-topics", type=int, default=4, dest="max_topics")
+    feed_parser.add_argument("--max-topics", type=_non_negative_integer, default=4, dest="max_topics",
+                             help="Maximum retrieval jobs across keyword queries and seeds.")
     feed_parser.add_argument("--workers", type=int, choices=range(1, 9), default=4,
                              help="Concurrent topic searches, bounded independently of result count.")
     feed_parser.add_argument("--timeout", type=_positive_seconds, default=30.0,
                              metavar="SECONDS", help="Network timeout for each topic search.")
     feed_parser.add_argument("--from-year", type=int, default=2005, dest="from_year")
-    feed_parser.add_argument("--min-citations", type=int, default=20,
-                             dest="min_citations")
+    feed_parser.add_argument("--min-citations", type=_non_negative_integer, default=0,
+                             dest="min_citations", help="Optional citation floor; default 0 keeps new papers eligible.")
     feed_parser.add_argument("--seen", default=None)
     feed_parser.add_argument("--draft-cards", default=None, dest="draft_cards",
                              metavar="PATH")
@@ -709,8 +714,20 @@ def build_parser():
 
     papers = sub.add_parser(
         "paper",
-        help="Find papers via OpenAlex: journal, DOI, citations and abstract.")
-    papers.add_argument("query")
+        help="Find, inspect and read papers or follow their citation graph via OpenAlex.")
+    papers.add_argument("query", nargs="?", help="Keyword query; use --id to inspect a known paper.")
+    papers.add_argument("--id", dest="paper_id", default=None, metavar="ID",
+                        help="OpenAlex W ID or DOI, including their standard HTTPS URLs.")
+    papers.add_argument("--related", choices=("references", "citations"), default=None,
+                        help="Retrieve a bounded set of graph neighbours of --id.")
+    papers.add_argument("--full-text", action="store_true",
+                        help="Read advertised OpenAlex structured full text for --id; availability may be unknown.")
+    papers.add_argument("--offset", type=_non_negative_integer, default=None,
+                        help="Character offset for --full-text (default 0).")
+    papers.add_argument("--max-chars", type=_positive_count, default=None,
+                        help="Characters per full-text reading window (default 12000); complete text stays cached.")
+    papers.add_argument("--timeout", type=_positive_seconds, default=30.0,
+                        metavar="SECONDS", help="Network timeout per paper request.")
     papers.add_argument("--limit", type=int, default=10,
                         help="Number of papers, 1-50 (default 10).")
     papers.add_argument("--from-year", type=int, default=None,
@@ -1473,9 +1490,12 @@ _COMMAND_EXAMPLES = {
     "catalog field-audit": ["catalog field-audit --fields close,volume"],
     "lint": ['lint --expr "rank(close)" --offline', "lint --file research.json"],
     "search": ['search "post earnings announcement drift" --min-authority 3'],
-    "paper": ['paper "accruals stock returns" --limit 3'],
+    "paper": ['paper "accruals stock returns" --limit 3',
+              'paper --id W2741809807', 'paper --id W2741809807 --related references --limit 5',
+              'paper --id W2741809807 --full-text --max-chars 12000'],
     "feed": ["feed --from-threads --workers 4 --timeout 30 --dry-run",
-             'feed --topic "analyst revisions" --topic "earnings quality" --action'],
+             'feed --topic "analyst revisions" --topic "earnings quality" --action',
+             'feed --seed W2741809807 --follow citations --dry-run'],
     "simulate": ['simulate --expr "rank(close)" --dry-run',
                  "simulate research.json --sort fitness --save results.json"],
     "resume": ["resume CHECKPOINT.json --save results.json"],

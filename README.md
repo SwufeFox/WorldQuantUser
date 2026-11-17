@@ -287,14 +287,17 @@ For the explore → select → experiment → review workflow, see
 ```bash
 python research_cli.py feed --from-threads --workers 4 --timeout 30 --dry-run
 python research_cli.py feed --topic "analyst revisions" --topic "earnings quality" --action
+python research_cli.py feed --seed W2741809807 --follow citations --dry-run
 ```
 
-`--workers` bounds concurrent queries (1–8, default 4); `--timeout` bounds each network
-request. Output retains topic order and balanced picks regardless of completion order.
-Within each topic, picks retain the provider's relevance order; citation counts and
-publication years do not reorder the results. `provider_ranks` records each paper's
-original position for every matching query. `rank` remains a legacy citation/year
-score for compatibility, not the selection order.
+`--workers` bounds concurrent retrieval jobs (1–8, default 4); `--timeout` bounds each
+network request. Keyword queries and explicit `--seed` reference/citation expansions share
+the `--max-topics` budget. Output retains input order and balanced picks regardless of
+completion order. Keyword results preserve provider relevance; graph results report their
+own ordering and coverage in `retrievals`. A citation edge does not imply agreement.
+The default citation floor is 0, so recent papers remain eligible; `--min-citations` is an
+explicit optional filter. `provider_ranks` retains original query positions. `rank` remains
+a legacy citation/year score, not the selection order.
 `next_actions` supplies bounded, evidence-linked retries, deferred searches, source reviews
 and contrasts. Its `argv` lists are arguments for `research_cli.py`, not shell strings.
 Threads may state an authored query with `; query: ...`, including after a Chinese heading.
@@ -303,6 +306,15 @@ Paper caches use the effective request under `<research>/cache/papers/`; web-sea
 also distinguish content and original-question options. Identical concurrent misses share
 one fetch; writes are atomic, expired/corrupt entries refetch, and failed cache writes do
 not discard successful retrievals. Paper records preserve available landing-page/PDF links.
+
+Feed abstracts remain bounded to 600 characters, with `abstract_chars` and
+`abstract_truncated` distinguishing an excerpt from a complete abstract. Source-review
+actions include executable `paper --id` arguments, conditional full-text reading steps,
+and reference expansion. Search caches also retain complete individual records, so reading
+a selected record normally needs no second request. DOI aliases are normalized against
+both new results and the existing seen store. Feed itself never downloads full text.
+`reference_count` keeps bibliography size visible without copying every reference ID into
+the digest; the complete list remains in `paper --id` records.
 
 Concurrent feeds reread seen state under a lock after retrieval. Drafts commit before seen;
 each file is atomic, but a crash between commits can repeat drafts, and a crash after seen
@@ -1184,15 +1196,22 @@ correlation tables missing exactly the rows fetched fastest.
 blogs, explainers and brokerage pages. Use source type and primary evidence to
 decide whether a result supports the economic claim.
 
-`paper` asks OpenAlex instead, which is free and needs no key:
+`paper` uses OpenAlex. Basic live queries can work without a key; larger usage and content
+access follow the provider's current policy. Set `OPENALEX_API_KEY` in `.env` or the
+environment when needed. Keys are sent in an authorization header and excluded from
+saved evidence and errors; existing usable caches remain readable without a key.
 
 ```bash
 python research_cli.py paper 'net operating assets stock returns anomaly' --limit 3
 python research_cli.py paper 'analyst coverage breadth' --from-year 2010 --min-citations 50
+python research_cli.py paper --id W2741809807
+python research_cli.py paper --id W2741809807 --related references --limit 5
+python research_cli.py paper --id W2741809807 --related citations --limit 5
+python research_cli.py paper --id W2741809807 --full-text --max-chars 12000
 ```
 
-Every row carries a journal, a year, a DOI and a citation count, plus the abstract when
-the publisher licensed it. Two details make it work:
+Records preserve available journal, year, DOI, citation count and abstract metadata;
+missing values stay unknown. Two details make search useful:
 
 * results are ranked by **relevance**, not citations. Sorting by citations answers a
   mechanism query with the most-cited finance papers ever written - the Fama-French
@@ -1201,8 +1220,21 @@ the publisher licensed it. Two details make it work:
   reconstructed, otherwise every hit is a title and the tool is no better than the web
   search it replaces.
 
-A missing abstract means the publisher withheld it; that is reported as absent rather than
-guessed at.
+A missing abstract is reported as absent; its cause is not inferred.
+
+`--id` accepts an OpenAlex W ID or DOI and returns the complete cached record. Graph
+expansion makes bounded requests: references inspect at most 100 advertised IDs in one
+batch and restore their provider list order; citations inspect one provider page. `coverage`
+records unfetched/unresolved IDs, filters and ordering, so a short result is not described
+as an exhaustive literature review.
+
+`--full-text` reads OpenAlex's advertised GROBID TEI XML explicitly. It distinguishes
+available, unavailable and unknown content; a publisher PDF link is not proof of readable
+TEI. The complete extracted text is cached, while stdout shows a character window
+(default 12000; maximum 100000). `next_actions` gives the next `--offset` command. Gzip and
+both documented TEI layouts are supported. Extracted text can omit PDF layout, tables or
+source material that GROBID did not capture; the output is reading evidence, not an
+automatically verified mechanism. See [the workflow and tool comparison](docs/tooling.md#从发现走到可核对的阅读证据).
 
 ## Check an idea against the literature
 
@@ -1216,9 +1248,8 @@ python research_cli.py search "deferred revenue anomaly" --count 20 --content
 python research_cli.py search --fetch https://www.nber.org/papers/w12345
 ```
 
-Requires `DEEPSEEK_API_KEY` in `.env` (or the environment); nothing else is
-needed and the key is never written to the repo. Search and Fetch are free of
-charge until billing starts on 2026-11-01 Beijing time.
+Requires `DEEPSEEK_API_KEY` in `.env` or the environment. The key stays out of the
+repository; availability and charges follow the provider's current pricing.
 
 Results keep the provider's ranking plus `rerank_score` (1.5+ is high quality),
 `authority` (3+ is authoritative) and `date`, so a journal article can be told

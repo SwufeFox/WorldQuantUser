@@ -603,6 +603,203 @@ class FeedTests(unittest.TestCase):
         self.assertFalse(os.path.exists(result["seen"]))
         self.assertFalse(os.path.exists(args.draft_cards))
 
+    def test_mixed_jobs_balance_queries_and_edges_without_reordering(self):
+        shared = self.paper("Shared", doi="10.1234/shared", openalex_id="W101")
+        query_only = self.paper("Query", doi="10.1234/query")
+        graph_only = self.paper("Graph", doi="10.1234/graph", citations=0)
+        graph = {"source": "openalex", "seed": "W100", "relation": "references",
+                 "query": "references of W100", "papers": [shared, graph_only],
+                 "total_available": 8,
+                 "coverage": {"truncated": True, "ordering": "referenced_works_order"},
+                 "cached": True}
+        with mock.patch("paper_search.search_papers", return_value={
+                "papers": [query_only, shared]}), \
+                mock.patch("paper_search.related_papers", return_value=graph) as related, \
+                mock.patch("paper_search.read_content") as fulltext:
+            result = feed.cmd_feed(self.args(seed=["https://openalex.org/W100"],
+                                             total=3, dry_run=True), None)
+        related.assert_called_once_with("W100", relation="references", limit=5,
+                                        from_year=2005, min_citations=0, timeout=30)
+        fulltext.assert_not_called()
+        self.assertEqual([row["title"] for row in result["papers"]], ["Query", "Shared", "Graph"])
+        self.assertEqual(result["papers"][1]["queries"], ["receivables"])
+        self.assertEqual([row["kind"] for row in result["papers"][1]["retrievals"]],
+                         ["query", "seed"])
+        edge = result["papers"][1]["retrievals"][1]
+        self.assertEqual((edge["seed"], edge["relation"], edge["position"]),
+                         ("W100", "references", 1))
+        self.assertEqual(edge["ordering_basis"], "referenced_works_order")
+        self.assertNotIn("support", edge)
+        self.assertNotIn("contradiction", edge)
+        self.assertEqual(result["searches"][1]["coverage"], graph["coverage"])
+        self.assertEqual(result["searches"][1]["total_available"], 8)
+
+    def test_seed_budget_deduplicates_aliases_and_defers_exact_jobs(self):
+        args = self.args(topic=["one", "two"], seed=["W1", "https://openalex.org/W1", "W2"],
+                         follow="citations", max_topics=3, dry_run=True)
+        with mock.patch("paper_search.search_papers", return_value={"papers": []}) as search, \
+                mock.patch("paper_search.related_papers", return_value={"papers": []}) as related:
+            result = feed.cmd_feed(args, None)
+        self.assertEqual(search.call_count, 2)
+        related.assert_called_once_with("W1", relation="citations", limit=5,
+                                        from_year=2005, min_citations=0, timeout=30)
+        self.assertEqual(result["seeds"], ["W1"])
+        self.assertEqual(result["unsearched_retrievals"][0]["seed"], "W2")
+        action = next(row for row in result["next_actions"] if row["kind"] == "search_deferred")
+        self.assertEqual(action["queries"], [])
+        self.assertIn("--seed", action["argv"])
+        self.assertIn("W2", action["argv"])
+        self.assertIn("citations", action["argv"])
+        self.assertNotIn("--topic", action["argv"])
+
+    def test_seed_failures_retry_the_graph_with_exact_context(self):
+        args = self.args(topic=None, seed=["W1"], follow="citations", dry_run=True,
+                         region="USA", universe="TOP3000", delay=1, instrument_type="EQUITY",
+                         meta_max_age=24, timeout=4.5)
+        with mock.patch("paper_search.related_papers", side_effect=RuntimeError("SECRET")), \
+                mock.patch("paper_search.search_papers") as search:
+            result = feed.cmd_feed(args, None)
+        search.assert_not_called()
+        action = result["next_actions"][0]
+        self.assertEqual(action["argv"], [
+            "--research-dir", self.root, "feed", "--seed", "W1", "--follow", "citations",
+            "--limit", "5", "--total", "3", "--max-topics", "1", "--from-year", "2005",
+            "--min-citations", "0", "--workers", "4", "--timeout", "4.5",
+            "--seen", result["seen"], "--region", "USA", "--universe", "TOP3000",
+            "--delay", "1", "--instrument-type", "EQUITY", "--meta-max-age", "24", "--dry-run"])
+        self.assertEqual(action["retrieval"]["relation"], "citations")
+        self.assertNotIn("SECRET", json.dumps(result))
+
+    def test_doi_aliases_dedupe_current_results_and_legacy_seen_bytes(self):
+        seen = self.write_file("seen.jsonl", '{"key":"https://doi.org/10.1234/KNOWN"}\n'
+                               '{"key":"legacytitle"}\n')
+        with open(seen, "rb") as handle:
+            previous = handle.read()
+        rows = [self.paper("Old", doi="doi:10.1234/known"),
+                self.paper("Legacy title", doi=None),
+                self.paper("New", doi="10.1234/new"),
+                self.paper("New alias", doi="https://doi.org/10.1234/NEW"),
+                self.paper("New", doi="doi:10.1234/distinct")]
+        result = self.run_feed(rows, self.args(seen=seen))
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["seen_before"], 2)
+        self.assertEqual(feed.load_seen(seen),
+                         {"10.1234/known", "legacytitle", "10.1234/new", "10.1234/distinct"})
+        with open(seen, "rb") as handle:
+            self.assertTrue(handle.read().startswith(previous))
+        again = self.run_feed([self.paper("Changed title", doi="doi:10.1234/NEW")],
+                              self.args(seen=seen))
+        self.assertEqual(again["count"], 0)
+
+    def test_reading_steps_are_executable_and_do_not_fetch_content(self):
+        draft = os.path.join(self.root, "drafts.jsonl")
+        paper = self.paper("Readable", doi="10.1234/readable", openalex_id="W42",
+                           source="openalex", abstract="evidence " * 200,
+                           reading={"grobid_xml": True, "pdf": True,
+                                    "full_text_state": "available"},
+                           referenced_works=["W%d" % index for index in range(9000)])
+        with mock.patch("paper_search.read_content") as content, \
+                mock.patch("paper_search.get_paper") as singleton:
+            result = self.run_feed([paper], self.args(draft_cards=draft))
+        content.assert_not_called()
+        singleton.assert_not_called()
+        row = result["papers"][0]
+        self.assertEqual(len(row["abstract"]), 600)
+        self.assertEqual(row["abstract_chars"], len(paper["abstract"]))
+        self.assertTrue(row["abstract_truncated"])
+        self.assertFalse(row["full_text_read"])
+        self.assertEqual(row["reference_count"], 9000)
+        self.assertNotIn("referenced_works", row)
+        self.assertLess(len(json.dumps(result)), 20000)
+        action = result["next_actions"][0]
+        self.assertEqual(action["argv"], ["--research-dir", self.root, "paper",
+                                         "--id", "W42", "--timeout", "30"])
+        read, expand = action["next_actions"]
+        self.assertEqual(read["argv"], action["argv"] +
+                         ["--full-text", "--offset", "0", "--max-chars", "12000"])
+        self.assertIn("--seed", expand["argv"])
+        self.assertIn("W42", expand["argv"])
+        self.assertIn("references", expand["argv"])
+        with open(draft, encoding="utf-8") as handle:
+            card = json.loads(handle.read())
+        self.assertEqual(card["reading"], paper["reading"])
+        self.assertEqual(card["source"]["openalex_id"], "W42")
+        self.assertEqual(card["abstract_chars"], len(paper["abstract"]))
+        self.assertEqual(card["retrievals"][0]["query"], "receivables")
+        self.assertIsNone(card["hypothesis"]["economic_mechanism"])
+
+    def test_identifier_aliases_deduplicate_within_and_across_feeds(self):
+        unidentified = self.paper("Same work", doi=None, openalex_id="W42")
+        identified = self.paper("Same work", doi="https://doi.org/10.1234/same", openalex_id="W42")
+        result = self.run_feed([unidentified, identified])
+        self.assertEqual(result["count"], 1)
+        later = self.run_feed([self.paper("Updated title", doi="doi:10.1234/same"), unidentified])
+        self.assertEqual(later["count"], 0)
+
+    def test_legacy_title_identity_survives_added_id_without_merging_distinct_doi(self):
+        seen = self.write_file("seen.jsonl", '{"key":"anonymous","title":"Anonymous"}\n')
+        old = self.paper("Anonymous", doi=None, openalex_id="W1")
+        distinct = self.paper("Anonymous", doi="10.1234/distinct", openalex_id="W2")
+        result = self.run_feed([old, distinct], self.args(seen=seen))
+        self.assertEqual([row["openalex_id"] for row in result["papers"]], ["W2"])
+
+    def test_pdf_link_and_missing_reading_metadata_do_not_claim_read_text(self):
+        rows = [self.paper("PDF", doi="10.1234/pdf", pdf_url="https://example.org/paper.pdf",
+                           reading={"pdf": True, "grobid_xml": False,
+                                    "full_text_state": "unavailable"}),
+                self.paper("Unknown", doi="10.1234/unknown", abstract=None)]
+        result = self.run_feed(rows, self.args(dry_run=True))
+        self.assertIsNone(result["papers"][1]["reading"])
+        self.assertFalse(result["papers"][1]["abstract_available"])
+        for action in result["next_actions"]:
+            if action["kind"] == "review_source":
+                self.assertTrue(action["argv"])
+                self.assertEqual([step["kind"] for step in action["next_actions"]],
+                                 ["expand_references"])
+
+    def test_invalid_seed_rejected_before_any_retrieval(self):
+        with mock.patch("paper_search.search_papers") as search, \
+                mock.patch("paper_search.related_papers") as related:
+            with self.assertRaises(feed.CliError):
+                feed.cmd_feed(self.args(seed=["https://example.org/W1?api_key=SECRET"]), None)
+        search.assert_not_called()
+        related.assert_not_called()
+
+    def test_mixed_jobs_share_workers_and_keep_order_when_seed_finishes_first(self):
+        both_started = threading.Barrier(2, timeout=5)
+        seed_reported = threading.Event()
+
+        def query(_query, **_options):
+            both_started.wait()
+            if not seed_reported.wait(5):
+                raise RuntimeError("seed report not delivered")
+            return {"papers": [self.paper("Query", doi="10.1234/query")]}
+
+        def related(_seed, **_options):
+            both_started.wait()
+            return {"papers": [self.paper("Seed", doi="10.1234/seed")]}
+
+        def note(message):
+            if message.startswith("feed: search 2/"):
+                seed_reported.set()
+
+        with mock.patch("paper_search.search_papers", side_effect=query), \
+                mock.patch("paper_search.related_papers", side_effect=related), \
+                mock.patch.object(feed.runtime, "note", side_effect=note):
+            result = feed.cmd_feed(self.args(seed=["W1"], workers=2, dry_run=True), None)
+        self.assertEqual([row["kind"] for row in result["searches"]], ["query", "seed"])
+        self.assertEqual([row["title"] for row in result["papers"]], ["Query", "Seed"])
+
+    def test_provider_errors_keep_safe_actionable_codes(self):
+        import paper_search
+
+        error = paper_search.PaperError("RATE_LIMITED", "Rate limited.",
+                                       hint="Wait before retrying.")
+        with mock.patch("paper_search.related_papers", side_effect=error):
+            result = feed.cmd_feed(self.args(topic=None, seed=["W1"], dry_run=True), None)
+        self.assertEqual(result["searches"][0]["error"]["code"], "RATE_LIMITED")
+        self.assertEqual(result["next_actions"][0]["error"]["hint"], "Wait before retrying.")
+
 
 class DataFitTests(unittest.TestCase):
     """Reading keywords do not establish account capabilities or signal validity."""
