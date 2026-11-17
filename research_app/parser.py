@@ -15,6 +15,7 @@ import research_config as config_io
 import research_paths
 
 from . import account, alphas, benchmark, feed, independence, triage, legs, mine, pairs, promote, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from . import docs_reader, reference
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -84,11 +85,13 @@ def _add_common_args(parser):
                        help="Use this research directory for this invocation, overriding BRAIN_RESEARCH_DIR.")
 
 
-def _add_session_args(parser):
+def _add_session_args(parser, *, metadata=True):
     parser.add_argument("--no-cache", action="store_true",
                         help="Ignore the cached session and re-authenticate.")
     parser.add_argument("--relogin", action="store_true",
                         help="Force a fresh login even if the cache looks valid.")
+    if not metadata:
+        return
     parser.add_argument("--meta-max-age", type=_non_negative_seconds, default=None,
                         metavar="SECONDS",
                         help="Accept cached catalog metadata up to this age "
@@ -209,6 +212,46 @@ def _add_settings_args(parser):
     parser.add_argument("--setting", action="append", type=_setting_assignment, default=None,
                         metavar="NAME=VALUE", help="Additional platform setting; repeatable. "
                         "Values accept JSON or unquoted text. Conflicting explicit flags are rejected.")
+
+
+def _add_reference_commands(sub):
+    def add(group, name, func, help_text):
+        command = group.add_parser(name, help=help_text)
+        _add_session_args(command, metadata=False)
+        command.set_defaults(func=func)
+        return command
+
+    def paginate(command, *, cursor=False):
+        command.add_argument("--limit", type=int, default=10, help="Items per response.")
+        if cursor:
+            command.add_argument("--cursor", help="Continue from pagination.after_cursor.")
+        else:
+            command.add_argument("--page", type=int, default=1, help="Page number.")
+
+    docs = sub.add_parser("docs", help="Read official BRAIN documentation and Help Center articles.")
+    docs_sub = docs.add_subparsers(dest="subcommand", metavar="<action>", parser_class=JsonArgumentParser)
+    docs_list = add(docs_sub, "list", docs_reader.cmd_docs_list, "List BRAIN documentation by category.")
+    docs_list.add_argument("--query", help="Filter category titles, page titles and IDs.")
+    docs_get = add(docs_sub, "get", docs_reader.cmd_docs_get, "Read a BRAIN documentation page's original content blocks.")
+    docs_get.add_argument("slug", help="Page ID from docs list.")
+    articles = add(docs_sub, "articles", reference.cmd_docs_articles, "List English Help Center articles in a category.")
+    articles.add_argument("category_id", help="Numeric ID from the Help Center category link.")
+    paginate(articles)
+    article = add(docs_sub, "article", reference.cmd_docs_article, "Read a Help Center article's HTML body.")
+    article.add_argument("article_id", help="Numeric ID from the Help Center article link.")
+
+    forum = sub.add_parser("forum", help="Search and read the signed-in BRAIN community.")
+    forum_sub = forum.add_subparsers(dest="subcommand", metavar="<action>", parser_class=JsonArgumentParser)
+    topics = add(forum_sub, "topics", reference.cmd_forum_topics, "List forum topics visible to this account.")
+    paginate(topics, cursor=True)
+    search = add(forum_sub, "search", reference.cmd_forum_search, "Search forum posts by relevance.")
+    search.add_argument("query", help="Search phrase.")
+    paginate(search)
+    post = add(forum_sub, "get", reference.cmd_forum_get, "Read a forum post's HTML body.")
+    post.add_argument("post_id", help="Numeric ID from the forum post link.")
+    comments = add(forum_sub, "comments", reference.cmd_forum_comments, "Read forum comments and their HTML bodies.")
+    comments.add_argument("post_id", help="Numeric ID from the forum post link.")
+    paginate(comments, cursor=True)
 
 
 def build_parser():
@@ -521,6 +564,8 @@ def build_parser():
     api_probe.add_argument("--alpha", default=None,
                            help="An alpha id for the per-alpha endpoints.")
     api_probe.set_defaults(func=account.cmd_api_probe)
+
+    _add_reference_commands(sub)
 
     cache = sub.add_parser(
         "cache", help="Inspect or clear local caches (session, catalog metadata).")
@@ -1495,6 +1540,16 @@ _COMMAND_EXAMPLES = {
     "auth": ["auth check"],
     "auth check": ["auth check"],
     "auth logout": ["auth logout"],
+    "docs": ["docs list --query python", "docs articles 41681062887191 --limit 5"],
+    "docs list": ["docs list --query python"],
+    "docs get": ["docs get how-translate-fast-expression-alpha-python-alpha"],
+    "docs articles": ["docs articles 41681062887191 --limit 5"],
+    "docs article": ["docs article 41681217386903"],
+    "forum": ['forum search "Systematic Predictions Challenge" --limit 5'],
+    "forum topics": ["forum topics --limit 5"],
+    "forum search": ['forum search "Systematic Predictions Challenge" --limit 5'],
+    "forum get": ["forum get 41113878259479"],
+    "forum comments": ["forum comments 41996433774359 --limit 5"],
     "cache": ["cache info"],
     "cache info": ["cache info"],
     "cache clear": ["cache clear --kind metadata"],

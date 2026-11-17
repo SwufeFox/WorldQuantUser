@@ -43,6 +43,35 @@ Python 检查源码的字段声明。`probe` 将预检报告交给 `tools.guarde
 仅在完整设置与源码匹配时复用。用 `pip install -r requirements.txt` 安装运行依赖。
 `pandas` 在调用 `fields_to_df()` 时按需加载，DataFrame 用户再单独安装。
 
+## 读平台文档和论坛
+
+```bash
+python research_cli.py docs list --query python
+python research_cli.py docs get how-translate-fast-expression-alpha-python-alpha
+python research_cli.py docs articles 41681062887191 --limit 5
+python research_cli.py docs article 41681217386903
+python research_cli.py forum topics --limit 5
+python research_cli.py forum search "Systematic Predictions Challenge" --limit 5
+python research_cli.py forum get 41113878259479
+python research_cli.py forum comments 41996433774359 --limit 5
+```
+
+`docs list` 筛选 BRAIN 文档目录中的标题、分类和 ID。`docs get` 返回原始 `content`
+块、来源与更新时间。`docs articles` 按分类列英语 Help Center 文章，`docs article` 读取 `body`。
+`forum get` 的 `details` 和 `forum comments` 的 `body` 保留原始 HTML。
+
+论坛搜索和 Help Center 分类用 `--page` 翻页。论坛主题和评论用 `--cursor` 接收
+上页的 `pagination.after_cursor`。列表每次返回一页，`--limit` 控制当前页大小。
+
+这些是账户内的只读入口。平台文档的 `/tutorials`、`/tutorial-pages/{slug}` 和
+论坛登录的 `/authentication/support` 来自 BRAIN 网页自身的调用。当前未核实到
+这三条路由的公开开发者契约，网页改版可能影响它们。
+
+SSO 后的论坛和 Help Center 读取使用公开文档化的 Zendesk API，运行在独立会话里。
+需要把本次读取留作证据时，用 `--save` 写到研究目录。
+[Zendesk 帖子 API](https://developer.zendesk.com/api-reference/help_center/help-center-api/posts/) ·
+[Zendesk 搜索 API](https://developer.zendesk.com/api-reference/help_center/help-center-api/help_center_search/)
+
 
 ## 给 AI 的信息按阶段进入
 
@@ -840,7 +869,7 @@ python3 research_cli.py ledger sync --pnl
 | `tools/campaign_runner.py` | 消费 `backlog/`，冻结训练期去重与组合边际证据后调用 `promote` |
 | `tools/atom_runner.py` | 把 `label / expr / settings` 列表交给 `probe`，用可恢复批次保存进度，把全 IS 指标和 checks 写成 `atom-results.jsonl` |
 | `tools/atom_screen.py` | 从 ATOM 账本按平台子宇宙检查初筛，同一 Alpha 分数相同时采用最新记录 |
-| `tools/spc_client.py` | 独立预测竞赛接口，提供 `recon` / `validate` / `submit` |
+| `tools/spc_client.py` | SPC 表单、提交列表、样例校验和离线输出对比 |
 
 队列与 ATOM 共用 `probe` 的预检与调度。研究目录的优先级依次为 `--research-dir`、
 `BRAIN_RESEARCH_DIR`、兼容的 `WQ_RESEARCH_DIR`、CLI 默认目录。
@@ -891,6 +920,32 @@ ATOM 的默认批次路径在 `checkpoints/`，以臂清单内容生成名称。
 `atom-results.jsonl` 保存带 `metrics_scope: full_is` 的指标与平台检查快照，供子宇宙初筛。
 常规训练筛选使用训练期回执，提交资格仍需实时平台 checks。
 
-`spc_client recon` 从 `OPTIONS /competitions/spc/submissions` 读取实时 schema。
-`validate` 按 `modelFamily` 和 `sampleOutput` 等字段校验 spec。
-`submit SPEC.json --yes` 是单独的比赛提交入口，需要明确授权。
+### 做 SPC 提示词实验
+
+```bash
+python tools/spc_client.py recon
+python tools/spc_client.py validate SPEC.json
+python tools/spc_client.py experiment SPEC.json --run RUN-A.json --run RUN-B.json
+python tools/spc_client.py experiment SPEC.json --run RUN-A.json --reference UNIVERSE.json
+```
+
+`recon` 和 `validate` 读取实时 SPC 表单。Spec 包含 `name`、`prompt`、`modelFamily`、
+`updateFrequency`、`weight` 和 `sampleOutput`。`sampleOutput` 是装有真实模型输出数组的
+JSON 字符串。`RUN.json` 文件直接保存模型返回的数组。固定 prompt、模型和信息时点做重复运行，
+可在 spec 里记录 `as_of`，以便后续复核。
+
+`experiment` 在本地检查每条记录、ISIN 校验位、MIC 格式、重复标的和预测数值。
+回执包含输入文件与 prompt 的 SHA-256，以及每个有效运行相对样例的标的重叠率、多空变化、
+置信度、期限和收益预测的平均绝对变化。失败的运行也会出现在回执中。退出码为 `0` 时输入通过
+本地检查，`2` 表示有输入错误。回执里的哈希用于核对输入版本，模型与时点来自实验人员的记录。
+
+可选的 `UNIVERSE.json` 是本地对照表。地区和行业使用 SPC 指南的分段名称，缺失分类可填 `null`。
+
+```json
+[{"isin":"US0378331005","mic":"XNAS","region":"Americas","sector":"Information Technology"}]
+```
+
+覆盖按置信度非零的输出行统计。回执保留命中和缺漏，这份统计用于实验比较，领奖资格由平台核算。
+[分段定义](https://support.worldquantbrain.com/hc/en-us/articles/44793597008919-What-is-the-segment-coverage-requirement)
+
+SPC 平台提交仍通过独立的 `submit SPEC.json --yes` 入口，需要明确授权。

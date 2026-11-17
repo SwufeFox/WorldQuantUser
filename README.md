@@ -276,6 +276,24 @@ Maintain one `- [open] **question** — evidence; next discriminating check` or
 For the explore → select → experiment → review workflow, see
 [the information flow guide](docs/tooling.md#给-ai-的信息按阶段进入).
 
+### Read BRAIN documentation and forum posts
+
+```bash
+python research_cli.py docs list --query python
+python research_cli.py docs get how-translate-fast-expression-alpha-python-alpha
+python research_cli.py forum search "Systematic Predictions Challenge" --limit 5
+python research_cli.py forum get 41113878259479
+```
+
+These commands read with the current BRAIN account. The tutorial and support
+sign-in routes were observed in BRAIN's web app. We have no verified public
+developer contract for those routes. Forum and Help Center reads use the
+documented Zendesk APIs once signed in.
+
+Documentation retains the original content blocks. Forum and Help Center reads
+retain the HTML body and source URL. See comment pagination and Help Center
+commands in [the tool map](docs/tooling.md#读平台文档和论坛).
+
 ### Collect research leads across sources
 
 ```bash

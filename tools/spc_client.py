@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SPC (Systematic Predictions Challenge) client: recon, validate, submit.
+"""SPC (Systematic Predictions Challenge) client and local experiment tools.
 
 Built 2026-11-17 at the user's request: tooling first, submissions only on an
 explicit authorisation, same rule as regular alphas.
@@ -19,18 +19,23 @@ requires `modelFamily` and the concrete model id.
 
 Subcommands:
   recon                  Print the schema, the submission list and endpoint reachability.
-  validate SPEC.json     Check one or more specs against the live schema, offline-safe.
+  validate SPEC.json     Read the live schema and validate local submission specs.
+  experiment SPEC.json --run RUN.json [--run MORE.json] [--reference UNIVERSE.json]
+                         Compare captured model outputs without platform access.
   submit SPEC.json --yes Perform the POST. Refuses without --yes; that flag is only
                          passed when the user says 提交.
 """
 from __future__ import annotations
 
+import argparse
+from decimal import Decimal
 import json
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import machine_lib  # noqa: E402
+from tools.spc_experiment import experiment, parse_predictions  # noqa: E402
 
 BASE = "https://api.worldquantbrain.com"
 SPC = f"{BASE}/competitions/spc/submissions"
@@ -94,39 +99,42 @@ def cmd_recon() -> int:
 
 
 def validate_spec(spec: dict, post: dict) -> list[str]:
+    if not isinstance(spec, dict):
+        return ["submission spec must be a JSON object"]
     problems = []
     for key in REQUIRED:
-        if spec.get(key) in (None, ""):
+        value = spec.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
             problems.append(f"missing required field: {key}")
-    name = spec.get("name") or ""
-    if len(name) > 200:
-        problems.append(f"name too long: {len(name)} > 200")
-    prompt = spec.get("prompt") or ""
-    if len(prompt) > 10000:
-        problems.append(f"prompt too long: {len(prompt)} > 10000")
-    raw = spec.get("sampleOutput")
-    if isinstance(raw, str):
-        if len(raw) > 100000:
-            problems.append(f"sampleOutput too long: {len(raw)} > 100000")
-        try:
-            parsed = json.loads(raw)
-        except Exception as exc:  # noqa: BLE001
-            problems.append(f"sampleOutput is not valid JSON: {exc}")
-        else:
-            if not isinstance(parsed, list):
-                problems.append("sampleOutput must be a JSON array")
-    elif raw is not None:
-        problems.append("sampleOutput must be a JSON string (the platform takes text)")
-    model = spec.get("modelFamily") or ""
-    if model and model not in model_index(post):
+
+    for key, default_limit in (("name", 200), ("prompt", 10000), ("sampleOutput", 100000),
+                               ("modelFamily", 100), ("updateFrequency", None)):
+        value = spec.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            problems.append(f"{key} must be a string")
+            continue
+        limit = (post.get(key) or {}).get("maxLength", default_limit)
+        if type(limit) is int and len(value) > limit:
+            problems.append(f"{key} too long: {len(value)} > {limit}")
+        elif key == "sampleOutput" and value.strip():
+            _, errors = parse_predictions(value)
+            problems.extend(f"sampleOutput: {error}" for error in errors)
+
+    model = spec.get("modelFamily")
+    if isinstance(model, str) and model.strip() and model not in model_index(post):
         problems.append(f"modelFamily not offered by the schema: {model}")
     freq = spec.get("updateFrequency")
     allowed = [c.get("value") for c in (post.get("updateFrequency") or {}).get("choices") or []]
-    if freq and freq not in allowed:
+    if isinstance(freq, str) and freq.strip() and freq not in allowed:
         problems.append(f"updateFrequency must be one of {allowed}, got {freq!r}")
     weight = spec.get("weight")
-    if weight is not None and not isinstance(weight, (int, float)):
-        problems.append("weight must be numeric")
+    if weight is not None:
+        if type(weight) not in (int, float) or not 0 <= weight <= 1:
+            problems.append("weight must be a number from 0 to 1")
+        elif (decimal_weight := Decimal(str(weight))) != decimal_weight.quantize(Decimal("0.01")):
+            problems.append("weight must have at most two decimal places")
     return problems
 
 
@@ -138,7 +146,7 @@ def cmd_validate(path: str) -> int:
     bad = 0
     for spec in specs:
         problems = validate_spec(spec, post)
-        label = spec.get("name") or "(unnamed)"
+        label = (spec.get("name") if isinstance(spec, dict) else None) or "(unnamed)"
         if problems:
             bad += 1
             print(f"FAIL {label}")
@@ -163,7 +171,8 @@ def cmd_submit(path: str, yes: bool) -> int:
     for spec in specs:
         problems = validate_spec(spec, post)
         if problems:
-            print(f"FAIL {spec.get('name')}: {problems}")
+            name = spec.get("name") if isinstance(spec, dict) else None
+            print(f"FAIL {name or '(unnamed)'}: {problems}")
             continue
         payload = {k: spec[k] for k in REQUIRED}
         r = s.post(SPC, json=payload, timeout=120)
@@ -171,18 +180,33 @@ def cmd_submit(path: str, yes: bool) -> int:
     return 0
 
 
-def main() -> int:
-    if len(sys.argv) < 2:
-        print(__doc__)
-        return 1
-    cmd = sys.argv[1]
-    if cmd == "recon":
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Inspect SPC and compare captured model outputs.")
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("recon", help="Read the live platform schema and submission list.")
+    validate = commands.add_parser("validate", help="Check a local spec against the live schema.")
+    validate.add_argument("spec", metavar="SPEC.json")
+    local = commands.add_parser("experiment", help="Compare captured model outputs offline.")
+    local.add_argument("spec", type=Path, metavar="SPEC.json", help="One spec with a frozen sampleOutput.")
+    local.add_argument("--run", required=True, action="append", type=Path, metavar="RUN.json",
+                       help="Raw JSON array from a repeat run. Pass once per capture.")
+    local.add_argument("--reference", type=Path, metavar="UNIVERSE.json",
+                       help="Optional local ISIN/MIC reference with regions and sectors.")
+    submit = commands.add_parser("submit", help="Create a submission with explicit confirmation.")
+    submit.add_argument("spec", metavar="SPEC.json")
+    submit.add_argument("--yes", action="store_true")
+    args = parser.parse_args(argv)
+    if args.command == "recon":
         return cmd_recon()
-    if cmd == "validate":
-        return cmd_validate(sys.argv[2])
-    if cmd == "submit":
-        return cmd_submit(sys.argv[2], "--yes" in sys.argv[3:])
-    print(f"unknown command {cmd!r}")
+    if args.command == "validate":
+        return cmd_validate(args.spec)
+    if args.command == "submit":
+        return cmd_submit(args.spec, args.yes)
+    if args.command == "experiment":
+        result = experiment(args.spec, args.run, reference_path=args.reference)
+        print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+        return 0 if result["ok"] else 2
+    parser.print_help()
     return 1
 
 

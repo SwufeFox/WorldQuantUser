@@ -95,6 +95,32 @@ class BriefContractTests(unittest.TestCase):
                 self.assertEqual(parse(proc)["error"]["code"], "INVALID_INPUT")
 
 
+class ReferenceContractTests(unittest.TestCase):
+    def test_schema_exposes_documentation_and_forum_read_options(self):
+        for path, expected in ((["docs", "get"], {"slug", "--relogin"}),
+                               (["forum", "search"], {"query", "--limit", "--page"}),
+                               (["forum", "comments"], {"post_id", "--limit", "--cursor"})):
+            with self.subTest(path=path):
+                proc = run_cli("schema", *path)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                command = parse(proc)["data"]["command"]
+                flags = {flag for option in command["options"] for flag in option["flags"]}
+                self.assertTrue(expected <= flags)
+
+    def test_invalid_reference_input_fails_before_login(self):
+        cases = (["docs", "get", "../other"], ["docs", "article", "not-an-id"],
+                 ["forum", "search", "  "], ["forum", "search", "SPC", "--limit", "26"],
+                 ["forum", "search", "SPC", "--page", "0"], ["forum", "topics", "--cursor", " "])
+        for args in cases:
+            with self.subTest(args=args):
+                stdout = io.StringIO()
+                with mock.patch.object(ml, "load_session", side_effect=AssertionError("network")) as load, \
+                        contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(cli_app.main(args), 2)
+                self.assertEqual(json.loads(stdout.getvalue())["error"]["code"], "INVALID_INPUT")
+                load.assert_not_called()
+
+
 class TriageContractTests(unittest.TestCase):
     def test_validation_only_options_cannot_silently_change_the_selection_view(self):
         for extra in (["--internal"], ["--train-end", "not-a-date"],
