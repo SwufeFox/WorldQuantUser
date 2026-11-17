@@ -49,7 +49,7 @@ def cmd_search(args, _sink):
 
     if args.fetch_url:
         try:
-            page = deepseek_search.fetch(args.fetch_url)
+            page = deepseek_search.fetch(args.fetch_url, timeout=getattr(args, "timeout", 60))
         except deepseek_search.DeepSeekSearchError as exc:
             raise _search_failure(exc) from exc
         content = page.get("content") or ""
@@ -71,11 +71,11 @@ def cmd_search(args, _sink):
     try:
         if args.no_cache:
             results = deepseek_search.search(
-                args.query, count=args.count, need_content=args.content)
+                args.query, count=args.count, need_content=args.content, timeout=getattr(args, "timeout", 60))
         else:
             results, cached = deepseek_search.search_cached(
                 research_paths.ensure_dir(), args.query, count=args.count,
-                need_content=args.content, max_age_hours=args.max_age_hours)
+                need_content=args.content, max_age_hours=args.max_age_hours, timeout=getattr(args, "timeout", 60))
     except deepseek_search.DeepSeekSearchError as exc:
         raise _search_failure(exc) from exc
 

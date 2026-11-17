@@ -433,12 +433,23 @@ def build_parser():
 
     feed_parser = sub.add_parser(
         "feed",
-        help="A bounded literature digest across open questions, with source and search status.",
-        description="Search the selected questions, balance results across topics, "
-                    "preserve source links and make missing evidence visible. "
-                    "Optional DRAFT cards still require deliberate research judgement.")
+        help="A bounded research digest across papers, news, social sources, forums and market observations.",
+        description="Collect selected sources, retain timestamps and provenance, and balance research leads. "
+                    "Evidence, source claims and hypotheses remain distinct; collection does not run simulations.")
     feed_parser.add_argument("--topic", action="append", default=None,
                              help="Search this instead of deriving from open-threads.")
+    feed_parser.add_argument("--source", action="append", default=None, metavar="ID",
+                             help="Source ID: paper, news, social, forum, trends, web, all, or a configured ID; repeatable.")
+    feed_parser.add_argument("--sources-file", default=None, metavar="PATH",
+                             help="JSON source definitions for RSS/Atom, indexed sites, markets or local forum exports.")
+    feed_parser.add_argument("--market", action="append", default=None, metavar="VENUE:SYMBOL",
+                             help="Explicit market observation, e.g. coinbase:BTC-USD or alpaca:AAPL; repeatable.")
+    feed_parser.add_argument("--book-depth", type=_positive_count, default=10,
+                             help="Local order-book retention depth, 1-50; does not change provider coverage.")
+    feed_parser.add_argument("--market-feed", type=str.lower, default="iex",
+                             help="Alpaca stock feed; default iex is one exchange, with provider-specific access requirements.")
+    feed_parser.add_argument("--summary", action="store_true",
+                             help="Return a compact digest/table with source outcomes, coverage and evidence paths.")
     feed_parser.add_argument("--seed", action="append", default=None, metavar="ID",
                              help="Expand references/citations of a known OpenAlex ID or DOI; repeatable.")
     feed_parser.add_argument("--follow", choices=("references", "citations"), default="references",
@@ -450,15 +461,15 @@ def build_parser():
                                   "(English queries, one per line).")
     feed_parser.add_argument("--topics-file", default=None, dest="topics_file")
     feed_parser.add_argument("--limit", type=int, default=5,
-                             help="Papers per query.")
+                             help="Items per retrieval job.")
     feed_parser.add_argument("--total", type=int, default=10,
-                             help="Papers in the digest.")
+                             help="Items in the digest.")
     feed_parser.add_argument("--max-topics", type=_non_negative_integer, default=4, dest="max_topics",
-                             help="Maximum retrieval jobs across keyword queries and seeds.")
+                             help="Maximum retrieval jobs across queries, seeds, fixed feeds and market observations.")
     feed_parser.add_argument("--workers", type=int, choices=range(1, 9), default=4,
-                             help="Concurrent topic searches, bounded independently of result count.")
+                             help="Concurrent retrieval jobs, bounded independently of result count.")
     feed_parser.add_argument("--timeout", type=_positive_seconds, default=30.0,
-                             metavar="SECONDS", help="Network timeout for each topic search.")
+                             metavar="SECONDS", help="Network timeout for each source request.")
     feed_parser.add_argument("--from-year", type=int, default=2005, dest="from_year")
     feed_parser.add_argument("--min-citations", type=_non_negative_integer, default=0,
                              dest="min_citations", help="Optional citation floor; default 0 keeps new papers eligible.")
@@ -709,6 +720,8 @@ def build_parser():
                      help="Reuse a cached answer younger than this (default 168).")
     lit.add_argument("--no-cache", action="store_true",
                      help="Ignore and do not write the cache.")
+    lit.add_argument("--timeout", type=_positive_seconds, default=60.0,
+                     metavar="SECONDS", help="Network timeout for search or page fetch.")
 
     lit.set_defaults(func=literature.cmd_search)
 
@@ -1495,7 +1508,10 @@ _COMMAND_EXAMPLES = {
               'paper --id W2741809807 --full-text --max-chars 12000'],
     "feed": ["feed --from-threads --workers 4 --timeout 30 --dry-run",
              'feed --topic "analyst revisions" --topic "earnings quality" --action',
-             'feed --seed W2741809807 --follow citations --dry-run'],
+             'feed --seed W2741809807 --follow citations --dry-run',
+             'feed --source all --topic "earnings guidance" --max-topics 12 --summary --dry-run',
+             'feed --sources-file radar-sources.json --summary --dry-run',
+             'feed --market coinbase:BTC-USD --book-depth 10 --summary --dry-run'],
     "simulate": ['simulate --expr "rank(close)" --dry-run',
                  "simulate research.json --sort fitness --save results.json"],
     "resume": ["resume CHECKPOINT.json --save results.json"],

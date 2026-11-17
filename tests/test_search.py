@@ -185,6 +185,24 @@ class SearchCacheTests(unittest.TestCase):
             "query": "alpha decay", "count": 50, "need_content": True,
             "ori_question": "x" * 128})
 
+    def test_timeout_budget_does_not_change_cached_evidence_identity(self):
+        first = ds.search_cached(self.directory, "alpha", timeout=3)
+        second = ds.search_cached(self.directory, "alpha", timeout=9)
+        self.assertEqual(first, (self.rows, False))
+        self.assertEqual(second, (self.rows, True))
+        self.post.assert_called_once()
+        self.assertEqual(self.post.call_args.kwargs["timeout"], 3)
+
+    def test_malformed_provider_response_is_not_cached_as_empty_success(self):
+        for index, payload in enumerate(({}, [], {"results": None}, {"results": {"title": "bad"}})):
+            query = "malformed-%d" % index
+            with self.subTest(payload=payload):
+                self.post.return_value = payload
+                with self.assertRaises(ds.SearchServiceError):
+                    ds.search_cached(self.directory, query)
+                self.post.return_value = {"results": self.rows}
+                self.assertEqual(ds.search_cached(self.directory, query), (self.rows, False))
+
     def test_every_effective_option_gets_its_own_cache(self):
         options = [{}, {"count": 3}, {"need_content": True},
                    {"ori_question": "mechanism"}, {"ori_question": "evidence"}]

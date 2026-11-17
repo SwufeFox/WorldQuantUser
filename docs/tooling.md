@@ -175,8 +175,9 @@ python3 research_cli.py feed --from-threads --workers 4 --timeout 30 --dry-run
 python3 research_cli.py feed --topic "analyst forecast dispersion" --topic "earnings quality" --action
 ```
 
-`--workers` 为 1–8，默认 4；`--max-topics` 限制关键词与种子扩展的任务总数，
-`--timeout` 是单次网络请求的超时秒数。检索后按输入顺序轮流选取，完成先后不会改变结果。
+`--workers` 为 1–8，默认 4；`--max-topics` 限制关键词、种子扩展、固定订阅源与行情任务总数，
+超过预算的任务会列为 deferred。`--timeout` 是单次网络请求的超时秒数；检索后按输入顺序
+轮流选取，完成先后不会改变结果。
 网络调用在锁外；提交结果前会锁住状态并重读 seen，避免并发重复选中。
 关键词保留相关性顺序；引用图的顺序、来源和覆盖范围另记在 `retrievals`。
 `--min-citations` 默认 0，让新论文保留资格；引用量不替代相关性或经济解释。
@@ -193,6 +194,79 @@ OpenAlex 使用 `<research>/cache/papers/`；网页搜索使用 `<research>/sear
 中文问题可以保留中文标题，并显式写 `; query: ...`；系统不自动编造翻译。
 摘要用 `reference_count` 显示参考文献数量，完整 ID 列表留在单篇记录；同一论文的 DOI 和
 OpenAlex ID 会共同参与去重，旧的无 DOI 标题记录继续有效。
+
+### 多来源线索与本地论坛材料
+
+```bash
+python3 research_cli.py feed --source all --topic "earnings guidance" --max-topics 12 --summary --dry-run
+python3 research_cli.py feed --market coinbase:BTC-USD --book-depth 10 --summary --dry-run
+python3 research_cli.py feed --market alpaca:AAPL --market-feed iex --summary --dry-run
+```
+
+没有选择来源时沿用论文检索。`--source` 可重复，`all` 选择内置来源及配置文件中的来源；
+行情须由 `--market` 或配置文件明确指定市场与品种。`--limit` 限制每项任务的返回条数，
+`--total` 限制最终选取条数。六类信息共享 `items`，旧的 `papers` 数组已移除。
+
+| 入口 | 实际来源 | 覆盖与访问条件 |
+| --- | --- | --- |
+| `--source paper` | OpenAlex 元数据、摘要、参考文献与后续引用 | 正文仍由 `paper --id --full-text` 显式读取；引用边不表示赞同 |
+| `--source news` | Google News RSS 搜索 | 聚合标题与摘要，不代表已读原始报道或完整新闻覆盖 |
+| `--source social` | Bluesky 公共帖子搜索 | 公共端点可能拒绝访问；403 是来源失败，不是空结果 |
+| `--source forum` | Hacker News 索引搜索 | 特定社区的故事与讨论线索，不代表全部金融论坛 |
+| `--source trends` | Hacker News front_page 索引 | 当前社区注意力，不能推断全网热度或收益方向 |
+| `--source web` | DeepSeek 网页索引，可限定站点 | 需要 `DEEPSEEK_API_KEY` 或 `WEBSEARCH_API_KEY`，只覆盖被索引内容 |
+| `--market coinbase:BTC-USD` | Coinbase Exchange 聚合 L2 盘口 | 单一加密资产交易所；不是股票盘口，也不是逐笔委托队列 |
+| `--market alpaca:AAPL` | Alpaca 股票最佳买卖报价 | 需要 `APCA_API_KEY_ID`、`APCA_API_SECRET_KEY`；默认 IEX 仅一个交易所，其他 feed 取决于订阅权限 |
+
+行情每次重新请求，不复用旧快照。`--book-depth` 为本地保留的档数（1–50），不扩展提供方
+覆盖，也不会把 Alpaca 的单档报价变成多档盘口。结果保留来源时间、采集时间、市场、feed、
+原生数量单位、覆盖范围及价差/失衡等派生观察；缺失或非法档位不会被补成可用的统计量。
+这些是当前观察，不能直接冒充历史回测数据。
+
+自定义来源使用研究目录中的 JSON 文件；例如同时接入已有论坛摘录与一个站点索引：
+
+```json
+{
+  "sources": [
+    {"id": "community-export", "kind": "forum", "adapter": "file", "path": "forum-excerpts.jsonl"},
+    {"id": "quant-forum", "kind": "forum", "adapter": "web", "sites": ["quant.stackexchange.com"]}
+  ]
+}
+```
+
+```bash
+python3 research_cli.py feed --sources-file radar-sources.json --source community-export --summary --dry-run
+python3 research_cli.py feed --sources-file radar-sources.json --source quant-forum --topic "transaction costs" --summary --dry-run
+```
+
+每个来源都要有唯一 `id`、`kind`、`adapter`；自定义 ID 不能覆盖内置 ID。
+`rss` 接受 `url`，支持 RSS/Atom 和可选的 `{query}` 占位符；`web` 接受最多 20 个 `sites`
+域名/路径；`file` 接受 `path`；`market` 接受 `venue`、`symbol` 和可选 `depth`、`feed`。
+另可显式配置 `bluesky`、`hn`、`hn_frontpage`。固定适配器的 kind 分别为 `social`、`forum`、
+`trend`、`market`；RSS、网页和文件的 kind 可选 `news/social/forum/trend/web`。
+未知字段、重复 ID 或含凭据的来源 URL 会在任何请求前被拒绝。密钥只放环境或私有 `.env`。
+
+本地 `.jsonl` 每行一个对象，`text` 或 `content` 必填，其余字段可选：
+
+```json
+{"id":"comment-1","title":"参数变化的观察","text":"已保存的评论摘录","author":"source-author","parent_id":"thread-1","published_at":null,"published_at_raw":"2个月前","content_scope":"selected_excerpts"}
+```
+
+也接受 UTF-8（可带 BOM）的 `.txt`、`.md`，每文件上限 4 MiB。相对路径以来源配置文件目录
+为基准。缺少 ID 时生成确定性标识；缺少标题时使用首个非空文本行。导入保留原始记录、作者、
+主帖/评论关系、文件路径和行号；`review` 等附加内容留在原始证据里。坏行与可用行分别计数。
+`collected_at` 是导入时刻；“6个月前”、年份、无时区日期等不会被捏造成精确发布时间。
+文件中的代码始终作为文本保留，不执行。导入摘录不意味着已经抓取完整帖文或访问登录论坛。
+
+先看 `--summary` 的短摘录、来源回执和下一步，再按 `evidence_path` 读取完整记录。
+正常运行先将选中证据写入 `<research>/inspiration/evidence/`，再提交草稿与 seen；
+`--dry-run` 不写这三者，但缓存和显式 `--save` 仍可写入。来源失败、真正空结果、重复已读
+分别记录；检索预算、提供方截断和未取回内容通过 coverage/deferred 信息保留。
+相同来源的转帖不能算独立佐证，热度和他人回测指标只产生待核验线索。
+
+`next_actions` 按材料类型提供原始来源、出版时间与历史可观察性核对，论文阅读/引文扩展，
+以及失败来源的重试参数。形成研究假设前，分别写清来源声称了什么、已有证据支持什么、
+什么结果能够否定自己的解释；真实模拟与提交仍需遵守各自执行边界。
 
 ### 从发现走到可核对的阅读证据
 
@@ -239,10 +313,10 @@ DOI 的常见前缀形式会统一，已有 seen 历史继续用于去重。
 先 dry-run。存在反证时先解释分歧，避免反复微调同一个高分表达式。工具的下一步建议提供证据
 入口；模拟、验证和提交仍遵循各自边界。
 
-seen 与草稿各自原子提交，草稿先于 seen：草稿失败不会把论文标成已读。它们不是跨文件事务，
-两次提交之间中断可能留下重复草稿；seen 已提交但 stdout 未送达时，也可能已消费本次选中的论文。
-`--dry-run` 不写 seen/草稿，检索缓存仍可写入。Windows 使用系统字节锁，POSIX 使用 flock；
-进程退出后系统释放锁，旧 `.pid` 文件不会阻塞新任务。
+证据、seen 与草稿各自原子提交，顺序为证据 → 草稿 → seen；前面的写入失败不会消耗 seen。
+它们不是跨文件事务：中断可能留下未引用的证据或重复草稿，seen 提交后 stdout 未送达也可能
+消耗本次选中条目。`--dry-run` 不写证据/seen/草稿，缓存和显式 `--save` 仍可写入。
+Windows 使用系统字节锁，POSIX 使用 flock；进程退出后系统释放锁，旧 `.pid` 文件不会阻塞新任务。
 
 
 ## 我要回答……

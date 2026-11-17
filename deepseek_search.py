@@ -168,7 +168,7 @@ def _search_payload(query, count, need_content, ori_question, localization=""):
 
 
 def search(query, count=10, need_content=False, ori_question=None,
-           localization=""):
+           localization="", timeout=60):
     """Run one search and return the provider's result list.
 
     The query is passed through with its operators intact, so ``site:``,
@@ -177,16 +177,18 @@ def search(query, count=10, need_content=False, ori_question=None,
     by the server, because the server's error does not say what to cut.
     """
     payload = _search_payload(query, count, need_content, ori_question, localization)
-    body = _post(SEARCH_URL, payload)
-    return body.get("results") or []
+    body = _post(SEARCH_URL, payload, timeout=timeout)
+    if not isinstance(body, dict) or not isinstance(body.get("results"), list):
+        raise SearchServiceError("search response did not contain a results list")
+    return body["results"]
 
 
-def fetch(url):
+def fetch(url, timeout=60):
     """Fetch one page as Markdown: ``{title, content}``."""
     target = (url or "").strip()
     if not target.lower().startswith(("http://", "https://")):
         raise SearchServiceError("fetch needs an http(s) URL")
-    return _post(FETCH_URL, {"url": target})
+    return _post(FETCH_URL, {"url": target}, timeout=timeout)
 
 
 def high_quality(results, min_score=1.5, min_authority=None):
@@ -231,7 +233,7 @@ def _cached_results(path, request, max_age_seconds):
 
 
 def search_cached(research_dir, query, count=10, need_content=False,
-                  ori_question=None, max_age_hours=168):
+                  ori_question=None, max_age_hours=168, timeout=60):
     """Reuse fresh request-specific results, serializing identical cache misses.
 
     Answers use atomic TTL envelopes. ``max_age_hours`` defaults to one week;
@@ -254,7 +256,7 @@ def search_cached(research_dir, query, count=10, need_content=False,
         if cached is not None:
             return cached, True
 
-        results = search(**request)
+        results = search(**request, timeout=timeout)
         try:
             cache_store.write_json_atomic(path, cache_store.build_entry(
                 "deepseek-search", {"request": request, "results": results},

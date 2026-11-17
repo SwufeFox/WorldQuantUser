@@ -169,6 +169,63 @@ class FeedContractTests(unittest.TestCase):
         self.assertEqual(result["topics"], ["analyst revisions momentum"])
         self.assertEqual(result["searches"][0]["status"], "failure")
 
+    def invoke_feed(self, directory, *arguments):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+            code = cli_app.main(["feed", "--research-dir", str(directory), "--quiet", *arguments])
+        return code, json.loads(stdout.getvalue())
+
+    def test_forum_export_keeps_full_evidence_and_unknown_publication_time(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            text = "reported research evidence " * 100 + "FULL_SOURCE_END"
+            record = {"id": "comment-1", "title": "A setting observation", "text": text,
+                      "author": "fixture-author", "parent_id": "thread-1",
+                      "published_at_raw": "two months ago", "content_scope": "excerpt"}
+            source = root / "forum.jsonl"
+            source.write_text(json.dumps(record) + "\n", encoding="utf-8")
+            config = root / "sources.json"
+            config.write_text(json.dumps({"sources": [{"id": "local-notes", "kind": "forum",
+                "adapter": "file", "path": source.name}]}), encoding="utf-8")
+            original = source.read_bytes()
+            with mock.patch("urllib.request.urlopen", side_effect=AssertionError("local source made HTTP request")):
+                code, document = self.invoke_feed(root, "--sources-file", str(config), "--summary")
+                self.assertEqual(code, 0, document)
+                self.assertNotIn("papers", document["data"])
+                item = document["data"]["items"][0]
+                self.assertEqual(item["kind"], "forum")
+                self.assertEqual(item["parent_id"], "thread-1")
+                self.assertIsNone(item["published_at"])
+                self.assertEqual(item["published_at_raw"], "two months ago")
+                evidence = json.loads(Path(item["evidence_path"]).read_text(encoding="utf-8"))
+                self.assertEqual(evidence["item"]["raw"]["text"], text)
+                self.assertNotIn("FULL_SOURCE_END", item["excerpt"])
+                repeat_code, repeated = self.invoke_feed(root, "--sources-file", str(config), "--summary")
+                self.assertEqual(repeat_code, 0, repeated)
+                self.assertEqual(repeated["data"]["count"], 0)
+            self.assertEqual(source.read_bytes(), original)
+
+    def test_bad_source_configuration_blocks_all_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "sources.json"
+            config.write_text(json.dumps({"sources": [{"id": "notes", "kind": "forum", "adapter": "rss",
+                "url": "https://example.invalid/feed", "misspelled_option": True}]}), encoding="utf-8")
+            with mock.patch("urllib.request.urlopen", side_effect=AssertionError("invalid config made HTTP request")):
+                code, document = self.invoke_feed(directory, "--source", "all", "--topic", "earnings",
+                                                  "--sources-file", str(config))
+            self.assertEqual(code, 2, document)
+            self.assertEqual(document["error"]["code"], "INVALID_INPUT")
+
+    def test_missing_stock_credentials_are_a_source_failure_not_empty_coverage(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"APCA_API_KEY_ID": "", "APCA_API_SECRET_KEY": ""}), \
+                mock.patch.object(ml, "_DOTENV_LOADED", True), \
+                mock.patch("urllib.request.urlopen", side_effect=AssertionError("unauthorized source made HTTP request")):
+            code, document = self.invoke_feed(directory, "--market", "alpaca:AAPL", "--summary", "--dry-run")
+            self.assertEqual(code, 0, document)
+            self.assertEqual(document["data"]["count"], 0)
+            self.assertEqual(document["data"]["searches"][0]["error"]["code"], "AUTH_MISSING")
+
 
 class PaperReadingContractTests(unittest.TestCase):
     def setUp(self):
@@ -215,7 +272,7 @@ class PaperReadingContractTests(unittest.TestCase):
             code, document = self.invoke("feed", "--topic", "earnings revisions", "--dry-run")
         self.assertEqual(code, 0, document)
         self.assertEqual(document["data"]["count"], 1)
-        row = document["data"]["papers"][0]
+        row = document["data"]["items"][0]
         self.assertEqual(row["citations"], 0)
         self.assertEqual(row["abstract"], abstract[:600])
         action = next(action for action in document["data"]["next_actions"]

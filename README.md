@@ -282,18 +282,27 @@ Maintain one `- [open] **question** — evidence; next discriminating check` or
 For the explore → select → experiment → review workflow, see
 [the information flow guide](docs/tooling.md#给-ai-的信息按阶段进入).
 
-### Retrieve independent questions concurrently
+### Collect research leads across sources
 
 ```bash
 python research_cli.py feed --from-threads --workers 4 --timeout 30 --dry-run
 python research_cli.py feed --topic "analyst revisions" --topic "earnings quality" --action
 python research_cli.py feed --seed W2741809807 --follow citations --dry-run
+python research_cli.py feed --source all --topic "earnings guidance" --max-topics 12 --summary --dry-run
+python research_cli.py feed --sources-file radar-sources.json --summary --dry-run
+python research_cli.py feed --market coinbase:BTC-USD --book-depth 10 --summary --dry-run
 ```
 
+Without source selection, existing paper queries remain the default. `--source all` selects
+paper, news, social, forum, trends and indexed web sources; markets require explicit symbols.
+Custom RSS/Atom feeds, indexed sites and local JSONL/text exports use `--sources-file`.
+See [source configuration and access limits](docs/tooling.md#多来源线索与本地论坛材料)
+for adapters, credentials and the distinction between quotes and order-book depth.
+
 `--workers` bounds concurrent retrieval jobs (1–8, default 4); `--timeout` bounds each
-network request. Keyword queries and explicit `--seed` reference/citation expansions share
-the `--max-topics` budget. Output retains input order and balanced picks regardless of
-completion order. Keyword results preserve provider relevance; graph results report their
+network request. Queries, reference/citation expansions, fixed feeds and markets share the
+`--max-topics` job budget. Output retains input order and balanced picks regardless of
+completion order. Paper keywords preserve provider relevance; graph results report their
 own ordering and coverage in `retrievals`. A citation edge does not imply agreement.
 The default citation floor is 0, so recent papers remain eligible; `--min-citations` is an
 explicit optional filter. `provider_ranks` retains original query positions. `rank` remains
@@ -307,18 +316,29 @@ also distinguish content and original-question options. Identical concurrent mis
 one fetch; writes are atomic, expired/corrupt entries refetch, and failed cache writes do
 not discard successful retrievals. Paper records preserve available landing-page/PDF links.
 
-Feed abstracts remain bounded to 600 characters, with `abstract_chars` and
-`abstract_truncated` distinguishing an excerpt from a complete abstract. Source-review
-actions include executable `paper --id` arguments, conditional full-text reading steps,
-and reference expansion. Search caches also retain complete individual records, so reading
-a selected record normally needs no second request. DOI aliases are normalized against
-both new results and the existing seen store. Feed itself never downloads full text.
+Results now share `items` rather than a paper-only `papers` array. Each item keeps its kind,
+provider, provenance, publication and collection times, coverage and claim state.
+`--summary` returns bounded excerpts and a table; `searches` distinguishes source failures,
+empty results and already-seen items. An unavailable source does not prove absence of evidence.
+Relative or ambiguous publication dates stay unknown, with their original text retained.
+
+Common excerpts are bounded to 600 characters in full output. Paper-specific `abstract_chars`
+and `abstract_truncated` distinguish an excerpt from a complete abstract. Paper review actions
+include executable `paper --id` arguments, conditional full-text reading steps and reference
+expansion. Other sources point to original links and archived evidence before forming a
+testable question. Search caches retain complete individual records, so reading a selected
+paper normally needs no second request. DOI aliases are normalized against both new results
+and the existing seen store. Feed itself never downloads paper full text.
 `reference_count` keeps bibliography size visible without copying every reference ID into
 the digest; the complete list remains in `paper --id` records.
 
-Concurrent feeds reread seen state under a lock after retrieval. Drafts commit before seen;
-each file is atomic, but a crash between commits can repeat drafts, and a crash after seen
-commits can consume picks before delivery. Dry-run leaves seen/drafts alone; caches may write.
+Concurrent feeds reread seen state under a lock after retrieval. Selected source evidence
+is archived under `<research>/inspiration/evidence/` before drafts and seen commit. Each file
+is atomic; these writes are not a cross-file transaction. A crash can leave an unused archive
+or repeated draft, and a crash after seen commits can consume picks before delivery. Dry-run
+leaves evidence, seen and drafts alone; retrieval caches and an explicit `--save` may write.
+Source text is untrusted evidence. Popularity, quoted results and current market snapshots
+do not establish a mechanism, historical availability or backtest suitability.
 
 `feed` evaluates data requirements only against a fresh, complete catalog snapshot
 for the selected account, region, universe, delay and instrument type. Keyword-derived

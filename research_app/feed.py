@@ -1,10 +1,10 @@
-"""Turn open questions into an attributable, balanced literature digest.
+"""Collect bounded, attributable research evidence without executing source claims.
 
-Search results retain their evidence and query provenance. Local closure decisions
-are cautions only when their declared match applies; they never suppress papers.
-Draft cards still require a deliberate mechanism and falsification review.
+Provider ordering and source coverage remain explicit. Selected evidence is archived
+before draft/seen state; all reading and strategy decisions require human review.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -15,6 +15,7 @@ from contextlib import ExitStack
 
 import cache_store
 import research_paths
+import source_io
 
 from . import runtime
 from .runtime import CliError
@@ -276,41 +277,127 @@ def _closure_cautions(paper, register):
 def _retrieval_job(value):
     if isinstance(value, dict):
         return dict(value)
-    return {"kind": "query", "query": value, "source": "openalex",
+    return {"kind": "query", "query": value, "source": "openalex", "source_id": "paper",
             "ordering_basis": "provider relevance"}
 
 
+def _build_jobs(args, topics, seeds, relation):
+    """Validate the whole configuration before creating bounded retrieval jobs."""
+    import research_sources
+    from market_sources import validate_market
+
+    try:
+        depth = getattr(args, "book_depth", 10)
+        if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 50:
+            raise source_io.SourceError("INVALID_INPUT", "Book depth must be an integer from 1 to 50.")
+        sources = research_sources.load_sources(getattr(args, "sources_file", None))
+        markets = []
+        for value in getattr(args, "market", None) or []:
+            if not isinstance(value, str) or ":" not in value:
+                raise source_io.SourceError("INVALID_INPUT", "Market must be VENUE:SYMBOL.")
+            venue, symbol = value.split(":", 1)
+            spec = validate_market(venue, symbol, depth=getattr(args, "book_depth", 10),
+                                   feed=getattr(args, "market_feed", "iex"))
+            suffix = hashlib.sha256(spec["symbol"].encode("utf-8")).hexdigest()[:16]
+            definition = {"id": "market-%s-%s" % (spec["venue"], suffix),
+                          "kind": "market", "adapter": "market", **spec}
+            if definition not in markets:
+                markets.append(definition)
+        requested = getattr(args, "source", None) or []
+        if requested:
+            selected = list(dict.fromkeys(identifier for value in requested
+                                         for identifier in (sources if value == "all" else [value])))
+        elif getattr(args, "sources_file", None):
+            selected = [identifier for identifier in sources
+                        if identifier not in research_sources.BUILTIN_SOURCES]
+        else:
+            selected = ["paper"] if topics or seeds or not markets else []
+        if any(identifier not in sources for identifier in selected):
+            raise source_io.SourceError("INVALID_INPUT", "Unknown source ID.",
+                                        hint="Use a built-in ID or one defined in --sources-file.")
+        per_source = []
+        for identifier in selected:
+            definition = sources[identifier]
+            if identifier == "paper":
+                paper_jobs = [_retrieval_job(topic) for topic in topics]
+                if not topics and not seeds and requested:
+                    paper_jobs.append({"kind": "query", "source_id": "paper", "source": "openalex",
+                                       "query": None, "_input_required": True})
+                per_source.append(paper_jobs)
+                continue
+            query_based = research_sources.requires_query(definition)
+            queries = topics if query_based and topics else [None]
+            per_source.append([{
+                "kind": "source", "source_id": identifier, "source": identifier,
+                "query": query, "ordering_basis": "provider order",
+                "descriptor": research_sources.describe_source(definition),
+                "_definition": definition,
+                **({"_input_required": True} if query_based and not topics else {}),
+            } for query in queries])
+        # First give every selected source a job, then take the next topic for each.
+        jobs = [bucket[index] for index in range(max(map(len, per_source), default=0))
+                for bucket in per_source if index < len(bucket)]
+        jobs.extend({"kind": "seed", "source_id": "paper", "seed": seed, "relation": relation,
+                     "source": "openalex", "query": "%s of %s" % (relation, seed),
+                     "ordering_basis": "provider order"} for seed in seeds)
+        jobs.extend({"kind": "market", "source_id": definition["id"], "source": definition["id"],
+                     "query": None, "market_spec": {key: definition[key] for key in
+                                                    ("venue", "symbol", "depth", "feed")},
+                     "ordering_basis": "one requested snapshot", "_definition": definition,
+                     "descriptor": research_sources.describe_source(definition)}
+                    for definition in markets)
+        return jobs
+    except source_io.SourceError as error:
+        raise CliError(error.code, str(error), hint=error.hint) from error
+
+
+def _public_job(job):
+    return {key: value for key, value in job.items() if not key.startswith("_")}
+
+
 def _search_topics(topics, args):
-    """Overlap bounded query/graph jobs and retain their deterministic input order."""
+    """Use one worker pool for all providers; retain deterministic job order."""
     import paper_search
+    import research_sources
 
     def search(value):
         job = _retrieval_job(value)
+        definition = job.pop("_definition", None)
+        missing_query = job.pop("_input_required", False)
+        if missing_query:
+            return job, [], {"code": "INPUT_REQUIRED", "hint": "Supply --topic for this source."}
         try:
-            options = dict(limit=args.limit, from_year=args.from_year,
-                           min_citations=args.min_citations, timeout=getattr(args, "timeout", 30))
-            if job["kind"] == "seed":
-                found = paper_search.related_papers(job["seed"], relation=job["relation"], **options)
+            if definition is not None:
+                found = research_sources.fetch_source(definition, query=job["query"], limit=args.limit,
+                                                       timeout=getattr(args, "timeout", 30))
+                rows = found.get("items") if isinstance(found, dict) else None
             else:
-                found = paper_search.search_papers(job["query"], **options)
-            rows = found.get("papers") if isinstance(found, dict) else found
+                options = dict(limit=args.limit, from_year=args.from_year,
+                               min_citations=args.min_citations, timeout=getattr(args, "timeout", 30))
+                found = (paper_search.related_papers(job["seed"], relation=job["relation"], **options)
+                         if job["kind"] == "seed" else paper_search.search_papers(job["query"], **options))
+                rows = found.get("papers") if isinstance(found, dict) else found
             if not isinstance(rows, list):
                 return job, [], {"code": "INVALID_RESPONSE"}
             if isinstance(found, dict):
                 for key in ("source", "seed", "relation", "coverage", "cached", "total_available",
-                            "ordering_basis"):
+                            "ordering_basis", "collected_at", "as_of", "age_seconds"):
                     if key in found:
                         job[key] = found[key]
                 if job["kind"] == "seed":
                     job["query"] = found.get("query") or job["query"]
-                    coverage = job.get("coverage") or {}
-                    job["ordering_basis"] = coverage.get("ordering") or job["ordering_basis"]
-            return job, rows, None
-        except Exception as error:  # noqa: BLE001 - a failed job must not cancel peers
-            # Never relay provider messages: they can contain request credentials.
+                job["ordering_basis"] = (job.get("coverage") or {}).get("ordering") or job["ordering_basis"]
+            # Older paper caches do not record collection time. Do not label them live.
+            job.setdefault("collected_at", None if job.get("cached") else source_io.utc_now())
+            job.setdefault("coverage", {"scope": "bounded provider results", "ordering": job["ordering_basis"]})
+            if len(rows) > args.limit:
+                job["coverage"] = {**job["coverage"], "omitted_by_limit": len(rows) - args.limit}
+            return job, rows[:args.limit], None
+        except Exception as error:  # noqa: BLE001 - one provider cannot cancel peers
+            if isinstance(error, source_io.SourceError):
+                return job, [], error.public()
             if isinstance(error, paper_search.PaperError):
-                return job, [], {"code": error.code, "hint": error.hint,
-                                 "type": type(error).__name__}
+                return job, [], {"code": error.code, "hint": error.hint, "type": type(error).__name__}
             return job, [], {"code": "SEARCH_FAILED", "type": type(error).__name__}
 
     if not topics:
@@ -327,66 +414,146 @@ def _search_topics(topics, args):
     return outcomes
 
 
-def _select_papers(outcomes, seen, total, register):
-    """Balance retrieval jobs without replacing the provider's order."""
+def _safe_url(value):
+    try:
+        return source_io.public_url(value) if value else None
+    except (source_io.SourceError, TypeError, ValueError):
+        return None
+
+
+def _item_keys(item):
+    if item.get("kind", "paper") == "paper":
+        return _paper_keys(item)
+    kind, provider = item["kind"], item["provider"]
+    identifier = item.get("id")
+    if not isinstance(identifier, str) or not identifier:
+        raise ValueError("Missing native identity")
+    native = "%s:%s:id:%s" % (kind, provider, identifier)
+    if kind == "market":
+        return [native]  # Endpoint URLs identify feeds, never individual snapshots.
+    native = "%s:%s:%s:id:%s" % (kind, provider, item["source_id"], identifier)
+    if provider == "local_file":
+        # Repeated pasted exports are one source, even under different filenames/config IDs.
+        content = {key: item.get(key) for key in
+                   ("id", "title", "excerpt", "author", "parent_id", "published_at_raw", "url")}
+        content["excerpt"] = item["_evidence"].get("excerpt")
+        fingerprint = hashlib.sha256(json.dumps(content, sort_keys=True, ensure_ascii=False).encode("utf-8")).hexdigest()
+        native = "%s:local_file:%s" % (kind, fingerprint)
+    url = _safe_url(item.get("url"))
+    return ["%s:url:%s" % (kind, url), native] if url else [native]
+
+
+def _normalize_item(row, job):
+    """Keep full evidence separately from the bounded display fields."""
+    item = dict(row)
+    is_paper = job.get("source_id", "paper") == "paper"
+    kind = "paper" if is_paper else item.get("kind")
+    if kind not in {"paper", "news", "social", "forum", "trend", "web", "market"}:
+        raise ValueError("Unknown evidence kind")
+    item["kind"] = kind
+    item["provider"] = item.get("provider") or item.get("source") or job["source"]
+    if not isinstance(item.get("title"), str) or not isinstance(item["provider"], str):
+        raise ValueError("Missing title or provider")
+    text = item.get("abstract") if is_paper else item.get("excerpt")
+    text = "" if text is None else text
+    if not isinstance(text, str):
+        raise ValueError("Invalid evidence text")
+    if is_paper:
+        rank = score(item)
+        if not math.isfinite(rank):
+            raise ValueError("Invalid paper metadata")
+        timestamp = source_io.parse_timestamp(item.get("publication_date") or
+                                               (str(item["year"]) if item.get("year") else None))
+        item.update(published_at=timestamp["value"], published_at_raw=timestamp["raw"],
+                    time_precision=timestamp["precision"], rank=rank,
+                    evidence={"basis": "OpenAlex metadata and available abstract",
+                              "claim_state": "unverified", "full_text_read": False},
+                    engagement=None)
+    item.setdefault("collected_at", job.get("collected_at"))
+    item.setdefault("published_at", None)
+    item.setdefault("published_at_raw", None)
+    item.setdefault("time_precision", "unknown")
+    item.setdefault("author", None)
+    item.setdefault("engagement", None)
+    item.setdefault("evidence", {"basis": "provider metadata", "claim_state": "unverified"})
+    item.update(source=job["source"], source_id=job.get("source_id", "paper"),
+                coverage=job.get("coverage"), cached=job.get("cached", False))
+    for field in ("url", "landing_page_url", "pdf_url", "cited_by_api_url"):
+        if field in item:
+            item[field] = _safe_url(item[field])
+    if isinstance(item.get("id"), str) and item["id"].lower().startswith(("http://", "https://")):
+        item["id"] = _safe_url(item["id"])
+    item["excerpt"] = text
+    full = dict(item)
+    item.update(excerpt=text[:600], excerpt_chars=len(text), excerpt_truncated=len(text) > 600,
+                evidence_path=None, _evidence=full)
+    item.pop("raw", None)
+    if is_paper:
+        item.update(abstract=text[:600], abstract_chars=len(text), abstract_truncated=len(text) > 600,
+                    abstract_available=bool(text), reading=row.get("reading"), full_text_read=False,
+                    reference_count=len(row["referenced_works"])
+                    if isinstance(row.get("referenced_works"), list) else None)
+        item.pop("referenced_works", None)
+    if kind == "market":
+        if not isinstance(item.get("market"), dict):
+            raise ValueError("Missing snapshot")
+        item["market"] = {key: value for key, value in item["market"].items()
+                          if key not in {"bids", "asks", "raw"}}
+    item["unknowns"] = ["claim validity", "historical first availability", "backtest applicability"]
+    if not item["published_at"]:
+        item["unknowns"].append("exact source publication time")
+    if item["collected_at"] is None:
+        item["unknowns"].append("original collection time")
+    return item
+
+
+def _select_items(outcomes, seen, total, register):
+    """Round-robin all jobs without converting popularity into evidence strength."""
     candidates, identities, buckets, reports, repeats = {}, {}, [], [], set()
     for value, rows, error in outcomes:
         job = _retrieval_job(value)
-        topic = job["query"]
-        report = {**job, "status": "failure" if error else "success" if rows else "empty",
+        topic = job.get("query")
+        report = {**_public_job(job), "status": "failure" if error else "success" if rows else "empty",
                   "returned": len(rows), "eligible": 0, "seen_before": 0,
                   "invalid": 0, "picked": 0}
         if error:
             report["error"] = error
         reports.append(report)
-        bucket = []
+        bucket, bucket_keys = [], set()
         buckets.append(bucket)
-        bucket_keys = set()
-        for provider_rank, paper in enumerate(rows, 1):
-            if not isinstance(paper, dict):
-                report["invalid"] += 1
-                continue
+        for provider_rank, row in enumerate(rows, 1):
             try:
-                keys = _paper_keys(paper)
+                if not isinstance(row, dict):
+                    raise ValueError("Invalid item")
+                item = _normalize_item(row, job)
+                keys = _item_keys(item)
                 key = keys[0]
-                rank = score(paper)
-                abstract = paper.get("abstract") or ""
-                valid = bool(key) and math.isfinite(rank) and isinstance(abstract, str)
+                if not key:
+                    raise ValueError("Missing identity")
             except (AttributeError, TypeError, ValueError, OverflowError):
-                valid = False
-            if not valid:
                 report["invalid"] += 1
                 continue
             if any(alias in seen for alias in keys) or (
-                not paper.get("doi") and _title_key(paper) in seen
+                item["kind"] == "paper" and not item.get("doi") and _title_key(item) in seen
             ):
                 repeats.add(keys[-1])
                 report["seen_before"] += 1
                 continue
             key = next((identities[alias] for alias in keys if alias in identities), key)
             if key not in candidates:
-                candidates[key] = {**paper, "source": paper.get("source") or job["source"],
-                                   "query": topic, "queries": [], "key": key,
-                                   "rank": rank, "abstract": abstract[:600],
-                                   "abstract_chars": len(abstract),
-                                   "abstract_truncated": len(abstract) > 600,
-                                   "reference_count": len(paper["referenced_works"])
-                                   if isinstance(paper.get("referenced_works"), list) else None,
-                                   "aliases": [],
-                                   "abstract_available": bool(abstract),
-                                   "reading": paper.get("reading"), "full_text_read": False,
+                candidates[key] = {**item, "query": topic, "queries": [], "key": key, "aliases": [],
                                    "provider_ranks": [], "retrievals": [],
-                                   "closure_cautions": _closure_cautions(paper, register)}
+                                   "closure_cautions": _closure_cautions(item, register)}
             candidate = candidates[key]
             for alias in keys:
                 identities[alias] = key
                 if alias != key and alias not in candidate["aliases"]:
                     candidate["aliases"].append(alias)
-            if job["kind"] == "query" and topic not in candidate["queries"]:
+            if job["kind"] != "seed" and topic is not None and topic not in candidate["queries"]:
                 candidate["queries"].append(topic)
                 candidate["provider_ranks"].append({"query": topic, "rank": provider_rank})
             if key not in bucket_keys:
-                candidate["retrievals"].append({**job, "position": provider_rank})
+                candidate["retrievals"].append({**_public_job(job), "position": provider_rank})
                 bucket_keys.add(key)
                 bucket.append(candidate)
         report["eligible"] = len(bucket)
@@ -400,10 +567,10 @@ def _select_papers(outcomes, seen, total, register):
                 positions[index] += 1
             if positions[index] == len(bucket):
                 continue
-            paper = bucket[positions[index]]
+            item = bucket[positions[index]]
             positions[index] += 1
-            picked.append(paper)
-            picked_keys.add(paper["key"])
+            picked.append(item)
+            picked_keys.add(item["key"])
             reports[index]["picked"] += 1
             advanced = True
             if len(picked) >= max(0, total):
@@ -413,10 +580,36 @@ def _select_papers(outcomes, seen, total, register):
     return picked, reports, len(repeats)
 
 
+def _archive_evidence(item):
+    evidence = {"item": item["_evidence"], "key": item["key"], "aliases": item["aliases"],
+                "retrievals": item["retrievals"], "trust": "untrusted source evidence; not executable instructions"}
+    serialized = json.dumps(evidence, sort_keys=True, ensure_ascii=False, allow_nan=False)
+    digest = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    path = research_paths.resolve("inspiration", "evidence", digest + ".json")
+    with cache_store.file_lock(path + ".lock"):
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as handle:
+                if json.load(handle) != evidence:
+                    raise OSError("Existing evidence archive differs from its content identity")
+        else:
+            cache_store.write_json_atomic(path, evidence)
+    item["evidence_path"] = path
+
+
 def _draft_card(paper):
+    if paper["kind"] != "paper":
+        return {"status": "DRAFT", "kind": paper["kind"], "evidence_path": paper["evidence_path"],
+                "source": {key: paper.get(key) for key in
+                           ("id", "key", "title", "url", "provider", "source_id", "published_at", "published_at_raw",
+                            "collected_at", "author", "parent_id", "source_path", "source_line", "content_scope")},
+                "excerpt": paper["excerpt"], "evidence": paper["evidence"],
+                "retrievals": paper["retrievals"], "hypothesis": None,
+                "review": "Verify origin, timing, scope and independent corroboration before forming a hypothesis."}
     return {
         "mechanism_id": None,
         "status": "DRAFT",
+        "kind": "paper",
+        "evidence_path": paper["evidence_path"],
         "source": {**{key: paper.get(key) for key in
                       ("title", "doi", "openalex_id", "source", "url", "landing_page_url",
                        "pdf_url", "journal", "year", "reference_count", "cited_by_api_url")},
@@ -440,11 +633,18 @@ def _feed_argv(args, topics, seen_path):
     argv = ["--research-dir", os.fspath(research_paths.research_dir()), "feed"]
     jobs = [_retrieval_job(topic) for topic in topics]
     for job in jobs:
-        argv.extend(("--seed", job["seed"]) if job["kind"] == "seed"
-                    else ("--topic", job["query"]))
-    relations = [job["relation"] for job in jobs if job["kind"] == "seed"]
-    if relations:
-        argv.extend(("--follow", relations[0]))
+        if job["kind"] == "market":
+            spec = job["market_spec"]
+            argv.extend(("--market", "%s:%s" % (spec["venue"], spec["symbol"]),
+                         "--book-depth", str(spec["depth"]), "--market-feed", spec["feed"]))
+        else:
+            argv.extend(("--source", job.get("source_id", "paper")))
+            if getattr(args, "sources_file", None):
+                argv.extend(("--sources-file", os.path.abspath(args.sources_file)))
+            if job["kind"] == "seed":
+                argv.extend(("--seed", job["seed"], "--follow", job["relation"]))
+            elif job.get("query") is not None:
+                argv.extend(("--topic", job["query"]))
     for option, value in (("--limit", args.limit), ("--total", args.total),
                           ("--max-topics", len(topics)), ("--from-year", args.from_year),
                           ("--min-citations", args.min_citations),
@@ -460,7 +660,7 @@ def _feed_argv(args, topics, seen_path):
             argv.extend((option, str(value)))
     if args.draft_cards:
         argv.extend(("--draft-cards", os.path.abspath(args.draft_cards)))
-    for option, attribute in (("--dry-run", "dry_run"), ("--action", "action")):
+    for option, attribute in (("--dry-run", "dry_run"), ("--action", "action"), ("--summary", "summary")):
         if getattr(args, attribute, False):
             argv.append(option)
     return argv
@@ -496,8 +696,8 @@ def _has_keyword(text, phrase):
 
 def data_fit(paper, field_scope=None):
     """Separate inferred reading needs from explicitly named field availability."""
-    text = ("%s %s" % (paper.get("title") or "", paper.get("abstract") or "")).lower()
-    needs = [{"need": need, "state": "inferred", "verdict": "unknown", "basis": "title_abstract_keywords"}
+    text = ("%s %s" % (paper.get("title") or "", paper.get("abstract") or paper.get("excerpt") or "")).lower()
+    needs = [{"need": need, "state": "inferred", "verdict": "unknown", "basis": "title_evidence_keywords"}
              for phrases, need in DATA_NEEDS if any(_has_keyword(text, phrase) for phrase in phrases)]
     supplied = paper.get("required_fields")
     valid = supplied is None or (isinstance(supplied, list) and all(isinstance(item, str) and item.strip() for item in supplied))
@@ -520,52 +720,137 @@ def data_fit(paper, field_scope=None):
                     "missing direct inputs do not rule out a separately justified proxy.")}
 
 
-def _next_actions(args, reports, unresolved, deferred, papers, seen_path):
-    """Bound recovery/review actions; each source has at most three reading steps."""
+def _next_actions(args, reports, unresolved, deferred, items, seen_path):
+    """Executable retries target exactly one job; source text never supplies argv."""
     actions = []
     for report in [row for row in reports if row["status"] == "failure"][:3]:
-        actions.append({"kind": "retry_search", "query": report["query"],
+        actions.append({"kind": "supply_query" if report["error"]["code"] == "INPUT_REQUIRED" else "retry_search",
+                        "query": report.get("query"),
                         "retrieval": {key: report[key] for key in
-                                      ("kind", "source", "seed", "relation") if key in report},
-                        "error": report["error"],
-                        "argv": _feed_argv(args, [report], seen_path)})
+                                      ("kind", "source", "source_id", "seed", "relation", "market_spec") if key in report},
+                        "error": report["error"], "argv": _feed_argv(args, [report], seen_path)})
     for question in unresolved[:3]:
         actions.append({"kind": "supply_query", **question,
-                        "instruction": "Add '; query:' followed by your own English search "
-                                       "terms to this open-thread line."})
-    if deferred:
-        jobs = [_retrieval_job(value) for value in deferred[:3]]
-        actions.append({"kind": "search_deferred",
-                        "queries": [job["query"] for job in jobs if job["kind"] == "query"],
-                        "retrievals": jobs, "remaining": max(0, len(deferred) - 3),
-                        "argv": _feed_argv(args, jobs, seen_path)})
-    for index, paper in enumerate(papers[:3]):
-        action = {"kind": "review_source", "paper_index": index,
-                  "sources": {key: paper.get(key) for key in
-                              ("doi", "openalex_id", "url", "landing_page_url", "pdf_url")},
-                  "instruction": "Read the source; record its sample, identification "
-                                 "strategy and falsification evidence before drafting a mechanism."}
-        identifier = _paper_identifier(paper)
-        if identifier:
-            argv = ["--research-dir", os.fspath(research_paths.research_dir()),
-                    "paper", "--id", identifier, "--timeout", str(getattr(args, "timeout", 30))]
-            action["argv"] = argv
-            action["next_actions"] = [{"kind": "expand_references", "argv":
-                _feed_argv(args, [{"kind": "seed", "seed": identifier,
-                                  "relation": "references"}], seen_path)}]
-            reading = paper.get("reading") or {}
-            if reading.get("grobid_xml") is True:
-                action["next_actions"].insert(0, {"kind": "read_full_text",
-                    "argv": argv + ["--full-text", "--offset", "0", "--max-chars", "12000"]})
+                        "instruction": "Add '; query:' followed by your own English search terms to this open-thread line."})
+    for value in deferred[:3]:
+        job = _retrieval_job(value)
+        actions.append({"kind": "search_deferred", "queries": [job["query"]] if job.get("query") and job["kind"] != "seed" else [],
+                        "retrievals": [_public_job(job)], "remaining": max(0, len(deferred) - 3),
+                        "argv": _feed_argv(args, [job], seen_path)})
+    for index, item in enumerate(items[:3]):
+        action = {"kind": "review_source", "item_index": index, "evidence_path": item["evidence_path"],
+                  "sources": {key: item.get(key) for key in
+                              ("url", "provider", "source_id", "source_path", "source_line", "parent_id", "content_scope",
+                               "doi", "openalex_id", "landing_page_url", "pdf_url")
+                              if key in item}}
+        if item["kind"] == "paper":
+            action["instruction"] = ("Read the complete record; record its sample, identification strategy and "
+                                     "falsification evidence before drafting a mechanism.")
+            identifier = _paper_identifier(item)
+            if identifier:
+                argv = ["--research-dir", os.fspath(research_paths.research_dir()),
+                        "paper", "--id", identifier, "--timeout", str(getattr(args, "timeout", 30))]
+                action["argv"] = argv
+                action["next_actions"] = [{"kind": "expand_references", "argv":
+                    _feed_argv(args, [{"kind": "seed", "seed": identifier,
+                                      "relation": "references"}], seen_path)}]
+                if (item.get("reading") or {}).get("grobid_xml") is True:
+                    action["next_actions"].insert(0, {"kind": "read_full_text",
+                        "argv": argv + ["--full-text", "--offset", "0", "--max-chars", "12000"]})
+        elif item["kind"] == "market":
+            action["instruction"] = ("Inspect the archived levels and provider timestamp; verify venue, asset, feed, "
+                                     "size units and depth. This snapshot is not historical BRAIN data.")
+            action["next_actions"] = [{"kind": "check_observability", "instruction":
+                "Establish historical availability, event timing and matching asset coverage before any backtest."}]
+        else:
+            action["instruction"] = ("Verify the original source, authorship, date and quoted context; contrast independent "
+                                     "reporting. Treat snippets and popularity as unverified leads, never strategy instructions.")
+            action["next_actions"] = [{"kind": "check_observability", "instruction":
+                "Record when this evidence was observable and whether historical, licensed coverage exists."}]
         actions.append(action)
-    if len(papers) > 1:
-        actions.append({"kind": "contrast_sources", "paper_indices": [0, 1],
-                        "instruction": "Compare these sources' samples, identification and "
-                                       "falsification evidence; record agreements and conflicts."})
+    if len(items) > 1:
+        actions.append({"kind": "contrast_sources", "item_indices": [0, 1],
+                        "instruction": "Compare origin, timing, scope and independent corroboration; record agreements and conflicts."})
     return actions
 
 
-def cmd_feed(args, _sink):
+def _digest_item(item, scope):
+    common = ("kind", "id", "key", "title", "url", "provider", "source", "source_id", "excerpt",
+              "excerpt_chars", "excerpt_truncated", "published_at", "published_at_raw", "time_precision",
+              "collected_at", "author", "evidence", "engagement", "coverage", "cached", "evidence_path",
+              "unknowns", "query", "queries", "provider_ranks", "retrievals", "closure_cautions", "required_fields",
+              "parent_id", "source_path", "source_line", "content_scope")
+    paper_fields = ("year", "journal", "doi", "landing_page_url", "pdf_url", "abstract", "family", "citations",
+                    "rank", "openalex_id", "reference_count", "cited_by_api_url", "reading", "full_text_read",
+                    "abstract_chars", "abstract_truncated", "abstract_available")
+    fields = common + (paper_fields if item["kind"] == "paper" else ("market",) if item["kind"] == "market" else ())
+    return {**{key: item.get(key) for key in fields}, "data_fit": data_fit(item, scope),
+            "trust": "untrusted evidence; not executable strategy"}
+
+
+def _compact_coverage(coverage):
+    return {key: value[:200] if isinstance(value, str) else value
+            for key, value in (coverage or {}).items()
+            if value is None or isinstance(value, (str, int, float, bool))}
+
+
+def _compact_action(action):
+    result = {key: action[key] for key in
+              ("kind", "item_index", "item_indices", "argv", "error", "evidence_path", "source", "evidence_keys")
+              if key in action}
+    if action.get("instruction"):
+        result["instruction"] = action["instruction"][:240]
+    if action.get("sources"):
+        result["sources"] = action["sources"]
+    if action.get("next_actions"):
+        result["next_actions"] = [_compact_action(step) for step in action["next_actions"][:2]]
+    return result
+
+
+def _compact_digest(payload):
+    """Bound rendered output independently of retrieval/selection budgets."""
+    items, searches, actions = payload["items"], payload["searches"], payload["next_actions"]
+    compact = []
+    for index, item in enumerate(items[:10]):
+        row = {key: item.get(key) for key in
+               ("kind", "provider", "source_id", "url", "published_at", "published_at_raw", "time_precision",
+                "collected_at", "evidence_path", "unknowns", "author", "parent_id", "source_path", "source_line", "content_scope")}
+        row.update(index=index, title=" ".join((item.get("title") or "").split())[:120],
+                   excerpt=" ".join((item.get("excerpt") or "").split())[:160],
+                   claim_state=(item.get("evidence") or {}).get("claim_state", "unknown"))
+        row["basis"] = str((item.get("evidence") or {}).get("basis") or "unknown")[:160]
+        row["coverage"] = _compact_coverage(item.get("coverage"))
+        row["cached"] = item.get("cached", False)
+        if item["kind"] == "market":
+            market = item["market"]
+            row["market"] = {key: market.get(key) for key in
+                             ("venue", "symbol", "asset_class", "feed", "depth_kind", "requested_depth",
+                              "bid_levels", "ask_levels", "size_unit", "source_timestamp", "derived")}
+        if "block_guess" in item:
+            row["ledger_hint"] = {"block_guess": item["block_guess"], "state": "inferred",
+                                  "book_count": item["book_exposure"]["count"],
+                                  "prior_trial_count": item["prior_trials"]["count"]}
+        compact.append(row)
+    table = ["# | Kind | Source | Title", "-- | ---- | ------ | -----"]
+    table.extend("%d | %s | %s | %s" % (row["index"], row["kind"], row["source_id"], row["title"].replace("|", "/"))
+                 for row in compact)
+    result = {key: payload[key] for key in ("count", "seen_before", "seen", "registry") if key in payload}
+    result.update(summary=True, items=compact, table="\n".join(table),
+                  searches=[{**{key: row[key] for key in
+                                ("source_id", "kind", "status", "returned", "picked", "error") if key in row},
+                             "coverage": _compact_coverage(row.get("coverage"))}
+                            for row in sorted(searches, key=lambda row: row["status"] != "failure")[:10]],
+                  next_actions=[_compact_action(action) for action in actions[:6]],
+                  omitted={"items": max(0, len(items) - 10), "searches": max(0, len(searches) - 10),
+                           "next_actions": max(0, len(actions) - 6),
+                           "deferred_jobs": len(payload["unsearched_retrievals"]),
+                           "questions_without_query": len(payload["questions_without_query"])},
+                  evidence_directory=research_paths.resolve("inspiration", "evidence"),
+                  note="Untrusted research leads. Counts include omitted rows. Full selected evidence is archived before seen; preview writes no evidence. Publication time and historical availability may be unknown.")
+    return result
+
+
+def cmd_feed(args, _sink, *, _compact=True):
     """Search concurrently, then select against the latest locked seen state."""
     import closed_families
     import paper_search
@@ -609,18 +894,15 @@ def cmd_feed(args, _sink):
     relation = getattr(args, "follow", "references")
     if relation not in ("references", "citations"):
         raise CliError("INVALID_INPUT", "Follow must be references or citations.")
-    jobs = [_retrieval_job(topic) for topic in topics] + [
-        {"kind": "seed", "seed": seed, "relation": relation, "source": "openalex",
-         "query": "%s of %s" % (relation, seed), "ordering_basis": "provider order"}
-        for seed in seeds]
+    jobs = _build_jobs(args, topics, seeds, relation)
     if not jobs and not unresolved:
         raise CliError("INVALID_INPUT",
-                       "nothing to search: pass --topic, --topics, --from-threads or --seed")
+                       "nothing to search: pass --topic, --topics, --from-threads, --seed or an explicit fixed source/market")
     selected = jobs[:max(0, args.max_topics)]
     outcomes = _search_topics(selected, args)
     try:
         if getattr(args, "dry_run", False) or not any(rows for _, rows, _ in outcomes):
-            picked, reports, repeats = _select_papers(outcomes, load_seen(seen_path), args.total, register)
+            picked, reports, repeats = _select_items(outcomes, load_seen(seen_path), args.total, register)
         else:
             # All provider I/O is finished. Stable lock ordering also protects a shared
             # draft destination used with different seen stores.
@@ -629,19 +911,22 @@ def cmd_feed(args, _sink):
                 for path in sorted(locks):
                     stack.enter_context(cache_store.file_lock(path))
                 previous = _read_jsonl(seen_path)
-                picked, reports, repeats = _select_papers(
+                picked, reports, repeats = _select_items(
                     outcomes, _seen_keys(previous), args.total, register)
                 if picked:
-                    # A failed draft write must leave every unseen pick available.
+                    # Every immutable evidence file must exist before either mutable state file.
+                    for item in picked:
+                        _archive_evidence(item)
                     if draft_path:
                         _append_jsonl_atomic(draft_path, (_draft_card(paper) for paper in picked))
                     _append_jsonl_atomic(seen_path, (
                         {"key": paper["key"], "title": paper.get("title"), "query": paper.get("query"),
+                         "kind": paper["kind"], "evidence_path": paper["evidence_path"],
                          **({"aliases": paper["aliases"]} if paper["aliases"] else {})}
                         for paper in picked), previous=previous)
-    except (OSError, cache_store.LockTimeout) as error:
+    except (OSError, ValueError, TypeError, cache_store.LockTimeout) as error:
         raise CliError("INVALID_INPUT", "Could not read or commit feed state.",
-                       hint="Check seen/draft paths and permissions. Drafts commit before seen; "
+                       hint="Check evidence/seen/draft paths and permissions. Evidence and drafts commit before seen; "
                             "a retry after a seen-write failure may repeat draft cards.",
                        details={"seen": seen_path, "draft_cards": draft_path,
                                 "type": type(error).__name__}) from error
@@ -650,11 +935,11 @@ def cmd_feed(args, _sink):
     settings = {"region": getattr(args, "region", None), "universe": getattr(args, "universe", None),
                 "delay": getattr(args, "delay", None), "instrumentType": getattr(args, "instrument_type", None)}
     scope = cached_field_scope(settings, getattr(args, "meta_max_age", None))
-    return {
-        "topics": [job["query"] for job in selected if job["kind"] == "query"],
+    payload = {
+        "topics": list(dict.fromkeys(job["query"] for job in selected if job.get("query") and job["kind"] != "seed")),
         "seeds": [job["seed"] for job in selected if job["kind"] == "seed"],
-        "unsearched_topics": [job["query"] for job in deferred if job["kind"] == "query"],
-        "unsearched_retrievals": [{**job, "status": "unsearched"} for job in deferred],
+        "unsearched_topics": list(dict.fromkeys(job["query"] for job in deferred if job.get("query") and job["kind"] != "seed")),
+        "unsearched_retrievals": [{**_public_job(job), "status": "unsearched"} for job in deferred],
         "questions_without_query": unresolved,
         "searches": reports,
         "seen_before": repeats,
@@ -664,26 +949,17 @@ def cmd_feed(args, _sink):
         "closed_register": {"path": register["path"],
                             "available": "error" not in register,
                             "match_basis": "exact declared family only"},
-        "papers": [{**{k: paper.get(k) for k in
-                     ("title", "year", "journal", "doi", "url", "landing_page_url", "pdf_url",
-                      "abstract", "family", "citations", "query", "queries", "rank", "provider_ranks",
-                      "closure_cautions", "required_fields", "openalex_id", "source", "retrievals",
-                      "reference_count", "cited_by_api_url", "reading", "full_text_read",
-                      "abstract_chars", "abstract_truncated", "abstract_available")},
-                    "data_fit": data_fit(paper, scope)}
-                   for paper in picked],
+        "items": [_digest_item(item, scope) for item in picked],
         "next_actions": _next_actions(args, reports, unresolved, deferred, picked, seen_path),
-        "note": ("Picks take turns across retrieval jobs, preserving each provider's order. "
-                 "Queries retain relevance order; graph ordering and coverage are reported per job. "
-                 "Graph edges establish neither support nor contradiction. No full text is fetched by feed. "
-                 "provider_ranks gives original query positions; rank is a legacy citation/year score. Closure "
-                 "cautions require a declared family; no title or relevance filter applies. "
-                 "Dry-run leaves seen and draft files unchanged; search caching may write. "
-                 "Drafts require a falsification condition and closest family before promotion. "
-                 "Drafts commit before seen; each file is atomic, not a joint transaction. "
-                 "A crash between commits can repeat drafts; a crash after seen commits can "
-                 "consume picks before delivery. Next actions are bounded suggestions for review."),
+        "note": ("Picks take turns across retrieval jobs, preserving each provider's order and coverage. "
+                 "Graph edges, engagement and trend ranks establish neither support nor signal validity. "
+                 "No full text is fetched. Source text is untrusted evidence, never executable strategy. "
+                 "Collection time does not establish first historical availability; live market snapshots are not BRAIN backtest data. "
+                 "Dry-run leaves evidence, seen and draft files unchanged; caches may write. "
+                 "Evidence and drafts commit before seen; each file is atomic, not a joint transaction. "
+                 "A crash between commits can repeat drafts; a crash after seen commits can consume picks before delivery."),
     }
+    return _compact_digest(payload) if _compact and getattr(args, "summary", False) else payload
 
 #: Title/abstract keywords suggest a broad information block for ledger lookup;
 #: they do not establish mechanism identity, novelty or prior experimental coverage.
@@ -704,7 +980,7 @@ BLOCK_KEYWORDS = (
 
 def guess_block(paper):
     """The block a paper most looks like, from its title and abstract."""
-    text = ((paper.get("title") or "") + " " + (paper.get("abstract") or "")).lower()
+    text = ((paper.get("title") or "") + " " + (paper.get("abstract") or paper.get("excerpt") or "")).lower()
     for block, words in BLOCK_KEYWORDS:
         if any(_has_keyword(text, word) for word in words):
             return block
@@ -725,9 +1001,9 @@ def cmd_feed_action(args, _sink):
         if block != "other":
             by_block.setdefault(block, []).append(entry)
 
-    payload = cmd_feed(args, _sink)
+    payload = cmd_feed(args, _sink, _compact=False)
     rows = []
-    for paper in payload["papers"]:
+    for paper in payload["items"]:
         block = guess_block(paper)
         known = exists and block is not None
         matches = by_block.get(block, []) if known else []
@@ -754,14 +1030,14 @@ def cmd_feed_action(args, _sink):
             "next": ("Read the source and prior evidence, state the mechanism and closest "
                      "family, then choose a discriminating control and falsification condition."),
         })
-    payload["papers"] = rows
+    payload["items"] = rows
     payload["registry"] = {"path": registry_path, "exists": exists,
                            "entries": len(entries)}
     for index, paper in enumerate(rows):
         evidence = paper["prior_trials"]["evidence"]
         if evidence:
             payload["next_actions"].append({
-                "kind": "contrast_prior_evidence", "paper_index": index,
+                "kind": "contrast_prior_evidence", "item_index": index,
                 "source": registry_path, "evidence_keys": [entry.get("key") for entry in evidence],
                 "instruction": "Read these prior trials and compare their recorded mechanisms, "
                                "controls and failure conditions with this source; a shared block "
@@ -772,4 +1048,4 @@ def cmd_feed_action(args, _sink):
                         "book exposure and prior trials are separate evidence. Missing sources "
                         "or unknown blocks remain unknown. Zero local matches do not establish "
                         "an unexplored mechanism or a marginal contribution to the book.")
-    return payload
+    return _compact_digest(payload) if getattr(args, "summary", False) else payload
