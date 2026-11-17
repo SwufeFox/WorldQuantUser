@@ -50,7 +50,7 @@ from itertools import combinations, product
 from os import environ
 from pathlib import Path
 from time import sleep
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import sys
 from datetime import datetime, timezone
@@ -659,24 +659,28 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
 
 
 def get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
-                 universe="TOP3000", limit=None, refresh=None, report=None):
+                 universe="TOP3000", limit=None, refresh=None, report=None, theme=None):
     """List datasets available for a region/universe/delay as ``list[dict]``.
 
     Quota-free and cached (see :func:`cached_metadata`). An empty result concerns
     this exact combination; it does not establish access for other universes or
     delays, or distinguish an unsupported combination from an empty catalog.
     """
+    if theme is not None and not isinstance(theme, bool):
+        raise ValueError("theme must be true, false or unspecified")
     params = {"instrumentType": instrument_type, "region": region,
               "delay": delay, "universe": universe, "limit": limit}
+    if theme is not None:
+        params["theme"] = theme
     return cached_metadata(
         "datasets", params,
-        lambda: _get_datasets(s, instrument_type, region, delay, universe, limit),
+        lambda: _get_datasets(s, instrument_type, region, delay, universe, limit, theme),
         refresh=refresh, report=report,
     )["data"]
 
 
 def _get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
-                 universe="TOP3000", limit=None):
+                  universe="TOP3000", limit=None, theme=None):
     """List datasets available for a region/universe/delay as ``list[dict]``.
 
     Quota-free. An empty result concerns only this exact combination.
@@ -684,6 +688,8 @@ def _get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
     results = []
     params = {"instrumentType": instrument_type, "region": region,
               "delay": delay, "universe": universe}
+    if theme is not None:
+        params["theme"] = "true" if theme else "false"
     for batch in _catalog_pages(s, "/data-sets", params, keys=("data-sets",)):
         results.extend(batch)
         if limit and len(results) >= limit:
@@ -1962,11 +1968,10 @@ def _extract_checks(alpha_payload):
         name = check.get("name")
         if not name:
             continue
-        info = {
-            "result": check.get("result"),
-            "limit": check.get("limit"),
-            "value": check.get("value"),
-        }
+        info = {key: value for key, value in check.items()
+                if key not in {"name", "expected_result", "value_consistent"}}
+        for key in ("result", "limit", "value"):
+            info.setdefault(key, None)
         verdict = reconcile_check(name, info)
         if verdict is not None:
             info["expected_result"] = verdict["expected"]
@@ -2034,6 +2039,72 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
         "complete": bool(checks),
         "payload_received": payload is not None,
     }
+
+
+def _performance_request(alpha_id, team_id=None, competition_id=None):
+    if team_id is not None and competition_id is not None:
+        raise ValueError("choose either a team or a competition, not both")
+    for name, value in (("alpha_id", alpha_id), ("team_id", team_id), ("competition_id", competition_id)):
+        if (name == "alpha_id" or value is not None) and (not isinstance(value, str) or not value.strip()):
+            raise ValueError("%s must be a nonempty identifier" % name)
+    kind, identifier = ("competition", competition_id) if competition_id is not None else (
+        ("team", team_id) if team_id is not None else ("user", "self"))
+    collection = {"competition": "competitions", "team": "teams", "user": "users"}[kind]
+    path = "/%s/%s/alphas/%s/before-and-after-performance" % (
+        collection, quote(identifier, safe=""), quote(alpha_id, safe=""))
+    return {"scope": {"kind": kind, "id": identifier}, "source": BRAIN_API_URL + path}
+
+
+def fetch_merged_performance(s, alpha_id, team_id=None, competition_id=None,
+                             max_wait_seconds=180.0, on_event=None):
+    """Read the platform's merged before/after comparison without submitting an alpha.
+
+    The provider owns the partition and metric period. A ready response is not
+    proof of train-only evidence or of a causal marginal contribution.
+    """
+    request = _performance_request(alpha_id, team_id, competition_id)
+    if (isinstance(max_wait_seconds, bool) or not isinstance(max_wait_seconds, (int, float))
+            or not math.isfinite(max_wait_seconds) or max_wait_seconds < 0):
+        raise ValueError("max_wait_seconds must be a finite, non-negative number")
+    deadline = time.monotonic() + max_wait_seconds
+    while True:
+        response = s.get(request["source"], timeout=_request_timeout(deadline))
+        status = response.status_code
+        if status in (401, 403):
+            raise AuthError("merged performance access rejected (HTTP %s)" % status)
+        if status == 404:
+            raise NotFound("merged performance is unavailable for the requested alpha and scope")
+        retry_after = _retry_after_seconds(response, cap_error_wait=False)
+        if not math.isfinite(retry_after):
+            raise ServiceError("merged performance returned an invalid Retry-After")
+        observed = {**request, "retrieved_at": datetime.now(timezone.utc).isoformat(), "http_status": status}
+        if retry_after > 0 and (200 <= status < 300 or status in (429, 503)):
+            if retry_after >= deadline - time.monotonic():
+                return {**observed, "complete": False, "payload": None,
+                        "next_poll_after_seconds": retry_after}
+            if on_event:
+                on_event("performance_pending", {"alpha_id": alpha_id, "retry_after_seconds": retry_after})
+            sleep(retry_after)
+            if time.monotonic() >= deadline:
+                return {**observed, "complete": False, "payload": None,
+                        "next_poll_after_seconds": 0.0}
+            continue
+        if status == 429:
+            raise RateLimited("merged performance read was rate limited")
+        if not 200 <= status < 300:
+            raise ServiceError("HTTP %s fetching merged performance" % status)
+        try:
+            payload = response.json()
+            json.dumps(payload, allow_nan=False)
+        except (ValueError, TypeError) as exc:
+            raise ServiceError("merged performance response was not finite JSON") from exc
+        stats = payload.get("stats") if isinstance(payload, dict) else None
+        if not isinstance(stats, dict) or any(
+            side not in stats or (stats[side] is not None and not isinstance(stats[side], dict))
+            for side in ("before", "after")
+        ):
+            raise ServiceError("merged performance response has no usable before/after statistics object")
+        return {**observed, "complete": True, "payload": payload, "next_poll_after_seconds": None}
 
 
 def pnl_cache_status(cache_dir, alpha_id, series=None):

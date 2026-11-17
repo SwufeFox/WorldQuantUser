@@ -8,7 +8,7 @@ import field_search
 import machine_lib as ml
 
 from .runtime import CliError, with_session
-from . import capabilities
+from . import capabilities, incentives
 
 
 def cmd_catalog_operators(args, _sink):
@@ -61,16 +61,18 @@ def cmd_catalog_datasets(args, _sink):
         s, instrument_type=args.instrument_type, region=args.region,
         delay=args.delay, universe=args.universe, limit=args.limit,
         report=cache_report,
+        theme=None if getattr(args, "theme", None) is None else args.theme == "true",
     ))
     data = {
         "region": args.region, "universe": args.universe, "delay": args.delay,
+        "instrument_type": args.instrument_type, "theme": getattr(args, "theme", None),
         "count": len(datasets), "datasets": datasets, "cache": cache_report,
     }
     if not datasets:
         data["hint"] = ("no datasets were returned for this scope; inspect cache freshness and "
                         "enumeration completeness before drawing an access conclusion")
 
-    return data
+    return incentives.catalog_summary(data, "datasets") if getattr(args, "summary", False) else data
 
 
 def cmd_catalog_fields(args, _sink):
@@ -128,6 +130,7 @@ def cmd_catalog_fields(args, _sink):
     data = {
         "dataset": args.dataset, "region": args.region, "universe": args.universe,
         "delay": args.delay, "count": len(fields), "scanned": len(everything),
+        "instrument_type": args.instrument_type,
         "type_counts": {
             kind: len([f for f in fields if f.get("type") == kind])
             for kind in sorted({f.get("type") for f in fields if isinstance(f.get("type"), str)})
@@ -137,9 +140,12 @@ def cmd_catalog_fields(args, _sink):
     if search_note:
         data["search"] = search_note
     if args.expressions:
-        data["expressions"] = ml.process_datafields(fields)
+        selected = fields[:incentives.SUMMARY_LIMIT] if getattr(args, "summary", False) else fields
+        data["expressions"] = ml.process_datafields(selected)
+        if getattr(args, "summary", False):
+            data["expressions_scope"] = "displayed_fields"
 
-    return data
+    return incentives.catalog_summary(data, "fields") if getattr(args, "summary", False) else data
 
 
 def cmd_catalog_find(args, _sink):

@@ -544,6 +544,10 @@ def build_parser():
     cat_ds.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
     cat_ds.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
     cat_ds.add_argument("--limit", type=int, default=None)
+    cat_ds.add_argument("--theme", choices=["true", "false"], default=None,
+                        help="Filter datasets by the platform theme flag; omit to leave it unset.")
+    cat_ds.add_argument("--summary", action="store_true",
+                        help="Bound catalog rows and show reported Pyramid/Theme metadata.")
 
     _add_session_args(cat_ds)
     cat_ds.set_defaults(func=catalog.cmd_catalog_datasets)
@@ -591,6 +595,8 @@ def build_parser():
     cat_f.add_argument("--limit", type=int, default=None)
     cat_f.add_argument("--expressions", action="store_true",
                        help="Also emit ready-to-use FASTEXPR snippets.")
+    cat_f.add_argument("--summary", action="store_true",
+                       help="Bound field rows and show reported Pyramid/Theme metadata.")
 
     _add_session_args(cat_f)
     cat_f.set_defaults(func=catalog.cmd_catalog_fields)
@@ -994,6 +1000,13 @@ def build_parser():
 
     a_get = alpha_sub.add_parser("get", help="Fetch one alpha's metrics and checks.")
     a_get.add_argument("alpha_id")
+    a_get.add_argument("--performance", nargs="?", const="summary", choices=["summary", "full"],
+                       help="Also read platform merged before/after performance; full includes all native series.")
+    a_get_scope = a_get.add_mutually_exclusive_group()
+    a_get_scope.add_argument("--team", dest="team_id", help="Team scope for --performance; default is the current user.")
+    a_get_scope.add_argument("--competition", dest="competition_id", help="Competition scope for --performance.")
+    a_get.add_argument("--max-wait", type=_non_negative_seconds, default=180.0,
+                       help="Maximum seconds to wait for asynchronous merged performance (default 180).")
     _add_session_args(a_get)
 
     a_get.set_defaults(func=alphas.cmd_alpha_get)
@@ -1495,8 +1508,10 @@ _COMMAND_EXAMPLES = {
     "cache clear": ["cache clear --kind metadata"],
     "catalog": ["catalog datasets --limit 10", "catalog fields --dataset fundamental6 --limit 10"],
     "catalog operators": ["catalog operators --search rank --limit 10"],
-    "catalog datasets": ["catalog datasets --region USA --limit 10"],
-    "catalog fields": ["catalog fields --dataset fundamental6 --search liability --expressions --limit 10"],
+    "catalog datasets": ["catalog datasets --region USA --limit 10",
+                         "catalog datasets --theme true --summary"],
+    "catalog fields": ["catalog fields --dataset fundamental6 --search liability --expressions --limit 10",
+                       "catalog fields --dataset fundamental6 --summary"],
     "catalog concepts": ["catalog concepts --dataset fundamental6 --limit 10"],
     "catalog verify": ["catalog verify --fields close volume --strict"],
     "catalog categories": ["catalog categories"],
@@ -1532,7 +1547,8 @@ _COMMAND_EXAMPLES = {
               "probe --resume BATCH.json --dry-run"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],
-    "alpha get": ["alpha get ALPHA_ID"],
+    "alpha get": ["alpha get ALPHA_ID", "alpha get ALPHA_ID --performance",
+                  "alpha get ALPHA_ID --performance full --competition COMPETITION_ID"],
     "alpha check": ["alpha check ALPHA_ID", "alpha check ALPHA_A ALPHA_B --workers 2"],
     "alpha self-corr": ["alpha self-corr ALPHA_ID"],
     "alpha describe": ['alpha describe ALPHA_ID --name "quality signal" --category FUNDAMENTAL'],

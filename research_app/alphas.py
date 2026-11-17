@@ -18,11 +18,65 @@ import machine_lib as ml
 import research_paths
 
 from .runtime import CliError, METRIC_KEYS, note, with_session
+from . import incentives
+
+
+def _merged_performance_view(result, detail):
+    payload = result.get("payload")
+    report = {key: value for key, value in result.items() if key != "payload"}
+    report.update(view=detail, metrics_scope="platform_merged", train_only_verified=False)
+    if payload is None:
+        report.update(data=None, delta_after_minus_before={}, unavailable_deltas=[], omitted_sections=[])
+        return report
+    stats = payload.get("stats") or {}
+    before, after = stats.get("before") or {}, stats.get("after") or {}
+    deltas, unavailable = {}, []
+    for key in sorted(set(before) | set(after)):
+        left, right = before.get(key), after.get(key)
+        try:
+            if type(left) not in (int, float) or type(right) not in (int, float) or not (
+                math.isfinite(left) and math.isfinite(right)
+            ):
+                unavailable.append(key)
+                continue
+            difference = right - left
+            if math.isfinite(difference):
+                deltas[key] = difference
+            else:
+                unavailable.append(key)
+        except OverflowError:
+            unavailable.append(key)
+    visible = payload if detail == "full" else {
+        key: payload[key] for key in ("partition", "partitionName", "stats", "score") if key in payload}
+    report.update(data=visible, delta_after_minus_before=deltas, unavailable_deltas=unavailable,
+                  omitted_sections=[key for key in payload if key not in visible])
+    return report
 
 
 def cmd_alpha_get(args, _sink):
     """Fetch one alpha's metrics, checks, metadata and out-of-sample split from BRAIN."""
-    payload = with_session(args, lambda s: ml.fetch_alpha_metrics(s, args.alpha_id))
+    detail = getattr(args, "performance", None)
+    team_id, competition_id = getattr(args, "team_id", None), getattr(args, "competition_id", None)
+    if detail is None and (team_id is not None or competition_id is not None):
+        raise CliError("INVALID_INPUT", "--team and --competition require --performance")
+    if detail is not None:
+        if detail not in {"summary", "full"}:
+            raise CliError("INVALID_INPUT", "performance detail must be summary or full")
+        try:
+            ml._performance_request(args.alpha_id, team_id, competition_id)
+        except ValueError as exc:
+            raise CliError("INVALID_INPUT", str(exc)) from exc
+
+        def read_with_performance(session):
+            alpha = ml.fetch_alpha_metrics(session, args.alpha_id)
+            comparison = ml.fetch_merged_performance(session, args.alpha_id,
+                team_id=team_id, competition_id=competition_id,
+                max_wait_seconds=getattr(args, "max_wait", 180.0), on_event=_sink)
+            return alpha, comparison
+
+        payload, comparison = with_session(args, read_with_performance)
+    else:
+        payload = with_session(args, lambda s: ml.fetch_alpha_metrics(s, args.alpha_id))
     in_sample = payload.get("is") or {}
     code, description, operator_count = ml.regular_expression(payload)
     document = {
@@ -44,9 +98,14 @@ def cmd_alpha_get(args, _sink):
         "metrics": {k: in_sample.get(k) for k in METRIC_KEYS if k in in_sample},
         "checks": ml._extract_checks(payload),
     }
+    document["incentives"] = incentives.check_summary(document["checks"])
     split = ml.extract_split(payload)
     if split:
         document["out_of_sample"] = split
+    if detail is not None:
+        document["merged_performance"] = _merged_performance_view(comparison, detail)
+        if comparison.get("complete"):
+            research_paths.log_view("alpha get --performance", "validation", [args.alpha_id])
 
     return document
 
@@ -157,7 +216,8 @@ def _check_result(alpha_id, payload=None, error=None):
     return {"alpha_id": alpha_id, "status": status, "outcome": outcome,
             "complete": complete, "payload_received": bool(payload.get("payload_received", checks)),
             "checks_resolved": resolved, "checks": checks,
-            "self_correlation": payload.get("self_correlation"), "error": error}
+            "self_correlation": payload.get("self_correlation"), "error": error,
+            "incentives": incentives.check_summary(checks, basis="live_check_endpoint")}
 
 
 def _isolated_check_session(source):

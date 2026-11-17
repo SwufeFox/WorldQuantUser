@@ -25,7 +25,7 @@ import simulation_slots
 from tools import guarded_sim
 
 from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, protect_output, with_session
-from . import costs, selection, stats
+from . import costs, incentives, selection, stats
 from .validation import _preflight_lint, attach_field_contracts, cached_field_scope
 
 
@@ -657,12 +657,18 @@ def _probe_summary(response):
               "train_sharpe_h1", "train_sharpe_h2")
     quota = next((report["quota"] for report in reversed(response.get("scheduling") or [])
                   if report.get("quota") is not None), None)
+    incentive_rows = [row for row in rows if (row.get("incentives") or {}).get("state") == "reported"]
     return {"path": response.get("path"), "run_id": response.get("run_id"),
             "request_fingerprint": response.get("request_fingerprint"), "view": "train",
             "total_count": (response.get("execution") or {}).get("total", response.get("arms", len(rows))),
             "displayed_count": min(20, len(rows)), "rows_omitted": max(0, len(rows) - 20),
             "execution": response.get("execution"), "recording": response.get("recording"),
             "quota": quota,
+            "incentives": [{"label": row.get("label"), "alpha_id": row.get("alpha_id"), **row["incentives"]}
+                           for row in incentive_rows[:incentives.SUMMARY_LIMIT]],
+            "incentives_reported_count": len(incentive_rows),
+            "incentives_unknown_count": len(rows) - len(incentive_rows),
+            "incentives_omitted": max(0, len(incentive_rows) - incentives.SUMMARY_LIMIT),
             "roles": {role: sum((row.get("role") or "unspecified") == role for row in rows)
                       for role in ("candidate", "diagnostic", "unspecified")},
             "missing_evidence_count": sum(any(row.get(key) is None for key in fields) for row in rows),
@@ -1591,6 +1597,7 @@ def _probe_row(record, arm, gate, show_test):
            "train_sharpe_h1": (record.get("half_sharpes") or (None, None))[0],
            "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
            "ops": arm["ops"], "gate": gate}
+    row["incentives"] = incentives.check_summary(record.get("checks"))
     for key in ("progress_url", "metrics_pending", "next_poll_at", "submission_attempted"):
         if key in record:
             row[key] = record[key]

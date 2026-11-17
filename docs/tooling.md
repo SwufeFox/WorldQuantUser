@@ -151,7 +151,42 @@ AST 用于识别表达式及所用字段；字段所属的数据集、平台类�
 倍率应带来源、观察时间和适用账户/活动范围，视为该时点的信息；具体数值不固化为程序
 常量，截图不能冒充持续有效的平台快照。表格留白只表示未提供数值，不默认填 0 或 1，
 也不据此判断数据访问权限。缺少规则时，计分基数和最终奖励金额保持未知。
-本节定义研究判断口径；当前 CLI 没有自动获取倍率或按倍率评分的功能。
+
+读取入口已经接入现有 CLI：
+
+```bash
+python research_cli.py catalog datasets --region USA --theme true --summary
+python research_cli.py catalog fields --dataset fundamental6 --summary --expressions
+python research_cli.py alpha get ALPHA_ID
+python research_cli.py alpha check ALPHA_ID
+```
+
+目录的 `--summary` 最多展示 20 行，成员列表最多展示 5 项，并报告省略数量；不加此选项
+保留原生目录记录。`--theme true|false` 仅用于数据集目录，省略时不发送该筛选项，三种查询
+分别缓存。结合响应中的请求范围和缓存信息判断来源与新鲜度，需要重新获取时使用
+`--refresh-meta` 并检查缓存/错误报告。
+
+Alpha 和 probe 的 `incentives` 摘要保留 `MATCHES_PYRAMID`、`MATCHES_THEMES` 的原生状态及
+有限的成员预览，完整 checks 保留平台扩展字段。`alpha get` 的依据为 Alpha 快照，
+`alpha check` 的依据为实时检查端点。`effective` 与 `multiplier` 分别保留，不互相推算；
+缺失倍率保持未知，主题命中不能覆盖质量检查失败。该能力提供平台报告的信息，不实现奖励计分公式。
+
+### 平台组合前后表现：显式验证视图
+
+```bash
+python research_cli.py alpha get ALPHA_ID --performance
+python research_cli.py alpha get ALPHA_ID --performance full --team TEAM_ID
+python research_cli.py alpha get ALPHA_ID --performance --competition COMPETITION_ID --max-wait 0
+```
+
+默认读取个人范围，团队和比赛范围互斥；指定范围必须同时使用 `--performance`。
+摘要保留平台 before/after 统计和 score，只对两侧均有有限数值的统计量计算 after-minus-before，
+缺失值不补零；默认省略 `pnl`、`yearlyStats`，`full` 保留完整原生响应。
+结果带范围、来源 URL 和取得时间。`Retry-After` 等待默认最多 180 秒，`--max-wait 0`
+只请求一次；尚未就绪会保留 incomplete 状态和下次读取时间信息。
+
+这份统计的训练期边界未经核验，输出明确标记 `train_only_verified: false`，成功读取记入
+validation 视图日志；按冻结后的验证证据使用。命令只读，不触发提交。
 
 ### 候选冻结、验证、检查与入库一次完成
 

@@ -378,12 +378,21 @@ with `--allow-lint-errors`.
 python research_cli.py catalog operators --search ts_ --group "Time Series"
 python research_cli.py catalog categories                 # field/alpha counts = crowding
 python research_cli.py catalog datasets --region USA
+python research_cli.py catalog datasets --region USA --theme true --summary
 python research_cli.py catalog fields --dataset fundamental6 --type MATRIX \
     --search liability --limit 20 --expressions
 ```
 
 `--expressions` also emits ready-to-paste snippets, already winsorized and
 backfilled. Add `--save out.json` to keep a snapshot for offline use.
+
+Dataset and field commands accept `--summary`: at most 20 catalog rows, with
+reported Pyramid multipliers, platform categories, and theme memberships. Nested
+memberships are bounded to five entries with omission counts. Missing multipliers
+stay unknown; they are never replaced with 0 or 1. `--expressions` follows the
+displayed field rows. Omit `--summary` for the native catalog records.
+`catalog datasets --theme true|false` sets the platform filter; omitting it leaves
+the filter unset. These three queries use separate metadata-cache entries.
 
 `--search` is ranked, not a substring filter, and it runs locally over the
 fetched catalogue so it can do what the endpoint cannot:
@@ -611,6 +620,35 @@ python research_cli.py alpha list --min-sharpe 1.5 --limit 20
 ```
 
 Both are quota-free.
+
+`alpha get`, `alpha check`, and `probe --summary` expose bounded `incentives`
+metadata for `MATCHES_PYRAMID` and `MATCHES_THEMES`. The ordinary checks retain
+all provider fields. `alpha get` labels this evidence as an alpha snapshot;
+`alpha check` labels it as coming from the live check endpoint. Native `effective`
+and `multiplier` remain separate fields, and `WARNING`/`PENDING` remain explicit.
+Theme matches do not replace quality checks or multiply performance statistics.
+
+Read the platform's merged portfolio comparison explicitly:
+
+```bash
+python research_cli.py alpha get ALPHA_ID --performance
+python research_cli.py alpha get ALPHA_ID --performance full --team TEAM_ID
+python research_cli.py alpha get ALPHA_ID --performance --competition COMPETITION_ID --max-wait 0
+```
+
+The default scope is the current user; team and competition scopes are mutually
+exclusive and require `--performance`. The summary preserves native before/after
+statistics and score, computes after-minus-before deltas only for available
+finite numeric statistics, and omits `pnl` and `yearlyStats`. `full` preserves the
+whole response. Missing values stay unknown. The read honors `Retry-After`, with
+a default waiting budget of 180 seconds; `--max-wait 0` makes one request without
+waiting. Pending reads remain incomplete and report when to poll again.
+
+`merged_performance` includes scope, source URL, retrieval time, and
+`train_only_verified: false`: these statistics are not established as train-only
+evidence. Successful reads are logged as validation views. This is a read-only
+comparison and does not submit the alpha.
+
 The daily-PnL reader honors `Retry-After` even on a nonempty HTTP 200 response.
 It bounds total waiting to 180 seconds by default and reports pending reads as `RATE_LIMITED`
 with incomplete evidence, preserving any previous cache. Platform `TIMEOUT`/`FAIL`/`ERROR`

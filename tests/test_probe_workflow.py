@@ -103,6 +103,39 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(self.registry.read_bytes(), before)
         self.assertTrue(all(row["train_sharpe_h1"] is None for row in recovered["rows"]))
 
+    def test_incentive_evidence_survives_summary_and_offline_recovery(self):
+        def simulate(expressions, settings, **kwargs):
+            records = []
+            for index, label in enumerate(kwargs["labels"]):
+                record = finished("SYNTHETIC_" + label)
+                record["checks"] = ml._extract_checks({"is": {"checks": [
+                    {"name": "MATCHES_PYRAMID", "result": "PASS", "multiplier": 2.25,
+                     "effective": 0, "pyramids": [{"name": "synthetic-%d" % n, "multiplier": 2.25}
+                                                  for n in range(8)]},
+                    {"name": "MATCHES_THEMES", "result": "PENDING"},
+                ]}})
+                kwargs["on_event"]("completed", {"index": index, **record})
+                records.append(record)
+            return records
+
+        with mock.patch.object(app.guarded_sim, "simulate", side_effect=simulate):
+            result = self.run_probe(summary=True)
+        summary = result["summary"]
+        self.assertEqual(summary["view"], "train")
+        self.assertEqual(summary["incentives_reported_count"], 3)
+        self.assertEqual(summary["incentives_unknown_count"], 0)
+        reported = summary["incentives"][0]["checks"]
+        self.assertEqual(reported["MATCHES_PYRAMID"]["pyramids"]["omitted"], 3)
+        self.assertEqual(reported["MATCHES_PYRAMID"]["effective"], 0)
+        self.assertEqual(reported["MATCHES_THEMES"]["result"], "PENDING")
+        self.assertEqual(result["rows"][0]["train_sharpe"], 1.4)
+        self.assertNotIn("sharpe", result["rows"][0])
+        stored = json.loads(self.batch.read_text(encoding="utf-8"))
+        self.assertEqual(len(stored["records"][0]["checks"]["MATCHES_PYRAMID"]["pyramids"]), 8)
+        with mock.patch.object(app, "with_session", side_effect=AssertionError("offline recovery")):
+            recovered = app.cmd_probe(arguments(recover=str(self.batch), summary=True), None)
+        self.assertEqual(recovered["summary"]["incentives"], summary["incentives"])
+
     def test_summary_preserves_daily_quota_pause_and_recovery_instruction(self):
         session = ml.requests.Session()
         session._brain_account_id = "offline-quota-summary"

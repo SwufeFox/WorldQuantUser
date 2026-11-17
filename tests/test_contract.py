@@ -1327,6 +1327,32 @@ class CheckExtractionTests(unittest.TestCase):
     def test_extract_checks_returns_none_when_absent(self):
         self.assertIsNone(ml._extract_checks({}))
 
+    def test_cli_theme_metadata_cannot_rescue_a_failed_quality_check(self):
+        response = ml.requests.Response()
+        response.status_code = 200
+        response._content = json.dumps({"is": {"checks": [
+            {"name": "LOW_SHARPE", "result": "FAIL", "limit": 1.25, "value": 0.4},
+            {"name": "MATCHES_PYRAMID", "result": "PASS", "effective": 0,
+             "multiplier": 2.25, "pyramids": [{"name": "synthetic pyramid", "multiplier": 2.25}],
+             "future_metadata": {"source": "fixture"}},
+            {"name": "MATCHES_THEMES", "result": "WARNING", "themes": []},
+        ]}}).encode("utf-8")
+        session = ml.requests.Session()
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ml, "load_session", return_value=session), \
+                mock.patch.object(session, "get", return_value=response), \
+                contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = cli_app.main(["alpha", "check", "SYNTHETIC", "--research-dir", directory, "--max-wait", "0"])
+        document = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0, document)
+        row = document["data"]["results"][0]
+        self.assertEqual(row["outcome"], "failed")
+        self.assertEqual(row["checks"]["MATCHES_PYRAMID"]["future_metadata"], {"source": "fixture"})
+        self.assertEqual(row["incentives"]["checks"]["MATCHES_PYRAMID"]["effective"], 0)
+        self.assertEqual(row["incentives"]["checks"]["MATCHES_THEMES"]["result"], "WARNING")
+        self.assertEqual(row["incentives"]["basis"], "live_check_endpoint")
+
     def test_legacy_submission_check_returns_correlation_or_fail(self):
         for status, expected in (("PASS", 0.24), ("PENDING", 0.24), ("FAIL", "fail")):
             with self.subTest(status=status):
