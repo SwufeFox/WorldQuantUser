@@ -603,6 +603,40 @@ python3 research_cli.py alpha check ALPHA_A ALPHA_B --workers 2 --max-wait 300
 `summary` 统计三种状态及 passed/failed/warning 结果，单项错误保留在该项而不抹掉其他结果。
 `--max-wait` 是每个 alpha 异步检查的等待预算，默认 180 秒，不是整批共享预算。
 
+#### 请求超时或没有结果文件时
+
+`--save` 在命令完成后原子写入最终 JSON，不是实时检查点。默认串行检查两个 Alpha，
+仅异步等待预算就可能达到 2 × 180 秒，另有认证、登录锁及网络等待；外层 `timeout 240`
+直接终止进程时，可能还没有最终文件。退出码 124 只说明外层时间预算耗尽，不能证明平台过载。
+认证 POST 与通用目录请求使用现有的 60 秒连接/读取超时；这不是整个命令的墙钟上限。
+
+先用 `cache info` 读取本地会话状态，不打印缓存里的凭据。定位无输出时，Python 使用 `-u`，
+阶段信息与堆栈写 stderr；在一次诊断中区分导入、认证、请求及异步等待，不反复执行相同的长调用。
+下面是 Linux 示例，先把 `CHECK_DIR` 改为 `brief` 返回的研究目录，每次只查一个 Alpha：
+
+```bash
+CHECK_DIR=/data/worldquant-research
+check_run="$CHECK_DIR/check-$(date -u +%Y%m%dT%H%M%SZ)"
+timeout --signal=INT --kill-after=5s 120s \
+  python -u -c 'import faulthandler, runpy; faulthandler.dump_traceback_later(20, repeat=True); runpy.run_path("research_cli.py", run_name="__main__")' \
+  alpha check ALPHA_ID --workers 1 --max-wait 30 --save "$check_run.json" \
+  2>"$check_run.stderr.log"
+```
+
+SIGINT 给 CLI 保存 `INTERRUPTED` 响应的机会，5 秒后仍不退出才强制终止；强制终止仍可能没有
+最终 JSON，此时保留 stderr 堆栈。另一个候选单独执行并保存到另一文件，已经获得的证据不会
+因后一个调用被终止而丢失。文件存在、顶层 `ok` 为 true 都不能代替每项检查的完成状态。
+
+查看外部 runner 时用 `pgrep -af '[a]tom_runner\.py'` 避免匹配查询它的 shell 自身。
+进程存在不证明剩余模拟仍在运行，`done` 行数也不包含失败与未知状态；核对已保存的任务
+Location/Alpha ID 后只读恢复，不重跑整份 spec。直接 runner 的日志需要逐项查看终态，
+不能只等进程消失。
+
+`GET /alphas/{id}` 的 checks 是快照；生产相关、SELF_CORRELATION 与 OLD_SIMULATION 要保留
+实时检查的状态、值与阈值，未取得或 PENDING 都记为未知。`dateCreated` 是创建时间，不能
+单独替代最近成功模拟的证据或平台有效期检查。字段听起来冷门、self correlation 较低，
+都不能推出 production correlation 更低；这些硬条件未核实前不作提交排序。
+
 
 ### 备份与重放
 

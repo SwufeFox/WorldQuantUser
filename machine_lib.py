@@ -280,7 +280,7 @@ def authenticate():
     username, password = get_credentials()
     session = requests.Session()
     session.auth = (username, password)
-    response = session.post(BRAIN_API_URL + "/authentication")
+    response = session.post(BRAIN_API_URL + "/authentication", timeout=_request_timeout(None))
     if response.status_code != 201:
         body = response.text[:300]
         if "captcha" in body.lower():
@@ -1032,7 +1032,8 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4):
     url = path if path.startswith("http") else BRAIN_API_URL + path
     last = None
     for attempt in range(1, max_retries + 1):
-        response = s.request(method, url, params=params, json=json_body)
+        response = s.request(method, url, params=params, json=json_body,
+                             timeout=_request_timeout(None))
         if response.status_code in (401, 403):
             raise AuthError(
                 "BRAIN rejected the session (HTTP %s) for %s %s"

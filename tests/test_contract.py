@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Contract tests for the research toolchain.
 
-Everything here runs offline: no BRAIN account, no credentials, no network.
+Everything here runs offline: no BRAIN account, no credentials, no external network.
 That is deliberate -- the whole point of the CLI contract is that a caller can
 discover and validate behaviour without spending quota.
 
@@ -625,6 +625,62 @@ runpy.run_path(sys.argv[0], run_name="__main__")
         with self.block_pandas(ImportError("pandas is absent")):
             with self.assertRaises(RuntimeError):
                 ml.fields_to_df(self.fields)
+
+
+class RequestTimeoutContractTests(unittest.TestCase):
+    def _check_silent_peer(self, arguments, authenticate):
+        import socketserver
+        import threading
+
+        release = threading.Event()
+
+        class SilentPeer(socketserver.BaseRequestHandler):
+            def handle(self):
+                # Bound the fixture too: a missing client timeout must fail,
+                # rather than leave the suite waiting for a response forever.
+                release.wait(2)
+
+        with socketserver.TCPServer(("127.0.0.1", 0), SilentPeer) as server, \
+                tempfile.TemporaryDirectory() as directory, ml.requests.Session() as session:
+            session.trust_env = False
+            thread = threading.Thread(target=server.serve_forever,
+                                      kwargs={"poll_interval": 0.01}, daemon=True)
+            thread.start()
+            target = Path(directory) / "response.json"
+            stdout, stderr = io.StringIO(), io.StringIO()
+            try:
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(mock.patch.object(ml, "BRAIN_API_URL",
+                                        "http://127.0.0.1:%d" % server.server_address[1]))
+                    stack.enter_context(mock.patch.object(ml, "_request_timeout", return_value=0.05))
+                    stack.enter_context(mock.patch.object(ml, "get_credentials",
+                                        return_value=("offline-user", "offline-secret")))
+                    if authenticate:
+                        stack.enter_context(mock.patch.object(ml.requests, "Session", return_value=session))
+                        stack.enter_context(mock.patch.object(ml, "load_session",
+                                            side_effect=lambda **kwargs: ml.authenticate()[0]))
+                    else:
+                        stack.enter_context(mock.patch.object(ml, "load_session", return_value=session))
+                    stack.enter_context(contextlib.redirect_stdout(stdout))
+                    stack.enter_context(contextlib.redirect_stderr(stderr))
+                    code = cli_app.main([*arguments, "--research-dir", directory,
+                                         "--save", str(target)])
+            finally:
+                release.set()
+                server.shutdown()
+                thread.join(2)
+            document = json.loads(stdout.getvalue())
+            self.assertEqual(code, 4, document)
+            self.assertFalse(document["ok"])
+            self.assertEqual(document["error"]["code"], "SERVICE_ERROR")
+            self.assertIn("ReadTimeout", document["error"]["message"])
+            self.assertEqual(json.loads(target.read_text(encoding="utf-8")), document)
+
+    def test_stalled_login_saves_timeout_evidence(self):
+        self._check_silent_peer(["alpha", "check", "A1"], authenticate=True)
+
+    def test_stalled_catalog_saves_timeout_evidence(self):
+        self._check_silent_peer(["catalog", "datasets", "--refresh-meta"], authenticate=False)
 
 
 class ErrorEnvelopeTests(unittest.TestCase):
