@@ -375,6 +375,62 @@ python3 research_cli.py feed --sources-file radar-sources.json --source communit
 以及失败来源的重试参数。形成研究假设前，分别写清来源声称了什么、已有证据支持什么、
 什么结果能够否定自己的解释；真实模拟与提交仍需遵守各自执行边界。
 
+### 导入外部定向检索
+
+外部检索工具可以按经济机制分别搜集交易员、投资者和量化研究者的观察。保留实际检索式，
+打开候选链接核对作者原文，再把检索回执和读到的摘录交给 `feed`。配置和导出文件放在研究目录。
+
+在 `radar-sources.json` 中声明一个 `format` 为 `harvest` 的本地来源。
+
+```json
+{
+  "sources": [
+    {"id": "web-harvest", "kind": "web", "adapter": "file", "path": "harvest.jsonl", "format": "harvest"}
+  ]
+}
+```
+
+`harvest.jsonl` 每行一个对象。下面的域名和内容仅用于演示记录格式。
+
+```jsonl
+{"record_type":"search_receipt","query":"relative strength pullback","audience":"trader","searched_at":"2026-11-17T08:00:00Z","status":"complete","results":[{"url":"https://example.org/trader-notes","status":"opened"},{"url":"https://example.org/search-only","status":"snippet_only"},{"url":"https://example.org/restricted","status":"blocked"}]}
+{"record_type":"observation","query":"relative strength pullback","audience":"trader","read_status":"opened_original","read_at":"2026-11-17T08:05:00Z","url":"https://example.org/trader-notes","title":"Relative strength pullbacks","text":"作者观察到，部分走势强于同行的股票在低量回撤后恢复上涨。","review":{"source_claim":"作者描述了低量回撤后的走势恢复。","mechanism":"短期卖压可能在回撤期间消退。","variables":["行业内相对强弱","回撤深度","回撤期间成交量"],"falsification":"控制回撤深度和波动率后，低量组后续收益没有改善。","control":"匹配回撤深度和波动率的普通成交量回撤","classification":"classic_baseline","closest_family":"相对强弱与短期反转","overlap_note":"需要核对已有趋势回撤实验的成交量对照。"}}
+```
+
+| 记录 | 必填信息 | 进入 feed 的位置 |
+| --- | --- | --- |
+| `search_receipt` | `query`，`audience`，带时区的 ISO 时间 `searched_at`，`status` 为 `complete` 或 `failed`，`results` 为包含 `url` 与 `status` 的数组。结果状态为 `opened`、`snippet_only` 或 `blocked`。 | 完整输出的 `search_receipts`。来源覆盖记录回执数量 `search_receipt_count`、检索状态 `search_status_counts`、结果状态 `search_result_counts` 和各视角的次数 `search_queries_by_audience`。 |
+| `observation` | `query`，`audience`，`read_status: opened_original`，带时区的 ISO 时间 `read_at`，公开 `url`，以及 `text` 或 `content`。可沿用普通导出的标题、作者、发布日期和 `content_scope`。 | `items`、证据与草稿。完整输出、摘要和草稿保留 `harvest` 及可选 `review`。 |
+
+`audience` 可取 `trader`、`investor` 或 `quant`。只看到搜索摘要或遇到访问限制的链接留在回执里。
+`search_queries_by_audience` 统计各类受众的检索尝试次数，包含失败与重试。`search_result_counts`
+统计回执报告的所有结果行。`--limit`、`--total` 和 seen 去重针对可入选的观察。
+
+检索结果与已读状态由采集者报告。`read_at` 是实际阅读时间，`collected_at` 表示本地导入时间。
+来源的陈述进入 feed 后仍处于 `unverified_claim` 状态。
+
+`review` 各字段可选。用 `source_claim` 写作者的原意，用 `mechanism`、`variables`、`falsification`
+和 `control` 写自己的研究设计。`variables` 的数组元素须是非空字符串。`classification` 可取
+`classic_baseline` 或 `new_lead`。`closest_family` 和 `overlap_note` 记录需要核对的既有研究。
+同一原文尽量使用同一个链接，不同网址仍可分别出现。判断转载和机制重复需要对照原文与已有试验。
+
+`--summary` 中 `review` 的文本字段和变量名称各最多显示 200 个字符，变量最多显示前 8 个。
+截断时标记 `review_truncated`。完整输出及草稿保留完整备注和原有换行。
+
+```bash
+python3 research_cli.py feed --sources-file radar-sources.json --source web-harvest --summary --action --dry-run
+python3 research_cli.py feed --sources-file radar-sources.json --source paper --source web-harvest --topic "relative strength pullback" --summary --dry-run
+python3 research_cli.py feed --sources-file radar-sources.json --source web-harvest --action --draft-cards research-drafts.jsonl
+```
+
+检索和打开网页都由采集者完成。单独运行本地来源只读取导出文件。组合命令还会向 OpenAlex 检索论文。
+去掉 `--summary` 可查看完整回执。
+
+`--action` 的完整输出为结构化观察列出 `block_guess`、`book_exposure` 和 `prior_trials`。
+摘要的 `ledger_hint` 汇总这些线索，供复核已有试验。
+
+确认摘录、回执和研究假设后，用最后一条命令写入证据、草稿和 seen。相对草稿路径以当前目录为基准。
+
 ### 从发现走到可核对的阅读证据
 
 ```bash

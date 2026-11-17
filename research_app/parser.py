@@ -502,7 +502,7 @@ def build_parser():
     feed_parser.add_argument("--source", action="append", default=None, metavar="ID",
                              help="Source ID: paper, news, social, forum, trends, all, or a configured ID; repeatable.")
     feed_parser.add_argument("--sources-file", default=None, metavar="PATH",
-                             help="JSON source definitions for RSS/Atom, markets or local forum exports.")
+                             help="JSON source definitions for RSS/Atom, markets, local exports or structured harvests.")
     feed_parser.add_argument("--market", action="append", default=None, metavar="VENUE:SYMBOL",
                              help="Explicit market observation, e.g. coinbase:BTC-USD or alpaca:AAPL; repeatable.")
     feed_parser.add_argument("--book-depth", type=_positive_count, default=10,

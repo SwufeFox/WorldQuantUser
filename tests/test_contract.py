@@ -208,6 +208,19 @@ class FeedContractTests(unittest.TestCase):
             code = cli_app.main(["feed", "--research-dir", str(directory), "--quiet", *arguments])
         return code, json.loads(stdout.getvalue())
 
+    def test_harvest_source_requires_jsonl_before_retrieval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "sources.json"
+            config.write_text(json.dumps({"sources": [{"id": "web-harvest", "kind": "web",
+                "adapter": "file", "path": "harvest.txt", "format": "harvest"}]}), encoding="utf-8")
+            with mock.patch("research_sources.fetch_source") as fetch:
+                code, document = self.invoke_feed(root, "--sources-file", str(config))
+            self.assertEqual(code, 2, document)
+            self.assertEqual(document["error"]["code"], "INVALID_INPUT")
+            fetch.assert_not_called()
+            self.assertFalse((root / "inspiration").exists())
+
     def test_forum_export_keeps_full_evidence_and_unknown_publication_time(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

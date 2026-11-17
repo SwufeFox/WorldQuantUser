@@ -1183,6 +1183,172 @@ class FeedTests(unittest.TestCase):
         self.assertEqual(len(result["items"][0]["retrievals"]), 2)
         self.assertEqual(result["items"][0]["source_line"], 1)
 
+    def write_harvest(self, *records):
+        self.write_file("harvest.jsonl", "".join(json.dumps(record) + "\n" for record in records))
+        return self.write_file("sources.json", json.dumps({"sources": [
+            {"id": "web-harvest", "kind": "web", "adapter": "file", "path": "harvest.jsonl",
+             "format": "harvest"}]}))
+
+    def harvest_observation(self, url="https://example.org/pullback", **overrides):
+        return {"record_type": "observation", "query": "relative strength pullback", "audience": "trader",
+                "read_status": "opened_original", "read_at": "2026-11-17T11:00:00+00:00", "url": url,
+                "title": "Relative strength on pullbacks", "text": "An original post excerpt.", **overrides}
+
+    def test_harvest_receipts_do_not_consume_item_limits_or_seen_state(self):
+        observation = self.harvest_observation()
+        receipt = {"record_type": "search_receipt", "query": observation["query"], "audience": "trader",
+                   "searched_at": "2026-11-17T10:00:00+00:00", "status": "complete", "results": [
+                       {"url": observation["url"], "status": "opened"},
+                       {"url": "https://example.org/snippet", "status": "snippet_only"},
+                       {"url": "https://example.org/blocked", "status": "blocked"}]}
+        sources_file = self.write_harvest(receipt, observation)
+        draft = os.path.join(self.root, "drafts.jsonl")
+        args = self.args(topic=None, sources_file=sources_file, limit=1, total=1, draft_cards=draft,
+                         dry_run=True)
+        with mock.patch("research_sources.request_bytes") as request_bytes, \
+                mock.patch("research_sources.request_json") as request_json:
+            preview = feed.cmd_feed(args, None)
+            self.assertIsNone(preview["items"][0]["evidence_path"])
+            self.assertFalse(os.path.exists(preview["seen"]))
+            self.assertFalse(os.path.exists(draft))
+            args.dry_run = False
+            result = feed.cmd_feed(args, None)
+            repeated = feed.cmd_feed(args, None)
+        request_bytes.assert_not_called()
+        request_json.assert_not_called()
+
+        row, = result["items"]
+        self.assertEqual(row["url"], observation["url"])
+        self.assertEqual(row["evidence"]["claim_state"], "unverified_claim")
+        provenance = {key: observation[key] for key in ("query", "audience", "read_status", "read_at")}
+        self.assertEqual(row["harvest"], provenance)
+        self.assertNotIn("review", row)
+        imported_receipt, = result["search_receipts"]
+        self.assertEqual(imported_receipt["source_id"], "web-harvest")
+        self.assertEqual(imported_receipt["results"], receipt["results"])
+        coverage = result["searches"][0]["coverage"]
+        self.assertEqual(coverage["search_receipt_count"], 1)
+        self.assertEqual(coverage["search_result_counts"], {"opened": 1, "snippet_only": 1, "blocked": 1})
+        self.assertEqual(coverage["search_queries_by_audience"], {"trader": 1, "investor": 0, "quant": 0})
+        with open(row["evidence_path"], encoding="utf-8") as handle:
+            archived = json.load(handle)["item"]
+        self.assertEqual(archived["harvest"], provenance)
+        self.assertEqual(archived["excerpt"], observation["text"])
+        with open(result["seen"], encoding="utf-8") as handle:
+            picked, = map(json.loads, handle)
+        self.assertEqual(picked["key"], row["key"])
+        self.assertEqual(repeated["items"], [])
+        self.assertEqual(repeated["search_receipts"], result["search_receipts"])
+        with open(draft, encoding="utf-8") as handle:
+            card, = map(json.loads, handle)
+        self.assertEqual(card["harvest"], provenance)
+        self.assertNotIn("review", card)
+
+    def test_harvest_dry_run_keeps_receipt_only_search_coverage_without_writes(self):
+        receipt = {"record_type": "search_receipt", "query": "pricing power volume", "audience": "investor",
+                   "searched_at": "2026-11-17T10:00:00+00:00", "status": "complete",
+                   "results": [{"url": "https://example.org/discussion", "status": "snippet_only"}]}
+        retry = dict(receipt, searched_at="2026-11-17T10:15:00+00:00", status="failed", results=[])
+        sources_file = self.write_harvest(receipt, retry)
+        draft = os.path.join(self.root, "drafts.jsonl")
+        args = self.args(topic=None, sources_file=sources_file, draft_cards=draft, dry_run=True)
+        result = feed.cmd_feed(args, None)
+
+        self.assertEqual(result["items"], [])
+        self.assertEqual(result["searches"][0]["status"], "success")
+        self.assertEqual([receipt["status"] for receipt in result["search_receipts"]], ["complete", "failed"])
+        coverage = result["searches"][0]["coverage"]
+        self.assertEqual(coverage["search_status_counts"], {"complete": 1, "failed": 1})
+        self.assertEqual(coverage["search_queries_by_audience"], {"trader": 0, "investor": 2, "quant": 0})
+        self.assertEqual(coverage["search_result_counts"], {"opened": 0, "snippet_only": 1, "blocked": 0})
+        self.assertFalse(os.path.exists(result["seen"]))
+        self.assertFalse(os.path.exists(draft))
+        self.assertFalse(os.path.exists(research_paths.resolve("inspiration", "evidence")))
+
+    def test_harvest_rejects_invalid_observations_without_losing_valid_evidence(self):
+        valid = self.harvest_observation(read_at="2026-11-17T13:30:00+02:30", query='"relative  strength" pullback')
+        sources_file = self.write_harvest(
+            self.harvest_observation("https://example.org/snippet", read_status="snippet_only"),
+            self.harvest_observation("https://example.org/invalid-review", review={"variables": ["   "]}),
+            self.harvest_observation("https://example.org/missing-offset", read_at="2026-11-17T11:00:00"),
+            valid,
+        )
+        malformed = json.dumps(self.harvest_observation("https://example.org/malformed"))[:-1]
+        with open(os.path.join(self.root, "harvest.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(malformed + ', "extra_number": 1e999}\n')
+            handle.write(malformed + ', "read_status": "opened_original"}\n')
+        result = feed.cmd_feed(self.args(topic=None, sources_file=sources_file, dry_run=True), None)
+
+        row, = result["items"]
+        self.assertEqual(row["url"], valid["url"])
+        self.assertEqual(row["harvest"]["read_at"], "2026-11-17T11:00:00+00:00")
+        self.assertEqual(row["harvest"]["query"], valid["query"])
+        search, = result["searches"]
+        self.assertEqual(search["status"], "success")
+        self.assertEqual(search["coverage"]["invalid_count"], 5)
+        self.assertTrue(search["coverage"]["partial"])
+
+    def test_harvest_summary_and_action_draft_preserve_unverified_review_and_ledger_evidence(self):
+        registry = self.write_file("alpha-registry.jsonl", json.dumps({
+            "key": "failed", "status": "COMPLETE", "expression": "rank(news_sentiment)",
+            "verdict": "falsified", "note": "control won"}) + "\n")
+        review = {"source_claim": "The discussion reports stronger returns after news surprises.",
+                  "mechanism": "Slow incorporation of news into near-term prices.",
+                  "variables": ["tagged event surprise", "next-session return"],
+                  "falsification": "The effect disappears outside the first publication window.",
+                  "control": "Compare with matched stocks without a contemporaneous event.",
+                  "classification": "classic_baseline", "closest_family": "earnings news",
+                  "overlap_note": "An existing news trial motivates a timing control."}
+        observations = [self.harvest_observation(
+            f"https://example.org/discussion/{index}", query="news sentiment", audience="quant",
+            title=f"News sentiment discussion {index}", review=review) for index in range(12)]
+        detailed_review = dict(review, control="Matched universe.\nSame announcement window.",
+                               overlap_note=("Detailed overlap. " * 25).strip(),
+                               variables=[f"Variable {index}: " + ("description " * 20).strip()
+                                          for index in range(9)])
+        observations[1]["review"] = detailed_review
+        receipt = {"record_type": "search_receipt", "query": "news sentiment", "audience": "quant",
+                   "searched_at": "2026-11-17T10:00:00+00:00", "status": "complete",
+                   "results": [{"url": observations[0]["url"], "status": "opened"}]}
+        sources_file = self.write_harvest(receipt, *observations)
+        draft = os.path.join(self.root, "drafts.jsonl")
+        args = self.args(topic=None, sources_file=sources_file, limit=12, total=12, draft_cards=draft,
+                         registry=registry, summary=True, action=True)
+        with mock.patch("research_app.mechanisms.block_of", return_value="news_sentiment"):
+            result = feed.cmd_feed_action(args, None)
+
+        self.assertEqual(result["count"], 12)
+        self.assertEqual(result["omitted"]["items"], 2)
+        coverage = result["searches"][0]["coverage"]
+        self.assertEqual(coverage["search_queries_by_audience"], {"trader": 0, "investor": 0, "quant": 1})
+        self.assertEqual(coverage["search_receipt_count"], 1)
+        row = result["items"][0]
+        self.assertEqual(row["harvest"]["audience"], "quant")
+        self.assertEqual(row["review"], review)
+        self.assertEqual(row["claim_state"], "unverified_claim")
+        self.assertEqual(row["ledger_hint"], {"block_guess": "news_sentiment", "state": "inferred",
+                                             "book_count": 0, "prior_trial_count": 1})
+        detailed_preview = result["items"][1]
+        self.assertTrue(detailed_preview["review_truncated"])
+        self.assertEqual(detailed_preview["review"]["overlap_note"], detailed_review["overlap_note"][:200])
+        self.assertEqual(detailed_preview["review"]["variables"],
+                         [variable[:200] for variable in detailed_review["variables"][:8]])
+        with open(draft, encoding="utf-8") as handle:
+            cards = [json.loads(line) for line in handle]
+        self.assertEqual(len(cards), 12)
+        card = cards[0]
+        self.assertEqual(card["status"], "DRAFT")
+        self.assertEqual(card["evidence"]["claim_state"], "unverified_claim")
+        self.assertEqual(card["harvest"], row["harvest"])
+        self.assertEqual(card["review"], review)
+        self.assertEqual(card["block_guess"], "news_sentiment")
+        self.assertEqual(card["book_exposure"]["count"], 0)
+        trial, = card["prior_trials"]["evidence"]
+        self.assertEqual(trial["key"], "failed")
+        self.assertEqual(trial["verdict"], "falsified")
+        self.assertEqual(cards[1]["review"]["variables"], detailed_review["variables"])
+        self.assertEqual(cards[1]["review"], detailed_review)
+
 
 class DataFitTests(unittest.TestCase):
     """Reading keywords do not establish account capabilities or signal validity."""

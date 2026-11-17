@@ -39,8 +39,19 @@ BUILTIN_SOURCES = {
 }
 _ADAPTER_KEYS = {"rss": {"url"}, "bluesky": set(),
                  "hn": set(), "hn_frontpage": set(),
-                 "market": {"venue", "symbol", "depth", "feed"}, "file": {"path"}, "paper": set()}
+                 "market": {"venue", "symbol", "depth", "feed"}, "file": {"path", "format"}, "paper": set()}
 _KINDS = {"news", "social", "forum", "trend", "web"}
+_MAX_HARVEST_DEPTH = 64
+_HARVEST_AUDIENCES = ("trader", "investor", "quant")
+_HARVEST_SEARCH_STATUSES = ("complete", "failed")
+_HARVEST_RESULT_STATUSES = ("opened", "snippet_only", "blocked")
+_HARVEST_REVIEW_TEXT_FIELDS = ("source_claim", "mechanism", "falsification", "control",
+                              "closest_family", "overlap_note")
+_HARVEST_REVIEW_FIELDS = frozenset(_HARVEST_REVIEW_TEXT_FIELDS) | {"variables", "classification"}
+_HARVEST_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
 
 
 def _invalid(message):
@@ -85,8 +96,11 @@ def _validate_definition(source, custom=False):
         value = source.get("path")
         if not isinstance(value, str) or not value.strip() or "\x00" in value:
             _invalid("File sources require a nonempty local path.")
-        if Path(value).suffix.lower() not in {".jsonl", ".txt", ".md"}:
+        suffix = Path(value).suffix.lower()
+        if suffix not in {".jsonl", ".txt", ".md"}:
             _invalid("File sources support only .jsonl, .txt and .md exports.")
+        if "format" in source and (source["format"] != "harvest" or suffix != ".jsonl"):
+            _invalid("File source format must be harvest and requires a .jsonl path.")
         try:
             result["path"] = str(Path(value).resolve())
         except (OSError, ValueError, RuntimeError):
@@ -221,6 +235,136 @@ def _packet(source, query, items, collected, limit, provider_count, invalid, end
             "collected_at": collected, "coverage": coverage}
 
 
+def _harvest_text(value):
+    return _safe_raw(value) if isinstance(value, str) and value.strip() else ""
+
+
+def _harvest_timestamp(value):
+    if not isinstance(value, str) or _HARVEST_TIMESTAMP.fullmatch(value) is None:
+        return None
+    try:
+        return parse_timestamp(value)["value"]
+    except OverflowError:
+        return None
+
+
+def _harvest_review(value):
+    """Validate a supplied review and project only its typed public fields."""
+    if not isinstance(value, dict) or set(value) - _HARVEST_REVIEW_FIELDS:
+        return None
+    review = {}
+    for key in _HARVEST_REVIEW_TEXT_FIELDS:
+        if key in value:
+            normalized = _harvest_text(value[key])
+            if not normalized:
+                return None
+            review[key] = normalized
+    if "variables" in value:
+        if not isinstance(value["variables"], list):
+            return None
+        variables = [_harvest_text(variable) for variable in value["variables"]]
+        if not all(variables):
+            return None
+        review["variables"] = variables
+    if "classification" in value:
+        if value["classification"] not in ("classic_baseline", "new_lead"):
+            return None
+        review["classification"] = value["classification"]
+    return review
+
+
+def _harvest_record(record):
+    """Normalize harvest metadata while retaining the observation body for the file importer."""
+    query = _harvest_text(record.get("query"))
+    audience = record.get("audience")
+    if not query or audience not in _HARVEST_AUDIENCES:
+        return None
+    metadata = {"query": query, "audience": audience}
+    if record.get("record_type") == "search_receipt":
+        searched_at = _harvest_timestamp(record.get("searched_at"))
+        status = record.get("status")
+        results = record.get("results")
+        if not searched_at or status not in _HARVEST_SEARCH_STATUSES or not isinstance(results, list):
+            return None
+        normalized_results = []
+        for result in results:
+            if not isinstance(result, dict) or result.get("status") not in _HARVEST_RESULT_STATUSES:
+                return None
+            url = _url(result.get("url"))
+            if url is None:
+                return None
+            normalized_results.append({"url": url, "status": result["status"]})
+        return dict(metadata, record_type="search_receipt", searched_at=searched_at,
+                    status=status, results=normalized_results)
+    if record.get("record_type") != "observation":
+        return None
+    read_at = _harvest_timestamp(record.get("read_at"))
+    if not read_at or record.get("read_status") != "opened_original" or _url(record.get("url")) is None:
+        return None
+    observation = {"harvest": dict(metadata, read_status="opened_original", read_at=read_at)}
+    if "review" in record:
+        review = _harvest_review(record["review"])
+        if review is None:
+            return None
+        observation["review"] = review
+    return observation
+
+
+def _file_item(source, path, line_number, record, collected, limitations, harvest):
+    text = record.get("text") if record.get("text") is not None else record.get("content")
+    if not isinstance(text, str) or not text.strip():
+        return None
+    text_fields = ("title", "url", "author", "published_at", "published_at_raw", "content_scope")
+    if any(record.get(key) is not None and not isinstance(record[key], str) for key in text_fields):
+        return None
+    if any(record.get(key) is not None and (isinstance(record[key], bool)
+            or not isinstance(record[key], (str, int))) for key in ("id", "parent_id")):
+        return None
+    if record.get("url") and _url(record["url"]) is None:
+        return None
+    title = record.get("title") or next(part.strip() for part in text.splitlines() if part.strip())[:160]
+    identity = record.get("id")
+    if identity is None or identity == "":
+        identity = hashlib.sha256(json.dumps({"path": str(path), "record": record},
+                                             sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    date = record.get("published_at") or record.get("published_at_raw")
+    item = _item(source, "local_file", identity, title, record.get("url"), text, date,
+                 collected, record.get("author"), record,
+                 "collector_reported_original" if harvest else "user_supplied_export", limitations)
+    if record.get("published_at_raw") is not None:
+        item["published_at_raw"] = record["published_at_raw"]
+    item.update(parent_id=str(record["parent_id"]) if record.get("parent_id") is not None else None,
+                source_path=str(path), source_line=line_number,
+                content_scope=record.get("content_scope") or (
+                    "captured_text" if line_number is None else "user_supplied_export"))
+    if harvest:
+        # These values can be retained verbatim by the ordinary file adapter.
+        for key in ("published_at_raw", "parent_id", "content_scope"):
+            item[key] = _safe_raw(item[key])
+    return item
+
+
+def _unique_json_object(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("Duplicate JSON object key")
+    return result
+
+
+def _valid_harvest_json(value, depth=0):
+    """Keep raw evidence serializable after the ledger wraps it in other objects."""
+    if depth > _MAX_HARVEST_DEPTH:
+        return False
+    if isinstance(value, dict):
+        return all(_valid_harvest_json(key, depth + 1) and _valid_harvest_json(item, depth + 1)
+                   for key, item in value.items())
+    if isinstance(value, list):
+        return all(_valid_harvest_json(item, depth + 1) for item in value)
+    if isinstance(value, str):
+        value.encode("utf-8")
+    return not isinstance(value, float) or math.isfinite(value)
+
+
 def _file(source, limit):
     """Import user-held exports as text evidence; never execute embedded content."""
     path = Path(source["path"])
@@ -234,10 +378,13 @@ def _file(source, limit):
         raise SourceError("RESPONSE_TOO_LARGE", "Local source export exceeds the 4 MiB import bound.",
                           hint="Split the export into smaller files.")
     collected = utc_now()
+    harvest = source.get("format") == "harvest"
     limitations = ["User-supplied local export only; no live platform access or full-thread coverage is implied.",
                    "Collection time is import time, not publication time or first historical availability.",
                    "Claims, comments, metrics and embedded code are unverified text; code was not executed.",
                    "Relative publication labels are retained without inferring calendar dates."]
+    if harvest:
+        limitations.append("Search and original-read metadata are collector-reported; import does not verify them.")
     rows, invalid, provider_count = [], 0, 0
     if path.suffix.lower() == ".jsonl":
         def reject_constant(value):
@@ -249,7 +396,8 @@ def _file(source, limit):
                 if not decoded.strip():
                     continue
                 provider_count += 1
-                record = json.loads(decoded, parse_constant=reject_constant)
+                record = json.loads(decoded, parse_constant=reject_constant,
+                                    object_pairs_hook=_unique_json_object if harvest else None)
             except UnicodeError:
                 provider_count += 1
                 invalid += 1
@@ -267,45 +415,48 @@ def _file(source, limit):
             raise SourceError("FORMAT_ERROR", "Local text export contains no captured text.")
         rows = [(None, {"text": text})]
         provider_count = 1
-    items = []
+    items, receipts = [], []
     for line_number, record in rows:
         if not isinstance(record, dict):
             invalid += 1
             continue
-        text = record.get("text") if record.get("text") is not None else record.get("content")
-        if not isinstance(text, str) or not text.strip():
+        try:
+            if harvest:
+                metadata = _harvest_record(record) if _valid_harvest_json(record) else None
+                if metadata is None:
+                    invalid += 1
+                    continue
+                if metadata.get("record_type") == "search_receipt":
+                    receipts.append(metadata)
+                    continue
+            item = _file_item(source, path, line_number, record, collected, limitations, harvest)
+        except (ValueError, OverflowError, RecursionError):
             invalid += 1
             continue
-        text_fields = ("title", "url", "author", "published_at", "published_at_raw", "content_scope")
-        if any(record.get(key) is not None and not isinstance(record[key], str) for key in text_fields):
+        if item is None:
             invalid += 1
-            continue
-        if any(record.get(key) is not None and (isinstance(record[key], bool)
-                or not isinstance(record[key], (str, int))) for key in ("id", "parent_id")):
-            invalid += 1
-            continue
-        if record.get("url") and _url(record["url"]) is None:
-            invalid += 1
-            continue
-        title = record.get("title") or next(part.strip() for part in text.splitlines() if part.strip())[:160]
-        identity = record.get("id")
-        if identity is None or identity == "":
-            identity = hashlib.sha256(json.dumps({"path": str(path), "record": record},
-                                                 sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-        date = record.get("published_at") or record.get("published_at_raw")
-        item = _item(source, "local_file", identity, title, record.get("url"), text, date,
-                     collected, record.get("author"), record, "user_supplied_export", limitations)
-        if record.get("published_at_raw") is not None:
-            item["published_at_raw"] = record["published_at_raw"]
-        item.update(parent_id=str(record["parent_id"]) if record.get("parent_id") is not None else None,
-                    source_path=str(path), source_line=line_number,
-                    content_scope=record.get("content_scope") or (
-                        "captured_text" if line_number is None else "user_supplied_export"))
-        items.append(item)
-    return _packet("local_file", None, items, collected, limit, provider_count, invalid, None,
-                   "User-supplied local export", "file_order", limitations, has_more=False,
-                   source_path=str(path), content_scope="user_supplied_export", cache_ttl_seconds=0,
-                   imported_at=collected, max_file_bytes=MAX_FILE_BYTES)
+        else:
+            if harvest:
+                item.update(metadata)
+            items.append(item)
+    packet = _packet("local_file", None, items, collected, limit, provider_count, invalid, None,
+                     "User-supplied web harvest" if harvest else "User-supplied local export",
+                     "file_order", limitations, has_more=False, source_path=str(path),
+                     content_scope="user_supplied_export", cache_ttl_seconds=0,
+                     imported_at=collected, max_file_bytes=MAX_FILE_BYTES)
+    if harvest:
+        result_counts = dict.fromkeys(_HARVEST_RESULT_STATUSES, 0)
+        status_counts = dict.fromkeys(_HARVEST_SEARCH_STATUSES, 0)
+        audience_counts = dict.fromkeys(_HARVEST_AUDIENCES, 0)
+        for receipt in receipts:
+            status_counts[receipt["status"]] += 1
+            audience_counts[receipt["audience"]] += 1
+            for result in receipt["results"]:
+                result_counts[result["status"]] += 1
+        packet["search_receipts"] = receipts
+        packet["coverage"].update(search_receipt_count=len(receipts), search_result_counts=result_counts,
+                                  search_status_counts=status_counts, search_queries_by_audience=audience_counts)
+    return packet
 
 
 def _local(tag):

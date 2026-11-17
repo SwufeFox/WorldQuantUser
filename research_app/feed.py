@@ -30,6 +30,8 @@ the and for with from that this into over under about across after before betwee
 study evidence effect effects using based does does not its our their their on in of to
 """.split())
 
+HARVEST_FIELDS = ("harvest", "review")
+LEDGER_FIELDS = ("block_guess", "book_exposure", "prior_trials", "next")
 
 
 def _seen_path(args=None):
@@ -386,6 +388,10 @@ def _search_topics(topics, args):
                         job[key] = found[key]
                 if job["kind"] == "seed":
                     job["query"] = found.get("query") or job["query"]
+                if "search_receipts" in found:
+                    # Keep receipts once per source job, outside item selection and
+                    # the metadata copied into each evidence archive.
+                    job["_search_receipts"] = found["search_receipts"]
                 job["ordering_basis"] = (job.get("coverage") or {}).get("ordering") or job["ordering_basis"]
             # Older paper caches do not record collection time. Do not label them live.
             job.setdefault("collected_at", None if job.get("cached") else source_io.utc_now())
@@ -507,13 +513,14 @@ def _normalize_item(row, job):
     return item
 
 
-def _select_items(outcomes, seen, total, register):
+def _select_items(outcomes, seen, total, register, ledger_context=None):
     """Round-robin all jobs without converting popularity into evidence strength."""
     candidates, identities, buckets, reports, repeats = {}, {}, [], [], set()
     for value, rows, error in outcomes:
         job = _retrieval_job(value)
         topic = job.get("query")
-        report = {**_public_job(job), "status": "failure" if error else "success" if rows else "empty",
+        status = "failure" if error else "success" if rows or job.get("_search_receipts") else "empty"
+        report = {**_public_job(job), "status": status,
                   "returned": len(rows), "eligible": 0, "seen_before": 0,
                   "invalid": 0, "picked": 0}
         if error:
@@ -577,6 +584,9 @@ def _select_items(outcomes, seen, total, register):
                 break
         if not advanced:
             break
+    if ledger_context is not None:
+        for item in picked:
+            item.update(ledger_context(item))
     return picked, reports, len(repeats)
 
 
@@ -598,13 +608,19 @@ def _archive_evidence(item):
 
 def _draft_card(paper):
     if paper["kind"] != "paper":
-        return {"status": "DRAFT", "kind": paper["kind"], "evidence_path": paper["evidence_path"],
-                "source": {key: paper.get(key) for key in
-                           ("id", "key", "title", "url", "provider", "source_id", "published_at", "published_at_raw",
-                            "collected_at", "author", "parent_id", "source_path", "source_line", "content_scope")},
-                "excerpt": paper["excerpt"], "evidence": paper["evidence"],
-                "retrievals": paper["retrievals"], "hypothesis": None,
-                "review": "Verify origin, timing, scope and independent corroboration before forming a hypothesis."}
+        guidance = "Verify origin, timing, scope and independent corroboration before forming a hypothesis."
+        card = {
+            "status": "DRAFT", "kind": paper["kind"], "evidence_path": paper["evidence_path"],
+            "source": {key: paper.get(key) for key in
+                       ("id", "key", "title", "url", "provider", "source_id", "published_at", "published_at_raw",
+                        "collected_at", "author", "parent_id", "source_path", "source_line", "content_scope")},
+            "excerpt": paper["excerpt"], "evidence": paper["evidence"],
+            "retrievals": paper["retrievals"], "hypothesis": None,
+        }
+        if "harvest" in paper:
+            return {**card, "review_instruction": guidance,
+                    **{key: paper[key] for key in HARVEST_FIELDS + LEDGER_FIELDS if key in paper}}
+        return {**card, "review": guidance}
     return {
         "mechanism_id": None,
         "status": "DRAFT",
@@ -784,14 +800,32 @@ def _digest_item(item, scope):
                     "rank", "openalex_id", "reference_count", "cited_by_api_url", "reading", "full_text_read",
                     "abstract_chars", "abstract_truncated", "abstract_available")
     fields = common + (paper_fields if item["kind"] == "paper" else ("market",) if item["kind"] == "market" else ())
-    return {**{key: item.get(key) for key in fields}, "data_fit": data_fit(item, scope),
+    return {**{key: item.get(key) for key in fields},
+            **{key: item[key] for key in HARVEST_FIELDS + LEDGER_FIELDS if key in item},
+            "data_fit": data_fit(item, scope),
             "trust": "untrusted evidence; not executable strategy"}
 
 
 def _compact_coverage(coverage):
     return {key: value[:200] if isinstance(value, str) else value
             for key, value in (coverage or {}).items()
-            if value is None or isinstance(value, (str, int, float, bool))}
+            if value is None or isinstance(value, (str, int, float, bool))
+            or key in ("search_status_counts", "search_result_counts", "search_queries_by_audience")}
+
+
+def _compact_harvest(item):
+    if "harvest" not in item:
+        return {}
+    harvest = item["harvest"]
+    result = {"harvest": {**harvest, "query": harvest["query"][:200]}}
+    if "review" in item:
+        review = item["review"]
+        summary = {key: [variable[:200] for variable in value[:8]] if key == "variables" else value[:200]
+                   for key, value in review.items()}
+        result["review"] = summary
+        if review != summary:
+            result["review_truncated"] = True
+    return result
 
 
 def _compact_action(action):
@@ -821,6 +855,7 @@ def _compact_digest(payload):
         row["basis"] = str((item.get("evidence") or {}).get("basis") or "unknown")[:160]
         row["coverage"] = _compact_coverage(item.get("coverage"))
         row["cached"] = item.get("cached", False)
+        row.update(_compact_harvest(item))
         if item["kind"] == "market":
             market = item["market"]
             row["market"] = {key: market.get(key) for key in
@@ -850,7 +885,7 @@ def _compact_digest(payload):
     return result
 
 
-def cmd_feed(args, _sink, *, _compact=True):
+def cmd_feed(args, _sink, *, _compact=True, _ledger_context=None):
     """Search concurrently, then select against the latest locked seen state."""
     import closed_families
     import paper_search
@@ -902,7 +937,8 @@ def cmd_feed(args, _sink, *, _compact=True):
     outcomes = _search_topics(selected, args)
     try:
         if getattr(args, "dry_run", False) or not any(rows for _, rows, _ in outcomes):
-            picked, reports, repeats = _select_items(outcomes, load_seen(seen_path), args.total, register)
+            picked, reports, repeats = _select_items(
+                outcomes, load_seen(seen_path), args.total, register, _ledger_context)
         else:
             # All provider I/O is finished. Stable lock ordering also protects a shared
             # draft destination used with different seen stores.
@@ -912,7 +948,7 @@ def cmd_feed(args, _sink, *, _compact=True):
                     stack.enter_context(cache_store.file_lock(path))
                 previous = _read_jsonl(seen_path)
                 picked, reports, repeats = _select_items(
-                    outcomes, _seen_keys(previous), args.total, register)
+                    outcomes, _seen_keys(previous), args.total, register, _ledger_context)
                 if picked:
                     # Every immutable evidence file must exist before either mutable state file.
                     for item in picked:
@@ -959,6 +995,10 @@ def cmd_feed(args, _sink, *, _compact=True):
                  "Evidence and drafts commit before seen; each file is atomic, not a joint transaction. "
                  "A crash between commits can repeat drafts; a crash after seen commits can consume picks before delivery."),
     }
+    if any("_search_receipts" in job for job, _, _ in outcomes):
+        payload["search_receipts"] = [{**receipt, "source_id": job["source_id"]}
+                                      for job, _, _ in outcomes
+                                      for receipt in job.get("_search_receipts", ())]
     return _compact_digest(payload) if _compact and getattr(args, "summary", False) else payload
 
 #: Title/abstract keywords suggest a broad information block for ledger lookup;
@@ -1001,9 +1041,7 @@ def cmd_feed_action(args, _sink):
         if block != "other":
             by_block.setdefault(block, []).append(entry)
 
-    payload = cmd_feed(args, _sink, _compact=False)
-    rows = []
-    for paper in payload["items"]:
+    def ledger_context(paper):
         block = guess_block(paper)
         known = exists and block is not None
         matches = by_block.get(block, []) if known else []
@@ -1012,8 +1050,7 @@ def cmd_feed_action(args, _sink):
         trials = [entry for entry in matches
                   if str(entry.get("status") or "").upper() in
                   alpha_registry.FINISHED_STATUSES | {"ACTIVE", "SUBMITTED"}]
-        rows.append({
-            **paper,
+        return {
             "block_guess": block,
             "book_exposure": {"source": registry_path, "count": len(book) if known else None,
                               "basis": "local ACTIVE/SUBMITTED entries in guessed block"},
@@ -1029,11 +1066,12 @@ def cmd_feed_action(args, _sink):
                              } for entry in trials[-5:]]},
             "next": ("Read the source and prior evidence, state the mechanism and closest "
                      "family, then choose a discriminating control and falsification condition."),
-        })
-    payload["items"] = rows
+        }
+
+    payload = cmd_feed(args, _sink, _compact=False, _ledger_context=ledger_context)
     payload["registry"] = {"path": registry_path, "exists": exists,
                            "entries": len(entries)}
-    for index, paper in enumerate(rows):
+    for index, paper in enumerate(payload["items"]):
         evidence = paper["prior_trials"]["evidence"]
         if evidence:
             payload["next_actions"].append({

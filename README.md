@@ -310,6 +310,8 @@ paper, news, social, forum and trends, plus configured sources. Markets require 
 Custom RSS/Atom feeds and local JSONL/text exports use `--sources-file`.
 See [source configuration and access limits](docs/tooling.md#多来源线索与本地论坛材料)
 for adapters, credentials and the distinction between quotes and order-book depth.
+The [external harvest format](docs/tooling.md#导入外部定向检索) imports search receipts and
+source excerpts with structured research notes for the digest and draft cards.
 
 `--workers` bounds concurrent retrieval jobs (1–8, default 4); `--timeout` bounds each
 network request. Queries, reference/citation expansions, fixed feeds and markets share the
