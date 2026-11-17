@@ -442,7 +442,7 @@ python research_cli.py simulate sample-batch.json --sort sharpe --top 5 --stream
 ```
 
 `--stream` emits JSON Lines progress events on stderr (`submitted`, `completed`,
-`rate_limited`) while the single JSON result stays on stdout. The result
+`quota`, `rate_limited`) while the single JSON result stays on stdout. The result
 contains one record per expression (`expression`, `decay`, `alpha_id`,
 `status`, `metrics`, `checks`, `error`) plus a `summary` with counts, a
 `ranking` sorted by sharpe, and `best`.
@@ -469,6 +469,21 @@ age alone never frees them. Observed completion or definite refusal releases a s
 workspaces and jobs launched outside this tool are not coordinated. Resume may change
 `--batch-size` without changing the saved expressions, settings or research fingerprint;
 accepted jobs can still be recovered after launch permissions shrink.
+
+Daily simulation quota is separate from concurrency and transient HTTP throttling.
+Successful repeats and every successful multi-simulation child count; Alpha creation-date
+filters cannot reconstruct that count. The current runner sends individual REGULAR requests;
+`--batch-size` is not a multi-simulation array size or evidence of `MULTI_SIMULATION` permission.
+
+`scheduling.quota` retains `X-Ratelimit-Limit`, `X-Ratelimit-Remaining` and
+`X-Ratelimit-Reset` from simulation responses. `observed_at` and `reset_at` are Unix seconds;
+`reset_seconds` is the original interval and `reset_after_seconds` is the remaining interval.
+Unknown/malformed values stay null. Confirmed zero pauses new submissions, while accepted jobs
+can still finish and queued work remains resumable. Observations share the account/workspace
+journal; they are not reservations against the account's whole daily allowance.
+After a known reset time the observation becomes `reset_due`; the tool does not invent a
+refilled balance. If the reset header is missing, zero stops the current run, while a later
+explicit invocation may obtain fresh evidence. Dry-run reports unknown quota without I/O.
 
 A failed expression is reported in its own record instead of aborting the run;
 the command only fails outright when *every* expression failed.
@@ -596,6 +611,11 @@ python research_cli.py alpha list --min-sharpe 1.5 --limit 20
 ```
 
 Both are quota-free.
+The daily-PnL reader honors `Retry-After` even on a nonempty HTTP 200 response.
+It bounds total waiting to 180 seconds by default and reports pending reads as `RATE_LIMITED`
+with incomplete evidence, preserving any previous cache. Platform `TIMEOUT`/`FAIL`/`ERROR`
+and cancellation are terminal failures; `WARNING` is terminal completion. Transport uncertainty
+remains resumable and is never treated as a definite refusal or silently reposted.
 
 `alpha list` filters on `status=UNSUBMITTED` by default, so it will not show
 what you have already submitted. Read the live book with:
@@ -1329,12 +1349,12 @@ Errors are typed and subclass `machine_lib.BrainError`: `MissingCredentials`,
 
 ## Notes and limits
 
-* **Simulation quota is real.** `simulate` without `--dry-run` spends it;
-  `catalog` and `alpha` never do.
-* **Rate limits.** Metadata endpoints return HTTP 429 under load and
-  submissions have their own limit. `machine_lib` absorbs both with the
-  advertised `Retry-After` backoff and surfaces `RateLimited` only when the
-  budget is exhausted.
+* **Simulation quota is real.** Successful re-simulations and multi-simulation children
+  count individually. Read observed quota headers, not the number of distinct Alpha IDs.
+  `catalog` and result retrieval do not spend simulation quota.
+* **Rate limits.** Transient HTTP throttling follows `Retry-After`; confirmed daily
+  exhaustion pauses new submissions and preserves recovery state instead of waiting for
+  hours or continuing into later batches. Unknown limits stay unknown.
 * **Pagination.** BRAIN caps `limit` at 50 per page; `get_datafields` pages
   internally.
 * **Region access is account-scoped.** Unknown regions and malformed neutralization

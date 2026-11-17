@@ -83,7 +83,8 @@ def _finished(record):
 def summarize(records):
     """Count outcomes and rank the scored alphas so a caller can pick winners."""
     completed = [r for r in records if _finished(r)]
-    failed = [r for r in records if (r.get("status") or "").upper() == "FAILED"]
+    failed_statuses = simulation_slots.TERMINAL_FAILURE_STATUSES | {"FAILED"}
+    failed = [r for r in records if (r.get("status") or "").upper() in failed_statuses]
     scored = [r for r in completed if isinstance(r.get("metrics"), dict)]
     ranking = sorted(
         (
@@ -654,11 +655,14 @@ def _probe_summary(response):
     rows = response.get("rows", response.get("results", []))
     fields = ("train_sharpe", "train_fitness", "train_turnover", "train_margin",
               "train_sharpe_h1", "train_sharpe_h2")
+    quota = next((report["quota"] for report in reversed(response.get("scheduling") or [])
+                  if report.get("quota") is not None), None)
     return {"path": response.get("path"), "run_id": response.get("run_id"),
             "request_fingerprint": response.get("request_fingerprint"), "view": "train",
             "total_count": (response.get("execution") or {}).get("total", response.get("arms", len(rows))),
             "displayed_count": min(20, len(rows)), "rows_omitted": max(0, len(rows) - 20),
             "execution": response.get("execution"), "recording": response.get("recording"),
+            "quota": quota,
             "roles": {role: sum((row.get("role") or "unspecified") == role for row in rows)
                       for role in ("candidate", "diagnostic", "unspecified")},
             "missing_evidence_count": sum(any(row.get(key) is None for key in fields) for row in rows),

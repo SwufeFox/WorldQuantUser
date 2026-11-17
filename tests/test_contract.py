@@ -1658,6 +1658,40 @@ class SimulationResumeTests(unittest.TestCase):
         self.assertEqual(session.post_calls, [])
         sleep.assert_not_called()
 
+    def test_cli_daily_quota_pause_preserves_completed_result_and_checkpoint_evidence(self):
+        account = {"state": "known", "fingerprint": "offline-quota-contract"}
+        capability = {"state": "unknown", "account": account,
+                      "concurrency": {"state": "unknown", "limit": None}}
+        session = self.Session(
+            get_responses=[self.Response(payload={"status": "COMPLETE", "alpha": "A1"}),
+                           self.Response(payload={"is": {"sharpe": 1.0}})],
+            post_responses=[self.Response(status_code=201, headers={
+                "Location": "/simulations/one", "X-Ratelimit-Limit": "100",
+                "X-Ratelimit-Remaining": "0", "X-Ratelimit-Reset": "3600"})])
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "quota-checkpoint.json"
+            stdout, stderr = io.StringIO(), io.StringIO()
+            source = {"alphas": ["rank(cap)", "rank(volume)", "rank(sales)"]}
+            with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(source))), \
+                    mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr), \
+                    mock.patch.object(cli_experiments, "with_session", side_effect=lambda args, work: work(session)), \
+                    mock.patch.object(cli_experiments, "_preflight_lint", return_value={"ok": True}), \
+                    mock.patch.object(cli_experiments.simulation_capabilities, "fetch", return_value=capability), \
+                    mock.patch.object(cli_experiments.simulation_capabilities, "account_provenance", return_value=account):
+                code = cli_app.main(["simulate", "-", "--research-dir", directory,
+                    "--checkpoint", str(checkpoint), "--registry", str(Path(directory) / "registry.jsonl"),
+                    "--batch-size", "1", "--quiet"])
+            document = json.loads(stdout.getvalue())
+            self.assertEqual(code, 0, document)
+            self.assertEqual(len(session.post_calls), 1)
+            self.assertEqual(document["data"]["summary"]["completed"], 1)
+            self.assertEqual(document["data"]["summary"]["queued"], 2)
+            self.assertEqual(document["data"]["scheduling"]["quota"]["remaining"], 0)
+            stored = json.loads(checkpoint.read_text(encoding="utf-8"))
+            self.assertEqual(stored["scheduling"]["quota"]["remaining"], 0)
+            self.assertEqual(stored["records"][0]["alpha_id"], "A1")
+            self.assertFalse(stored["records"][1].get("submission_attempted", False))
+
     def test_cli_checkpoint_can_be_resumed_without_new_submission(self):
         capabilities = mock.patch.object(cli_experiments.simulation_capabilities, "fetch", return_value={
             "state": "unknown", "account": {"state": "unknown"},

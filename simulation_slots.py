@@ -6,15 +6,18 @@ releases its slot. Other workspaces and unidentifiable accounts are not covered.
 """
 
 import hashlib
+import math
 import os
 import time
 import uuid
+from collections.abc import Mapping
 
 import cache_store
 import research_paths
 
 
-TERMINAL_STATUSES = frozenset({"COMPLETE", "COMPLETED", "ERROR", "FAIL", "CANCELLED", "CANCELED"})
+TERMINAL_FAILURE_STATUSES = frozenset({"ERROR", "FAIL", "TIMEOUT", "CANCELLED", "CANCELED"})
+TERMINAL_STATUSES = frozenset({"COMPLETE", "COMPLETED", "WARNING"}) | TERMINAL_FAILURE_STATUSES
 
 
 def _workspace():
@@ -154,3 +157,81 @@ def reconcile_record(record, account=None, *, outcome=None, progress_url=None, a
             else "accepted" if outcome == "accepted" else "unknown"
         )
     return record
+
+
+def _quota_number(value, integer=False):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return None
+    if integer and isinstance(value, float):
+        return None
+    try:
+        number = int(value) if integer else float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return number if number >= 0 and (integer or math.isfinite(number)) else None
+
+
+def observe_quota(account, headers):
+    """Retain only documented simulation-quota headers, never unrelated headers."""
+    if not isinstance(headers, Mapping):
+        return None
+    headers = {str(key).lower(): value for key, value in headers.items()}
+    observation = {
+        "limit": _quota_number(headers.get("x-ratelimit-limit"), integer=True),
+        "remaining": _quota_number(headers.get("x-ratelimit-remaining"), integer=True),
+        "reset_seconds": _quota_number(headers.get("x-ratelimit-reset")),
+    }
+    if all(value is None for value in observation.values()):
+        return None
+    if (observation["limit"] is not None and observation["remaining"] is not None
+            and observation["remaining"] > observation["limit"]):
+        observation["remaining"] = None
+    observation.update(observed_at=time.time(), source="POST /simulations response headers")
+    fingerprint = _fingerprint(account)
+    if fingerprint:
+        path, lock = _paths(fingerprint)
+        try:
+            with cache_store.file_lock(lock):
+                journal = _load(path, fingerprint)
+                journal["quota"] = observation
+                cache_store.write_json_atomic(path, journal)
+        except (OSError, cache_store.CacheError) as error:
+            # Losing telemetry must not lose an already accepted progress URL.
+            observation["storage_error"] = type(error).__name__
+    return observation
+
+
+def quota_snapshot(account, observation=None):
+    """Describe the latest observation; a reset makes it stale, never refills it.
+
+    Without a reset time, zero stops its current run only. A later invocation
+    may obtain a fresh response instead of being blocked indefinitely by history.
+    """
+    current_run = observation is not None
+    fingerprint = _fingerprint(account)
+    if observation is None and fingerprint:
+        path, lock = _paths(fingerprint)
+        with cache_store.file_lock(lock):
+            observation = _load(path, fingerprint).get("quota")
+    observation = observation if isinstance(observation, dict) else {}
+    limit = _quota_number(observation.get("limit"), integer=True)
+    remaining = _quota_number(observation.get("remaining"), integer=True)
+    observed_at = _quota_number(observation.get("observed_at"))
+    reset_seconds = _quota_number(observation.get("reset_seconds"))
+    if observed_at is None or (limit is not None and remaining is not None and remaining > limit):
+        remaining = None
+    reset_at = observed_at + reset_seconds if observed_at is not None and reset_seconds is not None else None
+    now = time.time()
+    state = ("unknown" if observed_at is None or remaining is None else
+             "reset_unknown" if reset_at is None else
+             "reset_due" if reset_at <= now else "observed")
+    return {
+        "state": state, "limit": limit, "remaining": remaining,
+        "observed_at": observed_at, "reset_seconds": reset_seconds,
+        "reset_at": reset_at,
+        "reset_after_seconds": max(0.0, reset_at - now) if reset_at is not None else None,
+        "blocked": remaining == 0 and (state == "observed" or (current_run and state == "reset_unknown")),
+        "source": observation.get("source"),
+        "scope": "account_and_research_workspace" if fingerprint and not observation.get("storage_error") else "invocation_only",
+        **({"storage_error": observation["storage_error"]} if observation.get("storage_error") else {}),
+    }

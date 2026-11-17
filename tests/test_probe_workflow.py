@@ -103,6 +103,35 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(self.registry.read_bytes(), before)
         self.assertTrue(all(row["train_sharpe_h1"] is None for row in recovered["rows"]))
 
+    def test_summary_preserves_daily_quota_pause_and_recovery_instruction(self):
+        session = ml.requests.Session()
+        session._brain_account_id = "offline-quota-summary"
+        accepted = ml.requests.Response()
+        accepted.status_code = 201
+        accepted.headers.update({"Location": "/simulations/one", "X-Ratelimit-Limit": "100",
+                                 "X-Ratelimit-Remaining": "0", "X-Ratelimit-Reset": "3600"})
+        accepted._content = b"{}"
+
+        def simulate(expressions, settings, session=None, preflight=None, force=False, **kwargs):
+            return ml.simulate_alphas(session, expressions, settings=settings, **kwargs)
+
+        with mock.patch.object(app.research_paths, "research_dir", return_value=str(self.root)), \
+                mock.patch.object(app, "with_session", side_effect=lambda args, work: work(session)), \
+                mock.patch.object(app.guarded_sim, "simulate", side_effect=simulate), \
+                mock.patch.object(session, "post", return_value=accepted) as post, \
+                mock.patch.object(ml, "poll_simulation", return_value={"status": "COMPLETE", "alpha": "A1"}), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {"sharpe": 1.0}}):
+            result = self.run_probe(summary=True)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(result["execution"]["not_submitted"], 2)
+        self.assertEqual(result["summary"]["quota"]["remaining"], 0)
+        self.assertTrue(result["summary"]["quota"]["blocked"])
+        self.assertGreater(result["summary"]["quota"]["reset_after_seconds"], 0)
+        self.assertTrue(any(action["action"] == "resume" for action in result["next_actions"]))
+        stored = json.loads(self.batch.read_text(encoding="utf-8"))
+        self.assertEqual(stored["records"][0]["alpha_id"], "A1")
+        self.assertEqual(stored["scheduling"][-1]["quota"]["remaining"], 0)
+
     def test_unknown_post_is_saved_and_never_reposted(self):
         def interrupted(expressions, settings, **kw):
             kw["on_event"]("submitting", {"index": 0, "status": "UNKNOWN_SUBMISSION",

@@ -121,6 +121,18 @@ CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、
 `--internal` 依赖测试期校准，必须搭配该验证流程；`--train-end` 不能越过记录中的测试起点。
 训练证据缺失时保持 unknown，不用全窗口数字补齐。
 
+平台文档建议先缩小初始搜索空间：结合 Coverage、Date Coverage、字段描述与样本可用性，
+从相似字段、算子族、时间尺度和中性化中各选一个有经济依据的代表；得到训练期信号后再
+逐项扩展。日期、标识符等技术字段先进入语义核对，不把“数值类型”当成可交易信号。
+Alpha Count / User Count 只能描述使用情况，低计数不证明新机制，高计数也不证明没有价值。
+BRAIN Labs 的覆盖、典型值、换手和收益相关分析可作补充证据，当前 CLI 不冒充已执行 Labs 分析。
+
+“先做 10–50 次”是探索建议，不是必须花完的预算；应按能否区分解释来安排实验。持续无信号
+时先检查模板、数据定义与条件，不自动穷举整个参数笛卡尔积，也不由一次低分否定机制。
+文档将 SLOW_AND_FAST 对应到 risk-handled、MaxTrade ON 对应到 investability-constrained；
+这提供设置语义，不能单独证明 ON 的结果总与 OFF 的某个返回分块完全一致。合法设置仍查
+当前账户的 OPTIONS 元数据，STATISTICAL 等不同风险处理需要单独提出解释与对照。
+
 ### 候选冻结、验证、检查与入库一次完成
 
 ```bash
@@ -414,6 +426,14 @@ if_else(is_nan(s), s, m)
 `idea` / `mechanism` / `note` 会随输出和批次文件保存；`--strict-gate` 只拒绝表达式与完整设置
 都相同的已完成结果。所有组先通过本地校验，等效设置合并，整批复用会话。输入支持 UTF-8 BOM。
 
+这里已使用 AST：`alpha_registry.expression_hash()` 先经 `fastexpr_ast.canonical()` 规范化，
+消除注释和冗余括号等差异；严格重复键再组合完整设置签名及已完成的历史结果。
+`exact_repeat_keys` 与 `structural_similarity_keys` 分列，骨架相似只提供线索。
+`--strict-gate` 拒绝精确重复并返回历史键，不自动替换成旧 `alpha_id`；已有结果通过
+`alpha get` / `compare` 读取。历史设置缺失时不补上今天的默认值来宣称命中。
+台账中旧的部分 `settings_fingerprint` 用于占位记录，不能拿来替代完整请求判重。
+文档中的 JSON 哈希 / Parquet 示例只作原理参考，继续沿用当前 AST 与台账机制。
+
 ```bash
 python3 research_cli.py probe sample-batch.spec.json --batch-size 6 --summary --batch-path sample-batch.json --save sample-response.json
 python3 research_cli.py probe --recover sample-batch.json --max-wait-seconds 60 --summary
@@ -449,6 +469,33 @@ diagnostic 保留用于归因，但不能进入候选冻结、候选架、晋级
 `simulation_slots.py` 在同账户、同研究目录内共享持久占位；接受或结果不明的提交不按时间过期，
 只有确认完成或拒绝才释放。不同研究目录及工具外启动的任务不共享这份占位。
 恢复可调整并发而不改变研究请求指纹；权限收缩时先取回已接受任务，再核验新启动的请求。
+
+`simulate/resume` 使用 `scheduling.quota` 展示配额观察；完整 probe 批次保留
+`scheduling[].quota`，`probe --summary` 的 `summary.quota` 仅保留最近一次观察，不复制调度历史。
+
+每日配额、并发占位与请求限流是不同信息。成功的重复模拟及 multi 的每个成功子模拟都会
+计数；Alpha 列表只保留首次创建日，不能靠“今天新增多少 Alpha”重建剩余额度。
+本工具目前发送单个 REGULAR 请求；API 文档中的 2–10 个对象 multi 数组另需
+`MULTI_SIMULATION` 权限，不能把该数组长度当成 `--batch-size` 的含义或账户日限额。
+
+模拟响应头的 `X-Ratelimit-Limit/Remaining/Reset` 作为配额观察保留；Reset 是秒数间隔。
+`limit/remaining` 缺失或非法保持 null，`observed_at/reset_at` 使用 Unix 秒，
+`reset_seconds` 保留原间隔，`reset_after_seconds` 给出据此计算的剩余间隔。
+确认 remaining 为零时停止当前运行的新提交，已接受任务继续取回结果，未提交工作保留
+QUEUED 与恢复点；429 不会导致跳到后面的批次继续提交。短期限流仍按 Retry-After 退避。
+同账户同研究目录共享观察，工具外任务不受此状态协调，也没有据此预留整日配额。
+
+到达已知重置时刻只把旧证据标为 `reset_due`，不自动将 remaining 加满。没有 Reset 时，
+零余额仅停止当前调用；下一次显式调用可获取新响应，避免旧观察永久阻塞。离线 dry-run
+保持配额 unknown，不为了估算余额发起模拟，也不硬编码论坛额度或按 EST 自行推算重置时间。
+
+记录集的 HTTP 200 和非空正文不代表就绪，正的 Retry-After 优先。每日 PnL 读取有总等待
+预算（默认 180 秒）；超出等待或尝试预算时返回 RATE_LIMITED、保留不完整状态与等待秒数，
+不覆盖已有缓存。TIMEOUT、FAIL、ERROR、取消释放模拟占位并计入失败；WARNING 是完成态。
+传输错误造成的 UNKNOWN_SUBMISSION 仍需要核对任务身份，不能按终态释放后重新 POST。
+
+认证继续沿用会话缓存和结构化错误。文档的 persona 示例需要人工完成认证，不能把
+`input()` 或自动重登循环移入 CLI；此处没有增加另一套凭据文件或自动生物识别登录流程。
 
 目录检查携带账户、region/universe/delay/instrumentType、完整性和时效证据。缺失、过期、
 不完整目录不能冒充预检通过；显式覆盖仍保留错误。字段类型按 AST 检查，经济口径不明则提示

@@ -1114,17 +1114,31 @@ def submit_single_simulation(
 ):
     """POST one single-alpha simulation and return its progress URL.
 
-    BRAIN applies a per-account submission rate limit (HTTP 429) and exposes no
-    queue to inspect, so 429 is absorbed here with the advertised backoff
-    instead of reaching the caller.
+    Daily-quota headers are retained separately from transient HTTP throttling.
+    Confirmed exhaustion defers new work; accepted jobs remain recoverable.
     """
+    import simulation_capabilities
+    import simulation_slots
+
+    account = simulation_capabilities.account_provenance(s)
     for attempt in range(1, max_retries + 1):
         if deadline is not None and deadline - time.monotonic() <= 0:
             raise RateLimited("submission deferred by the run time limit")
+        quota = simulation_slots.quota_snapshot(account)
+        if quota["blocked"]:
+            if on_event:
+                on_event("quota", quota)
+            raise RateLimited("daily simulation quota exhausted; resume after the reported reset")
         response = s.post(
             BRAIN_API_URL + "/simulations", json=simulation_data,
             timeout=_request_timeout(deadline),
         )
+        observation = (simulation_slots.observe_quota(account, response.headers)
+                       if response.status_code not in (401, 403) else None)
+        if observation is not None and on_event:
+            on_event("quota", observation)
+        if response.status_code == 429 and observation is not None and observation["remaining"] == 0:
+            raise RateLimited("daily simulation quota exhausted; resume after the reported reset")
         if response.status_code == 429:
             wait = _retry_after_seconds(response, cap_error_wait=False) or min(
                 60.0, 5.0 * attempt
@@ -1433,7 +1447,7 @@ def simulate_alphas(
 
     ``dry_run`` validates and builds the payloads but never touches the network
     (and requires no credentials). ``on_event(kind, payload)`` receives
-    ``submitted`` / ``polling`` / ``rate_limited`` / ``completed`` events.
+    ``submitted`` / ``polling`` / ``quota`` / ``rate_limited`` / ``completed`` events.
     Feeding it the result of ``resolve_settings`` is the caller's job.
     ``concurrency`` (or the legacy ``batch_size`` argument) is a positive local
     budget, clamped only by verified account capacity. A full shared workspace
@@ -1459,6 +1473,7 @@ def simulate_alphas(
         raise ValueError("concurrency and batch_size specify conflicting budgets")
     requested = concurrency if concurrency is not None else batch_size
     import simulation_capabilities
+    import simulation_slots
 
     if capability_snapshot is None and not dry_run:
         capability_snapshot = simulation_capabilities.cached()
@@ -1470,6 +1485,7 @@ def simulate_alphas(
         scheduling_report["shared_slots"] = {
             "state": "dry_run", "scope": "not_reserved", "cross_workspace_coordinated": False,
         }
+        scheduling_report["quota"] = simulation_slots.quota_snapshot({} if dry_run else plan["account"])
     if max_wait_seconds is not None and (
         not math.isfinite(max_wait_seconds) or max_wait_seconds < 0
     ):
@@ -1520,7 +1536,6 @@ def simulate_alphas(
             if "role" not in record and roles[index] is not None:
                 record["role"] = roles[index]
 
-    import simulation_slots
 
     for record in records:
         simulation_slots.reconcile_record(record, plan["account"])
@@ -1544,6 +1559,17 @@ def simulate_alphas(
             data = dict(payload or {})
             data["index"] = index
             on_event(kind, data)
+
+    quota_exhausted = False
+
+    def submission_event(kind, index, payload):
+        nonlocal quota_exhausted
+        if kind == "quota":
+            payload = simulation_slots.quota_snapshot(plan["account"], observation=payload)
+            quota_exhausted = quota_exhausted or payload["remaining"] == 0
+            if scheduling_report is not None:
+                scheduling_report["quota"] = payload
+        emit(kind, index, payload)
 
     def fetch_metrics_record(index):
         record = records[index]
@@ -1648,8 +1674,8 @@ def simulate_alphas(
                 return
             simulation_slots.reconcile_record(record, plan["account"], outcome="terminal")
             shared_state()
-            if progress.get("status") == "ERROR" or progress.get("message"):
-                record["error"] = progress.get("message") or "simulation error"
+            if progress.get("status") in simulation_slots.TERMINAL_FAILURE_STATUSES or progress.get("message"):
+                record["error"] = progress.get("message") or "simulation ended with %s" % record["status"]
                 note_operator_rejection(record.get("expression"), record["error"])
             if record["alpha_id"]:
                 record["simulation_status"] = record["status"]
@@ -1732,7 +1758,7 @@ def simulate_alphas(
     for start in range(0, len(pairs), batch_size):
         batch = pairs[start:start + batch_size]
         submitted = []
-        slots_blocked = False
+        submission_blocked = False
         for offset, (expression, decay) in enumerate(batch):
             index = start + offset
             record = {
@@ -1747,6 +1773,12 @@ def simulate_alphas(
                 emit("pending", index, record)
                 return records
             if deadline is not None and deadline - time.monotonic() <= 0:
+                break
+            if quota_exhausted:
+                submission_blocked = True
+                record["error"] = "daily simulation quota exhausted; resume after the reported reset"
+                records[index] = record
+                emit("deferred", index, record)
                 break
             if decay not in settings_checks:
                 settings_checks[decay] = simulation_capabilities.settings_evidence(
@@ -1763,7 +1795,7 @@ def simulate_alphas(
             if scheduling_report is not None:
                 scheduling_report["shared_slots"] = slots
             if identity is None and slots["available"] == 0:
-                slots_blocked = True
+                submission_blocked = True
                 record["error"] = "shared simulation slots are occupied; reconcile or resume existing attempts"
                 records[index] = record
                 emit("deferred", index, record)
@@ -1778,10 +1810,11 @@ def simulate_alphas(
             try:
                 location = submit_single_simulation(
                     s, _single_simulation_data(expression, decay, settings),
-                    on_event=lambda kind, payload, i=index: emit(kind, i, payload),
+                    on_event=lambda kind, payload, i=index: submission_event(kind, i, payload),
                     deadline=deadline,
                 )
             except RateLimited as exc:
+                submission_blocked = True
                 simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
                 record["status"] = "QUEUED"
                 record["submission_attempted"] = False
@@ -1836,7 +1869,7 @@ def simulate_alphas(
 
         poll_many(submitted)
         shared_state()
-        if slots_blocked:
+        if submission_blocked:
             return records
         if any(record.get("status") == "UNKNOWN_SUBMISSION" for record in records):
             break
@@ -2037,16 +2070,21 @@ def pnl_cache_status(cache_dir, alpha_id, series=None):
 
 
 def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
-                    page_limit=10000, attempts=3, report=None):
+                    page_limit=10000, attempts=3, report=None, max_wait_seconds=180.0):
     """Read daily PnL; never return or cache a silently truncated recordset.
 
     Raw cache files remain date/value maps. A hash-bound metadata sidecar records
     successful pagination; older cache files have unknown completeness until refreshed.
+    Retry-After takes precedence over a nonempty body. The total wait is bounded;
+    pending pages raise RateLimited without replacing complete cached evidence.
     """
     if not isinstance(page_limit, int) or isinstance(page_limit, bool) or page_limit < 1:
         raise ValueError("page_limit must be a positive integer")
     if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 1:
         raise ValueError("attempts must be a positive integer")
+    if (isinstance(max_wait_seconds, bool) or not isinstance(max_wait_seconds, (int, float))
+            or not math.isfinite(max_wait_seconds) or max_wait_seconds < 0):
+        raise ValueError("max_wait_seconds must be a finite, non-negative number")
     evidence = {"source": "platform", "complete": False, "pages": 0,
                 "points": 0, "as_of": None, "error": None, "missing_values": 0}
 
@@ -2073,6 +2111,7 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
 
     evidence = {"source": "platform", "complete": False, "pages": 0,
                 "points": 0, "as_of": None, "error": None, "missing_values": 0}
+    deadline = time.monotonic() + max_wait_seconds
     out = {}
     offset = 0
     total = None
@@ -2081,15 +2120,27 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
         while True:
             url = BRAIN_API_URL + "/alphas/" + alpha_id + "/recordsets/daily-pnl"
             for attempt in range(attempts):
+                if time.monotonic() >= deadline:
+                    raise RateLimited("daily PnL read exceeded its wait budget")
                 response = s.get(url, params={"limit": page_limit, "offset": offset},
-                                 timeout=_request_timeout(None))
-                if response.status_code == 200 and response.text.strip():
-                    break
+                                 timeout=_request_timeout(deadline))
                 if response.status_code in (401, 403):
                     raise AuthError("session rejected while reading daily PnL")
                 if response.status_code == 404:
                     raise NotFound("daily PnL is unavailable for %s" % alpha_id)
+                retry_after = _retry_after_seconds(response, cap_error_wait=False)
+                if retry_after > 0:
+                    evidence["retry_after_seconds"] = retry_after
+                    if attempt + 1 == attempts or retry_after >= deadline - time.monotonic():
+                        raise RateLimited("daily PnL is not ready; retry after the reported delay")
+                    time.sleep(retry_after)
+                    continue
+                if response.status_code == 200 and response.text.strip():
+                    evidence.pop("retry_after_seconds", None)
+                    break
                 if attempt + 1 < attempts:
+                    if 3 >= deadline - time.monotonic():
+                        raise RateLimited("daily PnL read exceeded its wait budget")
                     time.sleep(3)
             if response.status_code == 429:
                 raise RateLimited("daily PnL read was rate limited")
