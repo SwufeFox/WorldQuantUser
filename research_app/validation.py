@@ -23,6 +23,11 @@ def _python_finding(code, message, severity="error", **location):
 
 
 def _parse_python_source(source):
+    """Read the static BRAIN Alpha interface without importing analyst code.
+
+    Literal data declarations allow the online preflight to verify the exact
+    submitted field set. Return-array shape and dtype are runtime properties.
+    """
     result = {"language": "PYTHON", "expression": source, "declared_fields": None,
               "operator_count": None, "operator_estimate": None, "operators": [],
               "calls": [], "denylist_unverified": [], "details": None,
@@ -147,6 +152,8 @@ def _preflight_lint(session, pairs, settings, args, capability_snapshot=None):
         "account": account,
         "coverage": {"complete": False}, "freshness": {"state": "unknown"}})
     if python:
+        # Python declarations provide field names directly; operator metadata
+        # and FASTEXPR type inference do not apply.
         operator_evidence.update(state="not_applicable")
         results = [_parse_python_source(expression) for expression, _ in pairs]
         required = {field for result in results for field in (result["declared_fields"] or [])}

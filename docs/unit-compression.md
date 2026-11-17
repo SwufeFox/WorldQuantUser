@@ -9,6 +9,10 @@ stops and why**. Run `python3 tools/unit_report.py` against the current research
 directory for counts and coverage; private corpus measurements stay with that
 research evidence.
 
+The decomposition describes FastExpr. Python Alpha keeps its source identity in
+the ledger and uses the shared research workflow. Unit counts and derivations
+describe FastExpr constructions.
+
 ## Why not sugar, and not parts
 
 Sugar and parts answer different questions from unit compression:
@@ -36,9 +40,9 @@ An expression becomes five things:
 
 Three decisions in there were paid for by a failure:
 
-**Fields are shared slots, numbers are not.** A field appearing twice is one slot,
-because ``rank(close - low)`` and ``rank(close + low)`` are the same construction with
-the same input. Numbers appearing twice are *two* slots, because sharing them by value
+**Field slots can repeat.** Both occurrences of `close` in
+`rank(close / low) + rank(close / high)` share a slot. Numbers appearing twice
+occupy two slots, because sharing them by value
 made ``- 0.5 * x - 0.5`` and ``- 0.5 * x - 1.5`` land in different units although only
 a weight changed — a change of weight must not be a change of template.
 
@@ -49,11 +53,10 @@ to the hand-written original and be reported as novel. Four rewrites, none algeb
 ``a + -x -> a - x``, ``1 * x -> x``, ``-1 * x -> -x``, ``x + 0 -> x``. Nothing is
 commuted, factored or folded.
 
-**A scale factor on the whole signal is divided out.** Under portfolio
-normalisation, multiplying the whole signal by a positive scalar does not create
-a new construction. Factoring it out before decomposing the sum prevents a scaled
-copy from landing in its own template. Weights *inside* the sum remain grid values
-and are never stripped.
+**The report divides out whole-signal scale factors.** Factoring out a positive
+scale before decomposing the sum keeps scaled copies in one template. The
+current implementation removes negative factors too, so opposite exposures
+can share a unit. Weights inside the sum remain grid values.
 
 ## The hierarchy
 
@@ -65,6 +68,10 @@ and are never stripped.
 | Kinds (assembly × data family) | What combinations of shape and data families exist |
 | Units (exact template) | Which constructions and grid points are represented |
 | One-step moves | What can be tried next using values already observed |
+
+Unit compression keys on the flattened expression. Probe repeat checks use
+source identity and effective request settings. The FastExpr source hash
+retains assignments.
 
 Coarser levels compress more but say less about an individual alpha. Singleton
 templates and sparse grids indicate limited coverage of a construction; they do
@@ -129,9 +136,8 @@ not "promising".
 
 ## The round-trip gate
 
-`verify` refills every template from its own filling and demands canonical equality
-with the source expression. A template that cannot be re-instantiated cannot support
-a trustworthy coverage claim. The current report supplies any failures.
+`verify` refills every template from its own filling and compares it to the
+canonical, flattened point used by the report. The report shows refill failures.
 
 ## How to recompute
 

@@ -1093,7 +1093,11 @@ def _turnover_band(expression):
 
 
 def _settings_signature(settings):
-    """Stable identity of the complete settings, without inventing missing defaults."""
+    """Compare known settings without inventing missing defaults.
+
+    Python uses the effective wire settings. FASTEXPR retains the signature
+    used by earlier batches and ledger lookups.
+    """
     settings = settings or {}
     if ml.is_python_language(settings.get("language")):
         settings = ml.regular_wire_settings(settings)
@@ -1101,7 +1105,7 @@ def _settings_signature(settings):
 
 
 def _normalized_expression(text):
-    """Whitespace-free form so a platform expression matches its spec arm."""
+    """Legacy FASTEXPR text key for matching platform expressions to saved arms."""
     return "".join((text or "").split())
 
 
@@ -1580,6 +1584,7 @@ def _probe_checkpoint_refs(target, arms, gate):
 
 
 def _recoverable_probe_reference(row):
+    """Only link to recovery when the saved row identifies an accepted job."""
     if (row["submission_state"] != "accepted" or row.get("submission_attempted") is False
             or str(row.get("status") or "").upper() in simulation_slots.TERMINAL_FAILURE_STATUSES
             or (not row.get("metrics_pending") and row.get("train_fitness") is not None)):
@@ -1633,6 +1638,11 @@ def _prepare_probe(args):
 
 
 def _request_fingerprint(arms):
+    """Hash the ordered, materialized requests saved for a single batch.
+
+    Unlike replay matching, this includes labels and the full resolved
+    settings. Source file paths are provenance; saved source is the input.
+    """
     request = [{"label": arm["label"], "expression": arm["expression"],
                 "settings": arm["settings"]} for arm in arms]
     return hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":"),

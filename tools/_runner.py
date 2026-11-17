@@ -176,7 +176,12 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None):
 
 def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
               concurrency=None, consume=None):
-    """Visit one inbox at a time and archive only terminal outcomes."""
+    """Lock one inbox and archive only terminal outcomes.
+
+    A deferred job stays with its saved batch. In once mode, process at most
+    one spec and return 0 for done or empty, 1 for failed, or 3 for deferred
+    or busy. The optional consumer runs before terminal archival.
+    """
     inbox.mkdir(parents=True, exist_ok=True)
     for state in ("done", "failed"):
         (inbox / state).mkdir(exist_ok=True)

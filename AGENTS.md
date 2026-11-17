@@ -46,6 +46,11 @@ section when needed, rather than loading every recipe.
   and reports arm-minus-control train deltas. `triage` screens on train metrics
   and train PnL; `--show-test` is the explicit validation view after freezing.
   Missing evidence stays unknown rather than being filled from the full window.
+- For Python, declare `language: PYTHON` and the required `lookback`. Declare
+  BRAIN inputs in `@alpha(data=[...])`. Use the .py entry points or a
+  spec-relative `source_file`. Preflight parses the source without executing it.
+  Use an explore design to compare languages and align the PnL date ranges
+  before deciding whether two implementations agree.
 - Carry forward decisions, not the conversation. Keep `open-threads.md` in the
   research directory: one `- [open] **question** — evidence; next discriminating
   check` or `- [closed] **question** — conclusion; evidence; reopening condition`
@@ -57,6 +62,8 @@ section when needed, rather than loading every recipe.
 1. Always `simulate FILE --dry-run` / `probe FILE --dry-run` before a real run.
    Simulations consume time and platform capacity; account limits are live facts.
    Reuse stored results through `alpha get` / `alpha list` instead of rerunning.
+   Probe preview can point to past results and a recoverable job in the
+   expected batch file. References do not start jobs or substitute results.
    If a run stops, inspect its saved progress first: `resume CHECKPOINT` for
    simulation jobs, `probe --recover BATCH` for probe evidence. Never rerun a
    whole spec merely because its stdout was lost.
@@ -65,13 +72,15 @@ section when needed, rather than loading every recipe.
 3. Prefer `catalog fields --expressions` for field wrappers. Inspect structured
    checks and comparisons when deciding what an experiment demonstrated.
 4. Train data supports design and selection; view test data after freezing the
-   design. Keep validation distinct from another tuning round.
+   design. Campaign freezes its measured training gate before calling
+   `promote --selection`. If required evidence is unknown, the worker defers
+   the spec and does not open the test view.
 5. Keep credentials out of chat, logs and commits. `.env` and session caches are
    private; the current cache path comes from the CLI, not a remembered filename.
-6. stdout is exactly one JSON document, success or failure; stderr is progress
-   (and JSONL events with `--stream`). Branch on `error.code`, not message text.
-   Exit codes: 0 success, 2 input, 3 auth, 4 service/rate limit, 5 missing,
-   6 all simulations failed, 7 submission disabled, 130 interrupted.
+6. Structured commands, including `help` and `schema`, write one JSON document
+   to stdout. Terminal `--help` and `--version` write text. Progress and
+   `--stream` events go to stderr. Branch on `error.code` for structured errors.
+   See `schema` for the current error and exit codes.
 7. Code lives in the repo; results, evidence, caches and throwaway scripts live
    in the research directory. Do not add a new tool when an existing command can
    answer the question. Before a new entry point, explain the closest tool, why
@@ -86,6 +95,7 @@ section when needed, rather than loading every recipe.
 | Shared errors, output, settings, sessions | `research_app/runtime.py` |
 | Simulation, probe, resume, ablation, comparisons | `research_app/experiments.py` |
 | Catalog and validation | `research_app/catalog.py`, `research_app/validation.py` |
+| Training selection, promotion, candidate shelf | `research_app/triage.py`, `research_app/selection.py`, `research_app/promote.py`, `research_app/buffer_cmd.py` |
 | Platform alphas and local ledger | `research_app/alphas.py`, `research_app/ledger.py` |
 | Briefs, account, literature | `research_app/campaign.py`, `research_app/account.py`, `research_app/literature.py` |
 | Research-file contract and BRAIN client | `research_config.py`, `machine_lib.py` |
@@ -98,10 +108,10 @@ on CLI paths or call `input()`. Defaults and allowed settings live in
 
 Preserve the JSON envelope and documented error/exit codes. Update meaningful
 behavioral coverage in `tests/test_contract.py` for contract changes, and run the
-offline suite without credentials:
+offline pytest suite without credentials:
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pytest -q
 ```
 
 Update the relevant usage documentation; keep [docs/tooling.md](docs/tooling.md)

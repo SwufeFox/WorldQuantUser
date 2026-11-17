@@ -23,17 +23,20 @@ python3 tools/backup_replay.py replay --ids ALPHA_ID --run
 | Profile | Contents |
 | --- | --- |
 | `ledger` | `alpha-registry.jsonl`, `field-units.json` |
-| `state` | everything except `cache/` — results, PnL series, checkpoints, notes |
-| `full` | `state` plus the metadata cache, for a machine that has to work offline |
+| `state` | Research files under the selected root, excluding its `cache/` and the common exclusions |
+| `full` | `state` plus the research cache, subject to the same common exclusions |
 
 The default is `state`: the cache is fetched again on demand, the PnL series and the
 ledger are not.
 
-**A session cookie is never archived, in any profile.** `cache/session.json` is a
-live BRAIN session; an archive is a file that gets copied, mailed and restored onto
-other machines. Restoring a machine costs one login, so there is nothing to trade.
-The manifest records what was left out (`excluded_secrets`) so the omission is
-visible rather than remembered.
+All profiles exclude known credential filenames, including `cache/session.json`
+and `.env`. The manifest lists detected exclusions under `excluded_secrets`.
+This is a filename filter, so notes, results, or source files may still contain
+sensitive content.
+
+An archive covers the selected root. Standalone `simulate` defaults to
+`.brain_checkpoints/` in the invocation directory. To keep those checkpoints in
+scope, pass `--checkpoint` with a path under the research root.
 
 ## What an archive is
 
@@ -42,8 +45,8 @@ visible rather than remembered.
 
 * every member's path, size, mtime and sha256;
 * the archive's own size and sha256;
-* the ledger's numbers — rows, distinct keys, date range, verdict mix, and the book
-  counted **per key**;
+* the ledger's row count, distinct keys, date range, verdict mix, and latest
+  `ACTIVE` count per key;
 * anything deliberately excluded.
 
 Member paths in the manifest and archive use `/` on every platform. Windows
@@ -61,7 +64,7 @@ cannot be mistaken for the number of distinct alphas.
 prints success. An unreadable backup that claims to be fine is worse than no backup,
 because it stops you making a second one.
 
-`verify` fails on **three** things, not one:
+`verify` checks the archive hash and compares its members with the manifest.
 
 * a member whose hash or size differs;
 * a member in the manifest that is missing from the archive;
@@ -75,25 +78,27 @@ write.
 
 ## Point-in-time replay (`asof`)
 
-The ledger is append-only, so any past view is recoverable: take the rows up to a
-timestamp and keep the newest record per key. **Filter first, deduplicate second** —
-that order is the whole feature, because a key rewritten after the cutoff has to
-keep the value it had before it.
+Point-in-time views use the dated history retained in the ledger. Apply the
+cutoff before keeping the newest record per key. A revision after the cutoff
+leaves the earlier value visible.
+
+An explicit cutoff omits undated rows. Reconstruction uses the keys saved in the
+ledger, including historical expression hash formats.
 
 `asof --json` writes the reconstructed rows, so a report can be checked against the
 state it was written from instead of against today's ledger.
 
 ## Drift check (`replay`)
 
-Re-simulates selected rows through `guarded_sim` — the only supported simulation
-entry point — and diffs `sharpe`, `fitness`, `turnover`, `returns`, `drawdown`
-against what was recorded, field by field, with a tolerance.
+Re-simulates selected rows through `guarded_sim` with stored source and
+settings, then compares `sharpe`, `fitness`, `turnover`, `returns`, and
+`drawdown` field by field. Python rows need a stored language marker and currently
+verified account capability. The platform runs with today's data and rules.
 
 * It is a **dry run unless `--run`** is given, because it spends simulations.
-* It **writes a report, not the ledger**. A replay is evidence, not a new
-  observation; appending it would double every key.
-* A metric missing on either side is reported as *missing*, never as a difference of
-  zero.
+* It prints a report. `--json PATH` saves the report separately from the ledger.
+* A metric present on only one side is reported as missing. A metric absent on
+  both sides is omitted from the comparison.
 * A different alpha id for the same expression and settings is reported separately:
   that is an identity change, not a numeric drift.
 * One failure does not stop the batch.
@@ -106,8 +111,10 @@ directory so they remain tied to the selected records and observation time.
 
 * No incremental or deduplicated archives: every backup is a full copy in a format
   that can be opened with `tar`.
-* No encryption. The exclusion list is the security boundary, so treat an archive as
-  a copy of the research directory minus credentials.
+* Archives are unencrypted. Treat them as copies of private research data.
+* Verification expects regular files. File symlinks selected under the root can
+  cause verification to fail because tar stores them as links. `--exclude NAME`
+  can omit a directory by name, including the files inside it.
 * `restore` extracts a whole archive; there is no single-file restore.
 * `replay` re-simulates one expression at a time, so a large sample is slow; it is a
   spot check, not a nightly job.

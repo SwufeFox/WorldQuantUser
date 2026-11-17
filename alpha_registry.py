@@ -124,20 +124,15 @@ def default_registry_path():
 
 
 def expression_hash(expression, language=None):
-    """Stable short hash of an expression, used as the fallback key.
+    """Stable short hash of Alpha source, used in placeholder keys and lookups.
 
-    Identity goes through the tree: ``rank(close)``, ``((rank(close)))`` and a copy
-    with a leading comment are one expression, and hashing their text gives three
-    keys. The canonical form (see :func:`fastexpr_ast.canonical`) collapses those.
+    Python hashes the source under ``py:`` after normalizing line endings.
+    Indentation and whitespace inside strings can change the program, so all
+    other text is retained.
 
-    The prefix records which rule produced the key. Rows written before 2026-10-31
-    carry ``expr:`` and are left untouched -- rewriting historical keys would silently
-    change what the append-only ledger dedupes against, and a key that changes meaning
-    is worse than a key that is merely older. New rows use ``expr2:``.
-
-    Unparseable text keeps the text hash under ``expr:``: a damaged expression still
-    needs a stable key, and pretending its tree is empty would collide every such row
-    with every other.
+    FASTEXPR uses ``expr2:`` for canonical trees. This collapses extra parentheses
+    and comments. Unparseable source retains the legacy text hash under ``expr:``.
+    Existing ledger keys stay intact to preserve historical deduplication.
     """
     if ml.is_python_language(language):
         source = ml.normalize_python_source(expression or "")
@@ -183,10 +178,10 @@ _FINGERPRINT_KEYS = ("universe", "region", "delay", "decay", "neutralization",
 
 
 def settings_fingerprint(settings):
-    """Short hash of the settings that decide what a simulation measures.
+    """Short settings hash for records without a platform Alpha ID.
 
-    The expression hash carries language identity independently. Display settings
-    such as ``visualization`` do not distinguish ledger placeholders.
+    Python includes the REGULAR wire settings, including lookback. FASTEXPR
+    keeps the historical subset so legacy placeholder keys continue to match.
     """
     if not settings:
         return "nosettings"

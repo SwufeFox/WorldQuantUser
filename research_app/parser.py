@@ -403,7 +403,8 @@ def build_parser():
                                help="Validate --selection using full-window and test evidence; logs the view.")
     triage_parser.add_argument("--train-end", metavar="YYYY-MM-DD",
                                help="Exclusive train end; cannot extend past recorded test starts. "
-                                    "Default: earliest recorded test start, else 2023-01-01.")
+                                    "Default: earliest recorded test start, else 2023-01-01. "
+                                    "Shelf screening requires known test starts for the compared alphas.")
     triage_parser.add_argument("--min-delta", type=float, default=None, dest="min_delta",
                                help="Minimum train delta; validation retains the frozen criterion.")
     triage_parser.add_argument("--retention-floor", type=float, default=None,
@@ -413,7 +414,8 @@ def build_parser():
     triage_parser.add_argument("--against-shelf", action="store_true",
                                help="Compare candidates against the shelf on the same training window.")
     triage_parser.add_argument("--max-shelf-correlation", type=float, default=None, metavar="RHO",
-                               help="Require measured train evidence and a shelf correlation below this ceiling "
+                               help="With --against-shelf, require positive train contribution and a "
+                                    "maximum absolute shelf correlation below this ceiling "
                                     "before writing a requested freeze.")
     triage_parser.add_argument("--buffer", default=None, metavar="PATH",
                                help="Candidate shelf used by --against-shelf.")
@@ -423,9 +425,9 @@ def build_parser():
 
     promote_parser = sub.add_parser(
         "promote", help="Freeze, validate, check and shelve one candidate.",
-        description="Run triage freeze, frozen validation, alpha check and buffer add in order. "
+        description="Freeze the candidate or reuse --selection, then validate, check and add to the shelf. "
                     "Keep every completed step's evidence; stop on an operational failure. "
-                    "Dry runs still freeze, validate and check, but do not write the shelf.")
+                    "Dry runs still open the test view and perform platform checks.")
     promote_parser.add_argument("alpha_id", metavar="ALPHA_ID")
     promote_parser.add_argument("--note", default=None)
     retention_option = promote_parser.add_argument(
@@ -442,7 +444,8 @@ def build_parser():
     promote_parser.add_argument("--buffer", default=None, metavar="PATH",
                                 help="Shelf file (default: in research dir).")
     promote_parser.add_argument("--dry-run", action="store_true",
-                                help="Run freeze, validation and checks; report would_buffer if eligible.")
+                                help="Run validation and platform checks. Report would_buffer without "
+                                     "writing the shelf if eligible.")
     _add_cost_args(promote_parser)
     promote_parser.set_defaults(func=promote.cmd_promote)
 
@@ -780,8 +783,8 @@ def build_parser():
     sim.add_argument("--registry", default=None,
                      help="Override the alpha registry path.")
     sim.add_argument("--allow-lint-errors", action="store_true",
-                     help="Submit even when the operator lint fails (the previous "
-                          "behaviour). Not recommended: the failure costs a rerun.")
+                     help="Permit a FASTEXPR launch with lint findings. Python preflight and "
+                          "unsupported setting errors still block.")
     sim.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
                      help="Sort results by this metric, best first.")
     sim.add_argument("--top", type=int, default=None,
@@ -931,8 +934,8 @@ def build_parser():
                     "Results include durable path, run identity, per-arm outcomes and next actions. "
                     "--recover only reads platform jobs; --resume explicitly starts unsubmitted work.")
     probe.add_argument("--allow-lint-errors", action="store_true", dest="allow_lint_errors",
-                       help="Simulate even when the lint reports blocking findings. Not "
-                            "recommended: the platform will reject the arm anyway.")
+                       help="Permit a FASTEXPR launch with lint findings. Python preflight and "
+                            "unsupported setting errors still block.")
     probe.add_argument("--strict-gate", action="store_true", dest="strict_gate",
                        help="Refuse a finished prior result with the same expression and "
                             "effective settings. Dry-run previews the blocking evidence.")
@@ -944,7 +947,7 @@ def build_parser():
                                    "use --dry-run to preview first.")
     probe.add_argument("spec", nargs="?", default=None,
                        help="JSON experiment spec. Arms take an inline expression or a relative Python "
-                            "source_file. Use design=explore for scans. "
+                            "source_file. Use design=explore for scans or mixed-language batches. "
                             "Omitted with --recover or --resume.")
     _add_settings_args(probe)
     _add_session_args(probe)
@@ -1505,7 +1508,8 @@ _COMMAND_EXAMPLES = {
     "catalog verify": ["catalog verify --fields close volume --strict"],
     "catalog categories": ["catalog categories"],
     "catalog field-audit": ["catalog field-audit --fields close,volume"],
-    "lint": ['lint --expr "rank(close)" --offline', "lint --file research.json"],
+    "lint": ['lint --expr "rank(close)" --offline', "lint --file research.json",
+             "lint --file reversal.py --offline"],
     "paper": ['paper "accruals stock returns" --limit 3',
               'paper --id W2741809807', 'paper --id W2741809807 --related references --limit 5',
               'paper --id W2741809807 --full-text --max-chars 12000'],
@@ -1516,6 +1520,7 @@ _COMMAND_EXAMPLES = {
              'feed --sources-file radar-sources.json --summary --dry-run',
              'feed --market coinbase:BTC-USD --book-depth 10 --summary --dry-run'],
     "simulate": ['simulate --expr "rank(close)" --dry-run',
+                 "simulate reversal.py --setting lookback=0 --dry-run",
                  "simulate research.json --sort fitness --save results.json"],
     "resume": ["resume CHECKPOINT.json --save results.json"],
     "ablate": ['ablate --expr "a = rank(close); b = rank(volume); a + b" --out variants.json'],
@@ -1523,13 +1528,16 @@ _COMMAND_EXAMPLES = {
                 "compare --frozen --selection choice.json --summary",
                 'compare --match "sample-batch*.json" --latest --sort none'],
     "triage": ["triage --batch BATCH.json --freeze choice.json",
+               "triage --ids ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --freeze choice.json",
                "triage --show-test --selection choice.json"],
     "promote": ['promote ALPHA_ID --note "frozen validation passed" --cost-bps 5 10 20',
+                "promote ALPHA_ID --selection choice.json --max-self-correlation 0.7",
                 "promote ALPHA_ID --dry-run"],
     "brief": ["brief", "brief --days 7 --top 5"],
     "ask": ["ask --by neutralization --stat n,median:sharpe,floor_share",
             "ask --where status=ACTIVE --list"],
     "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json --check",
+              "probe python.spec.json --batch-path PYTHON_BATCH.json --dry-run",
               "probe batch.spec.json --batch-path BATCH.json --save response.json",
               "probe --recover BATCH.json --max-wait-seconds 60",
               "probe --resume BATCH.json --dry-run"],

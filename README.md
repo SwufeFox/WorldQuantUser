@@ -1,8 +1,8 @@
 # Alpha Machine
 
 Tools for researching [WorldQuant BRAIN](https://platform.worldquantbrain.com/)
-alphas: generate FASTEXPR expressions, simulate them, and read back which ones
-scored well.
+alphas. Simulate FASTEXPR expressions and Python Alpha source, keep the evidence
+from each experiment, and validate candidates against a frozen training choice.
 
 The repository is built around one idea: **a program should be able to drive the
 research loop without reading the source.** The core workflow is exposed by
@@ -25,7 +25,7 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `research_app/runtime.py` | Shared CLI contract, JSON output, input settings and authenticated sessions. |
 | `research_app/account.py` | Account access and local cache commands. |
 | `research_app/catalog.py` | Dataset, datafield and operator discovery. |
-| `research_app/validation.py` | Expression lint and simulation preflight checks. |
+| `research_app/validation.py` | FASTEXPR lint, Python Alpha static checks and simulation preflight. |
 | `research_app/experiments.py` | Simulation, resumption, labelled probes, ablation and comparison. |
 | `research_app/alphas.py` | Platform alpha inspection, metadata, submission and correlation. |
 | `research_app/ledger.py` | Local ledger recording, labels, lineage, coverage, shared legs and offline queries. |
@@ -54,7 +54,9 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `alpha_unit.py` | Compress the ledger into constructions: template, grid, derivation. |
 | `expression_units.py` | Field units, harvested from the simulator's rejections. |
 | `rejection_reasons.py` | Why a rejection happened: the cause, not just the gate. |
-| `tools/guarded_sim.py` | Simulate only after the catalogue check; refuses unknown names. |
+| `tools/guarded_sim.py` | Bind simulation launches to preflight for the exact source and settings. |
+| `tools/_runner.py` | Shared workspace and durable Probe handling for research queues. |
+| `tools/campaign_runner.py` | Screen completed experiments on training evidence before candidate promotion. |
 | `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
 | `research_app/substitution.py` | Whole-token field substitution: the "change exactly one input" batch. Exact and identifier-bounded, because `replace("sales", ...)` also rewrote `sales_growth`. |
 | `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |
@@ -127,18 +129,12 @@ pattern-matching the string.
 
 ## Documentation
 
-Four pages, each written to stop a specific mistake being repeated:
-
 | Page | Read it when |
 | --- | --- |
-| `docs/tooling.md` | you are about to add a tool, or cannot remember which one answers a question |
-| `docs/ast-pipeline.md` | you are about to inspect an expression with a regex |
-| `docs/unit-compression.md` | you want to know how many constructions there really are, and what each has not tried |
-| `docs/backup-replay.md` | you are about to trust a number, or touch the research directory |
-
-The pattern in all four is the same: measure first, record what was measured *and
-rejected*, and state the number with its unit, because the counts in prose go stale
-and the reasons do not.
+| [Tool map](docs/tooling.md) | Choose a CLI command, check its evidence, or recover a runner batch. |
+| [Expression pipeline](docs/ast-pipeline.md) | Understand FASTEXPR parsing, source identity, and structural analysis. |
+| [Unit compression](docs/unit-compression.md) | Inspect FASTEXPR construction coverage and reproduce the report. |
+| [Backup and replay](docs/backup-replay.md) | Archive research state, restore a workspace, or check historical results. |
 
 ## Install
 
@@ -494,6 +490,66 @@ explicit invocation may obtain fresh evidence. Dry-run reports unknown quota wit
 A failed expression is reported in its own record instead of aborting the run;
 the command only fails outright when *every* expression failed.
 
+### Python Alpha
+
+Save a whole Alpha as `signal.py`. The source below illustrates the input shape
+for a short price-reversal experiment.
+
+```python
+from brain.alphas import alpha
+
+
+@alpha(data=["returns"], store=[])
+def signal(data, store):
+    return (-data.returns[-1]).astype("float32")
+```
+
+A `.py` input to `lint` or `simulate` supplies one Python Alpha and sets the
+language. A Probe spec declares the language and lookback in effective settings
+and supplies either inline source in `expression` or a `source_file` path relative
+to the spec. Save the example spec below as `python-reversal.spec.json` next to the
+source. For a spec read from stdin, use inline `expression`.
+
+```json
+{
+  "name": "python-reversal",
+  "design": "explore",
+  "settings": {"language": "PYTHON", "lookback": 0, "testPeriod": "P1Y"},
+  "arms": [{"label": "recent-returns", "source_file": "signal.py"}]
+}
+```
+
+```bash
+python research_cli.py lint --file signal.py --offline
+python research_cli.py simulate signal.py --setting lookback=0 --dry-run
+python research_cli.py probe python-reversal.spec.json --dry-run
+python research_cli.py probe python-reversal.spec.json --check
+```
+
+Static lint parses a top-level `@alpha` function with two positional arguments
+and reads the literal `data=[...]` declaration without executing the code.
+Live preflight requires account-scoped evidence for Python and the declared
+fields. The REGULAR request carries source in `regular` and omits `unitHandling`
+and `nanHandling` for Python. It omits `selectionHandling` and `selectionLimit`
+for both languages. The Alpha handles its own
+missing values and output dtype. Preflight reports omitted settings under
+`settings_capabilities.omitted_from_payload`. `--allow-lint-errors` cannot clear
+Python preflight failures.
+
+The runtime passes up to `lookback + 1` rows per field, with the latest row last.
+Warm-up windows may be shorter. Return a one-dimensional `float32` array with
+one value per instrument.
+
+Python shares the existing ledger, PnL, checkpoint and recovery workflow.
+The checkpoint contains the source itself, so resuming uses the captured version.
+Python identity preserves whitespace and indentation and only
+normalizes line endings. FASTEXPR AST transformations and structural comparisons
+apply to FASTEXPR code.
+
+A Probe with both languages uses `design: "explore"`. For a cross-language
+comparison, explicitly align the daily PnL on shared training dates before
+interpreting differences in scores.
+
 ### Probe a labelled experiment
 
 Use one spec for a batch of arms and their settings:
@@ -526,13 +582,14 @@ python research_cli.py probe sample-batch.spec.json --batch-size 6 --summary --b
 `probe --dry-run` is a fully offline preview: it loads no session or credentials,
 contacts no catalog, and spends no simulation quota. It validates every settings
 group, resolves defaults and per-arm decay, and returns the complete settings and
-exact `POST /simulations` payload for each labelled arm in `results`. Structural
-lint and the learned denylist run locally; `blocking` lists their errors. Matching
+exact `POST /simulations` payload for each labelled arm in `results`. FASTEXPR
+lint includes the learned denylist. Python uses static source checks.
+`blocking` lists local findings that would prevent a launch. Matching
 private catalog snapshots can supply scoped field evidence, but live metadata remains
 unchecked. `probe SPEC --check` authenticates and verifies the exact same resolved
 requests without submitting a simulation. Missing, stale or incomplete required
-catalogs block execution unless explicitly overridden with `--allow-lint-errors`;
-an override preserves the errors and cannot make `preflight_complete` true.
+catalogs block execution. A FASTEXPR `--allow-lint-errors` override preserves
+those errors and leaves `preflight_complete` false.
 
 A real probe validates every group locally before loading a session or submitting
 anything, then checks current capabilities and required catalogs. The guarded launch reuses
@@ -546,10 +603,16 @@ under `unavailable`; explore batches report no attribution. Spec `idea`, `mechan
 and `note` travel with the preview, batch file and summary. Existing batch files
 are protected before simulation; choose another path/name or pass `--force`.
 
-`--strict-gate` refuses only an arm whose canonical expression and complete
-effective settings already have a finished result in the registry. A dry run
-shows `gate_blocking` / `would_block` and the prior evidence keys; structural
-similarity is reported separately and never blocks.
+`--strict-gate` refuses a finished registry result with the same source identity
+and complete effective settings. A dry run exposes `gate_blocking` and
+`would_block`, along with available prior train metrics in `gate.completed_refs`.
+`gate.structural_refs` gives related FASTEXPR history for review.
+
+Preview also inspects the intended batch path. Pass `--batch-path` to check an
+older batch. Exact matches may add `gate.checkpoint_completed_refs` or
+`gate.checkpoint_recovery_refs`, with a read-only `probe --recover` command under
+`next_actions` when an accepted job needs evidence. These references are for
+explicit recovery or comparison. Simulation launches remain separate actions.
 
 `probe` accepts the same settings and session flags as `simulate`. Explicit settings
 override the spec and each arm's settings; an arm's top-level `decay` remains its
@@ -608,6 +671,29 @@ dollar traded; `margin_bps = margin * 10000`. `--cost-bps` gives one-way scenari
 dollar traded (default 5, 10, 20), so `net_margin_bps = margin_bps - cost_bps`. Aggregate
 turnover does not identify a daily trading path: daily costs and net Sharpe remain unknown.
 Missing train margin is never replaced by full-window margin.
+
+### Screen a campaign candidate before promotion
+
+```bash
+python research_cli.py triage --ids ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --min-delta 0 --freeze campaign-choice.json
+python research_cli.py promote ALPHA_ID --selection campaign-choice.json --max-self-correlation 0.7
+```
+
+With a shelf ceiling, `triage` writes the selection only after the local training
+gate passes. It requires measured PnL coverage, positive book contribution,
+and a candidate-to-shelf correlation below the ceiling. `training_gate`
+explains a rejection or missing evidence. The shelf, book membership and source
+identity are bound to the frozen choice.
+
+`promote --selection` uses that exact single-candidate selection with its saved
+retention floor and cost scenarios. It opens the test view, checks live
+platform results, and writes to the shelf only if the gates pass. The optional
+self-correlation ceiling is a separate live requirement. `--dry-run` still
+accesses the test view and runs the platform checks.
+
+`tools/campaign_runner.py` applies this order automatically to durable Probe
+batches. It keeps work with missing training evidence in the queue and logs
+the reason.
 
 ### Inspect results
 
@@ -1004,12 +1090,12 @@ python research_cli.py lint --file sample-batch.json --dataset fundamental6
 python research_cli.py lint --offline 'rank(close)'      # no account needed
 ```
 
-The operator names in an expression are checked against `GET /operators`, the
+The operator names in a FASTEXPR expression are checked against `GET /operators`, the
 authoritative list -- not the documentation site, which describes operators the
 simulator does not accept. (`regression_neut` is the cautionary example: a docs
 page exists, the operator does not.) `simulate` runs the same check before
-submitting and refuses to spend quota on an expression that cannot work; pass
-`--allow-lint-errors` to override. Exit code is `2` on a lint failure and the
+submitting. FASTEXPR can explicitly override lint errors with
+`--allow-lint-errors`. Exit code is `2` on a lint failure and the
 error envelope carries every finding under `error.details`.
 
 Online `lint` and simulation preflight derive names and types from one exact field scope.
@@ -1321,8 +1407,9 @@ automatically verified mechanism. See [the workflow and tool comparison](docs/to
 
 `lint` and `simulate` accept repeated `--file` and `--expr` arguments. Files merge
 in order; later files override earlier settings, then command-line flags override
-the merged settings. Each expression's own `decay` remains authoritative. A file
-that does not start with `{` or `[` is plain text: one expression per line,
+the merged settings. Each expression's own `decay` remains authoritative. A
+`.py` file is one whole source as described in [Python Alpha](#python-alpha).
+Other text without a JSON prefix holds one FASTEXPR expression per line, with
 blank lines and `#` comments skipped. Inputs are UTF-8, with or without a BOM.
 
 ```bash
@@ -1390,14 +1477,15 @@ platform's own terms.
 ## Tests
 
 ```bash
-python -m unittest discover -s tests -v
+python -m pip install pytest
+python -m pytest -q
 ```
 
-Fully offline: schema, dry-run payloads, research-file parsing, credential
-precedence, error envelopes, and a guard that no credential file is tracked by
-git.
+The suite runs offline with local fixtures and mocked platform responses.
 
-`tests/test_contract_v2.py` covers the v2 additions: field-contract inference and
-verdicts (including the exact share-count and fiscal-alignment blockers from the
-research notes), lint operator/arity/denylist behaviour, and registry
-append/replace/merge semantics.
+| What changed | Relevant tests |
+| --- | --- |
+| CLI schema, error envelopes and file inputs | [`test_contract.py`](tests/test_contract.py), [`test_contract_v2.py`](tests/test_contract_v2.py) |
+| Python source, account preflight and payload | [`test_python_preflight.py`](tests/test_python_preflight.py), [`test_regular_settings_payload.py`](tests/test_regular_settings_payload.py), [`test_expression_identity.py`](tests/test_expression_identity.py) |
+| Probe reuse, queue recovery and Campaign | [`test_probe.py`](tests/test_probe.py), [`test_research_runners.py`](tests/test_research_runners.py) |
+| Training freeze and candidate validation | [`test_triage_modes.py`](tests/test_triage_modes.py), [`test_promote.py`](tests/test_promote.py) |

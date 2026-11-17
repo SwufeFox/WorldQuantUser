@@ -1,9 +1,12 @@
 # The expression tree, and what it is for
 
-Everything below depends on one change: FASTEXPR is parsed into a tree instead of
-being inspected as a string. This document records *why*, what it bought, what was
-measured before each step, and what was measured and then deliberately not done —
-so the same ground is not re-covered.
+FastExpr is parsed into a tree for linting, identity, and structural research.
+This document records which operations use that tree and where its claims stop.
+
+Python Alpha uses a separate static source check. It parses Python syntax and
+reads the literal field declaration on `@alpha` without executing the source.
+Online preflight also checks account language availability and the declared field
+scope. The [tool map](tooling.md#写表达式跑模拟) shows how to run it.
 
 ## Why a parser
 
@@ -37,6 +40,11 @@ Two properties are load-bearing and are pinned by tests:
   and `subindustry` is a field, decided by position rather than by spelling.
 * `skeleton` replaces fields with `F` and literals with `L`, giving a structure key
   that is stable under renaming a field and sensitive to changing a shape.
+
+The ledger uses `expr2:` hashes for parseable FastExpr and keeps the legacy
+`expr:` fallback for damaged expressions. Python uses a separate `py:` hash with
+only line endings normalized. Indentation, whitespace, and string contents
+remain part of Python source identity. Existing ledger keys stay in place.
 
 ## Sugar
 
@@ -128,22 +136,21 @@ Accounting amounts may be stored as dimensionless, so units alone do not identif
 levels. `intent.derive_levels` adds candidates disjoint from the curated list;
 the curated list remains the primary signal for this rewrite.
 
-## The family graph
+## Structural grouping and lineage
 
-`research_cli.py ledger mechanisms` builds nodes from structure and three kinds of edge:
+`research_cli.py ledger mechanisms` groups FastExpr by economic block and
+skeleton. The former family graph used the following edge vocabulary.
 
 | Edge | Test | Meaning |
 | --- | --- | --- |
-| `sibling` | identical skeleton | the same expression with different inputs |
+| `sibling` | identical skeleton | the same tree shape across inputs and literal values |
 | `extends` | leg set is a proper subset | "that alpha plus a leg" |
 | `shares` | one common leg, no containment | weak relation, excluded from components |
 
-Families are connected components over `sibling` edges only. `extends` is recorded as
-lineage and deliberately excluded from the merge: containment is transitive through a
-shared ancestor, so single linkage chains unrelated constructions together — A with one
-leg, B = A + leg1, C = A + leg2 puts B and C in one "family" although they share no
-construction. Current mechanism reporting groups by economic block and skeleton;
-containment remains lineage evidence rather than proof of one construction.
+The graph merged only `sibling` edges. Combining containment edges would place
+`A + leg1` and `A + leg2` in the same component through their shared parent.
+`ledger lineage` reads recorded parent links. Containment alone supplies
+insufficient evidence to treat two expressions as the same construction.
 
 **Structure is not independence.** Distinct constructions can share the same
 underlying bet. Structural grouping finds copies cheaply; daily PnL comparison
@@ -152,12 +159,16 @@ is needed to assess shared exposure.
 A platform book query supplies current membership; a local ledger's status reflects
 the last recorded observation and may be stale until reconciled with `ledger sync`.
 
-## One entry point for simulation
+## Simulation preflight
 
-`tools/guarded_sim.py` lints against the cached catalogue and raises before spending
-a simulation. The lint already knew about unknown names; the research scripts simply
-called `ml.simulate_alphas` directly and skipped it. A rule that can be bypassed is
-not a rule.
+`research_cli.py probe` and `simulate` bind preflight findings to the exact
+expression and effective settings before execution. `tools/guarded_sim.py`
+is the guarded library path used by `probe` and replay. It also accepts a
+matching preflight result from the caller.
+
+FastExpr preflight checks operator and field catalogs. Python preflight checks
+the account's advertised language capability and declared fields. Python
+resumes use the source saved in the checkpoint.
 
 ## Measured, then not done
 

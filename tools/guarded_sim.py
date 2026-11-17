@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
-"""Simulate only after checking names against the *cached* catalog.
+"""Check Alpha source and settings before dispatching a BRAIN simulation.
 
-Why this exists: on 2026-10-30 three separate batches died on names that were
-never real (`historical_volatility_252` does not exist; the catalog stops at 180)
-and on variables that were declared but unused. Every one of those was catchable
-locally. The lint already knew how -- the research scripts simply called
-``ml.simulate_alphas`` directly and skipped it.
-
-So the fix is not more rules, it is a single entry point that cannot be skipped:
+Probe supplies its scoped preflight report. This wrapper checks that the report
+matches the resolved settings and normalized source submitted to the client.
+Direct callers can let the wrapper check the inputs:
 
     from guarded_sim import simulate
     records = simulate(["rank(close)"], {"universe": "TOP500"})
 
-The catalog comes from the on-disk metadata cache and is fetched only when a
-scope has never been seen. Nothing here hardcodes an operator or field name.
+Direct FASTEXPR checks use operator and field catalogs. Python also requires
+verified language access for the dispatching account and validates declared
+fields through the CLI preflight.
 """
 
 from __future__ import annotations
@@ -127,6 +124,8 @@ def simulate(expressions, settings=None, labels=None, force=False, session=None,
     if python:
         import simulation_capabilities
 
+        # Preflight may have been supplied by the caller. Bind the evidence
+        # to the session that will actually send the Python request.
         claimed = (report.get("capability_snapshot") or {}).get("account") or {}
         account = simulation_capabilities.account_provenance(session)
         if ((report.get("language_capability") or {}).get("state") != "verified"
@@ -148,7 +147,6 @@ if __name__ == "__main__":
 
     print("guarded_sim is a library, not a command:\n"
           "  from guarded_sim import simulate, check\n"
-          "  or move the call into research_cli.py probe, the only entry point that "
-          "calls machine_lib.simulate_alphas directly",
+          "  CLI entry point: research_cli.py probe SPEC.json",
           file=_sys.stderr)
     raise SystemExit(2)

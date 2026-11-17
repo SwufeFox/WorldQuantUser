@@ -1,10 +1,7 @@
 # 工具地图
 
-这里不解释怎么用，只回答一个问题：**我想问的那句话，对应哪个命令。**
-
-20 个入口。这个数字是砍出来的：2026-11-01 之前是 26 个，删掉了 8 个——宏子系统（`expression_macros` / `ast_macros` / `macro_parity`，被 `alpha_unit` 的模板+槽位取代）、`sugar_rewrite`（量过一次，结论已在文档里）、`family_tree`（被 `family_graph` 取代）、以及三个跑完的台账迁移（`repair_ledger` / `backfill_registry` / `backfill_reason_codes`，东西已经改了，工具留着只会让人以为还要跑）。2026-11-04 加了 `ask`：一个只读查询入口，替掉每次都要重写一遍的内联脚本。2026-11-09 又砍了 9 个：`book_audit` / `reconcile_status` / `pool_stats` / `book_inventory` / `turnover_repair` / `wire_guard` / `research_template` / `family_graph` / `family_graph_png`——前六个被 `ledger sync`、`brief --drift`、`health --pool`、`ledger mechanisms`、`probe` 一一取代，`family_graph` 的历史结论留在 `docs/ast-pipeline.md`，`research_template` 里唯一还有用的整词替换搬进了 `research_app/substitution.py`。记忆索引另由 `memory_index` 从条目生成，用 `--check` 检测漂移。
-
-删除标准只有一条：**被取代，或者跑完就没下次。** 不是"文件不够干净"。
+按研究问题选择命令。日常使用 `research_cli.py`，后台跑批见文末的 runner。
+具体参数以当前 CLI 的 `help` / `schema` 为准。
 
 ## 先从统一 CLI 进入
 
@@ -41,9 +38,9 @@ CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、
 文献检索分别在 `account.py`、`campaign.py`、`literature.py`。
 这些是内部模块，入口仍是 `research_cli.py`；改命令时直接修改、测试所属模块。
 
-字段枚举统一走 `field_index.fetch_all_fields`。`validation.py` 的在线 lint 和
-模拟预检从一次查询同时生成字段名、类型及市场/披露分类。原生批次把预检报告交给
-`tools.guarded_sim`，只有完整设置与表达式完全相同才复用，避免再次枚举。基础安装只需 `requests`，
+在线 lint 和模拟预检通过字段目录核对账户数据范围。FASTEXPR 还检查字段类型与算子，
+Python 检查源码的字段声明。`probe` 将预检报告交给 `tools.guarded_sim`，
+仅在完整设置与源码匹配时复用。用 `pip install -r requirements.txt` 安装运行依赖。
 `pandas` 在调用 `fields_to_df()` 时按需加载，DataFrame 用户再单独安装。
 
 
@@ -193,7 +190,7 @@ validation 视图日志；按冻结后的验证证据使用。命令只读，不
 ```bash
 python3 research_cli.py promote ALPHA_ID --note "冻结后验证通过" --cost-bps 5 10 20
 python3 research_cli.py promote ALPHA_ID --retention-floor 0.2 --dry-run
-python3 research_cli.py triage --ids ALPHA_ID --against-shelf --freeze choice.json
+python3 research_cli.py triage --ids ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --min-delta 0 --freeze choice.json
 python3 research_cli.py promote ALPHA_ID --selection choice.json --max-self-correlation 0.7
 ```
 
@@ -208,12 +205,23 @@ python3 research_cli.py promote ALPHA_ID --selection choice.json --max-self-corr
 不满足条件返回 `ok: true`、`outcome: rejected`、`buffered: false` 和 `reasons`，退出 0。
 默认冻结文件为研究目录下 `promote-freeze-<ID>-<UTC timestamp>.json`；
 可用 `--freeze PATH` 和 `--buffer PATH` 指定位置，冻结文件保持原有不可变规则。
-已有单候选冻结文件时，`promote --selection PATH` 沿用里面的验收标准和成本情景。
-`--max-self-correlation` 要求实时检查给出的自相关有数值且严格低于指定上限。
+已有单候选冻结文件时，`promote ALPHA_ID --selection PATH` 检查候选 ID，并沿用里面的
+留存门槛和成本情景。此模式和 `--freeze` 互斥。若冻结使用自定义候选架，`promote`
+也应传入同一路径。`--max-self-correlation` 另行要求实时平台自相关有数值且严格低于上限。
 
-`triage --against-shelf` 在组合边际所用的训练窗内比较候选架，`--buffer PATH` 可指定候选架。
-回执附带 PnL 覆盖、样本交集和最相似的成员。Campaign 只对训练期证据齐全、边际为正且未与
-候选架重复的 Alpha 使用同一份冻结选择打开测试期。缺证据的候选留待复核。
+`triage --against-shelf` 用候选、组合和候选架成员已记录的最早测试起点截断训练窗，
+`--train-end` 可以把窗口缩短。`--buffer PATH` 可指定候选架。回执的 `evidence` 保留
+时间窗、组合成员摘要、候选与组合的 PnL 覆盖和交集。它还给出全书相关性、最相关的成员和
+训练前后半段的边际。候选架相关性另见 `shelf_correlation`，按相关绝对值比较并保留符号。
+
+加上 `--max-shelf-correlation` 后才启用训练筛选。所有待冻结候选都须有可核验的 PnL 与
+足够的交集，边际须为正且达到 `--min-delta`，也须通过组合与候选架去重。
+候选架最高绝对相关达到上限时不通过。缺训练边界、覆盖或交集时为 `unknown`。
+未通过时回执仍保留证据，但不会写冻结文件。若书、候选架成员或候选源码与设置在冻结后变化，
+按候选架筛选生成的冻结选择会在查看测试期之前被拒绝。
+
+Campaign 用同一份训练筛选生成的冻结选择调用 `promote`，沿用原来的边际、去重与覆盖证据。
+单独运行 `promote ALPHA_ID` 仍走原有冻结流程，适合已经人工审过训练证据的候选。
 
 回执包含 `alpha_id`、`freeze_path`、`validate` 的训练/测试 Sharpe、retention、
 rho_book、max_member_rho，以及完整 `checks`、`buffered`、`outcome`、`reasons`。
@@ -221,9 +229,8 @@ rho_book、max_member_rho，以及完整 `checks`、`buffered`、`outcome`、`re
 返回 `ok: false`、现有类型的 `error` 和退出码，同时在 `data` 保留已完成证据及 `failed_step`；
 `--save PATH` 保存完全相同的回执，且不能覆盖冻结文件或候选架。
 
-`--dry-run` 仍会写冻结文件、读取测试期并执行实时平台检查；通过时返回
-`outcome: would_buffer`，第四步标记 `would_buffer`，但不写候选架；不通过仍为 `rejected`。
-该命令只入候选架，不提交 alpha。
+`promote --dry-run` 仍然读取测试期并执行实时检查。未提供 `--selection` 时也会写冻结文件。
+通过时返回 `outcome: would_buffer`，候选架不写入。平台提交另见下文。
 
 ### 用现有问题文件交接
 
@@ -469,26 +476,62 @@ if_else(is_nan(s), s, m)
 
 ### 写表达式、跑模拟
 
-Python Alpha 使用同一条 `probe` 流程。Spec 里用 `source_file` 引用相对于 JSON 文件的
-`.py`，或把完整源码放在 `expression` 中。给 Python 臂明确设置 `language: "PYTHON"`
-及所需的 `lookback`。用离线预览核对源码和请求，再用 `--check` 核对账户能力与字段目录。
+#### Python Alpha
+
+把源码保存为 `reversal.py`。下面的例子读取最近一行收益，返回每只标的一维 `float32` 信号。
+
+```python
+from brain.alphas import alpha
+
+
+@alpha(data=["returns"], store=[])
+def reversal(data, store):
+    return (-data.returns[-1]).astype("float32")
+```
+
+用 `simulate` 预览单个文件，或者把它和其他实验臂放在同一份 `probe` spec 中。
+
+```bash
+python3 research_cli.py lint --file reversal.py --setting lookback=0 --offline
+python3 research_cli.py simulate reversal.py --setting lookback=0 --dry-run
+python3 research_cli.py probe python-reversal.json --dry-run
+python3 research_cli.py probe python-reversal.json --check
+```
+
+将下面的 JSON 存为与源码同目录的 `python-reversal.json`。
 
 ```json
 {
   "name": "python-reversal",
   "design": "explore",
-  "settings": {"language": "PYTHON", "lookback": 4, "testPeriod": "P1Y"},
+  "settings": {"language": "PYTHON", "lookback": 0, "testPeriod": "P1Y"},
   "arms": [{"label": "reversal", "source_file": "reversal.py"}]
 }
 ```
 
-`lint --file reversal.py --offline` 只做静态检查，`simulate reversal.py --setting lookback=4
---dry-run` 可预览单文件。源码保存在 checkpoint，恢复沿用当时的版本。源码身份保留缩进和字符串内
-的空白，只统一换行符。Python 复用批次、台账、PnL 和训练期验证，FASTEXPR 专用的算子与结构分析
-仍依照原来的语言规则。
+直接读取 `.py` 时，`lint` 和 `simulate` 把整份文件作为一个 Python Alpha。
+`probe` 则按每臂的有效设置选择语言。Python 臂可使用相对于 spec 的 `source_file`，
+也可用 `expression` 写入完整源码，二者只能选一个。stdin spec 使用内联源码。
+探索批次可以混合语言并分组运行。受控实验的对照和干预臂须使用同一语言。
 
-Python REGULAR 请求会省略 FASTEXPR 的 `unitHandling` 和 `nanHandling`；预检回执会明确
-列出从请求中省略的设置。Python 需要自行决定缺失值和 dtype 的处理方式。
+静态检查会解析单个顶层 `@alpha(data=[...])` 函数，核对两个位置参数与字面量字段列表。
+`data.universe` 由平台隐式提供。回测运行在平台上，离线 lint 与预览仅解析源码。
+在线预检还要求当前账户的 `OPTIONS /simulations` 声明支持 `PYTHON`，并核对同一账户、
+region/universe/delay/instrumentType 的字段目录。语言证据不足时会报告
+`python_language_unverified`。字段目录无法核验时会报告 `catalog_unverified`。
+`--allow-lint-errors` 对 Python 预检无效。
+FASTEXPR 算子目录、结构匹配、换手估计和自动消融均不适用于 Python 源码。
+
+设置按平台字典透传。例如 `lookback` 是额外历史行数，完整窗口长度为 `lookback + 1`。
+热身阶段行数可能更少。源码负责处理 NaN、原生 dtype、热身与返回形状。
+REGULAR 请求统一省略 `selectionHandling` 和 `selectionLimit`，Python 还省略
+`unitHandling` 和 `nanHandling`。核对实际请求看预览的 `payload.settings`，
+在线证据的 `settings_capabilities.omitted_from_payload` 会列出 Python 请求中涉及的省略项。
+
+持久批次与 checkpoint 保存当时的源码，恢复沿用该版本。源文件路径只保留在本地批次中，
+平台请求的 `regular` 字段包含源码。`--save` 和 `--batch-path` 不能覆盖 Probe 引用的源码文件。
+
+#### 批次流程与复用
 
 | 问题 | 命令 |
 | --- | --- |
@@ -506,18 +549,20 @@ Python REGULAR 请求会省略 FASTEXPR 的 `unitHandling` 和 `nanHandling`；�
 `idea` / `mechanism` / `note` 会随输出和批次文件保存；`--strict-gate` 只拒绝表达式与完整设置
 都相同的已完成结果。所有组先通过本地校验，等效设置合并，整批复用会话。输入支持 UTF-8 BOM。
 
-这里已使用 AST：`alpha_registry.expression_hash()` 先经 `fastexpr_ast.canonical()` 规范化，
-消除注释和冗余括号等差异；严格重复键再组合完整设置签名及已完成的历史结果。
-`gate.completed_refs` 给出精确匹配的台账标识、批次和现有训练指标。
-`gate.structural_refs` 给出同经济块、同骨架的台账线索，供回查历史。
-`--strict-gate` 继续按 `exact_repeat_keys` 拒绝精确重复。历史设置缺失时不补上今天的默认值。
+精确身份由设置签名和对应语言的源码标识组成。FASTEXPR 经 AST 规范化，消除注释和
+冗余括号等差异。Python 只统一换行符，保留缩进、注释和字符串内的空白，设置以实际发送的
+REGULAR 字段为准。
+`gate.completed_refs` 给出精确匹配的台账标识、批次和现有训练指标。`gate.structural_refs`
+给出 FASTEXPR 同经济块、同骨架的台账线索。`--strict-gate` 继续按 `exact_repeat_keys`
+拒绝台账中的已完成精确重复。历史设置缺失时不补上今天的默认值。
 
 预览也会查看当前指定的批次路径。精确匹配的已完成记录见
 `gate.checkpoint_completed_refs`，能回读的任务见 `gate.checkpoint_recovery_refs`
 以及 `next_actions` 里的 `probe --recover`。这只检查当前默认路径或显式的
 `--batch-path`，可以用该选项指向以往的批次。预览不联系平台，给出的引用不会自动替换结果或重提任务。
-台账中旧的部分 `settings_fingerprint` 用于占位记录，不能拿来替代完整请求判重。
-文档中的 JSON 哈希 / Parquet 示例只作原理参考，继续沿用当前 AST 与台账机制。
+恢复时优先沿用已记录的任务地址或 Alpha ID。任务身份缺失时才核对平台最近的候选列表，
+须有唯一匹配的源码和完整设置。Python 源码仍按保留缩进的规则匹配。台账中旧的部分
+`settings_fingerprint` 用于占位记录，不能拿来替代完整请求判重。
 
 ```bash
 python3 research_cli.py probe sample-batch.spec.json --batch-size 6 --summary --batch-path sample-batch.json --save sample-response.json
@@ -582,15 +627,14 @@ QUEUED 与恢复点；429 不会导致跳到后面的批次继续提交。短期
 认证继续沿用会话缓存和结构化错误。文档的 persona 示例需要人工完成认证，不能把
 `input()` 或自动重登循环移入 CLI；此处没有增加另一套凭据文件或自动生物识别登录流程。
 
-目录检查携带账户、region/universe/delay/instrumentType、完整性和时效证据。缺失、过期、
-不完整目录不能冒充预检通过；显式覆盖仍保留错误。字段类型按 AST 检查，经济口径不明则提示
-unknown。`feed` 的关键词只产生阅读线索；明确字段需求才与当前作用域目录核对可用性。
+目录检查携带账户、region/universe/delay/instrumentType、完整性和时效证据。
+`feed` 的关键词只产生阅读线索。提供了明确字段后，才与当前作用域目录核对可用性。
 
-模拟预检按 AST 提取实际字段，用同账户同作用域的私有快照定位数据集，再实时完整刷新
-所需目录。快照即使过期也只作定位提示，不作权限或字段可用性证明。无关目录故障不会
-否定所用字段的新鲜证据；所用字段缺失、缓存回退、过期或不完整仍阻断。回执分别保留
-`required_fields_only` 核验与全目录完整性；局部核验不覆盖离线用的完整快照。未知字段或
-已迁移的字段回退全目录发现，不凭旧映射认定不存在。
+FASTEXPR 从 AST 提取用到的字段与类型，Python 则使用 `@alpha` 的字段声明。
+两者先用同账户、同作用域的私有快照定位数据集，再实时刷新所需目录。
+过期快照只作定位提示。所用字段的证据缺失、过期或不完整时，预检无法确认可用性。
+回执分别保留 `required_fields_only` 核验与全目录完整性。局部核验不覆盖离线用的完整快照。
+字段未知或数据集迁移时回到全目录发现。
 
 
 ### 合并已有结果与读取实时检查
@@ -712,6 +756,9 @@ python3 research_cli.py alpha explain ALPHA_ID
 
 腿是从表达式树读出来的，所以不会和公式漂移。`0.25*(a+b)` 这种会被摊开成两条腿——否则一个六腿复合体会显示成"一条腿"。
 
+Python Alpha 的 `alpha explain` 仍可输出台账指标、Fitness 复算与本地相关性。
+自动拆腿的 `construction.available` 为 false。
+
 ## 提交与本地回写
 
 ```bash
@@ -775,7 +822,8 @@ python3 research_cli.py ledger sync --pnl
 | `parallel` | 相互对照：只动一个旋钮做梯度 | 与对照的 settings 差**恰好一个键** |
 | `rescue` | 互补：换一个*不同实现*把效果补回来 | 必须写 `proxy_of` |
 
-不带对照的批次必须把 `"design": "explore"` 写在 spec 顶层。这不是逃生门，是**记录**：扫描和实验在台账里长得一样，唯一区别是扫描自己承认了。
+不带对照的批次把 `"design": "explore"` 写在 spec 顶层。混合 Python 与 FASTEXPR 的批次
+也使用 `explore`。需要归因时，选择同一语言的对照，并在各臂显式记录变化轴。
 
 对照必须与要回答的问题相符。若基准本身不满足设计条件，实验臂变差也无法说明是哪项改动造成；对照、设置和变化轴需要随批次一起保存，才能解释差值。
 
@@ -794,10 +842,55 @@ python3 research_cli.py ledger sync --pnl
 | `tools/atom_screen.py` | 从 ATOM 账本按平台子宇宙检查初筛，同一 Alpha 分数相同时采用最新记录 |
 | `tools/spc_client.py` | 独立预测竞赛接口，提供 `recon` / `validate` / `submit` |
 
-队列与 ATOM 共用主 CLI 的研究目录解析、预检和调度。用 `--research-dir` 可以指定目录，
-旧的 `WQ_RESEARCH_DIR` 仍可作为环境变量回退。队列把仍需恢复的 spec 保留在原队列。
+队列与 ATOM 共用 `probe` 的预检与调度。研究目录的优先级依次为 `--research-dir`、
+`BRAIN_RESEARCH_DIR`、兼容的 `WQ_RESEARCH_DIR`、CLI 默认目录。
+两个队列都接受 `--root` 作为 `--research-dir` 的别名。
 
-ATOM 用 `--dry-run` 离线预览，用 `--recover BATCH` 回读已提交任务，用 `--resume BATCH` 继续
-明确未发出的工作。它的结果账本供 ATOM 初筛；提交资格仍需实时平台 checks。
+```bash
+python3 tools/sim_queue.py --research-dir RESEARCH_DIR --once
+python3 tools/campaign_runner.py --research-dir RESEARCH_DIR --once
+python3 tools/atom_runner.py arms.json --research-dir RESEARCH_DIR --dry-run
+python3 tools/atom_runner.py --recover BATCH --research-dir RESEARCH_DIR
+python3 tools/atom_runner.py --resume BATCH --research-dir RESEARCH_DIR
+python3 tools/atom_screen.py --research-dir RESEARCH_DIR
+```
 
-`spc_client` 的 schema 来自实时 `OPTIONS /competitions/spc/submissions`：字段是 `modelFamily`（不是论坛帖子里的 `model` + `modelVersion`），`sampleOutput` 是对象数组，字段为 `company_name`/`ticker`/`isin`/`mic`/`confidence_score`/`investment_horizon`/`return_prediction`。`/competitions/spc`、`/leaderboard`、`/score` 均 404，只有 submissions 一个入口。
+把 `.json` Probe spec 放到所选队列的入口目录。下面的路径都相对于研究目录，`NAME` 是
+spec 去掉扩展名后的文件名。
+
+| 队列 | 入口 | 批次 | CLI 回执 | 日志 |
+| --- | --- | --- | --- | --- |
+| Simulation queue | `queue/NAME.json` | `queue/batches/NAME-batch.json` | `NAME-result.json` | `queue/queue.log` |
+| Campaign | `backlog/NAME.json` | `backlog-results/NAME-batch.json` | `backlog-results/NAME-result.json` | `campaign-log.jsonl` |
+
+两个队列的 `--once` 只处理排序后的首份 spec。省略该选项时，worker 会持续轮询。
+已知终态才归档到对应的 `done/` 或 `failed/`。需要补证据、重新轮询或只读恢复时，原 spec
+保留在入口目录。恢复前核对源码与设置指纹以及实验角色，旧批次指向多个可能结果时要求显式恢复。
+归档会移动 spec。回读已发出的请求时，使用保存了完整源码的批次文件。
+
+| `--once` 退出码 | 含义 |
+| --- | --- |
+| 0 | 队列为空或本次完成 |
+| 1 | 本次终态失败 |
+| 3 | 仍待恢复、训练证据待补，或已有另一个 worker |
+
+Campaign 先过滤诊断臂，再按下表筛选候选。`triage` 在同一训练窗核对组合边际与候选架去重。
+通过后把冻结选择交给 `promote --selection`。测试期读取、实时自相关和候选入架都发生在此之后。
+
+| 步骤 | 当前条件 |
+| --- | --- |
+| 训练指标初筛 | Sharpe ≥ 1.25，Fitness ≥ 1.0，训练期前后两半的 Sharpe 均大于 0 |
+| `triage` 冻结 | 训练边际为正，未被组合判为重复，有完整测量证据，候选架最大绝对相关低于 0.70 |
+| `promote` 验证 | test Sharpe 为正，达到冻结的留存门槛，实时平台 checks 通过，实时自相关低于 0.70 |
+
+Campaign 的冻结文件与 `promote-ALPHA_ID.json` 回执也放在 `backlog-results/`。
+
+ATOM 的默认批次路径在 `checkpoints/`，以臂清单内容生成名称。已有同名批次时使用
+`--recover` 或 `--resume`。`--recover` 回读已知任务，`--resume` 也可继续已知未提交的臂。
+`--dry-run` 可用于新扫描和续跑预览，跳过结果账本写入。
+`atom-results.jsonl` 保存带 `metrics_scope: full_is` 的指标与平台检查快照，供子宇宙初筛。
+常规训练筛选使用训练期回执，提交资格仍需实时平台 checks。
+
+`spc_client recon` 从 `OPTIONS /competitions/spc/submissions` 读取实时 schema。
+`validate` 按 `modelFamily` 和 `sampleOutput` 等字段校验 spec。
+`submit SPEC.json --yes` 是单独的比赛提交入口，需要明确授权。

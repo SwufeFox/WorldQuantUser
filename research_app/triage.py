@@ -189,6 +189,7 @@ def _candidate_evidence(row, candidate, dates, window, book_state, missing_bound
 
 
 def _training_gate(row, min_delta, max_shelf_correlation):
+    """Decide whether a training row can be frozen for automatic validation."""
     if row.get("shelf_correlation", {}).get("already_shelved"):
         return {"state": "rejected", "reason": "already_shelved"}
     if row.get("evidence", {}).get("state") != "measured":
@@ -469,6 +470,8 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
     shelf, shelved = None, set()
     frozen_shelf = manifest["inputs"].get("shelf") if manifest else None
     if frozen_shelf is not None:
+        # Check the scope before scoring or recording a test view. A changed
+        # membership invalidates the training evidence used by Campaign.
         shelf, _ = _shelf_scope(frozen_shelf["path"], targets)
         if (shelf["member_digest"] != frozen_shelf["member_digest"]
                 or manifest["inputs"]["book_state"]["local"]["member_digest"] != book["member_digest"]):
@@ -503,6 +506,8 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
         if not dates and not against_shelf:
             raise ValueError("no cached book PnL before train end %s" % cutoff)
     window.update(_observed_window(dates))
+    # The ordinary train view can report on its legacy/default cutoff. The
+    # scoped gate requires a known boundary for every compared Alpha.
     scoring_days = [] if against_shelf and missing_boundaries else dates
     book_sharpe = legs.sharpe_of([sum(values[day] for values in series.values()) for day in scoring_days])
     if scoring_days and book_sharpe is None and not show_test and not against_shelf:

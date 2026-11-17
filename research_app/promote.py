@@ -53,6 +53,8 @@ def cmd_promote(args, sink):
         if max_corr is not None and (not _finite(max_corr) or not 0 <= max_corr <= 1):
             raise CliError("INVALID_INPUT", "--max-self-correlation must be between 0 and 1")
         if saved_choice:
+            # Campaign already selected the candidate using training evidence.
+            # Reuse its manifest to keep validation bound to that decision.
             manifest = _selection_call(selection.load, freeze, source="triage")
             if [row.get("alpha_id") for row in manifest["rows"]] != [alpha_id]:
                 raise CliError("INVALID_INPUT", "promotion selection must contain exactly this candidate")

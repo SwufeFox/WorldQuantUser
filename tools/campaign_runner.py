@@ -42,7 +42,11 @@ def finite(value):
 
 
 def freeze_candidate(root, results, alpha_id):
-    """Get the training evidence and verify the frozen choice if admitted."""
+    """Read train evidence and verify any manifest before allowing promotion.
+
+    Triage returns a decision row even if the gate rejects or defers the
+    candidate. Only a passing gate writes a manifest for the validation step.
+    """
     path = results / f"campaign-freeze-{uuid4().hex}.json"
     response = run_cli(root, "triage", "--ids", alpha_id, "--against-shelf",
                        "--max-shelf-correlation", str(MAX_CORRELATION),

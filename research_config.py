@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Research-file parsing and validation, shared by the CLI and research scripts.
 
-A "research file" is the unit of work this toolchain trades in: a set of
-expressions plus the settings to simulate them with. Keeping the format here
-means the CLI, research scripts and tests agree on exactly one definition.
+A research file contains Alpha source and optional simulation settings.
+The CLI and research scripts use this parser to interpret the same input.
 
-Two shapes are accepted:
-
-* JSON -- an array of expressions, or an object with ``settings`` and
+* JSON: an array of expressions, or an object with ``settings`` and
   ``alphas``, or a single object with an ``expression``.
-* Plain text -- anything that does not start with ``{`` or ``[`` is read line
-  by line: one expression per line, blank lines and ``#`` comments ignored.
+* A named ``.py`` file is one complete Python Alpha, including significant
+  whitespace. This applies even if its first character looks like JSON.
+* Other text is read as one FASTEXPR expression per line. Blank lines and
+  lines starting with ``#`` are ignored.
 """
 
 from __future__ import annotations

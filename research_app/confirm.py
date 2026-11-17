@@ -4,9 +4,9 @@ Submitting an alpha cannot be undone, so one CLI invocation must never be enough
 `require_double_call` stages the intent on the first call and lets a second call
 through only inside a short window; the stage is consumed as it is used.
 
-The stage lives in the research directory rather than in memory: a crash between
-the two calls must not silently authorise the next one, and a stale stage expires
-on its own.
+The stage lives in the research directory so separate CLI invocations can share
+it. Consumption and restaging use one lock. Expired records and records with
+different caller context cannot confirm a submission.
 """
 from __future__ import annotations
 
@@ -32,8 +32,8 @@ def require_double_call(kind: str, key: str, *, now: float | None = None,
                         ttl: int = TTL_SECONDS, research_dir=None, context=None) -> bool:
     """Return True only on the confirming (second) call.
 
-    Raises CliError with CONFIRM_REQUIRED on the staging call, so the caller stops
-    before touching the platform.
+    Raises CONFIRM_REQUIRED on the staging call. Callers may already have run
+    read-only checks, but must acquire confirmation before sending a submission.
     """
     path = stage_path(research_dir)
     with cache_store.file_lock(path.with_suffix(".lock")):
@@ -61,5 +61,5 @@ def require_double_call(kind: str, key: str, *, now: float | None = None,
     raise CliError(
         "CONFIRM_REQUIRED",
         "%s is staged but not performed: run the same command once more within %d minutes" % (key, ttl // 60),
-        "this action is irreversible, so it takes two consecutive calls; nothing was sent to the platform",
+        "repeat the matching request within the confirmation window; no submission was sent",
     )

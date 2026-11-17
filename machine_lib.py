@@ -1293,9 +1293,12 @@ def resolve_settings(overrides=None):
 #: Settings the OPTIONS schema advertises as required but the POST contract
 #: rejects for ``type=REGULAR`` ("Selection handling ... is not allowed for
 #: simulation type REGULAR"). They belong to a selection simulation type this
-#: account's REGULAR flow never uses, so specs may carry them (the preflight
-#: requires them) and the request drops them.
+#: REGULAR path never sends, even if legacy specs include them. Python
+#: preflight checks the actual REGULAR payload against the account schema.
 _REGULAR_UNSENT_SETTINGS = ("selectionHandling", "selectionLimit")
+#: The native schema advertises these FASTEXPR controls, but the Python
+#: REGULAR endpoint rejects them. Keep the original settings in the spec and
+#: checkpoint; use the wire subset for dispatch and Python identity.
 _PYTHON_UNSENT_SETTINGS = ("unitHandling", "nanHandling")
 
 
