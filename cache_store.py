@@ -57,6 +57,7 @@ __all__ = [
     "remove",
     "utc_now",
     "write_json_atomic",
+    "write_text_atomic",
 ]
 
 #: Bumped when the on-disk envelope changes shape. A mismatched version is
@@ -108,7 +109,13 @@ def _ensure_parent(path):
 
 
 def write_json_atomic(path, payload, mode=0o600, indent=None):
-    """Serialise ``payload`` to ``path`` atomically.
+    """Serialise ``payload`` to ``path`` atomically."""
+    data = json.dumps(payload, ensure_ascii=False, indent=indent, sort_keys=False)
+    return write_text_atomic(path, data + "\n", mode=mode)
+
+
+def write_text_atomic(path, data, mode=0o600):
+    """Write UTF-8 text to ``path`` atomically.
 
     The temporary file is created in the *same directory* so ``os.replace``
     stays a rename on one filesystem. ``mode`` defaults to ``0o600`` because
@@ -118,13 +125,11 @@ def write_json_atomic(path, payload, mode=0o600, indent=None):
     """
     path = os.path.abspath(path)
     parent = _ensure_parent(path)
-    data = json.dumps(payload, ensure_ascii=False, indent=indent, sort_keys=False)
     fd, tmp_path = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".",
                                     suffix=".tmp", dir=parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(data)
-            handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         try:

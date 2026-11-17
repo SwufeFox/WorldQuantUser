@@ -1408,7 +1408,7 @@ def _novelty_gate(arms, registry_path=None):
             book_keys.setdefault(key, []).append(entry.get("key") or entry.get("alpha_id"))
 
     block_marginals = {}
-    snapshot = Path(research_paths.ensure_dir()) / "convergence.json"
+    snapshot = Path(research_paths.resolve("convergence.json"))
     if snapshot.exists():
         try:
             payload = json.loads(snapshot.read_text(encoding="utf-8"))

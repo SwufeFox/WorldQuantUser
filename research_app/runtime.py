@@ -19,6 +19,7 @@ EXIT_CODES = {
     "OK": 0,
     "USAGE": 2,
     "INVALID_INPUT": 2,
+    "CONFIRM_REQUIRED": 2,
     "AUTH_MISSING": 3,
     "AUTH_FAILED": 3,
     "AUTH_CAPTCHA": 3,
@@ -34,6 +35,7 @@ EXIT_CODES = {
 ERROR_CODES = {
     "USAGE": "Bad command line; see `research_cli.py schema`.",
     "INVALID_INPUT": "A research file, expression or setting failed validation.",
+    "CONFIRM_REQUIRED": "A submission was staged. Repeat the same request within the confirmation window.",
     "AUTH_MISSING": "No BRAIN credentials configured (environment or .env).",
     "AUTH_FAILED": "BRAIN rejected the configured credentials.",
     "AUTH_CAPTCHA": "BRAIN wants a captcha before issuing a session; wait, then retry.",

@@ -15,6 +15,12 @@ import math
 
 #: Below this many points a Sharpe is not reported, it is guessed.
 MIN_POINTS = 30
+FITNESS_TURNOVER_FLOOR = 0.125
+
+
+def platform_fitness(sharpe, returns, turnover):
+    """BRAIN Fitness for a complete set of reported metrics."""
+    return sharpe * math.sqrt(abs(returns) / max(turnover, FITNESS_TURNOVER_FLOOR))
 
 
 def sharpe(values, min_points=MIN_POINTS):

@@ -18,7 +18,7 @@ import machine_lib as ml
 import research_paths
 
 from .runtime import CliError, METRIC_KEYS, note, with_session
-from . import incentives
+from . import incentives, stats
 
 
 def _merged_performance_view(result, detail):
@@ -495,6 +495,15 @@ def submit_workflow(session, args, shelf_entry=None):
                 if fresh is not None and fresh >= GATE and not getattr(args, "force", False):
                     raise CliError("INVALID_INPUT", "fresh self-correlation exceeds the shelf gate",
                                    "pass --force to attempt the platform gate anyway")
+            # A submission cannot be undone, so one invocation must never be enough.
+            # Every read-only validation above still runs on the staging call; only
+            # the POST is held back until the same command is issued again.
+            from .confirm import require_double_call
+            require_double_call("alpha_submit", args.alpha_id, context={
+                "selection_id": selection_id,
+                "entrypoint": "buffer" if shelf_entry is not None else "alpha",
+                "force": bool(getattr(args, "force", False)),
+            })
             journal = {"alpha_id": args.alpha_id, "state": "INTENT",
                        "selection_id": selection_id,
                        "started_at": datetime.now(timezone.utc).isoformat()}
@@ -696,10 +705,10 @@ def cmd_alpha_explain(args, _sink):
     returns, fitness = metrics.get("returns"), metrics.get("fitness")
     denominator = None
     if isinstance(turnover, (int, float)):
-        denominator = max(turnover, 0.125)
+        denominator = max(turnover, stats.FITNESS_TURNOVER_FLOOR)
     implied = None
     if isinstance(sharpe, (int, float)) and isinstance(returns, (int, float)) and denominator:
-        implied = round(sharpe * (returns / denominator) ** 0.5, 3)
+        implied = round(stats.platform_fitness(sharpe, returns, turnover), 3)
 
     ablations = []
     for entry in entries:
@@ -722,10 +731,10 @@ def cmd_alpha_explain(args, _sink):
         "metrics": {k: metrics.get(k) for k in
                     ("sharpe", "fitness", "turnover", "returns", "drawdown")},
         "fitness_arithmetic": {
-            "formula": "sharpe * sqrt(returns / max(turnover, 0.125))",
+            "formula": f"sharpe * sqrt(abs(returns) / max(turnover, {stats.FITNESS_TURNOVER_FLOOR}))",
             "denominator_used": denominator,
             "below_turnover_floor": bool(isinstance(turnover, (int, float))
-                                         and turnover < 0.125),
+                                         and turnover < stats.FITNESS_TURNOVER_FLOOR),
             "implied_fitness": implied,
             # The gap is the integrity check this block exists for: a row whose
             # stored Fitness cannot be rebuilt from its own Sharpe/returns/turnover

@@ -70,6 +70,12 @@ class SubmissionWorkflowTests(unittest.TestCase):
         return {str(path.relative_to(self.root)): path.read_bytes()
                 for path in self.root.rglob("*") if path.is_file()}
 
+    def stage(self, command, args, post):
+        with self.assertRaises(CliError) as caught:
+            command(args, None)
+        self.assertEqual(caught.exception.code, "CONFIRM_REQUIRED")
+        post.assert_not_called()
+
     def test_both_entrypoints_reconcile_same_facts_without_record_flag(self):
         records = []
         for command, alpha_id in ((alphas.cmd_alpha_submit, "CANDIDATE"),
@@ -93,7 +99,9 @@ class SubmissionWorkflowTests(unittest.TestCase):
                     mock.patch.object(ml, "fetch_alpha_checks", return_value=complete_checks()), \
                     mock.patch.object(ml, "submit_alpha", side_effect=submit) as post, \
                     mock.patch.object(ml, "fetch_daily_pnl", side_effect=complete_pnl):
-                result = command(self.args(alpha_id=alpha_id), None)
+                args = self.args(alpha_id=alpha_id)
+                self.stage(command, args, post)
+                result = command(args, None)
             post.assert_called_once()
             self.assertTrue(result["reconciled"])
             self.assertTrue(result["reconciliation"]["shelf"]["consumed"])
@@ -108,13 +116,14 @@ class SubmissionWorkflowTests(unittest.TestCase):
     def test_ambiguous_transport_is_read_back_and_never_reposted(self):
         with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()) as reads, \
                 mock.patch.object(ml, "submit_alpha", side_effect=requests.Timeout("unknown delivery")) as post:
+            self.stage(alphas.cmd_alpha_submit, self.args(), post)
             first = alphas.cmd_alpha_submit(self.args(), None)
             second = alphas.cmd_alpha_submit(self.args(selection=None), None)
         self.assertEqual(first["submission"], "UNKNOWN")
         self.assertEqual(second["submission"], "UNKNOWN")
         self.assertFalse(second["post_attempted"])
         self.assertEqual(post.call_count, 1)
-        self.assertEqual(reads.call_count, 3)
+        self.assertEqual(reads.call_count, 4)
 
     def test_accepted_and_uncertain_are_not_reposted(self):
         for state in ("INTENT", "ACCEPTED", "UNCERTAIN"):
@@ -239,6 +248,7 @@ class SubmissionWorkflowTests(unittest.TestCase):
                 mock.patch.object(ml, "submit_alpha", side_effect=submit) as post, \
                 mock.patch.object(ml, "fetch_daily_pnl", side_effect=complete_pnl), \
                 ThreadPoolExecutor(max_workers=2) as pool:
+            self.stage(alphas.cmd_alpha_submit, self.args(), post)
             one = pool.submit(alphas.cmd_alpha_submit, self.args(), None)
             two = pool.submit(second)
             self.assertTrue(one.result(timeout=10)["submitted"])

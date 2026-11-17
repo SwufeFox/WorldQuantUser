@@ -695,6 +695,9 @@ python3 research_cli.py ledger sync --pnl
 不带 `--yes` 只预检。`alpha submit` 与 `buffer submit` 共用持久提交状态；未知结果再次运行时
 只回读平台，不隐式重复 POST。
 
+首次带 `--yes` 的新提交通过预检后返回 `CONFIRM_REQUIRED`。十分钟内用同一入口、冻结选择
+及强制选项重发，才会尝试提交。
+
 确认远端成功后自动同步台账、消费候选架、刷新 PnL，并使旧平台组合快照失效，不再需要
 `--record`。回执分别报告 `submission` 与 `reconciliation.{ledger,shelf,book_snapshot,pnl}`；
 某项本地修复失败不抹掉远端成功，`repair_actions` 列出未完成项。对已确认 alpha 再运行
@@ -751,18 +754,20 @@ python3 research_cli.py ledger sync --pnl
 * 仓库（`/data/src/magix/WorldQuantUser`）放**工具**：任何能把函数跑两次的东西。
 * 研究目录（`/data/worldquant-research`）放**结果**：台账、缓存、一次性脚本、报告。一次性脚本不进 git。
 
-## Power Pool / ATOM 与 SPC：两条独立通道
+## 后台研究工具
 
-2026-11-17 账户升为顾问后，常规 alpha 的门槛升到 Sharpe 1.58，同时打开 Power Pool / ATOM 与 SPC 两条独立通道。三个工具各自负责一条。
+| 工具 | 职责 |
+| --- | --- |
+| `tools/sim_queue.py` | 消费 `queue/` 中的 Probe spec，保存批次与回执 |
+| `tools/campaign_runner.py` | 消费 `backlog/`，在训练期初筛后复用 `promote`，并检查候选重复与组合边际 |
+| `tools/atom_runner.py` | 把 `label / expr / settings` 列表交给 `probe`，用可恢复批次保存进度，把全 IS 指标和 checks 写成 `atom-results.jsonl` |
+| `tools/atom_screen.py` | 从 ATOM 账本按平台子宇宙检查初筛，同一 Alpha 分数相同时采用最新记录 |
+| `tools/spc_client.py` | 独立预测竞赛接口，提供 `recon` / `validate` / `submit` |
 
-| 工具 | 通道 | 判据 |
-| --- | --- | --- |
-| `tools/atom_runner.py` | Power Pool / ATOM | Sharpe ≥ 1.0、换手 1%–70%、唯一算子 ≤ 8、唯一字段 ≤ 3、PP 相关性 < 0.5，并记录子宇宙与生产相关性 |
-| `tools/spc_client.py` | SPC 预测竞赛 | `recon` / `validate` / `submit`，提交被 `--yes` 硬锁 |
-| `tools/campaign_runner.py` | 常规 alpha 无人值守环 | Sharpe ≥ 1.25、fitness ≥ 1.0、两半为正，入库前去重与边际闸 |
+队列与 ATOM 共用主 CLI 的研究目录解析、预检和调度。用 `--research-dir` 可以指定目录，
+旧的 `WQ_RESEARCH_DIR` 仍可作为环境变量回退。队列把仍需恢复的 spec 保留在原队列。
 
-三个工具都用 `WQ_RESEARCH_DIR`（默认 `/data/worldquant-research`）定位研究目录，路径不再写死。
-
-`atom_runner` 直接调用 `POST /simulations` 并轮询 `Location`，不经 CLI 的 lint 前置：顾问升级后 `lint`/`probe --check` 会在目录加载处卡住，而平台本身正常。它把每个臂的 `metrics` 与 `checks` 一起写进 `atom-results.jsonl`，因为决定资格的是检查项而不是头条指标 —— 高 Sharpe 的信号常常在子宇宙上为负。
+ATOM 用 `--dry-run` 离线预览，用 `--recover BATCH` 回读已提交任务，用 `--resume BATCH` 继续
+明确未发出的工作。它的结果账本供 ATOM 初筛；提交资格仍需实时平台 checks。
 
 `spc_client` 的 schema 来自实时 `OPTIONS /competitions/spc/submissions`：字段是 `modelFamily`（不是论坛帖子里的 `model` + `modelVersion`），`sampleOutput` 是对象数组，字段为 `company_name`/`ticker`/`isin`/`mic`/`confidence_score`/`investment_horizon`/`return_prediction`。`/competitions/spc`、`/leaderboard`、`/score` 均 404，只有 submissions 一个入口。

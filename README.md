@@ -5,8 +5,9 @@ alphas: generate FASTEXPR expressions, simulate them, and read back which ones
 scored well.
 
 The repository is built around one idea: **a program should be able to drive the
-whole loop without reading the source.** Every capability is reachable from
-`research_cli.py`, whose contract is documented by the tool itself.
+research loop without reading the source.** The core workflow is exposed by
+`research_cli.py`, whose contract is documented by the tool itself. Batch
+runners and the separate SPC client sit under `tools/`.
 
 ```
 python research_cli.py brief                # current evidence and source paths
@@ -66,9 +67,7 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `tools/backup_replay.py` | Snapshot the research directory; replay it as of a date; diff drift. |
 | `tests/` | Offline contract tests. No account required. |
 
-`docs/tooling.md` maps these to the question each one answers. There are 18 of them
-because eight were removed on 2026-11-01 for being superseded or one-shot -- see the
-note at the top of that file before adding a nineteenth.
+`docs/tooling.md` maps these tools to the questions they answer.
 
 **This repository versions the tool, not the research.** Simulation results,
 field-catalog snapshots, the alpha registry and the learned operator denylist
@@ -145,7 +144,7 @@ and the reasons do not.
 ## Install
 
 ```bash
-pip install -r requirements.txt      # required: requests
+pip install -r requirements.txt
 ```
 
 `pandas` is imported only when `fields_to_df()` is called. Install it separately

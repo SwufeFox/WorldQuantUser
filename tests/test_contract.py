@@ -66,6 +66,8 @@ class SchemaContractTests(unittest.TestCase):
         for key in ("exit_codes", "error_codes", "research_file",
                     "settings_defaults", "credentials", "commands"):
             self.assertIn(key, data)
+        self.assertEqual(data["exit_codes"]["CONFIRM_REQUIRED"], 2)
+        self.assertIn("CONFIRM_REQUIRED", data["error_codes"])
 
 
 

@@ -1,229 +1,134 @@
 #!/usr/bin/env python3
-"""Long-running research loop: simulate, gate, validate, shelve - unattended.
+"""Run queued regular-alpha experiments and promote eligible research arms."""
 
-For every spec in ``backlog/``: lint-check it, simulate its arms with the
-platform's own concurrency, then take each candidate arm that clears the train
-gate (Sharpe >= 1.25, Fitness >= 1.0, both halves positive) through
-``promote``, which freezes the choice, validates on the held-out window and
-shelves it only if every platform check passes and retention clears the floor.
-
-Diagnostic arms are never promoted. Failures are logged and skipped; the loop
-keeps going until the backlog is empty, then waits for new specs. Every step is
-appended to ``campaign-log.jsonl`` so a later session can reconstruct what ran.
-"""
 from __future__ import annotations
 
+import argparse
 import json
-import os
-import shutil
-import subprocess
 import sys
-import time
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 
-CLI = "/data/src/magix/WorldQuantUser/research_cli.py"
-PY = sys.executable
-CWD = "/data/src/magix/WorldQuantUser"
-ROOT = Path(os.environ.get("WQ_RESEARCH_DIR", "/data/worldquant-research"))
-BACKLOG = ROOT / "backlog"
-RESULTS = ROOT / "backlog-results"
-LOG = ROOT / "campaign-log.jsonl"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from tools._runner import research_root, run_cli, run_queue
 
-def buffer_ids() -> list[str]:
-    """Current shelf, read from the tool so the runner never guesses."""
-    tmp = Path("/tmp/campaign-buffer.json")
-    done = run([PY, CLI, "buffer", "list", "--quiet", "--save", str(tmp)], 300)
-    if done.returncode != 0:
-        return []
-    try:
-        rows = json.loads(tmp.read_text())["data"]["rows"]
-    except Exception:
-        return []
-    return [r["alpha_id"] for r in rows if r.get("alpha_id")]
-
-
-def duplicate_of(alpha_id: str, floor: float = 0.70) -> dict | None:
-    """The shelf entry this alpha is the same bet as, if any.
-
-    Self-correlation only compares against submitted alphas, so two shelved
-    blends that share a leg sail past every platform check and then turn out to
-    be one bet (2026-11-17: eight shelf entries inside a single 0.71-0.82
-    cluster). This compares against the shelf itself before the alpha is added.
-    """
-    ids = [i for i in buffer_ids() if i != alpha_id]
-    if not ids:
-        return None
-    tmp = Path("/tmp/campaign-corr.json")
-    done = run([PY, CLI, "alpha", "corr", alpha_id, *ids, "--threshold", str(floor),
-                "--quiet", "--save", str(tmp)], 900)
-    if done.returncode != 0:
-        return None
-    try:
-        pairs = json.loads(tmp.read_text())["data"]["matrix"]["pairs"]
-    except Exception:
-        return None
-    hits = [p for p in pairs if p.get("r", 0) >= floor]
-    if not hits:
-        return None
-    return max(hits, key=lambda p: p["r"])
-
-
-def marginal_delta(alpha_id: str) -> dict:
-    """How much the book's Sharpe moves when this alpha is added.
-
-    The campaign is marginal-first (user decision 2026-11-17): a unit that clears
-    every gate but adds nothing to the portfolio is inventory, not a bet.
-    """
-    tmp = Path("/tmp/campaign-triage.json")
-    done = run([PY, CLI, "triage", "--ids", alpha_id, "--cost-bps", "5", "10", "20",
-                "--quiet", "--save", str(tmp)], 900)
-    if done.returncode != 0:
-        return {}
-    try:
-        rows = json.loads(tmp.read_text())["data"]["rows"]
-    except Exception:
-        return {}
-    return rows[0] if rows else {}
 TRAIN_SHARPE = 1.25
 TRAIN_FITNESS = 1.0
+MAX_CORRELATION = 0.70
+COST_BPS = ("5", "10", "20")
 
 
-def now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def log(path, record):
+    entry = json.dumps({"at": datetime.now(timezone.utc).isoformat(), **record},
+                       ensure_ascii=False)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(entry + "\n")
+    print(entry[:400], flush=True)
 
 
-def log(record: dict) -> None:
-    record["at"] = now()
-    with LOG.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-    print(json.dumps(record, ensure_ascii=False)[:400], flush=True)
+def require_data(response, operation):
+    if not response.ok:
+        raise RuntimeError(f"{operation}: {response.detail}")
+    return response.data
 
 
-def run(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, cwd=CWD, capture_output=True, text=True, timeout=timeout)
-
-
-def probe(spec: Path, out: Path) -> dict | None:
-    check = run([PY, CLI, "probe", str(spec), "--check", "--quiet"], 600)
-    if check.returncode != 0:
-        log({"kind": "check-failed", "spec": spec.name,
-             "tail": (check.stdout or check.stderr)[-300:]})
+def duplicate_of(root, alpha_id):
+    """Find candidate-to-shelf pairs above the campaign's correlation ceiling."""
+    shelf = require_data(run_cli(root, "buffer", "list", timeout=300), "read shelf")
+    ids = [row["alpha_id"] for row in shelf.get("rows", [])
+           if row.get("alpha_id") and row["alpha_id"] != alpha_id]
+    if not ids:
         return None
-    batch = RESULTS / (spec.stem + "-batch.json")
-    done = run([PY, CLI, "probe", str(spec), "--batch-size", "3",
-                "--max-wait-seconds", "600", "--batch-path", str(batch),
-                "--quiet", "--save", str(out)], 1800)
-    if not out.exists():
-        log({"kind": "probe-failed", "spec": spec.name,
-             "tail": (done.stdout or done.stderr)[-300:]})
-        return None
-    return json.loads(out.read_text()).get("data") or {}
+    response = run_cli(root, "alpha", "corr", alpha_id, *ids, "--threshold",
+                       str(MAX_CORRELATION), timeout=900)
+    pairs = require_data(response, f"check correlation for {alpha_id}")["matrix"]["pairs"]
+    return max((pair for pair in pairs if alpha_id in {pair["a"], pair["b"]}
+                and pair["r"] >= MAX_CORRELATION), key=lambda pair: pair["r"], default=None)
 
 
-def promote(alpha_id: str, label: str) -> dict:
-    out = RESULTS / f"promote-{alpha_id}.json"
-    done = run([PY, CLI, "promote", alpha_id,
-                "--note", f"backlog admission: {label}; train gate cleared, frozen validation applied.",
-                "--cost-bps", "5", "10", "20", "--quiet", "--save", str(out)], 1800)
-    if not out.exists():
-        return {"alpha_id": alpha_id, "outcome": "promote-error",
-                "tail": (done.stdout or done.stderr)[-200:]}
-    data = json.loads(out.read_text()).get("data") or {}
-    checks = data.get("checks") or {}
-    rows = checks.get("results") or []
-    self_corr = None
-    if rows:
-        self_corr = ((rows[0].get("checks") or {}).get("SELF_CORRELATION") or {}).get("value")
+def promote(root, results, alpha_id, label):
+    output = results / f"promote-{alpha_id}.json"
+    response = run_cli(root, "promote", alpha_id, "--note",
+                       f"backlog admission: {label}; training gate cleared.",
+                       "--cost-bps", *COST_BPS, "--save", output, timeout=1800)
+    data = require_data(response, f"promote {alpha_id}")
+    checks = (data.get("checks") or {}).get("results") or []
+    check = next((row for row in checks if row.get("alpha_id") == alpha_id), {})
+    validation = data.get("validate") or {}
     return {"alpha_id": alpha_id, "outcome": data.get("outcome"),
             "reasons": data.get("reasons"),
-            "self_correlation": self_corr,
-            "test_sharpe": (data.get("validate") or {}).get("test_sharpe"),
-            "retention": (data.get("validate") or {}).get("retention")}
+            "self_correlation": ((check.get("checks") or {}).get("SELF_CORRELATION") or {}).get("value"),
+            "test_sharpe": validation.get("test_sharpe"), "retention": validation.get("retention")}
 
 
-def process(spec: Path) -> None:
-    out = RESULTS / (spec.stem + "-result.json")
-    data = probe(spec, out)
-    if data is None:
-        return
-    rows = data.get("rows") or []
-    for row in rows:
-        label = row.get("label")
-        role = row.get("role")
+def check_marginal(root, alpha_id, result):
+    """Apply campaign-specific portfolio rules to a newly shelved candidate."""
+    self_corr = result["self_correlation"]
+    if isinstance(self_corr, (int, float)) and self_corr >= MAX_CORRELATION:
+        note = f"platform self-correlation {self_corr} exceeds the {MAX_CORRELATION} campaign criterion"
+        outcome = "dropped-over-gate"
+    else:
+        response = run_cli(root, "triage", "--ids", alpha_id, "--cost-bps", *COST_BPS,
+                           timeout=900)
+        rows = require_data(response, f"check marginal contribution for {alpha_id}").get("rows") or []
+        marginal = rows[0] if rows else {}
+        delta = marginal.get("delta")
+        result.update(delta=delta, rho_book=marginal.get("rho_book"),
+                      margin_bps=(marginal.get("costs") or {}).get("margin_bps"))
+        if not isinstance(delta, (int, float)) or delta > 0:
+            return
+        note = f"marginal-first: delta {delta} <= 0"
+        outcome = "dropped-dilutive"
+    drop = run_cli(root, "buffer", "drop", alpha_id, "--note", note, timeout=600)
+    require_data(drop, f"drop {alpha_id}")
+    result.update(outcome=outcome, drop_ok=True)
+
+
+def process(root, results, log_entry, spec, data):
+    for row in data["rows"]:
+        alpha_id, label, role = row.get("alpha_id"), row.get("label"), row.get("role")
         status = row.get("status")
-        sharpe = row.get("train_sharpe")
-        fitness = row.get("train_fitness")
-        h1 = row.get("train_sharpe_h1")
-        h2 = row.get("train_sharpe_h2")
-        alpha_id = row.get("alpha_id")
-        summary = {"kind": "arm", "spec": spec.name, "label": label, "role": role,
+        sharpe, fitness = row.get("train_sharpe"), row.get("train_fitness")
+        h1, h2 = row.get("train_sharpe_h1"), row.get("train_sharpe_h2")
+        log_entry({"kind": "arm", "spec": spec.name, "label": label, "role": role,
                    "status": status, "train_sharpe": sharpe, "train_fitness": fitness,
-                   "h1": h1, "h2": h2, "alpha_id": alpha_id}
-        log(summary)
-        if role == "diagnostic" or status != "COMPLETE" or not alpha_id:
+                   "h1": h1, "h2": h2, "alpha_id": alpha_id})
+        if role == "diagnostic" or status not in {"COMPLETE", "WARNING", "UNSUBMITTED"} or not alpha_id:
             continue
-        if sharpe is None or fitness is None or h1 is None or h2 is None:
+        if None in (sharpe, fitness, h1, h2):
             continue
         if sharpe < TRAIN_SHARPE or fitness < TRAIN_FITNESS or h1 <= 0 or h2 <= 0:
             continue
-        dup = duplicate_of(alpha_id)
-        if dup:
-            log({"kind": "skipped-duplicate", "spec": spec.name, "label": label,
-                 "alpha_id": alpha_id, "train_sharpe": sharpe,
-                 "correlates_with": dup["a"] if dup["b"] == alpha_id else dup["b"],
-                 "r": dup["r"]})
+        duplicate = duplicate_of(root, alpha_id)
+        if duplicate:
+            log_entry({"kind": "skipped-duplicate", "spec": spec.name, "label": label,
+                       "alpha_id": alpha_id, "train_sharpe": sharpe,
+                       "correlates_with": duplicate["a"] if duplicate["b"] == alpha_id else duplicate["b"],
+                       "r": duplicate["r"]})
             continue
-        result = promote(alpha_id, label)
-        result["kind"] = "promote"
-        result["spec"] = spec.name
-        # BRAIN passes self-correlation above the 0.70 line when the alpha's own
-        # Sharpe clears an exception rule (expected_result comes back FAIL while
-        # the check reports PASS). The campaign's criterion is stricter: value
-        # must be under 0.70, so an exception-passed alpha is dropped here rather
-        # than counted.
-        sc = result.get("self_correlation")
-        if result.get("outcome") == "buffered" and isinstance(sc, (int, float)) and sc >= 0.70:
-            drop = run([PY, CLI, "buffer", "drop", alpha_id, "--note",
-                        f"dropped by the campaign rule: platform self-correlation {sc} passed via the "
-                        "exception rule but exceeds the 0.70 criterion", "--quiet"], 600)
-            result["outcome"] = "dropped-over-gate"
-            result["drop_ok"] = drop.returncode == 0
-        # Marginal-first (user decision 2026-11-17): a shelved unit is kept only
-        # if it adds portfolio Sharpe. Anything at or below zero is inventory.
-        if result.get("outcome") == "buffered":
-            marg = marginal_delta(alpha_id)
-            result["delta"] = marg.get("delta")
-            result["rho_book"] = marg.get("rho_book")
-            result["margin_bps"] = (marg.get("costs") or {}).get("margin_bps")
-            if isinstance(marg.get("delta"), (int, float)) and marg["delta"] <= 0:
-                run([PY, CLI, "buffer", "drop", alpha_id, "--note",
-                     f"marginal-first: delta {marg['delta']} <= 0", "--quiet"], 600)
-                result["outcome"] = "dropped-dilutive"
-        log(result)
+        result = promote(root, results, alpha_id, label)
+        if result["outcome"] == "buffered":
+            check_marginal(root, alpha_id, result)
+        log_entry({"kind": "promote", "spec": spec.name, **result})
 
 
-def main() -> int:
-    BACKLOG.mkdir(parents=True, exist_ok=True)
-    RESULTS.mkdir(parents=True, exist_ok=True)
-    done_dir = BACKLOG / "done"
-    fail_dir = BACKLOG / "failed"
-    done_dir.mkdir(exist_ok=True)
-    fail_dir.mkdir(exist_ok=True)
-    log({"kind": "start", "backlog": len(list(BACKLOG.glob('*.json')))})
-    while True:
-        specs = sorted(BACKLOG.glob("*.json"))
-        if not specs:
-            time.sleep(30)
-            continue
-        for spec in specs:
-            try:
-                process(spec)
-                shutil.move(str(spec), str(done_dir / spec.name))
-            except Exception as exc:  # noqa: BLE001 - one bad spec must not stop the loop
-                log({"kind": "spec-crashed", "spec": spec.name, "error": f"{type(exc).__name__}: {exc}"})
-                shutil.move(str(spec), str(fail_dir / spec.name))
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--research-dir", "--root", dest="root")
+    parser.add_argument("--once", action="store_true")
+    args = parser.parse_args(argv)
+    root = research_root(args.root)
+    results = root / "backlog-results"
+    results.mkdir(parents=True, exist_ok=True)
+    report = partial(log, root / "campaign-log.jsonl")
+
+    def paths(spec):
+        return (results / f"{spec.stem}-batch.json", results / f"{spec.stem}-result.json")
+
+    return run_queue(root, root / "backlog", paths, report, max_wait=600, interval=30,
+                     once=args.once, concurrency=3, consume=partial(process, root, results, report))
 
 
 if __name__ == "__main__":

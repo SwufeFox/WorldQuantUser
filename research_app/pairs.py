@@ -166,7 +166,7 @@ def cmd_pairs(args, _sink):
             turnover = (float(metrics_a.get("turnover") or 0) + float(metrics_b.get("turnover") or 0)) / 2
             estimated_fitness = None
             if returns and turnover:
-                estimated_fitness = sharpe * math.sqrt(abs(returns) / max(turnover, 0.125))
+                estimated_fitness = stats.platform_fitness(sharpe, returns, turnover)
             rows.append({
                 "a": pool[i], "b": pool[j],
                 "sharpe_a": None if np.isnan(sharpes[i]) else round(float(sharpes[i]), 3),
