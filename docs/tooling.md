@@ -540,3 +540,19 @@ python3 research_cli.py ledger sync --pnl
 
 * 仓库（`/data/src/magix/WorldQuantUser`）放**工具**：任何能把函数跑两次的东西。
 * 研究目录（`/data/worldquant-research`）放**结果**：台账、缓存、一次性脚本、报告。一次性脚本不进 git。
+
+## Power Pool / ATOM 与 SPC：两条独立通道
+
+2026-11-17 账户升为顾问后，常规 alpha 的门槛升到 Sharpe 1.58，同时打开 Power Pool / ATOM 与 SPC 两条独立通道。三个工具各自负责一条。
+
+| 工具 | 通道 | 判据 |
+| --- | --- | --- |
+| `tools/atom_runner.py` | Power Pool / ATOM | Sharpe ≥ 1.0、换手 1%–70%、唯一算子 ≤ 8、唯一字段 ≤ 3、PP 相关性 < 0.5，并记录子宇宙与生产相关性 |
+| `tools/spc_client.py` | SPC 预测竞赛 | `recon` / `validate` / `submit`，提交被 `--yes` 硬锁 |
+| `tools/campaign_runner.py` | 常规 alpha 无人值守环 | Sharpe ≥ 1.25、fitness ≥ 1.0、两半为正，入库前去重与边际闸 |
+
+三个工具都用 `WQ_RESEARCH_DIR`（默认 `/data/worldquant-research`）定位研究目录，路径不再写死。
+
+`atom_runner` 直接调用 `POST /simulations` 并轮询 `Location`，不经 CLI 的 lint 前置：顾问升级后 `lint`/`probe --check` 会在目录加载处卡住，而平台本身正常。它把每个臂的 `metrics` 与 `checks` 一起写进 `atom-results.jsonl`，因为决定资格的是检查项而不是头条指标 —— 高 Sharpe 的信号常常在子宇宙上为负。
+
+`spc_client` 的 schema 来自实时 `OPTIONS /competitions/spc/submissions`：字段是 `modelFamily`（不是论坛帖子里的 `model` + `modelVersion`），`sampleOutput` 是对象数组，字段为 `company_name`/`ticker`/`isin`/`mic`/`confidence_score`/`investment_horizon`/`return_prediction`。`/competitions/spc`、`/leaderboard`、`/score` 均 404，只有 submissions 一个入口。
