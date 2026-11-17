@@ -11,9 +11,11 @@ import machine_lib as ml
 import requests
 import research_paths
 
-from . import alphas, buffer_cmd, triage
+from . import alphas, buffer_cmd, selection, triage
 from .experiments import _selection_call
 from .runtime import CliError, note, protect_output
+
+DEFAULT_RETENTION_FLOOR = 0.2
 
 
 def _finite(value):
@@ -26,7 +28,8 @@ def cmd_promote(args, sink):
     alphas._candidate_role(args)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", alpha_id)
-    freeze = Path(args.freeze or research_paths.resolve(
+    saved_choice = getattr(args, "selection", None)
+    freeze = Path(saved_choice or args.freeze or research_paths.resolve(
         "promote-freeze-%s-%s.json" % (safe_id, stamp))).expanduser().resolve()
     shelf = buffer_cmd.buffer_path(args).resolve()
     protect_output(args, freeze, shelf)
@@ -45,16 +48,41 @@ def cmd_promote(args, sink):
         # commands when their optional settings change.
         from .parser import build_parser
         parser = build_parser()
-        freeze_args = parser.parse_args(["triage", "--ids", alpha_id, "--freeze", str(freeze)])
-        freeze_args.retention_floor = args.retention_floor
-        freeze_args.cost_bps = args.cost_bps
-        frozen = _selection_call(triage.cmd_triage, freeze_args, sink)
+        retention_floor, cost_bps = args.retention_floor, args.cost_bps
+        max_corr = getattr(args, "max_self_correlation", None)
+        if max_corr is not None and (not _finite(max_corr) or not 0 <= max_corr <= 1):
+            raise CliError("INVALID_INPUT", "--max-self-correlation must be between 0 and 1")
+        if saved_choice:
+            manifest = _selection_call(selection.load, freeze, source="triage")
+            if [row.get("alpha_id") for row in manifest["rows"]] != [alpha_id]:
+                raise CliError("INVALID_INPUT", "promotion selection must contain exactly this candidate")
+            frozen_shelf = manifest["inputs"].get("shelf")
+            if frozen_shelf and Path(frozen_shelf["path"]).resolve() != shelf:
+                raise CliError("INVALID_INPUT", "--buffer conflicts with the frozen shelf")
+            saved_criteria = manifest["criteria"]
+            for key, provided in (("retention_floor", retention_floor), ("cost_bps", cost_bps)):
+                if provided is not None and provided != saved_criteria.get(key):
+                    raise CliError("INVALID_INPUT", f"{key} conflicts with the frozen selection")
+            retention_floor = saved_criteria.get("retention_floor", DEFAULT_RETENTION_FLOOR)
+            cost_bps = saved_criteria.get("cost_bps")
+            frozen = {"selection_id": manifest["selection_id"], "rows": manifest["rows"],
+                      "criteria": saved_criteria, "window": manifest["window"]}
+        else:
+            retention_floor = DEFAULT_RETENTION_FLOOR if retention_floor is None else retention_floor
+        if not _finite(retention_floor):
+            raise CliError("INVALID_INPUT", "retention floor must be finite")
+        if not saved_choice:
+            freeze_args = parser.parse_args(["triage", "--ids", alpha_id, "--freeze", str(freeze)])
+            freeze_args.retention_floor = retention_floor
+            freeze_args.cost_bps = cost_bps
+            frozen = _selection_call(triage.cmd_triage, freeze_args, sink)
         data["steps"][step] = {"status": "completed", "evidence": frozen}
 
         step = "validate"
         validate_args = parser.parse_args(["triage", "--selection", str(freeze), "--show-test"])
-        validate_args.retention_floor = args.retention_floor
-        validate_args.cost_bps = args.cost_bps
+        if not saved_choice:
+            validate_args.retention_floor = retention_floor
+            validate_args.cost_bps = cost_bps
         validated = _selection_call(triage.cmd_triage, validate_args, sink)
         data["steps"][step] = {"status": "completed", "evidence": validated}
         row = next((row for row in validated.get("rows", [])
@@ -80,6 +108,12 @@ def cmd_promote(args, sink):
             reasons.append("platform_checks_not_resolved")
         if summary["failed"]:
             reasons.append("platform_checks_failed: " + ", ".join(summary["failed"]))
+        if max_corr is not None:
+            value = (result.get("self_correlation") or {}).get("value")
+            if not _finite(value):
+                reasons.append("self_correlation_missing_or_nonfinite")
+            elif value >= max_corr:
+                reasons.append("self_correlation_at_or_above_limit")
         test = data["validate"]["test_sharpe"]
         retention = data["validate"]["retention"]
         if not _finite(test):
@@ -88,8 +122,8 @@ def cmd_promote(args, sink):
             reasons.append("test_sharpe <= 0")
         if not _finite(retention):
             reasons.append("retention_missing_or_nonfinite")
-        elif retention < args.retention_floor:
-            reasons.append("retention < retention_floor (%s < %s)" % (retention, args.retention_floor))
+        elif retention < retention_floor:
+            reasons.append("retention < retention_floor (%s < %s)" % (retention, retention_floor))
         if reasons:
             data["steps"]["buffer"] = {"status": "skipped"}
             return data
@@ -101,7 +135,7 @@ def cmd_promote(args, sink):
         step = "buffer"
         buffer_args = parser.parse_args(["buffer", "add", alpha_id, "--selection", str(freeze)])
         buffer_args.buffer, buffer_args.note = args.buffer, args.note
-        buffer_args.cost_bps = args.cost_bps
+        buffer_args.cost_bps = cost_bps
         buffered = buffer_cmd.cmd_buffer_add(buffer_args, sink, checked=result)
         data["steps"][step] = {"status": "completed", "evidence": buffered}
         data.update(buffered=True, outcome="buffered")

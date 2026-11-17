@@ -18,13 +18,20 @@ The two numbers that matter and are easy to confuse:
 """
 
 import json
+import math
 import os
+from datetime import date
 
 import alpha_registry
+import machine_lib as ml
 import research_paths
 
 from . import benchmark, costs, legs, mechanisms, selection
+from .book_state import describe_book, member_digest
 from .runtime import CliError
+
+
+MIN_OVERLAP_DAYS = 120
 
 
 def _book_series(latest, directory):
@@ -89,6 +96,127 @@ def _round(value, places=3):
     return None if value is None else round(value, places)
 
 
+def _observed_window(dates):
+    return {"observed_start": dates[0] if dates else None,
+            "observed_end": dates[-1] if dates else None, "days": len(dates)}
+
+
+def _test_boundaries(latest, ids):
+    starts, missing = {}, []
+    for alpha_id in sorted(set(ids)):
+        split = (latest.get(alpha_id) or {}).get("out_of_sample") or {}
+        start = (split.get("test") or {}).get("startDate")
+        if not start:
+            missing.append(alpha_id)
+            continue
+        try:
+            starts[alpha_id] = date.fromisoformat(str(start)[:10]).isoformat()
+        except ValueError:
+            raise ValueError("invalid recorded test boundary for %s" % alpha_id) from None
+    return starts, missing
+
+
+def _shelf_scope(path, targets):
+    from . import buffer_cmd
+
+    state = buffer_cmd.shelf_state(buffer_cmd.read_events(path))
+    # A single candidate cannot duplicate itself. Its own shelf writes do not
+    # invalidate a retry, but adding another peer changes the screening set.
+    excluded = set(targets) if len(targets) == 1 else set()
+    ids = sorted(alpha_id for alpha_id, entry in state.items()
+                 if alpha_id not in excluded and entry.get("state") not in {"consumed", "dropped"})
+    return {"path": os.path.abspath(os.path.expanduser(os.fspath(path))),
+            "member_ids": ids, "member_digest": member_digest(ids)}, {
+                alpha_id for alpha_id, entry in state.items()
+                if entry.get("eligible") and entry.get("state") not in {"consumed", "dropped"}
+            }
+
+
+def _shelf_correlations(alpha_id, candidate, dates, peers, coverage, missing_boundaries, candidate_complete):
+    measured, missing = [], []
+    for peer, values in peers.items():
+        if peer == alpha_id:
+            continue
+        shared = [day for day in dates if day in candidate and day in values]
+        reason = None
+        if alpha_id in missing_boundaries or peer in missing_boundaries:
+            reason = "missing_train_boundary"
+        elif not candidate or not values:
+            reason = "missing_pnl"
+        elif candidate_complete is not True or coverage[peer]["complete"] is not True:
+            reason = "unverified_pnl_coverage"
+        elif len(shared) < MIN_OVERLAP_DAYS:
+            reason = "insufficient_overlap"
+        else:
+            rho = legs.correlation([candidate[day] for day in shared], [values[day] for day in shared])
+            if rho is None:
+                reason = "undefined_correlation"
+            else:
+                measured.append((rho, peer, len(shared)))
+        if reason:
+            missing.append({"alpha_id": peer, "reason": reason, "overlap_days": len(shared)})
+    rho, peer, days = max(measured, key=lambda item: abs(item[0]), default=(None, None, None))
+    return {"state": "unknown" if missing else "measured", "eligible": len(measured) + len(missing),
+            "measured": len(measured), "missing": missing, "max_member": peer,
+            "max_rho": abs(rho) if rho is not None else None, "max_rho_signed": rho,
+            "max_member_overlap_days": days}
+
+
+def _candidate_evidence(row, candidate, dates, window, book_state, missing_boundaries, directory):
+    book, coverage = book_state["local"], book_state["pnl"]
+    estimate = coverage["coverage"].get(row["alpha_id"])
+    if estimate is None:
+        estimate = ml.pnl_cache_status(directory, row["alpha_id"], candidate)
+    overlap = [day for day in dates if day in candidate]
+    reasons = []
+    if missing_boundaries:
+        reasons.append("missing_train_boundary")
+    if estimate["complete"] is not True:
+        reasons.append("unverified_candidate_pnl")
+    if not coverage["complete"]:
+        reasons.append("unverified_book_pnl")
+    if row.get("delta") is None:
+        reasons.append("unmeasurable_marginal")
+    if row.get("book_correlations_measured") != book["member_count"] or row.get("rho_book") is None:
+        reasons.append("incomplete_book_correlations")
+    return {"state": "unknown" if reasons else "measured", "reasons": reasons,
+            "window": window, "book_member_digest": book["member_digest"],
+            "missing_train_boundary_ids": missing_boundaries,
+            "candidate_pnl": {key: estimate.get(key) for key in ("points", "complete", "as_of", "error")},
+            "book_pnl": {"complete": coverage["complete"], "members": book["member_count"],
+                         "available": len(coverage["available_ids"]), "verified": len(coverage["complete_ids"])},
+            "overlap": _observed_window(overlap)}
+
+
+def _training_gate(row, min_delta, max_shelf_correlation):
+    if row.get("shelf_correlation", {}).get("already_shelved"):
+        return {"state": "rejected", "reason": "already_shelved"}
+    if row.get("evidence", {}).get("state") != "measured":
+        return {"state": "unknown", "reason": "incomplete_book_or_candidate_evidence"}
+    shelf = row["shelf_correlation"]
+    if shelf["state"] != "measured":
+        return {"state": "unknown", "reason": "incomplete_shelf_evidence"}
+    if row.get("member") or row.get("role") == "diagnostic":
+        return {"state": "rejected", "reason": "not_a_candidate"}
+    if row["delta"] <= 0 or row["delta"] < min_delta:
+        return {"state": "rejected", "reason": "insufficient_train_marginal"}
+    if row["verdict"] == "duplicate":
+        return {"state": "rejected", "reason": "book_duplicate"}
+    if shelf["max_rho"] is not None and shelf["max_rho"] >= max_shelf_correlation:
+        return {"state": "rejected", "reason": "shelf_duplicate"}
+    return {"state": "pass", "reason": None}
+
+
+def _delta_segments(book, comparison, dates, member):
+    midpoint = len(dates) // 2
+    result = []
+    for segment in (slice(None, midpoint), slice(midpoint, None)):
+        before, after = legs.sharpe_of(book[segment]), legs.sharpe_of(comparison[segment])
+        delta = None if before is None or after is None else (before - after if member else after - before)
+        result.append({**_observed_window(dates[segment]), "delta": _round(delta, 4)})
+    return result
+
+
 def _cohort_retentions(latest, days=45):
     """Retention distribution of recently recorded arms, for a percentile.
 
@@ -120,7 +248,7 @@ def _percentile(values, value):
     return round(100.0 * below / len(values), 0)
 
 
-def _score(alpha_id, entry, series, dates, criteria):
+def _score(alpha_id, entry, series, dates, criteria, candidate=None):
     """The four questions plus the internal bar, for one alpha."""
     directory = criteria["pnl_dir"]
     n = len(series)
@@ -129,6 +257,8 @@ def _score(alpha_id, entry, series, dates, criteria):
     train = train_metrics.get("sharpe")
     show_test = criteria["show_test"]
     metrics = (entry.get("metrics") or {}) if show_test else train_metrics
+    language = alpha_registry.entry_language(entry)
+    expression = entry.get("expression") or ""
 
     row = {
         "alpha_id": alpha_id,
@@ -141,7 +271,7 @@ def _score(alpha_id, entry, series, dates, criteria):
         "rho_book": None,
         "slope": None,
         "delta": None,
-        "ops": (entry.get("expression") or "").count("("),
+        "ops": None if ml.is_python_language(language) else expression.count("("),
     }
     row["costs"] = costs.evidence(metrics, row["metrics_scope"], criteria.get("cost_bps"))
     row["source_settings"] = entry.get("settings") or {}
@@ -163,11 +293,12 @@ def _score(alpha_id, entry, series, dates, criteria):
         row["platform_checks"] = entry.get("checks") or {}
 
     in_book = alpha_id in series
-    candidate = legs.load_pnl(alpha_id, directory)
+    if candidate is None:
+        candidate = legs.load_pnl(alpha_id, directory)
     if candidate and dates:
         common = [day for day in dates if day in candidate]
         row["overlap_days"] = len(common)
-        if len(common) >= 120:
+        if len(common) >= MIN_OVERLAP_DAYS:
             book_slice = [sum(values[day] for values in series.values()) for day in common]
             values = [candidate[day] for day in common]
             rho = legs.correlation(values, book_slice)
@@ -178,6 +309,7 @@ def _score(alpha_id, entry, series, dates, criteria):
                 other = legs.correlation(values, [member_values[day] for day in common])
                 if other is not None:
                     member_rhos.append((other, member))
+            row["book_correlations_measured"] = len(member_rhos)
             own = legs.sharpe_of(values)
             now = legs.sharpe_of(book_slice)
             if member_rhos:
@@ -194,23 +326,26 @@ def _score(alpha_id, entry, series, dates, criteria):
             if in_book:
                 # A member is already in the book, so the question is what removing it
                 # costs: leave-one-out, the same number `health` reported.
-                without = [(b - v) / (n - 1) for b, v in zip(book_slice, values)] if n > 1 else []
-                if without:
-                    left = legs.sharpe_of(without)
+                comparison = [(b - v) / (n - 1) for b, v in zip(book_slice, values)] if n > 1 else []
+                if comparison:
+                    left = legs.sharpe_of(comparison)
                     if now is not None and left is not None:
                         row["delta"] = round(now - left, 4)
                         row["member"] = True
             else:
-                after = legs.sharpe_of([(b + v) / (n + 1) for b, v in zip(book_slice, values)])
+                comparison = [(b + v) / (n + 1) for b, v in zip(book_slice, values)]
+                after = legs.sharpe_of(comparison)
                 if now is not None and after is not None:
                     row["delta"] = round(after - now, 4)
+            if comparison and not show_test:
+                row["train_delta_by_half"] = _delta_segments(book_slice, comparison, common, in_book)
 
     if criteria.get("internal"):
         # The row carries neither field: the block has to come off the ledger entry, or
         # be derived from its expression. Reading the row silently gave "other" for
         # everything, which is the one block with the worst measured ratio.
         block = (row.get("block") or entry.get("block")
-                 or mechanisms.block_of(entry.get("expression") or ""))
+                 or mechanisms.block_of(expression, language))
         factors = {
             "shrink": benchmark.shrink_factor(train),
             "contribution": benchmark.contribution_factor(
@@ -223,7 +358,8 @@ def _score(alpha_id, entry, series, dates, criteria):
         fitness = row["fitness"]
         row["internal_fitness"] = None if fitness is None else round(fitness * combined, 3)
         row["factors"] = {name: round(value, 3) for name, value in factors.items()}
-        row["ops_warning"] = benchmark.ops_warning(row["ops"], criteria["ops_warn"])
+        ops = row["ops"]
+        row["ops_warning"] = None if ops is None else benchmark.ops_warning(ops, criteria["ops_warn"])
 
     row["verdict"], row["why"] = _verdict(row, criteria)
     return row
@@ -265,11 +401,9 @@ def _verdict(row, criteria):
 def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
            retention_floor=None, internal=False, whole_book=False, criteria=None,
            show_test=False, train_end=None, freeze_path=None, selection_path=None,
-           cost_bps=None, roles=None, source_files=None):
+           cost_bps=None, roles=None, source_files=None, against_shelf=False, shelf_path=None,
+           max_shelf_correlation=None):
     """Freeze training decisions and join validation evidence without reranking."""
-    from datetime import date
-    from .book_state import describe_book
-
     if show_test and not selection_path:
         raise ValueError("--show-test requires --selection from a training freeze")
     if freeze_path and (show_test or selection_path):
@@ -278,6 +412,16 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
         raise ValueError("--selection requires --show-test")
     if internal and not show_test:
         raise ValueError("--internal uses test-calibrated factors; freeze the design and pass --show-test")
+    if against_shelf and (show_test or whole_book):
+        raise ValueError("--against-shelf only applies to candidate screening on train PnL")
+    if shelf_path is not None and not against_shelf:
+        raise ValueError("--buffer requires --against-shelf")
+    if max_shelf_correlation is not None:
+        if not against_shelf:
+            raise ValueError("--max-shelf-correlation requires --against-shelf")
+        if (type(max_shelf_correlation) not in (int, float) or not math.isfinite(max_shelf_correlation)
+                or not 0 < max_shelf_correlation <= 1):
+            raise ValueError("--max-shelf-correlation must be in (0, 1]")
     manifest = selection.load(selection_path, source="triage") if selection_path else None
     if train_end is not None:
         try:
@@ -317,21 +461,38 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
     directory = os.path.abspath(os.path.expanduser(os.fspath(
         pnl_dir or os.path.join(research_paths.ensure_dir(), "pnl"))))
     series, dates = _book_series(latest, directory)
-    if not dates and not show_test:
+    if not dates and not show_test and not against_shelf:
         raise ValueError("no cached book PnL; the book cannot be scored")
     book_state = describe_book(latest, series=series, registry_path=registry_path, pnl_dir=directory)
     targets = frozen_ids if manifest else (sorted(series) if whole_book else list(dict.fromkeys(ids or [])))
+    book = book_state["local"]
+    shelf, shelved = None, set()
+    frozen_shelf = manifest["inputs"].get("shelf") if manifest else None
+    if frozen_shelf is not None:
+        shelf, _ = _shelf_scope(frozen_shelf["path"], targets)
+        if (shelf["member_digest"] != frozen_shelf["member_digest"]
+                or manifest["inputs"]["book_state"]["local"]["member_digest"] != book["member_digest"]):
+            raise ValueError("book or shelf membership changed since training freeze")
+        for row in manifest["rows"]:
+            current = latest.get(row["alpha_id"]) or {}
+            if (row.get("source_expression") != current.get("expression")
+                    or row.get("source_settings") != (current.get("settings") or {})):
+                raise ValueError("candidate expression or settings changed since training freeze")
+    elif against_shelf:
+        if shelf_path is None:
+            from . import buffer_cmd
+            shelf_path = buffer_cmd.buffer_path()
+        shelf, shelved = _shelf_scope(shelf_path, targets)
+        if freeze_path and os.path.realpath(os.path.expanduser(freeze_path)) == os.path.realpath(shelf["path"]):
+            raise ValueError("--freeze and --buffer must use distinct paths")
     window = {"mode": "full" if show_test else "train", "end": None, "source": None}
+    missing_boundaries = []
     if not show_test:
-        boundaries = []
-        for alpha_id in set(series) | set(targets):
-            split = (latest.get(alpha_id) or {}).get("out_of_sample") or {}
-            start = (split.get("test") or {}).get("startDate")
-            if start:
-                try:
-                    boundaries.append(date.fromisoformat(str(start)[:10]).isoformat())
-                except ValueError:
-                    raise ValueError("invalid recorded test boundary for %s" % alpha_id) from None
+        relevant = set(book["member_ids"]) | set(targets) if against_shelf else set(series) | set(targets)
+        if against_shelf:
+            relevant.update(shelf["member_ids"])
+        bounds, missing_boundaries = _test_boundaries(latest, relevant)
+        boundaries = bounds.values()
         cutoff = min(boundaries) if boundaries else "2023-01-01"
         source = "recorded_test_start" if boundaries else "default_train_end"
         if train_end is not None:
@@ -339,12 +500,12 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
             source = "explicit_and_recorded" if boundaries else "explicit"
         window.update({"end": cutoff, "source": source, "end_exclusive": True})
         dates = [day for day in dates if day < cutoff]
-        if not dates:
+        if not dates and not against_shelf:
             raise ValueError("no cached book PnL before train end %s" % cutoff)
-    window.update({"observed_start": dates[0] if dates else None,
-                   "observed_end": dates[-1] if dates else None, "days": len(dates)})
-    book_sharpe = legs.sharpe_of([sum(values[day] for values in series.values()) for day in dates])
-    if book_sharpe is None and not show_test:
+    window.update(_observed_window(dates))
+    scoring_days = [] if against_shelf and missing_boundaries else dates
+    book_sharpe = legs.sharpe_of([sum(values[day] for values in series.values()) for day in scoring_days])
+    if scoring_days and book_sharpe is None and not show_test and not against_shelf:
         raise ValueError("the book's own Sharpe is not measurable on the cached days")
     if manifest:
         decision_criteria = dict(manifest["criteria"])
@@ -359,9 +520,13 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
         decision_criteria.update({"min_delta": 0.02 if min_delta is None else min_delta,
                                   "retention_floor": 0.2 if retention_floor is None else retention_floor,
                                   "cost_bps": list(costs.DEFAULT_COST_BPS if cost_bps is None else cost_bps)})
+        if max_shelf_correlation is not None:
+            decision_criteria["max_shelf_correlation"] = max_shelf_correlation
     costs.evidence({}, "train", decision_criteria["cost_bps"])
     settings = {**decision_criteria, "pnl_dir": directory, "internal": bool(internal),
                 "show_test": bool(show_test), "cohort": _cohort_retentions(latest) if show_test else []}
+    peer_series = {peer: legs.load_pnl(peer, directory) for peer in shelf["member_ids"]} if against_shelf else {}
+    peer_coverage = {peer: ml.pnl_cache_status(directory, peer, values) for peer, values in peer_series.items()}
     rows = []
     for alpha_id in targets:
         entry = latest.get(alpha_id)
@@ -369,10 +534,24 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
             entry = {**entry, "role": alpha_registry.evidence_role(entry, {"role": roles[alpha_id]})}
         if entry is None:
             if not manifest:
-                rows.append({"alpha_id": alpha_id, "verdict": "unknown", "missing": True,
-                             "why": "not in the ledger", "costs": costs.evidence({}, "train", settings["cost_bps"])})
+                row = {"alpha_id": alpha_id, "verdict": "unknown", "missing": True,
+                       "why": "not in the ledger", "costs": costs.evidence({}, "train", settings["cost_bps"])}
+                if max_shelf_correlation is not None:
+                    row["training_gate"] = _training_gate(row, settings["min_delta"], max_shelf_correlation)
+                rows.append(row)
             continue
-        rows.append(_score(alpha_id, entry, series, dates, settings))
+        candidate = series[alpha_id] if alpha_id in series else legs.load_pnl(alpha_id, directory)
+        row = _score(alpha_id, entry, series, scoring_days, settings, candidate=candidate)
+        row["evidence"] = _candidate_evidence(
+            row, candidate, scoring_days, window, book_state, missing_boundaries, directory)
+        if against_shelf:
+            row["shelf_correlation"] = _shelf_correlations(
+                alpha_id, candidate, scoring_days, peer_series, peer_coverage,
+                missing_boundaries, row["evidence"]["candidate_pnl"]["complete"])
+            row["shelf_correlation"]["already_shelved"] = alpha_id in shelved
+            if max_shelf_correlation is not None:
+                row["training_gate"] = _training_gate(row, settings["min_delta"], max_shelf_correlation)
+        rows.append(row)
     if manifest:
         rows = selection.ordered_rows(manifest, rows)
         for row, frozen in zip(rows, manifest["rows"]):
@@ -391,20 +570,29 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
         "note": ("Validation evidence in immutable training order; missing candidates remain missing."
                  if show_test else "Selection view: train metrics and PnL only. Missing train metrics stay unknown."),
     }
-    if freeze_path:
+    if freeze_path and (max_shelf_correlation is None or (
+            rows and all(row["training_gate"]["state"] == "pass" for row in rows))):
+        inputs = {"registry_path": os.path.abspath(os.path.expanduser(os.fspath(
+                      registry_path or alpha_registry.default_registry_path()))),
+                  "pnl_dir": directory, "whole_book": bool(whole_book),
+                  "files": source_files or [], "book_state": book_state}
+        if against_shelf:
+            inputs["shelf"] = shelf
         manifest = selection.freeze(freeze_path, source="triage", rows=rows,
                                     criteria=decision_criteria, window=window,
-                                    inputs={"registry_path": os.path.abspath(os.path.expanduser(os.fspath(
-                                                registry_path or alpha_registry.default_registry_path()))),
-                                            "pnl_dir": directory, "whole_book": bool(whole_book),
-                                            "files": source_files or [],
-                                            "book_state": book_state})
+                                    inputs=inputs)
     if manifest:
         result["selection_id"] = manifest["selection_id"]
         result["selection_path"] = os.path.abspath(os.fspath(selection_path or freeze_path))
         result["frozen_window"] = manifest["window"]
         result["frozen_book_state"] = manifest["inputs"].get("book_state")
         result["book_changed"] = book_state != result["frozen_book_state"]
+        frozen_digest = ((result["frozen_book_state"] or {}).get("local") or {}).get("member_digest")
+        if show_test and frozen_digest and frozen_digest != book["member_digest"]:
+            for row in rows:
+                if "evidence" in row:
+                    row["evidence"]["state"] = "stale"
+                    row["evidence"]["reasons"].append("book_membership_changed_since_freeze")
     if show_test:
         research_paths.log_view("triage", "test", [row["alpha_id"] for row in rows],
                                 note={"selection_id": manifest["selection_id"],
@@ -460,5 +648,8 @@ def _cmd_triage(args):
                     freeze_path=getattr(args, "freeze", None),
                     selection_path=getattr(args, "selection", None),
                     cost_bps=getattr(args, "cost_bps", None), roles=roles,
+                    against_shelf=getattr(args, "against_shelf", False),
+                    shelf_path=getattr(args, "buffer", None),
+                    max_shelf_correlation=getattr(args, "max_shelf_correlation", None),
                     source_files=[os.path.abspath(path)] if getattr(args, "batch", None) else None)
     return result

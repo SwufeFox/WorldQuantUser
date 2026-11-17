@@ -305,6 +305,25 @@ def authenticate():
     return session, info
 
 
+def is_python_language(language):
+    """Recognize the Python variant in platform settings."""
+    return isinstance(language, str) and language.upper() == "PYTHON"
+
+
+def normalize_python_source(source):
+    """Normalize line endings while preserving Python indentation and whitespace."""
+    return source.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def alpha_language(alpha):
+    """Read the language marker from a platform alpha or ledger record."""
+    for source in (alpha.get("settings"), alpha.get("regular"), alpha):
+        language = source.get("language") if isinstance(source, dict) else None
+        if isinstance(language, str) and language:
+            return language.upper()
+    return None
+
+
 def regular_expression(alpha):
     """Return ``(code, description, operator_count)`` from an alpha payload.
 
@@ -319,7 +338,7 @@ def regular_expression(alpha):
     else:
         code, description, count = regular, None, None
     if isinstance(code, str):
-        code = code.strip()
+        code = normalize_python_source(code) if is_python_language(alpha_language(alpha)) else code.strip()
     return code, description, count
 
 
@@ -1258,6 +1277,8 @@ def resolve_settings(overrides=None):
     for key, value in normalize_setting_keys(overrides).items():
         if value is not None or key not in DEFAULT_SETTINGS:
             settings[key] = value
+    if is_python_language(settings.get("language")):
+        settings["language"] = "PYTHON"
     for key in ("region", "instrumentType", "universe", "neutralization",
                 "pasteurization", "nanHandling"):
         value = settings.get(key)
@@ -1275,14 +1296,41 @@ def resolve_settings(overrides=None):
 #: account's REGULAR flow never uses, so specs may carry them (the preflight
 #: requires them) and the request drops them.
 _REGULAR_UNSENT_SETTINGS = ("selectionHandling", "selectionLimit")
+_PYTHON_UNSENT_SETTINGS = ("unitHandling", "nanHandling")
+
+
+def _regular_unsent_settings(settings):
+    if is_python_language(settings.get("language")):
+        return _REGULAR_UNSENT_SETTINGS + _PYTHON_UNSENT_SETTINGS
+    return _REGULAR_UNSENT_SETTINGS
+
+
+def regular_wire_settings(settings):
+    """Return the writable settings present in a REGULAR simulation request."""
+    excluded = _regular_unsent_settings(settings)
+    return {key: value for key, value in settings.items() if key not in excluded}
 
 
 def _single_simulation_data(expression, decay, settings):
     """Build one ``POST /simulations`` payload from a resolved settings dict."""
-    body = {key: value for key, value in settings.items()
-            if key not in _REGULAR_UNSENT_SETTINGS}
+    body = regular_wire_settings(settings)
     body["decay"] = decay
     return {"type": "REGULAR", "settings": body, "regular": expression}
+
+
+def regular_settings_evidence(settings, snapshot):
+    """Check the settings that the REGULAR request will actually send."""
+    from simulation_capabilities import settings_evidence
+
+    wire = regular_wire_settings(settings)
+    schema = snapshot.get("settings_schema")
+    excluded = _regular_unsent_settings(settings)
+    if isinstance(schema, dict):
+        snapshot = {**snapshot, "settings_schema": {
+            key: value for key, value in schema.items() if key not in excluded}}
+    report = settings_evidence(wire, snapshot)
+    report["omitted_from_payload"] = [key for key in excluded if key in settings]
+    return report
 
 
 #: Keys a per-alpha dict in a research file may carry. Anything else is an
@@ -1330,7 +1378,11 @@ def normalize_alphas(alphas, settings):
             raise ValueError("alphas[%d] has an empty or non-string expression" % index)
         if not isinstance(decay, int) or isinstance(decay, bool) or decay < 0:
             raise ValueError("alphas[%d] has an invalid decay %r" % (index, decay))
-        normalized.append((expression.strip(), decay))
+        if is_python_language(settings.get("language")):
+            expression = normalize_python_source(expression)
+        else:
+            expression = expression.strip()
+        normalized.append((expression, decay))
     return normalized
 
 
@@ -1683,7 +1735,8 @@ def simulate_alphas(
             shared_state()
             if progress.get("status") in simulation_slots.TERMINAL_FAILURE_STATUSES or progress.get("message"):
                 record["error"] = progress.get("message") or "simulation ended with %s" % record["status"]
-                note_operator_rejection(record.get("expression"), record["error"])
+                if not is_python_language(settings.get("language")):
+                    note_operator_rejection(record.get("expression"), record["error"])
             if record["alpha_id"]:
                 record["simulation_status"] = record["status"]
                 record["metrics_pending"] = True
@@ -1788,7 +1841,9 @@ def simulate_alphas(
                 emit("deferred", index, record)
                 break
             if decay not in settings_checks:
-                settings_checks[decay] = simulation_capabilities.settings_evidence(
+                check_settings = (regular_settings_evidence if is_python_language(settings.get("language"))
+                                  else simulation_capabilities.settings_evidence)
+                settings_checks[decay] = check_settings(
                     {**settings, "decay": decay}, settings_snapshot)
             capability_check = settings_checks[decay]
             if capability_check["unsupported"]:
@@ -1853,9 +1908,13 @@ def simulate_alphas(
                 record["status"] = "FAILED" if refused else "UNKNOWN_SUBMISSION"
                 record["error"] = "submit failed: %s" % exc
                 if refused:
+                    detail = getattr(exc.response, "text", "")
+                    if is_python_language(settings.get("language")) and isinstance(detail, str) and detail.strip():
+                        record["error"] += " (" + detail.strip()[:500] + ")"
                     simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
                     record["status"] = "FAILED"
-                    note_operator_rejection(record.get("expression"), record["error"])
+                    if not is_python_language(settings.get("language")):
+                        note_operator_rejection(record.get("expression"), record["error"])
                 records[index] = record
                 emit("failed" if refused else "pending", index, record)
                 if not refused:

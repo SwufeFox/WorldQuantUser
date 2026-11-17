@@ -410,6 +410,13 @@ def build_parser():
                                dest="retention_floor",
                                help="Validation test/train floor; retained in the frozen choice.")
     triage_parser.add_argument("--registry", default=None)
+    triage_parser.add_argument("--against-shelf", action="store_true",
+                               help="Compare candidates against the shelf on the same training window.")
+    triage_parser.add_argument("--max-shelf-correlation", type=float, default=None, metavar="RHO",
+                               help="Require measured train evidence and a shelf correlation below this ceiling "
+                                    "before writing a requested freeze.")
+    triage_parser.add_argument("--buffer", default=None, metavar="PATH",
+                               help="Candidate shelf used by --against-shelf.")
     _add_selection_args(triage_parser)
     _add_cost_args(triage_parser)
     triage_parser.set_defaults(func=triage.cmd_triage)
@@ -421,9 +428,17 @@ def build_parser():
                     "Dry runs still freeze, validate and check, but do not write the shelf.")
     promote_parser.add_argument("alpha_id", metavar="ALPHA_ID")
     promote_parser.add_argument("--note", default=None)
-    promote_parser.add_argument("--retention-floor", type=float, default=0.2)
-    promote_parser.add_argument("--freeze", default=None, metavar="PATH",
+    retention_option = promote_parser.add_argument(
+        "--retention-floor", type=float, default=None,
+        help=f"Minimum test/train Sharpe retention (new selections default to {promote.DEFAULT_RETENTION_FLOOR}).")
+    retention_option.documented_default = promote.DEFAULT_RETENTION_FLOOR
+    promote_parser.add_argument("--max-self-correlation", type=float, default=None, metavar="RHO",
+                                help="Require a measured live self-correlation below this value.")
+    promote_source = promote_parser.add_mutually_exclusive_group()
+    promote_source.add_argument("--freeze", default=None, metavar="PATH",
                                 help="Frozen selection path (default: promote-freeze-ID-timestamp.json in research dir).")
+    promote_source.add_argument("--selection", default=None, metavar="PATH",
+                                help="Validate an existing single-candidate training selection.")
     promote_parser.add_argument("--buffer", default=None, metavar="PATH",
                                 help="Shelf file (default: in research dir).")
     promote_parser.add_argument("--dry-run", action="store_true",
@@ -439,9 +454,9 @@ def build_parser():
     feed_parser.add_argument("--topic", action="append", default=None,
                              help="Search this instead of deriving from open-threads.")
     feed_parser.add_argument("--source", action="append", default=None, metavar="ID",
-                             help="Source ID: paper, news, social, forum, trends, web, all, or a configured ID; repeatable.")
+                             help="Source ID: paper, news, social, forum, trends, all, or a configured ID; repeatable.")
     feed_parser.add_argument("--sources-file", default=None, metavar="PATH",
-                             help="JSON source definitions for RSS/Atom, indexed sites, markets or local forum exports.")
+                             help="JSON source definitions for RSS/Atom, markets or local forum exports.")
     feed_parser.add_argument("--market", action="append", default=None, metavar="VENUE:SYMBOL",
                              help="Explicit market observation, e.g. coinbase:BTC-USD or alpaca:AAPL; repeatable.")
     feed_parser.add_argument("--book-depth", type=_positive_count, default=10,
@@ -683,17 +698,16 @@ def build_parser():
 
     lint = sub.add_parser(
         "lint",
-        help="Pre-flight expressions against the operator catalog (quota-free).")
+        help="Preflight FASTEXPR expressions or Python Alpha source (quota-free).")
     lint.add_argument("expression", nargs="?",
                       help="Expression to lint, e.g. 'rank(ts_delta(close, 5))'.")
     lint.add_argument("--file", dest="files", action="append", default=[],
-                      help="Research file or - for stdin; repeat to merge expressions. "
+                      help="Research file, Python source (.py), or - for stdin. "
                            "Later file settings override earlier files.")
     lint.add_argument("--expr", action="append", default=[], metavar="EXPRESSION",
                       help="Inline expression; repeat and combine with files or the positional expression.")
     lint.add_argument("--offline", action="store_true",
-                      help="Skip the operator catalog; check structure and the "
-                           "learned denylist only.")
+                      help="Check structure without platform catalogs or account access.")
     lint.add_argument("--dataset", default=None,
                       help="Treat this dataset's fields as known so unknown "
                            "identifiers are flagged.")
@@ -705,31 +719,6 @@ def build_parser():
 
     _add_session_args(lint)
     lint.set_defaults(func=validation.cmd_lint)
-
-    lit = sub.add_parser(
-        "search",
-        help="Literature search and page fetch via the DeepSeek Search API.")
-    lit.add_argument("query", nargs="?",
-                     help="Search query. Supports site:, \"exact phrase\", "
-                          "lang:, after:, before: and -exclude.")
-    lit.add_argument("--fetch", dest="fetch_url", default=None,
-                     help="Fetch one URL as Markdown instead of searching.")
-    lit.add_argument("--count", type=int, default=10,
-                     help="Number of results, 1-50 (default 10).")
-    lit.add_argument("--content", action="store_true",
-                     help="Ask the API to include page content in results.")
-    lit.add_argument("--min-score", type=float, default=0.0,
-                     help="Drop results below this rerank_score (1.5+ is high quality).")
-    lit.add_argument("--min-authority", type=int, default=None,
-                     help="Drop results below this authority level (3+ is authoritative).")
-    lit.add_argument("--max-age-hours", type=float, default=168.0,
-                     help="Reuse a cached answer younger than this (default 168).")
-    lit.add_argument("--no-cache", action="store_true",
-                     help="Ignore and do not write the cache.")
-    lit.add_argument("--timeout", type=_positive_seconds, default=60.0,
-                     metavar="SECONDS", help="Network timeout for search or page fetch.")
-
-    lit.set_defaults(func=literature.cmd_search)
 
     papers = sub.add_parser(
         "paper",
@@ -759,7 +748,7 @@ def build_parser():
     sim = sub.add_parser(
         "simulate", help="Simulate alphas; preview with --dry-run before using platform capacity.")
     sim.add_argument("file", nargs="?",
-                     help="Research file: JSON, or one expression per line. "
+                     help="Research file: JSON, one FASTEXPR expression per line, or one Python Alpha (.py). "
                           "Omit when using --expr.")
     sim.add_argument("--expr", action="append", default=[], metavar="EXPRESSION",
                      help="Inline expression; repeat for several.")
@@ -954,8 +943,8 @@ def build_parser():
                               help="Continue a saved batch, including definitely unsubmitted arms; "
                                    "use --dry-run to preview first.")
     probe.add_argument("spec", nargs="?", default=None,
-                       help="JSON spec: {name, design?, settings, arms:[{label, expression, "
-                            "design?, proxy_of?, settings?}]}; use design=explore for scans. "
+                       help="JSON experiment spec. Arms take an inline expression or a relative Python "
+                            "source_file. Use design=explore for scans. "
                             "Omitted with --recover or --resume.")
     _add_settings_args(probe)
     _add_session_args(probe)
@@ -1517,7 +1506,6 @@ _COMMAND_EXAMPLES = {
     "catalog categories": ["catalog categories"],
     "catalog field-audit": ["catalog field-audit --fields close,volume"],
     "lint": ['lint --expr "rank(close)" --offline', "lint --file research.json"],
-    "search": ['search "post earnings announcement drift" --min-authority 3'],
     "paper": ['paper "accruals stock returns" --limit 3',
               'paper --id W2741809807', 'paper --id W2741809807 --related references --limit 5',
               'paper --id W2741809807 --full-text --max-chars 12000'],
@@ -1631,8 +1619,9 @@ def _describe_options(parser):
             entry["choices"] = [str(c) for c in action.choices]
         if action.help:
             entry["help"] = action.help
-        if action.default not in (None, False, [], argparse.SUPPRESS):
-            entry["default"] = action.default
+        default = getattr(action, "documented_default", action.default)
+        if default not in (None, False, [], argparse.SUPPRESS):
+            entry["default"] = default
         options.append(entry)
     return options
 

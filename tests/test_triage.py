@@ -272,7 +272,7 @@ class TriageEvidenceBoundaryTests(unittest.TestCase):
         from unittest.mock import patch
         self.rows.extend({"alpha_id": alpha_id} for alpha_id in ("C2", "C3"))
         self.save_registry()
-        with patch("research_app.triage._score", side_effect=lambda alpha_id, *_:
+        with patch("research_app.triage._score", side_effect=lambda alpha_id, *_, **_options:
                    {"alpha_id": alpha_id, "delta": {"C1": 0, "C2": -0.1, "C3": None}[alpha_id]}):
             result = triage.triage(["C2", "C3", "C1"], registry_path=str(self.registry), pnl_dir=str(self.pnl))
         self.assertEqual([row["alpha_id"] for row in result["rows"]], ["C1", "C2", "C3"])

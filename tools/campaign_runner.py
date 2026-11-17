@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
+from uuid import uuid4
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from research_app import selection
 from tools._runner import research_root, run_cli, run_queue
 
 TRAIN_SHARPE = 1.25
@@ -34,25 +37,35 @@ def require_data(response, operation):
     return response.data
 
 
-def duplicate_of(root, alpha_id):
-    """Find candidate-to-shelf pairs above the campaign's correlation ceiling."""
-    shelf = require_data(run_cli(root, "buffer", "list", timeout=300), "read shelf")
-    ids = [row["alpha_id"] for row in shelf.get("rows", [])
-           if row.get("alpha_id") and row["alpha_id"] != alpha_id]
-    if not ids:
-        return None
-    response = run_cli(root, "alpha", "corr", alpha_id, *ids, "--threshold",
-                       str(MAX_CORRELATION), timeout=900)
-    pairs = require_data(response, f"check correlation for {alpha_id}")["matrix"]["pairs"]
-    return max((pair for pair in pairs if alpha_id in {pair["a"], pair["b"]}
-                and pair["r"] >= MAX_CORRELATION), key=lambda pair: pair["r"], default=None)
+def finite(value):
+    return type(value) in (int, float) and math.isfinite(value)
 
 
-def promote(root, results, alpha_id, label):
+def freeze_candidate(root, results, alpha_id):
+    """Get the training evidence and verify the frozen choice if admitted."""
+    path = results / f"campaign-freeze-{uuid4().hex}.json"
+    response = run_cli(root, "triage", "--ids", alpha_id, "--against-shelf",
+                       "--max-shelf-correlation", str(MAX_CORRELATION),
+                       "--min-delta", "0", "--cost-bps", *COST_BPS, "--freeze", path, timeout=900)
+    report = require_data(response, f"training evidence for {alpha_id}")
+    selection_id = report.get("selection_id")
+    rows = report.get("rows") or []
+    if selection_id:
+        manifest = selection.load(path, source="triage")
+        if selection_id != manifest["selection_id"]:
+            raise ValueError(f"training selection did not match {alpha_id}")
+        rows = manifest["rows"]
+    if len(rows) != 1 or rows[0].get("alpha_id") != alpha_id:
+        raise ValueError(f"training selection did not match {alpha_id}")
+    return (path if selection_id else None), rows[0]
+
+
+def promote(root, results, alpha_id, label, selection_path):
     output = results / f"promote-{alpha_id}.json"
     response = run_cli(root, "promote", alpha_id, "--note",
                        f"backlog admission: {label}; training gate cleared.",
-                       "--cost-bps", *COST_BPS, "--save", output, timeout=1800)
+                       "--selection", selection_path, "--max-self-correlation",
+                       str(MAX_CORRELATION), "--save", output, timeout=1800)
     data = require_data(response, f"promote {alpha_id}")
     checks = (data.get("checks") or {}).get("results") or []
     check = next((row for row in checks if row.get("alpha_id") == alpha_id), {})
@@ -61,29 +74,6 @@ def promote(root, results, alpha_id, label):
             "reasons": data.get("reasons"),
             "self_correlation": ((check.get("checks") or {}).get("SELF_CORRELATION") or {}).get("value"),
             "test_sharpe": validation.get("test_sharpe"), "retention": validation.get("retention")}
-
-
-def check_marginal(root, alpha_id, result):
-    """Apply campaign-specific portfolio rules to a newly shelved candidate."""
-    self_corr = result["self_correlation"]
-    if isinstance(self_corr, (int, float)) and self_corr >= MAX_CORRELATION:
-        note = f"platform self-correlation {self_corr} exceeds the {MAX_CORRELATION} campaign criterion"
-        outcome = "dropped-over-gate"
-    else:
-        response = run_cli(root, "triage", "--ids", alpha_id, "--cost-bps", *COST_BPS,
-                           timeout=900)
-        rows = require_data(response, f"check marginal contribution for {alpha_id}").get("rows") or []
-        marginal = rows[0] if rows else {}
-        delta = marginal.get("delta")
-        result.update(delta=delta, rho_book=marginal.get("rho_book"),
-                      margin_bps=(marginal.get("costs") or {}).get("margin_bps"))
-        if not isinstance(delta, (int, float)) or delta > 0:
-            return
-        note = f"marginal-first: delta {delta} <= 0"
-        outcome = "dropped-dilutive"
-    drop = run_cli(root, "buffer", "drop", alpha_id, "--note", note, timeout=600)
-    require_data(drop, f"drop {alpha_id}")
-    result.update(outcome=outcome, drop_ok=True)
 
 
 def process(root, results, log_entry, spec, data):
@@ -97,21 +87,35 @@ def process(root, results, log_entry, spec, data):
                    "h1": h1, "h2": h2, "alpha_id": alpha_id})
         if role == "diagnostic" or status not in {"COMPLETE", "WARNING", "UNSUBMITTED"} or not alpha_id:
             continue
-        if None in (sharpe, fitness, h1, h2):
+        if not all(map(finite, (sharpe, fitness))):
+            raise RuntimeError(f"training metrics incomplete for {alpha_id}")
+        if sharpe < TRAIN_SHARPE or fitness < TRAIN_FITNESS:
             continue
-        if sharpe < TRAIN_SHARPE or fitness < TRAIN_FITNESS or h1 <= 0 or h2 <= 0:
+        if not all(map(finite, (h1, h2))):
+            raise RuntimeError(f"training half-window metrics incomplete for {alpha_id}")
+        if h1 <= 0 or h2 <= 0:
             continue
-        duplicate = duplicate_of(root, alpha_id)
-        if duplicate:
-            log_entry({"kind": "skipped-duplicate", "spec": spec.name, "label": label,
-                       "alpha_id": alpha_id, "train_sharpe": sharpe,
-                       "correlates_with": duplicate["a"] if duplicate["b"] == alpha_id else duplicate["b"],
-                       "r": duplicate["r"]})
+
+        path, trained = freeze_candidate(root, results, alpha_id)
+        gate = trained.get("training_gate") or {}
+        shelf = trained.get("shelf_correlation") or {}
+        decision = {"spec": spec.name, "label": label, "alpha_id": alpha_id,
+                    "selection_path": str(path) if path else None, "delta": trained.get("delta"),
+                    "rho_book": trained.get("rho_book"), "training_gate": gate,
+                    "max_book_member_rho": trained.get("max_member_rho"),
+                    "max_shelf_rho": shelf.get("max_rho"), "max_shelf_member": shelf.get("max_member"),
+                    "margin_bps": (trained.get("costs") or {}).get("margin_bps")}
+        if gate.get("state") == "rejected":
+            log_entry({"kind": "training-rejected", **decision})
             continue
-        result = promote(root, results, alpha_id, label)
-        if result["outcome"] == "buffered":
-            check_marginal(root, alpha_id, result)
-        log_entry({"kind": "promote", "spec": spec.name, **result})
+        if (gate.get("state") != "pass" or path is None
+                or not finite(decision["delta"]) or decision["delta"] <= 0):
+            log_entry({"kind": "training-evidence-deferred", **decision})
+            reason = gate.get("reason") or "no admissible frozen training selection"
+            raise RuntimeError(f"training evidence for {alpha_id}: {reason}")
+
+        result = promote(root, results, alpha_id, label, path)
+        log_entry({"kind": "promote", **decision, **result})
 
 
 def main(argv=None):

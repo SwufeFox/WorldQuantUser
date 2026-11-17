@@ -826,29 +826,33 @@ class FeedTests(unittest.TestCase):
                 "collected_at": "2026-11-17T12:00:00+00:00", "query": None,
                 "coverage": {"scope": "bounded fixture", "ordering": "provider order", "partial": True}}
 
-    def test_six_kinds_share_fair_selection_and_web_failure_is_independent(self):
+    def test_six_kinds_share_fair_selection_and_custom_feed_failure_is_independent(self):
         import source_io
 
+        sources_file = self.write_file("sources.json", json.dumps({"sources": [
+            {"id": "custom-news", "kind": "news", "adapter": "rss", "url": "https://example.org/feed"}]}))
+
         def fetch(source, query=None, **options):
-            if source["id"] == "web":
-                raise source_io.SourceError("AUTH_MISSING", "Search key is absent.", hint="Configure the search key.")
+            if source["id"] == "custom-news":
+                raise source_io.SourceError("RATE_LIMITED", "Feed is temporarily rate limited.")
             self.assertEqual(options["limit"], 2)
             return self.source_packet(self.source_item(source["kind"], "first"),
                                       self.source_item(source["kind"], "second"))
 
         with mock.patch("research_sources.fetch_source", side_effect=fetch), \
                 mock.patch("paper_search.search_papers", return_value={"papers": [self.paper(), self.paper("Second")]}):
-            result = feed.cmd_feed(self.args(source=["all"], market=["coinbase:BTC-USD"],
+            result = feed.cmd_feed(self.args(source=["all"], sources_file=sources_file, market=["coinbase:BTC-USD"],
                                              max_topics=7, total=6, limit=2, dry_run=True), None)
         self.assertEqual([row["kind"] for row in result["items"]],
                          ["paper", "news", "social", "forum", "trend", "market"])
         self.assertEqual(len(result["searches"]), 7)
-        self.assertEqual(result["searches"][5]["error"]["code"], "AUTH_MISSING")
+        self.assertEqual(result["searches"][5]["error"]["code"], "RATE_LIMITED")
         self.assertNotIn("papers", result)
         self.assertTrue(all(row["coverage"] for row in result["items"]))
         self.assertTrue(all("rank" not in row for row in result["items"][1:]))
         retry = next(row for row in result["next_actions"] if row["kind"] == "retry_search")
-        self.assertIn("web", retry["argv"])
+        self.assertIn("custom-news", retry["argv"])
+        self.assertIn(sources_file, retry["argv"])
         self.assertNotIn("all", retry["argv"])
         self.assertNotIn("--market", retry["argv"])
 
@@ -1089,19 +1093,35 @@ class FeedTests(unittest.TestCase):
         import source_io
 
         def fetch(source, **options):
-            if source["id"] == "web":
-                raise source_io.SourceError("AUTH_MISSING", "Search key is absent.")
+            if source["id"] == "forum":
+                raise source_io.SourceError("RATE_LIMITED", "Forum is temporarily rate limited.")
             return self.source_packet(self.source_item())
 
         with mock.patch("research_sources.fetch_source", side_effect=fetch):
-            result = feed.cmd_feed(self.args(source=["news", "web"], summary=True, dry_run=True), None)
+            result = feed.cmd_feed(self.args(source=["news", "forum"], summary=True, dry_run=True), None)
         failure = result["searches"][0]
-        self.assertEqual(failure["error"]["code"], "AUTH_MISSING")
+        self.assertEqual(failure["error"]["code"], "RATE_LIMITED")
         self.assertEqual(result["items"][0]["coverage"]["scope"], "bounded fixture")
         retry = result["next_actions"][0]
-        self.assertIn("web", retry["argv"])
+        self.assertIn("forum", retry["argv"])
         self.assertIn("--summary", retry["argv"])
         self.assertNotIn("news", retry["argv"])
+
+    def test_local_web_evidence_stays_readable_after_removing_indexed_search(self):
+        sources_file = self.write_file("sources.json", json.dumps({"sources": [
+            {"id": "captured", "kind": "web", "adapter": "file", "path": "captured.jsonl"}]}))
+        self.write_file("captured.jsonl", json.dumps({
+            "id": "capture-1", "title": "Saved web excerpt", "text": "Previously captured evidence.",
+            "url": "https://example.org/capture"}) + "\n")
+        with mock.patch("research_sources.request_bytes") as request_bytes, \
+                mock.patch("research_sources.request_json") as request_json:
+            result = feed.cmd_feed(self.args(topic=None, sources_file=sources_file, dry_run=True), None)
+        request_bytes.assert_not_called()
+        request_json.assert_not_called()
+        self.assertEqual(result["count"], 1)
+        row = result["items"][0]
+        self.assertEqual((row["kind"], row["provider"], row["excerpt"]),
+                         ("web", "local_file", "Previously captured evidence."))
 
     def test_reused_rss_guid_does_not_merge_unrelated_custom_sources(self):
         path = self.write_file("sources.json", json.dumps({"sources": [

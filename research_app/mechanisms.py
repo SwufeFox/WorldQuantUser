@@ -20,7 +20,9 @@ import re
 from collections import defaultdict
 from pathlib import PurePosixPath
 
+import alpha_registry
 import fastexpr_ast
+import machine_lib as ml
 
 #: Which information the expression reads, in the order that decides ties: the first rule
 #: that matches wins, so the list runs from most specific to most generic.
@@ -62,8 +64,10 @@ def _field_tokens(text):
     return tokens
 
 
-def block_of(expression):
+def block_of(expression, language=None):
     """The information block an expression reads (``other`` when nothing matches)."""
+    if ml.is_python_language(language):
+        return "other"
     text = " ".join((expression or "").split())
     if not text:
         return "other"
@@ -76,8 +80,10 @@ def block_of(expression):
     return "other"
 
 
-def skeleton_of(expression):
+def skeleton_of(expression, language=None):
     """AST skeleton with fields and literals blanked, or ``None`` when unparseable."""
+    if ml.is_python_language(language):
+        return None
     text = " ".join((expression or "").split())
     if not text:
         return None
@@ -87,9 +93,9 @@ def skeleton_of(expression):
         return None
 
 
-def mechanism_key(expression):
+def mechanism_key(expression, language=None):
     """``(block, skeleton)``: the unit the campaign counts as one bet."""
-    skeleton = skeleton_of(expression)
+    skeleton = skeleton_of(expression, language)
     if skeleton is None:
         return None
     return (block_of(expression), skeleton[:200])
@@ -107,7 +113,7 @@ def summarise(entries, marginals=None):
                                   "fitness": [], "marginal": []})
     skipped = []
     for entry in entries:
-        key = mechanism_key(entry.get("expression"))
+        key = mechanism_key(entry.get("expression"), alpha_registry.entry_language(entry))
         alpha_id = entry.get("alpha_id") or entry.get("key")
         if key is None:
             skipped.append(alpha_id)
@@ -170,13 +176,13 @@ def convergence(entries, marginals=None, recent_batches=8):
     for entry in entries:
         idea = (entry.get("idea") or "").strip() or "untagged"
         batches[idea].append(entry)
-    book_keys = {mechanism_key(e.get("expression")) for e in entries
+    book_keys = {mechanism_key(e.get("expression"), alpha_registry.entry_language(e)) for e in entries
                  if str(e.get("status") or "").upper() == "ACTIVE"}
     book_keys.discard(None)
 
     rows = []
     for idea, members in batches.items():
-        keys = [mechanism_key(e.get("expression")) for e in members]
+        keys = [mechanism_key(e.get("expression"), alpha_registry.entry_language(e)) for e in members]
         keys = [key for key in keys if key]
         if not keys:
             continue

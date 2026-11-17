@@ -6,7 +6,6 @@ import datetime
 import hashlib
 import json
 import math
-import os
 import threading
 import time
 import uuid
@@ -26,7 +25,7 @@ from tools import guarded_sim
 
 from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, protect_output, with_session
 from . import costs, incentives, selection, stats
-from .validation import _preflight_lint, attach_field_contracts, cached_field_scope
+from .validation import _preflight_lint, attach_field_contracts, cached_field_scope, lint_python_source
 
 
 #: Operators per arm above which the report says so. Not a hard limit (the platform's
@@ -311,6 +310,8 @@ def cmd_ablate(args, _sink):
             raise CliError("INVALID_INPUT", str(exc)) from exc
         settings_source = args.file
     resolved = merge_settings(settings, args)
+    if ml.is_python_language(resolved.get("language")):
+        raise CliError("INVALID_INPUT", "ablate only supports FASTEXPR")
     if any(getattr(args, flag, None) is not None for flag in (
             "region", "universe", "instrument_type", "neutralization", "decay",
             "delay", "truncation", "pasteurization", "nan_handling", "test_period")):
@@ -348,6 +349,9 @@ def cmd_ablate(args, _sink):
             entry = alpha_registry.resolve(entries, raw)
             if entry is None:
                 skipped.append({"alpha_id": raw, "reason": "not in the ledger"})
+                continue
+            if ml.is_python_language(ml.alpha_language(entry)):
+                skipped.append({"alpha_id": raw, "reason": "ablate only supports FASTEXPR"})
                 continue
             source = entry.get("expression") or ""
             legs_legend = None
@@ -931,13 +935,23 @@ def _load_probe_spec(path):
         except ValueError as exc:
             raise CliError("INVALID_INPUT", "spec settings: %s" % exc) from exc
     for index, arm in enumerate(arms, 1):
-        if isinstance(arm, dict):
-            _selection_call(alpha_registry.evidence_role, arm)
-        if not isinstance(arm, dict) or not isinstance(arm.get("expression"), str) \
-                or not arm["expression"].strip():
+        if not isinstance(arm, dict):
             raise CliError("INVALID_INPUT", "arm %d has no expression" % index,
                            "an arm is {\"label\": ..., \"expression\": ..., "
                            "\"settings\": {...} (optional)}")
+        _selection_call(alpha_registry.evidence_role, arm)
+        if "source_file" in arm:
+            if "expression" in arm:
+                raise CliError("INVALID_INPUT", "arm %d must choose expression or source_file" % index)
+            if not isinstance(arm["source_file"], str) or not arm["source_file"].strip() \
+                    or arm["source_file"] == "-":
+                raise CliError("INVALID_INPUT", "arm %d source_file must be a file path" % index)
+            if str(path) == "-":
+                raise CliError("INVALID_INPUT", "source_file requires a probe spec file",
+                               "use inline expression when reading a spec from stdin")
+        elif not isinstance(arm.get("expression"), str) or not arm["expression"].strip():
+            raise CliError("INVALID_INPUT", "arm %d has no expression" % index,
+                           "provide expression or a Python source_file")
         if "settings" in arm and not isinstance(arm["settings"], dict):
             raise CliError("INVALID_INPUT", "arm %d settings must be an object" % index)
         if "settings" in arm:
@@ -994,6 +1008,9 @@ def _probe_design(spec, settings):
                 "name the different implementation of the same economic quantity, "
                 "e.g. \"proxy_of\": \"gross_profit/assets\"")
         effective = {**settings, **(arm.get("settings") or {})}
+        if ml.is_python_language(base.get("language")) != ml.is_python_language(effective.get("language")):
+            raise CliError("INVALID_INPUT", "arm %r changes alpha language" % arm["label"],
+                           "use design explore or run a separate batch for each language")
         moved = sorted(key for key in set(base) | set(effective)
                        if base.get(key) != effective.get(key))
         if design == "parallel":
@@ -1077,12 +1094,23 @@ def _turnover_band(expression):
 
 def _settings_signature(settings):
     """Stable identity of the complete settings, without inventing missing defaults."""
-    return json.dumps(settings or {}, sort_keys=True, separators=(",", ":"))
+    settings = settings or {}
+    if ml.is_python_language(settings.get("language")):
+        settings = ml.regular_wire_settings(settings)
+    return json.dumps(settings, sort_keys=True, separators=(",", ":"))
 
 
 def _normalized_expression(text):
     """Whitespace-free form so a platform expression matches its spec arm."""
     return "".join((text or "").split())
+
+
+def _recovery_expression_key(expression, language):
+    if not expression:
+        return None
+    if ml.is_python_language(language):
+        return alpha_registry.expression_hash(expression, language=language)
+    return _normalized_expression(expression)
 
 
 def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.0,
@@ -1105,7 +1133,7 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
                                    order="-dateCreated", status="UNSUBMITTED")
             for alpha in batch:
                 code, _description, _ops = ml.regular_expression(alpha)
-                key = _normalized_expression(code)
+                key = _recovery_expression_key(code, ml.alpha_language(alpha))
                 if key:
                     index.setdefault(key, []).append({"alpha_id": alpha.get("id"),
                         "signature": _settings_signature(alpha.get("settings"))})
@@ -1145,8 +1173,8 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
                     continue
                 wanted = (_settings_signature(row["settings"]) if "settings" in row
                           else row.get("settings_signature") or _settings_signature(None))
-                exact = [candidate for candidate in index.get(
-                    _normalized_expression(row.get("expression")), [])
+                key = _recovery_expression_key(row.get("expression"), _recovery_language(row, wanted))
+                exact = [candidate for candidate in index.get(key, [])
                     if candidate["signature"] == wanted]
                 if len(exact) != 1:
                     if len(exact) > 1:
@@ -1189,6 +1217,16 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
             on_progress(row, raw)
     return {"recovered": len(matched), "still_missing": still_missing,
             "ambiguous": ambiguous, "matched": matched, "not_submitted": not_submitted}
+
+
+def _recovery_language(row, signature):
+    settings = row.get("settings")
+    if not isinstance(settings, dict):
+        try:
+            settings = json.loads(signature)
+        except (TypeError, ValueError):
+            return None
+    return settings.get("language") if isinstance(settings, dict) else None
 
 
 def _load_probe_batch(value):
@@ -1359,6 +1397,9 @@ def cmd_fmt(args, _sink):
             raise CliError("INVALID_INPUT", "%s has no arms" % path.name)
         changed = 0
         for arm in arms:
+            settings = {**(document.get("settings") or {}), **(arm.get("settings") or {})}
+            if "source_file" in arm or ml.is_python_language(settings.get("language")):
+                continue
             original = arm.get("expression") or ""
             formatted = expression_lint.pretty_expression(original)
             if formatted != original:
@@ -1370,12 +1411,36 @@ def cmd_fmt(args, _sink):
         return {"path": str(path), "arms": len(arms), "changed": changed,
                 "written": bool(args.write), "formatted": document}
 
+    if path.suffix.lower() == ".py" and path.exists():
+        raise CliError("INVALID_INPUT", "fmt only formats FASTEXPR")
     # Not a spec file: treat the argument as one expression.
     formatted = expression_lint.pretty_expression(target)
     if args.write:
         raise CliError("USAGE", "--write needs a spec file",
                        "pass the path to a JSON spec instead of a bare expression")
     return {"formatted": formatted}
+
+
+_PROBE_REFERENCE_LIMIT = 3
+
+
+def _probe_history_ref(record, *, key=None, train=False):
+    """A reusable identity, with at most explicit train statistics."""
+    result = {name: record[name] for name in ("alpha_id", "status", "role", "batch", "mechanism")
+              if record.get(name) is not None}
+    if key is not None:
+        result["key"] = key
+    if train:
+        split = record.get("out_of_sample")
+        metrics = split.get("train") if isinstance(split, dict) else None
+        result["train"] = {name: value for name, value in metrics.items()
+                           if name in METRIC_KEYS and _finite_metric(value)} if isinstance(metrics, dict) else {}
+    return result
+
+
+def _probe_identity(expression, settings):
+    language = (settings or {}).get("language")
+    return alpha_registry.expression_hash(expression, language=language), _settings_signature(settings)
 
 
 def _novelty_gate(arms, registry_path=None):
@@ -1399,13 +1464,13 @@ def _novelty_gate(arms, registry_path=None):
         if key:
             latest[key] = entry
 
-    book = [entry for entry in latest.values()
-            if str(entry.get("status") or "").upper() == "ACTIVE"]
-    book_keys = {}
-    for entry in book:
-        key = mechanisms.mechanism_key(entry.get("expression"))
-        if key:
-            book_keys.setdefault(key, []).append(entry.get("key") or entry.get("alpha_id"))
+    arm_keys = [None if ml.is_python_language(arm["settings"].get("language"))
+                else mechanisms.mechanism_key(arm["expression"]) for arm in arms]
+    wanted_mechanisms = {key for key in arm_keys if key}
+    wanted_blocks = {key[0] for key in wanted_mechanisms}
+    arm_identities = [_probe_identity(arm["expression"], arm["settings"]) for arm in arms]
+    wanted_identities = set(arm_identities)
+    wanted_settings = {signature for _, signature in arm_identities}
 
     block_marginals = {}
     snapshot = Path(research_paths.resolve("convergence.json"))
@@ -1416,30 +1481,47 @@ def _novelty_gate(arms, registry_path=None):
         except (OSError, ValueError):
             block_marginals = {}
 
-    exact_results = {}
+    exact_results, structural_results, book_keys = {}, {}, {}
     for entry in latest.values():
-        prior_settings = entry.get("settings")
-        if not entry.get("expression") or not _has_finished_result(entry):
+        expression = entry.get("expression")
+        if not expression:
             continue
-        if not isinstance(prior_settings, dict) or any(
-                prior_settings.get(key) is None for key in ml.DEFAULT_SETTINGS):
+        entry_key = entry.get("key") or entry.get("alpha_id")
+        prior_settings = entry.get("settings")
+        if (not ml.is_python_language(ml.alpha_language(entry))
+                and mechanisms.block_of(expression) in wanted_blocks):
+            key = mechanisms.mechanism_key(expression)
+            if key in wanted_mechanisms:
+                structural_results.setdefault(key, []).append(entry)
+                if str(entry.get("status") or "").upper() == "ACTIVE":
+                    book_keys.setdefault(key, []).append(entry_key)
+        if not _has_finished_result(entry):
+            continue
+        if not isinstance(prior_settings, dict):
+            continue
+        defaults = (ml.regular_wire_settings({**ml.DEFAULT_SETTINGS, "language": "PYTHON"})
+                    if ml.is_python_language(ml.alpha_language(entry)) else ml.DEFAULT_SETTINGS)
+        if any(prior_settings.get(key) is None for key in defaults):
             continue
         try:
             resolved = ml.resolve_settings(prior_settings)
         except (ValueError, TypeError):
             continue
-        identity = (alpha_registry.expression_hash(entry["expression"]),
-                    _settings_signature(resolved))
-        exact_results.setdefault(identity, []).append(entry.get("key") or entry.get("alpha_id"))
+        signature = _settings_signature(resolved)
+        if signature in wanted_settings:
+            identity = _probe_identity(expression, resolved)
+            if identity in wanted_identities:
+                exact_results.setdefault(identity, []).append(entry)
     verdicts = []
-    for arm in arms:
-        text = arm["expression"]
-        key = mechanisms.mechanism_key(text)
+    for key, identity in zip(arm_keys, arm_identities):
         block = key[0] if key else None
         block_row = block_marginals.get(block) or {}
-        exact = exact_results.get((alpha_registry.expression_hash(text),
-                                   _settings_signature(arm["settings"])), [])
+        completed = exact_results.get(identity, [])
+        exact = [entry.get("key") or entry.get("alpha_id") for entry in completed]
+        exact_keys = set(exact)
         structural = book_keys.get(key, []) if key else []
+        similar = [entry for entry in structural_results.get(key, [])
+                   if (entry.get("key") or entry.get("alpha_id")) not in exact_keys]
         verdicts.append({
             "available": True,
             "block": block,
@@ -1448,8 +1530,67 @@ def _novelty_gate(arms, registry_path=None):
             "structural_similarity_keys": structural,
             "exact_repeat_keys": exact,
             "already_simulated": bool(exact),
+            "history_registry": str(Path(registry).expanduser().resolve()),
+            "completed_refs": [_probe_history_ref(entry, key=entry.get("key") or entry.get("alpha_id"),
+                                                  train=True)
+                               for entry in completed[:_PROBE_REFERENCE_LIMIT]],
+            "structural_refs": [_probe_history_ref(entry, key=entry.get("key") or entry.get("alpha_id"))
+                                for entry in similar[:_PROBE_REFERENCE_LIMIT]],
+            "structural_history_count": len(similar),
         })
     return verdicts
+
+
+def _probe_checkpoint_refs(target, arms, gate):
+    """Look for exact matches at the intended checkpoint without searching the workspace."""
+    if not target.is_file():
+        return []
+    try:
+        path, document = _load_probe_batch(target)
+    except (CliError, KeyError, TypeError, ValueError):
+        return []
+    index = {}
+    for row, record in zip(document["rows"], document["records"]):
+        identity = _probe_identity(row["expression"], row["settings"])
+        index.setdefault(identity, []).append((row, record))
+
+    recovery_labels = []
+    for arm, verdict in zip(arms, gate):
+        identity = _probe_identity(arm["expression"], arm["settings"])
+        for row, record in index.get(identity, []):
+            ref = {"batch_path": str(path), "run_id": document["run_id"], "label": row["label"],
+                   **_probe_history_ref(record, train=True)}
+            if _has_finished_result(record) and not row.get("metrics_pending"):
+                ref_type = "checkpoint_completed_refs"
+            elif _recoverable_probe_reference(row):
+                ref_type = "checkpoint_recovery_refs"
+            else:
+                continue
+            refs = verdict.setdefault(ref_type, [])
+            if len(refs) < _PROBE_REFERENCE_LIMIT:
+                refs.append(ref)
+        if verdict.get("checkpoint_recovery_refs"):
+            recovery_labels.append(arm["label"])
+    if not recovery_labels:
+        return []
+    return [{"action": "recover", "batch_path": str(path), "platform_read_only": True,
+             "matching_arms": recovery_labels,
+             "argv": ["python", "research_cli.py", "--research-dir", research_paths.research_dir(),
+                      "probe", "--recover", str(path)]}]
+
+
+def _recoverable_probe_reference(row):
+    if (row["submission_state"] != "accepted" or row.get("submission_attempted") is False
+            or str(row.get("status") or "").upper() in simulation_slots.TERMINAL_FAILURE_STATUSES
+            or (not row.get("metrics_pending") and row.get("train_fitness") is not None)):
+        return False
+    if row.get("alpha_id"):
+        return True
+    try:
+        ml._validated_progress_url(row.get("progress_url"))
+    except ml.SimulationError:
+        return False
+    return True
 
 
 def _prepare_probe(args):
@@ -1462,15 +1603,25 @@ def _prepare_probe(args):
         overrides = merge_settings({**(spec.get("settings") or {}),
                                     **(original.get("settings") or {})}, args)
         entry = {key: value for key, value in original.items()
-                 if key not in {"settings", "design", "proxy_of"}}
+                 if key not in {"settings", "design", "proxy_of", "source_file"}}
+        source_file = original.get("source_file")
+        if source_file and not ml.is_python_language(overrides.get("language")):
+            raise CliError("INVALID_INPUT", "arm %r source_file requires language PYTHON" % original["label"])
         try:
+            if source_file:
+                source_file = Path(args.spec).expanduser().resolve().parent / Path(source_file).expanduser()
+                entry["expression"] = config_io.read_input_text(source_file)
             resolved, pairs = config_io.build_config(overrides, [entry])
         except config_io.ResearchError as exc:
             raise CliError("INVALID_INPUT", str(exc)) from exc
         expression, decay = pairs[0]
         settings = {**resolved, "decay": decay}
         arm = {**original, "expression": expression, "settings": settings,
-               "arm_index": index, "ops": expression_lint.estimate_operator_count(expression)}
+               "arm_index": index,
+               "ops": None if ml.is_python_language(settings.get("language"))
+               else expression_lint.estimate_operator_count(expression)}
+        if source_file:
+            arm["source_file"] = str(source_file.resolve())
         arms.append(arm)
         group = groups.setdefault(_settings_signature(settings),
                                   {"settings": settings, "arms": [], "pairs": []})
@@ -1496,6 +1647,24 @@ def cmd_probe(args, sink):
     return result
 
 
+def _offline_simulation_lint(pairs, settings, scoped=None):
+    if ml.is_python_language(settings.get("language")):
+        known_fields = (scoped or {}).get("known_fields")
+        reports = [lint_python_source(source, known_fields=known_fields) for source, _ in pairs]
+        return {"ok": all(report["ok"] for report in reports), "language": "PYTHON",
+                "errors": [error for report in reports for error in report["errors"]],
+                "warnings": [warning for report in reports for warning in report["warnings"]],
+                "results": reports}
+    if scoped is None:
+        return expression_lint.lint_all(pairs, denylist=expression_lint.load_denylist())
+    report = expression_lint.lint_all(
+        pairs, denylist=expression_lint.load_denylist(),
+        known_fields=scoped.get("known_fields"), field_types=scoped.get("field_types"),
+        strict_fields=scoped.get("known_fields") is not None)
+    attach_field_contracts(report, scoped)
+    return report
+
+
 def _cmd_probe(args, _sink):
     """Prepare exact requests before checking, executing or continuing a batch."""
     recover = getattr(args, "recover", None)
@@ -1513,7 +1682,10 @@ def _cmd_probe(args, _sink):
         return _cmd_probe_resume(args)
     spec, name, groups, arms, design, gate = _prepare_probe(args)
     target = Path(getattr(args, "batch_path", None) or research_paths.batch_path(name)).expanduser().resolve()
-    protect_output(args, target)
+    source_paths = [Path(arm["source_file"]) for arm in arms if "source_file" in arm]
+    if target in source_paths:
+        raise CliError("INVALID_INPUT", "batch path would overwrite an input source_file")
+    protect_output(args, target, *source_paths)
     context = {key: spec[key] for key in ("idea", "mechanism", "note") if key in spec}
     base = {"name": name, **context, "path": str(target), "arms": len(arms),
             "groups": len(groups), "design": design, "arm_order": [arm["label"] for arm in arms],
@@ -1525,15 +1697,12 @@ def _cmd_probe(args, _sink):
                      for arm, verdict in zip(arms, gate)
                      if getattr(args, "strict_gate", False) and verdict.get("already_simulated")]
     if dry_run:
+        recovery_actions = _probe_checkpoint_refs(target, arms, gate)
         results = [None] * len(arms)
         reports = []
         for group in groups.values():
             scoped = cached_field_scope(group["settings"])
-            report = expression_lint.lint_all(group["pairs"],
-                denylist=expression_lint.load_denylist(),
-                known_fields=scoped.get("known_fields"), field_types=scoped.get("field_types"),
-                strict_fields=scoped.get("known_fields") is not None)
-            attach_field_contracts(report, scoped)
+            report = _offline_simulation_lint(group["pairs"], group["settings"], scoped)
             reports.append({**report, "scope": scoped.get("evidence")})
             scheduling = {}
             preview = ml.simulate_alphas(None, group["pairs"], settings=group["settings"],
@@ -1547,7 +1716,10 @@ def _cmd_probe(args, _sink):
                     "role": arm.get("role"),
                     "design": arm.get("design"), "proxy_of": arm.get("proxy_of"),
                     "settings": arm["settings"], "gate": gate[index],
-                    "turnover_band": _turnover_band(arm["expression"])}
+                    "turnover_band": None if ml.is_python_language(arm["settings"].get("language"))
+                    else _turnover_band(arm["expression"])}
+                if "source_file" in arm:
+                    results[index]["source_file"] = arm["source_file"]
         blocking = [item for report in reports for item in report.get("errors", [])]
         return {**base, "dry_run": True, "results": results, "blocking": blocking,
                 "gate_blocking": gate_blocking, "would_block": bool(blocking or gate_blocking),
@@ -1558,7 +1730,7 @@ def _cmd_probe(args, _sink):
                          "operator_catalog_checked": False, "field_catalog_checked": False,
                          "hint": "Live catalogs were not checked; run probe --check for exact authenticated preflight.",
                          "groups": reports},
-                "next_actions": [{"action": "check", "spec": str(args.spec)}]}
+                "next_actions": recovery_actions or [{"action": "check", "spec": str(args.spec)}]}
     if gate_blocking:
         raise CliError("INVALID_INPUT", "exact finished requests repeat under --strict-gate",
                        details={"gate_blocking": gate_blocking})
@@ -1864,6 +2036,9 @@ def cmd_simulate(args, sink):
     metadata = {}
     file_settings, alphas = collect_alphas(args, metadata=metadata)
     settings = merge_settings(file_settings, args)
+    paths = [getattr(args, "file", None), *(getattr(args, "files", None) or ())]
+    sources = [path for path in paths if path and Path(path).suffix.lower() == ".py"]
+    protect_output(args, *sources)
     try:
         settings, pairs = config_io.build_config(settings, alphas)
     except config_io.ResearchError as exc:
@@ -1887,10 +2062,7 @@ def cmd_simulate(args, sink):
         # Offline lint: catches structural problems and learned rejections. The
         # authoritative operator check needs the catalog, so it runs on `lint`
         # and on a real submission below, not here.
-        offline_lint = expression_lint.lint_all(
-            pairs,
-            denylist=expression_lint.load_denylist(),
-        )
+        offline_lint = _offline_simulation_lint(pairs, settings)
         return {
             "status": "DRY_RUN",
             "dry_run": True,
@@ -1899,7 +2071,9 @@ def cmd_simulate(args, sink):
             "summary": {"total": len(records), "payloads": len(records)},
             "lint": {
                 "operator_catalog_checked": False,
-                "hint": "run `lint` for the authoritative operator check",
+                "hint": ("run `lint` to check Python source and platform fields"
+                         if ml.is_python_language(settings.get("language"))
+                         else "run `lint` for the authoritative operator check"),
                 "ok": offline_lint["ok"],
                 "errors": offline_lint["errors"],
                 "warnings": offline_lint["warnings"],

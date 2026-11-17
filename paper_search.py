@@ -1,22 +1,9 @@
 #!/usr/bin/env python3
-"""Find papers, not web pages.
+"""Search and read research papers through OpenAlex.
 
-The general search in ``deepseek_search`` is a web search with reranking. Measured over
-three mechanism queries it returned zero to one academic domain out of ten: the rest were
-research-blog posts, accounting explainers and retail brokerage pages. That is fine for
-looking up a definition and useless for finding the source of an anomaly.
-OpenAlex supports keyless metadata queries and optional OPENALEX_API_KEY authentication.
-Full-text downloads require a key. Two properties matter more than the metadata:
-
-* sorting by relevance rather than citations. Sorting by citations answers the query "net
-  operating assets stock returns" with the most-cited finance papers ever written - the
-  Fama-French mutual fund study among them - because citation count is not relevance. The
-  default ranking returns the actual NOA paper.
-* abstracts arrive as an inverted index, ``{"word": [positions]}``. Reconstructing them is
-  required; without it every result is a title and the reason to prefer this over the web
-  search disappears.
-
-Missing abstracts and content remain unknown; retrieved text is never inferred.
+Metadata queries support optional OPENALEX_API_KEY authentication. Full-text downloads
+require a key. Search follows provider relevance and reconstructs abstracts from their
+inverted indexes. Missing abstracts and content remain unknown.
 """
 
 from __future__ import annotations

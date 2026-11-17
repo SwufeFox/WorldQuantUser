@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -53,6 +54,8 @@ def check(expressions, settings=None, session=None):
     """Lint against the live catalog and return the report (no simulation)."""
     settings = dict(settings or {})
     session = session or ml.login()
+    if ml.is_python_language(settings.get("language")):
+        return _check_python(expressions, ml.resolve_settings(settings), session)
     operator_index, known, types = _catalog(session, settings)
     pairs = [(expr, settings.get("decay", 4)) for expr in expressions]
     return expression_lint.lint_all(
@@ -66,10 +69,25 @@ def check(expressions, settings=None, session=None):
     )
 
 
+def _check_python(expressions, settings, session, capability_snapshot=None):
+    from research_app.runtime import CliError
+    from research_app.validation import _preflight_lint
+
+    pairs = ml.normalize_alphas(expressions, settings)
+    try:
+        return _preflight_lint(session, pairs, settings, SimpleNamespace(),
+                               capability_snapshot=capability_snapshot)
+    except CliError as exc:
+        if exc.details is None:
+            raise
+        return exc.details
+
+
 def simulate(expressions, settings=None, labels=None, force=False, session=None,
              preflight=None, **kwargs):
     """Validate once, reusing only a report bound to these exact resolved requests."""
     settings = ml.resolve_settings(settings or {})
+    python = ml.is_python_language(settings.get("language"))
     if preflight is not None:
         expected = {"settings": settings,
                     "pairs": [list(pair) for pair in ml.normalize_alphas(expressions, settings)]}
@@ -78,6 +96,10 @@ def simulate(expressions, settings=None, labels=None, force=False, session=None,
             raise UnknownNameError("preflight does not match the exact simulation requests")
         report = preflight
         blocking = report["errors"]
+    elif python:
+        session = session or ml.login()
+        report = _check_python(expressions, settings, session, kwargs.get("capability_snapshot"))
+        blocking = report["errors"]
     else:
         session = session or ml.login()
         report = check(expressions, settings, session=session)
@@ -85,7 +107,7 @@ def simulate(expressions, settings=None, labels=None, force=False, session=None,
                     if e["code"] in {"unknown_operator", "unknown_identifier",
                                      "unused_variable", "operator_arg_constraint",
                                      "signal_type", "undefined_variable"}]
-    if blocking and (not force or any(e.get("code") == "unsupported_setting" for e in blocking)):
+    if blocking and (python or not force or any(e.get("code") == "unsupported_setting" for e in blocking)):
         lines = []
         for item in blocking:
             subject = item.get("identifier") or item.get("operator") or item["code"]
@@ -102,6 +124,14 @@ def simulate(expressions, settings=None, labels=None, force=False, session=None,
             % (len(blocking), "\n".join(lines))
         )
     session = session or ml.login()
+    if python:
+        import simulation_capabilities
+
+        claimed = (report.get("capability_snapshot") or {}).get("account") or {}
+        account = simulation_capabilities.account_provenance(session)
+        if ((report.get("language_capability") or {}).get("state") != "verified"
+                or not claimed.get("fingerprint") or claimed["fingerprint"] != account.get("fingerprint")):
+            raise UnknownNameError("Python preflight does not verify availability for this account")
     return ml.simulate_alphas(
         session,
         expressions,

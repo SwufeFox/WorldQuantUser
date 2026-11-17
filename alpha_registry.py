@@ -35,6 +35,7 @@ import os
 
 import research_paths
 import cache_store
+import machine_lib as ml
 
 __all__ = [
     "VERDICTS",
@@ -122,7 +123,7 @@ def default_registry_path():
     return research_paths.resolve("alpha-registry.jsonl")
 
 
-def expression_hash(expression):
+def expression_hash(expression, language=None):
     """Stable short hash of an expression, used as the fallback key.
 
     Identity goes through the tree: ``rank(close)``, ``((rank(close)))`` and a copy
@@ -138,6 +139,9 @@ def expression_hash(expression):
     needs a stable key, and pretending its tree is empty would collide every such row
     with every other.
     """
+    if ml.is_python_language(language):
+        source = ml.normalize_python_source(expression or "")
+        return "py:" + hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
     try:
         import fastexpr_ast
 
@@ -149,8 +153,23 @@ def expression_hash(expression):
     return prefix + digest[:16]
 
 
-def same_expression(left, right):
-    """True when two expressions parse to the same tree, whatever the spelling."""
+def entry_language(entry):
+    """Language of normalized ledger evidence, including older top-level markers."""
+    return ml.alpha_language(entry)
+
+
+def entry_expression_hash(entry):
+    """Get an identity for matching without rewriting historical ledger keys."""
+    language = entry_language(entry)
+    if ml.is_python_language(language):
+        return expression_hash(entry.get("expression"), language)
+    return entry.get("expression_hash")
+
+
+def same_expression(left, right, language=None):
+    """Compare FastExpr trees or exact Python source under one known language."""
+    if ml.is_python_language(language):
+        return ml.normalize_python_source(left or "") == ml.normalize_python_source(right or "")
     import fastexpr_ast
 
     return fastexpr_ast.canonical(left) == fastexpr_ast.canonical(right)
@@ -166,12 +185,15 @@ _FINGERPRINT_KEYS = ("universe", "region", "delay", "decay", "neutralization",
 def settings_fingerprint(settings):
     """Short hash of the settings that decide what a simulation measures.
 
-    Only the inputs that alter results are included; cosmetic keys such as
-    ``language`` or ``visualization`` would make two identical experiments look
-    different.
+    The expression hash carries language identity independently. Display settings
+    such as ``visualization`` do not distinguish ledger placeholders.
     """
     if not settings:
         return "nosettings"
+    if ml.is_python_language(settings.get("language")):
+        wire = ml.regular_wire_settings(settings)
+        text = json.dumps(wire, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
     parts = []
     for key in _FINGERPRINT_KEYS:
         if key in settings and settings[key] is not None:
@@ -191,7 +213,8 @@ def placeholder_key(expression, settings):
     Combines the expression with the settings fingerprint so two runs of one
     formula under different universes or decays stay distinct.
     """
-    return "%s@%s" % (expression_hash(expression), settings_fingerprint(settings))
+    return "%s@%s" % (expression_hash(expression, (settings or {}).get("language")),
+                      settings_fingerprint(settings))
 
 
 def _now():
@@ -266,6 +289,9 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
     metrics = _pick_metrics(alpha.get("metrics"))
     checks = _normalize_checks(alpha.get("checks"))
     settings = alpha.get("settings") or {}
+    language = entry_language(alpha)
+    if language and not settings.get("language"):
+        settings = {**settings, "language": language}
     if alpha.get("decay") is not None and "decay" not in settings:
         settings = dict(settings)
         settings["decay"] = alpha["decay"]
@@ -282,7 +308,7 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
         "verdict": verdict,
         "note": note,
         "expression": expression,
-        "expression_hash": expression_hash(expression),
+        "expression_hash": expression_hash(expression, language),
         "settings": settings,
         "settings_fingerprint": settings_fingerprint(settings),
         "metrics": metrics,
@@ -342,8 +368,15 @@ def load_entries(path=None):
             continue
         if not isinstance(entry, dict):
             continue
-        key = entry.get("key") or entry.get("alpha_id") or \
-            expression_hash(entry.get("expression") or "")
+        key = entry.get("key") or entry.get("alpha_id")
+        if not key:
+            expression = entry.get("expression") or ""
+            language = entry_language(entry)
+            if ml.is_python_language(language):
+                settings = {**(entry.get("settings") or {}), "language": language}
+                key = placeholder_key(expression, settings)
+            else:
+                key = expression_hash(expression, language)
         entry.setdefault("key", key)
         entry["role"] = evidence_role(by_key.get(key), entry)
         if key not in by_key:
@@ -371,8 +404,10 @@ def _comparable(entry):
     comparable = {key: value for key, value in entry.items()
                   if key not in _VOLATILE}
     if "expression" in comparable:
-        comparable["expression"] = " ".join(
-            (comparable.get("expression") or "").split())
+        expression = comparable.get("expression") or ""
+        comparable["expression"] = (ml.normalize_python_source(expression)
+                                    if ml.is_python_language(entry_language(entry))
+                                    else " ".join(expression.split()))
     return comparable
 
 
@@ -555,6 +590,7 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
                 "expression": record.get("expression"),
                 "decay": record.get("decay"),
                 "settings": record.get("settings") or settings,
+                "language": entry_language(record),
                 "metrics": record.get("metrics"),
                 "checks": record.get("checks"),
                 "out_of_sample": record.get("out_of_sample"),
@@ -792,13 +828,15 @@ def relabel(entry, family=None, verdict=None, mechanism=None, idea=None,
     return updated
 
 
-def derive_legs(expression):
+def derive_legs(expression, language=None):
     """Leg names parsed from an expression, or an empty list.
 
     Derived on demand rather than migrated into every record: the ledger predates
     the legs column, and a backfill would have to be re-run whenever the parser
     improves. Parsing is cheap and the grammar is the same one the ablation uses.
     """
+    if ml.is_python_language(language):
+        return []
     try:
         import ablation
         return list(ablation.parse(expression)["used"])
@@ -811,7 +849,7 @@ def legs_of(entry):
     legs = entry.get("legs")
     if legs:
         return list(legs)
-    return derive_legs(entry.get("expression"))
+    return derive_legs(entry.get("expression"), entry_language(entry))
 
 
 def leg_bodies(entry):
@@ -821,6 +859,8 @@ def leg_bodies(entry):
     name is not an identity. Comparing bodies is what makes "the same leg" mean
     the same sub-expression.
     """
+    if ml.is_python_language(entry_language(entry)):
+        return {}
     try:
         import ablation
         parsed = ablation.parse(entry.get("expression"))
@@ -878,6 +918,8 @@ def resolve(entries, reference):
         if reference in (entry.get("alpha_id"), entry.get("key"),
                          entry.get("expression_hash")):
             return entry
+        if isinstance(reference, str) and reference.startswith("py:") and reference == entry_expression_hash(entry):
+            return entry
     return None
 
 
@@ -908,11 +950,11 @@ def descendants(entries, reference):
     if target is None:
         return []
     target_key = target.get("key")
-    target_hash = target.get("expression_hash")
+    target_hash = entry_expression_hash(target)
     out = []
     for entry in entries:
         parent = entry.get("parent")
-        if parent and parent in (target_key, target_hash, target.get("alpha_id")):
+        if parent and parent in (target_key, target_hash, target.get("expression_hash"), target.get("alpha_id")):
             out.append(entry)
     return out
 

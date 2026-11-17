@@ -80,7 +80,8 @@ def protect_output(args, *paths):
         return
     destination = Path(target).expanduser().resolve()
     protected = (*paths, *(getattr(args, name, None) for name in _PROTECTED_OUTPUT_ARGS))
-    if getattr(args, "command", None) == "promote":
+    if (getattr(args, "command", None) == "promote"
+            or (getattr(args, "command", None) == "triage" and getattr(args, "against_shelf", False))):
         from .buffer_cmd import buffer_path
         protected = (*protected, buffer_path(args))
     for path in protected:
@@ -166,7 +167,7 @@ def collect_alphas(args, metadata=None):
             settings, entries = config_io.parse_research_text(text, source=str(path))
         except config_io.ResearchError as exc:
             raise CliError("INVALID_INPUT", str(exc)) from exc
-        if metadata is not None and text.lstrip().startswith("{"):
+        if metadata is not None and Path(path).suffix.lower() != ".py" and text.lstrip().startswith("{"):
             payload = json.loads(text)
             for key in ("legs", "legend", "note"):
                 if payload.get(key) is not None:

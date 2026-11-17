@@ -91,6 +91,7 @@ def cmd_alpha_get(args, _sink):
         "expression": code,
         "expression_description": description,
         "operator_count": operator_count,
+        "language": ml.alpha_language(payload),
         "settings": payload.get("settings"),
         "status": payload.get("status"),
         "date_created": payload.get("dateCreated"),
@@ -139,6 +140,9 @@ def cmd_alpha_near(args, _sink):
         entry = latest.get(args.alpha_id)
         if entry is None:
             raise CliError("INVALID_INPUT", "%s is not in the ledger" % args.alpha_id)
+        if ml.is_python_language(alpha_registry.entry_language(entry)):
+            raise CliError("INVALID_INPUT", "alpha near compares FastExpr structure",
+                           "use alpha get to inspect the stored Python source")
         expression = entry.get("expression") or ""
     else:
         expression = args.expression or ""
@@ -158,6 +162,8 @@ def cmd_alpha_near(args, _sink):
     rows = []
     for alpha_id, entry in latest.items():
         if args.alpha_id and alpha_id == args.alpha_id:
+            continue
+        if ml.is_python_language(alpha_registry.entry_language(entry)):
             continue
         if args.status:
             wanted = {part.strip().upper() for part in args.status.split(",")}
@@ -359,6 +365,7 @@ def _platform_entry(current, alpha_id, existing=None, selection_id=None, source=
     facts = {"alpha_id": alpha_id, "expression": code,
              "role": alpha_registry.evidence_role(existing),
              "settings": current.get("settings") or {},
+             "language": ml.alpha_language(current),
              "metrics": current.get("is") or {}, "checks": checks,
              "status": current.get("status"),
              "out_of_sample": ml.extract_split(current) or {}}
@@ -653,6 +660,7 @@ def cmd_alpha_list(args, _sink):
             "expression": code,
             "expression_description": description,
             "operator_count": operator_count,
+            "language": ml.alpha_language(alpha),
             "sharpe": in_sample.get("sharpe"),
             "fitness": in_sample.get("fitness"),
             "turnover": in_sample.get("turnover"),
@@ -690,13 +698,15 @@ def cmd_alpha_explain(args, _sink):
         raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id,
                        "run `alpha list` or `alpha get` to find the id")
 
-    point = au.split(target.get("expression") or "",
-                     datasets=au.load_field_datasets())
-    if point is None:
-        raise CliError("INVALID_INPUT", "%s does not parse" % args.alpha_id,
-                       "the ledger row may be damaged; `alpha get` shows the raw text")
-
-    explanation = au.explain(point)
+    language = alpha_registry.entry_language(target)
+    if ml.is_python_language(language):
+        explanation = {"available": False, "reason": "FastExpr leg analysis is unavailable for Python source"}
+    else:
+        point = au.split(target.get("expression") or "", datasets=au.load_field_datasets())
+        if point is None:
+            raise CliError("INVALID_INPUT", "%s does not parse" % args.alpha_id,
+                           "the ledger row may be damaged; `alpha get` shows the raw text")
+        explanation = au.explain(point)
     metrics = target.get("metrics") or {}
     settings = target.get("settings") or {}
 
@@ -725,6 +735,7 @@ def cmd_alpha_explain(args, _sink):
         "alpha_id": args.alpha_id,
         "status": target.get("status"),
         "family": target.get("family"),
+        "language": language,
         "settings": {k: settings.get(k) for k in
                      ("universe", "neutralization", "decay", "truncation", "delay")},
         "construction": explanation,
@@ -1206,7 +1217,7 @@ def cmd_alpha_book(args, sink):
         alpha_id = entry.get("alpha_id")
         if alpha_id:
             by_id.setdefault(alpha_id, entry)
-        digest = entry.get("expression_hash")
+        digest = alpha_registry.entry_expression_hash(entry)
         if digest:
             by_hash.setdefault(digest, entry)
 
@@ -1225,8 +1236,10 @@ def cmd_alpha_book(args, sink):
         alpha_id = alpha.get("id")
         metrics = alpha.get("is") or {}
         code, _, _ = ml.regular_expression(alpha)
-        entry = by_id.get(alpha_id) or by_hash.get(
-            alpha_registry.expression_hash(code)) if code else by_id.get(alpha_id)
+        language = ml.alpha_language(alpha)
+        entry = by_id.get(alpha_id)
+        if entry is None and code:
+            entry = by_hash.get(alpha_registry.expression_hash(code, language))
         mechanism = (entry or {}).get("mechanism")
         family = (entry or {}).get("family")
         if not mechanism:
@@ -1248,6 +1261,7 @@ def cmd_alpha_book(args, sink):
             "family": family,
             "idea": (entry or {}).get("idea"),
             "expression": code,
+            "language": language,
         })
 
     document = {

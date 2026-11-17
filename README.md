@@ -30,7 +30,7 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `research_app/alphas.py` | Platform alpha inspection, metadata, submission and correlation. |
 | `research_app/ledger.py` | Local ledger recording, labels, lineage, coverage, shared legs and offline queries. |
 | `research_app/campaign.py` | Research briefs and train/test view history. |
-| `research_app/literature.py` | Web literature search and OpenAlex paper discovery. |
+| `research_app/literature.py` | OpenAlex paper discovery and reading. |
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and research scripts. |
 | `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
 | `simulation_capabilities.py` | Account identity and current settings evidence; unknown capabilities remain explicit. |
@@ -39,7 +39,6 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `expression_types.py` | Five field types, operator signatures, and the mismatches they imply. |
 | `field_index.py` | Live field-name verification and vocabulary-free variant grouping. |
 | `field_search.py` | Ranked local search over fields and operators: AND, exclusion, fuzzy. |
-| `deepseek_search.py` | Literature search and page fetch, so an idea can be checked against the paper. |
 | `paper_search.py` | OpenAlex paper search: journal, DOI, citations, reconstructed abstract. |
 | `field_contract.py` | Field contracts: declared vs inferred period/unit/sign, verdicts. |
 | `research_paths.py` | Resolves where results go -- always outside this working tree. |
@@ -164,8 +163,8 @@ Copy the template and fill it in:
 cp .env.example .env
 ```
 
-`.env.example` is the single list of variables this tool reads: required credentials,
-the research directory, the literature-search key and its alias, and the two tuning knobs.
+`.env.example` lists the credentials and settings the tool reads, including BRAIN,
+OpenAlex and Alpaca access and the research directory.
 It is guarded by a test that extracts environment names from the source, because that list
 had already drifted once - four variables were documented nowhere, including the one that
 decides where the ledger lives.
@@ -293,8 +292,8 @@ python research_cli.py feed --market coinbase:BTC-USD --book-depth 10 --summary 
 ```
 
 Without source selection, existing paper queries remain the default. `--source all` selects
-paper, news, social, forum, trends and indexed web sources; markets require explicit symbols.
-Custom RSS/Atom feeds, indexed sites and local JSONL/text exports use `--sources-file`.
+paper, news, social, forum and trends, plus configured sources. Markets require explicit symbols.
+Custom RSS/Atom feeds and local JSONL/text exports use `--sources-file`.
 See [source configuration and access limits](docs/tooling.md#多来源线索与本地论坛材料)
 for adapters, credentials and the distinction between quotes and order-book depth.
 
@@ -310,10 +309,9 @@ a legacy citation/year score, not the selection order.
 and contrasts. Its `argv` lists are arguments for `research_cli.py`, not shell strings.
 Threads may state an authored query with `; query: ...`, including after a Chinese heading.
 
-Paper caches use the effective request under `<research>/cache/papers/`; web-search caches
-also distinguish content and original-question options. Identical concurrent misses share
-one fetch; writes are atomic, expired/corrupt entries refetch, and failed cache writes do
-not discard successful retrievals. Paper records preserve available landing-page/PDF links.
+Paper caches use the effective request under `<research>/cache/papers/`. Identical concurrent
+misses share one fetch. Writes are atomic, expired or corrupt entries refetch, and successful
+retrievals survive cache write failures. Paper records preserve available landing-page/PDF links.
 
 Results now share `items` rather than a paper-only `papers` array. Each item keeps its kind,
 provider, provenance, publication and collection times, coverage and claim state.
@@ -325,7 +323,7 @@ Common excerpts are bounded to 600 characters in full output. Paper-specific `ab
 and `abstract_truncated` distinguish an excerpt from a complete abstract. Paper review actions
 include executable `paper --id` arguments, conditional full-text reading steps and reference
 expansion. Other sources point to original links and archived evidence before forming a
-testable question. Search caches retain complete individual records, so reading a selected
+testable question. Paper caches retain complete individual records, so reading a selected
 paper normally needs no second request. DOI aliases are normalized against both new results
 and the existing seen store. Feed itself never downloads paper full text.
 `reference_count` keeps bibliography size visible without copying every reference ID into
@@ -1267,11 +1265,7 @@ nothing. The endpoint returns 200 with an empty body when polled too quickly;
 that is retried rather than recorded as "no PnL", which would otherwise leave
 correlation tables missing exactly the rows fetched fastest.
 
-## Find the paper, not the blog post
-
-`search` is a web search with reranking and can return academic papers, research
-blogs, explainers and brokerage pages. Use source type and primary evidence to
-decide whether a result supports the economic claim.
+## Find and read research papers
 
 `paper` uses OpenAlex. Basic live queries can work without a key; larger usage and content
 access follow the provider's current policy. Set `OPENALEX_API_KEY` in `.env` or the
@@ -1293,9 +1287,8 @@ missing values stay unknown. Two details make search useful:
 * results are ranked by **relevance**, not citations. Sorting by citations answers a
   mechanism query with the most-cited finance papers ever written - the Fama-French
   mutual fund study among them - because citation count is not relevance;
-* OpenAlex ships abstracts as an **inverted index**, `{"word": [positions]}`. It has to be
-  reconstructed, otherwise every hit is a title and the tool is no better than the web
-  search it replaces.
+* OpenAlex ships abstracts as an **inverted index**, `{"word": [positions]}`. The client
+  reconstructs the abstract when the index is available.
 
 A missing abstract is reported as absent; its cause is not inferred.
 
@@ -1312,31 +1305,6 @@ TEI. The complete extracted text is cached, while stdout shows a character windo
 both documented TEI layouts are supported. Extracted text can omit PDF layout, tables or
 source material that GROBID did not capture; the output is reading evidence, not an
 automatically verified mechanism. See [the workflow and tool comparison](docs/tooling.md#从发现走到可核对的阅读证据).
-
-## Check an idea against the literature
-
-A field name tells you the data exists. It does not tell you whether the economic
-claim has already been tested and rejected. `search` closes that gap without
-leaving the CLI:
-
-```bash
-python research_cli.py search "equity method income persistence abnormal returns" --min-authority 3
-python research_cli.py search "deferred revenue anomaly" --count 20 --content
-python research_cli.py search --fetch https://www.nber.org/papers/w12345
-```
-
-Requires `DEEPSEEK_API_KEY` in `.env` or the environment. The key stays out of the
-repository; availability and charges follow the provider's current pricing.
-
-Results keep the provider's ranking plus `rerank_score` (1.5+ is high quality),
-`authority` (3+ is authoritative) and `date`, so a journal article can be told
-apart from a blog post restating it. Answers are cached for a week inside the
-results tree, so re-running the same query in a later session costs nothing;
-`--no-cache` bypasses that.
-
-Query operators work as documented by the provider: `site:`, `"exact phrase"`,
-`-exclude`, `lang:`, `after:`, `before:`. Queries longer than 128 characters are
-rejected locally, because the server's error does not say what to shorten.
 
 ## Research files
 

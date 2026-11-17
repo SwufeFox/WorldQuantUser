@@ -22,7 +22,7 @@ from pathlib import Path
 import machine_lib as ml
 
 RESEARCH_FILE_SPEC = {
-    "description": "Input to `lint`, `simulate`, and `ablate`: JSON or plain text. "
+    "description": "Input to `lint`, `simulate`, and `ablate`: JSON or FASTEXPR text. "
                    "Use - as the file path to read UTF-8 stdin (an optional BOM is accepted).",
     "json": {
         "array": ["raw(liabilities/assets)", {"expression": "rank(cap)", "decay": 4}],
@@ -49,9 +49,13 @@ RESEARCH_FILE_SPEC = {
         ],
     },
     "plain_text": {
-        "description": "Any file that does not start with '{' or '[' is read line "
+        "description": "Other text that does not start with '{' or '[' is read line "
                        "by line: one expression per line, blank lines and '# comments skipped.",
         "example": "rank(liabilities/assets)-0.5\n# next one\nrank(cap)",
+    },
+    "python_source": {
+        "description": "For lint and simulate, a .py file is one whole Python Alpha. "
+                       "Use --setting lookback=VALUE to specify its history window.",
     },
 }
 
@@ -66,6 +70,10 @@ def parse_research_text(text, source="<text>"):
     Raises :class:`ResearchError` when neither shape applies. Setting names are
     canonicalized; call :func:`build_config` to validate their values.
     """
+    if Path(source).suffix.lower() == ".py":
+        if not text.strip():
+            raise ResearchError("%s contains no Python source" % source)
+        return {"language": "PYTHON"}, [ml.normalize_python_source(text)]
     stripped = text.lstrip()
     if stripped.startswith(("{", "[")):
         try:

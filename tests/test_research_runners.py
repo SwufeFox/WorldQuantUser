@@ -6,12 +6,19 @@ from unittest import TestCase, mock
 import json
 import subprocess
 
+from research_app import selection
 from tools import _runner as runner
 from tools import campaign_runner as campaign
 
 
 def arm(status, **fields):
     return {"status": status, **fields}
+
+
+def candidate(**overrides):
+    return arm("COMPLETE", **({"alpha_id": "candidate", "label": "label",
+                             "train_sharpe": 2.0, "train_fitness": 1.2,
+                             "train_sharpe_h1": 1.5, "train_sharpe_h2": 2.0} | overrides))
 
 
 class ResearchRunnerTests(TestCase):
@@ -104,17 +111,94 @@ class ResearchRunnerTests(TestCase):
                                               max_wait=30, interval=1, once=True), 1)
         self.assertTrue((self.inbox / "failed" / self.spec.name).exists())
 
-    def test_campaign_checks_only_pairs_with_new_candidate(self):
-        existing = runner.CliResult(True, {"rows": [{"alpha_id": "A"}, {"alpha_id": "B"}]})
-        correlation = runner.CliResult(True, {"matrix": {"pairs": [
-            {"a": "A", "b": "B", "r": 0.98}, {"a": "A", "b": "C", "r": 0.10}
-        ]}})
-        with mock.patch.object(campaign, "run_cli", side_effect=[existing, correlation]):
-            self.assertIsNone(campaign.duplicate_of(self.root, "C"))
+    def campaign_reply(self, *, freeze=True, **updates):
+        training = {"alpha_id": "candidate", "delta": 0.01, "evidence": {"state": "measured"},
+                    "training_gate": {"state": "pass", "reason": None},
+                    "shelf_correlation": {"state": "measured", "eligible": 0, "measured": 0}}
+        training.update(updates)
+
+        def reply(_root, command, *args, **kwargs):
+            if command == "triage":
+                if not freeze:
+                    return runner.CliResult(True, {"rows": [training]})
+                path = args[args.index("--freeze") + 1]
+                saved = selection.freeze(path, source="triage", rows=[training])
+                return runner.CliResult(True, {"selection_id": saved["selection_id"]})
+            if command == "promote":
+                return runner.CliResult(True, {"outcome": "buffered"})
+            self.fail(f"unexpected Campaign command: {command}")
+
+        return reply
+
+    def test_campaign_promotes_from_the_same_training_selection(self):
+        log = mock.Mock()
+        with mock.patch.object(campaign, "run_cli", side_effect=self.campaign_reply()) as cli:
+            campaign.process(self.root, self.root, log, self.spec, {"rows": [candidate()]})
+        triage_call, promote_call = [call.args for call in cli.call_args_list]
+        self.assertEqual(triage_call[1:5], ("triage", "--ids", "candidate", "--against-shelf"))
+        self.assertEqual(triage_call[triage_call.index("--max-shelf-correlation") + 1], "0.7")
+        self.assertNotIn("--show-test", triage_call)
+        path = triage_call[triage_call.index("--freeze") + 1]
+        self.assertEqual(promote_call[1:3], ("promote", "candidate"))
+        self.assertEqual(promote_call[promote_call.index("--selection") + 1], path)
+        self.assertIn("--max-self-correlation", promote_call)
+        self.assertEqual(log.call_args.args[0]["outcome"], "buffered")
+
+    def test_campaign_skips_dilutive_and_duplicate_candidates_without_validation(self):
+        for changes, reason in (
+            ({"delta": 0.0}, "insufficient_train_marginal"),
+            ({"shelf_correlation": {"state": "measured", "eligible": 1, "measured": 1,
+                                     "max_rho": 0.7, "max_rho_signed": -0.7,
+                                     "max_member": "other"}}, "shelf_duplicate"),
+            ({"max_member_rho": 0.99}, "book_duplicate"),
+            ({"shelf_correlation": {"state": "unknown", "already_shelved": True}}, "already_shelved"),
+        ):
+            changes["training_gate"] = {"state": "rejected", "reason": reason}
+            with self.subTest(reason=reason), \
+                    mock.patch.object(campaign, "run_cli",
+                                      side_effect=self.campaign_reply(freeze=False, **changes)) as cli:
+                log = mock.Mock()
+                campaign.process(self.root, self.root, log, self.spec, {"rows": [candidate()]})
+                cli.assert_called_once()
+                self.assertEqual(log.call_args.args[0]["kind"], "training-rejected")
+                self.assertEqual(log.call_args.args[0]["training_gate"]["reason"], reason)
+
+    def test_campaign_keeps_pending_evidence_in_queue_without_validation(self):
+        changes = [
+            {"shelf_correlation": {"state": "unknown", "eligible": 2, "measured": 1,
+                                  "max_rho": 0.14},
+             "training_gate": {"state": "unknown", "reason": "incomplete_shelf_evidence"}},
+            {"evidence": {"state": "unknown"}, "delta": 0.1,
+             "training_gate": {"state": "unknown", "reason": "incomplete_book_or_candidate_evidence"}},
+            {"delta": None},
+            {},  # Plausible training values without a frozen selection must also defer.
+        ]
+        for evidence in changes:
+            with self.subTest(evidence=evidence), \
+                    mock.patch.object(runner, "run_probe", return_value=runner.ProbeRun(
+                        "done", {"rows": [candidate()]})), \
+                    mock.patch.object(campaign, "run_cli",
+                                      side_effect=self.campaign_reply(freeze=False, **evidence)) as cli:
+                log = mock.Mock()
+                consume = lambda spec, data: campaign.process(self.root, self.root, log, spec, data)
+                code = runner.run_queue(self.root, self.inbox, lambda _: (self.batch, self.receipt),
+                                        log, max_wait=30, interval=1, once=True, consume=consume)
+                self.assertEqual(code, 3)
+                self.assertTrue(self.spec.exists())
+                cli.assert_called_once()
+                self.assertEqual(log.call_args.args[0]["kind"], "deferred")
+
+    def test_campaign_needs_halves_only_after_initial_training_gate(self):
+        rows = [candidate(train_sharpe=0.5, train_sharpe_h2=None)]
+        with mock.patch.object(campaign, "run_cli") as cli:
+            campaign.process(self.root, self.root, mock.Mock(), self.spec, {"rows": rows})
+            with self.assertRaisesRegex(RuntimeError, "half-window"):
+                campaign.process(self.root, self.root, mock.Mock(), self.spec,
+                                 {"rows": [candidate(train_sharpe_h2=None)]})
+        cli.assert_not_called()
 
     def test_campaign_does_not_archive_after_an_operational_error(self):
-        row = arm("COMPLETE", alpha_id="candidate", train_sharpe=2.0, train_fitness=1.2,
-                  train_sharpe_h1=1.5, train_sharpe_h2=2.0)
+        row = candidate()
         consume = lambda spec, data: campaign.process(self.root, self.root, mock.Mock(), spec, data)
         report = mock.Mock()
         with mock.patch.object(runner, "run_probe", return_value=runner.ProbeRun("done", {"rows": [row]})), \
@@ -123,4 +207,4 @@ class ResearchRunnerTests(TestCase):
                                     report, max_wait=30, interval=1, once=True, consume=consume)
         self.assertEqual(code, 3)
         self.assertTrue(self.spec.exists())
-        self.assertIn("read shelf: connection lost", report.call_args.args[0]["detail"])
+        self.assertIn("training evidence for candidate: connection lost", report.call_args.args[0]["detail"])

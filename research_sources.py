@@ -2,7 +2,7 @@
 
 RSS follows https://www.rssboard.org/rss-specification and RFC 4287.
 Provider schemas: https://endpoints.bsky.app/openapi.bluesky-app.json,
-https://hn.algolia.com/api and https://api-docs.deepseek.com/api/search.
+https://hn.algolia.com/api.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ import xml.etree.ElementTree as ET
 
 import cache_store
 import research_paths
-from source_io import (SourceError, canonical_url, parse_timestamp, public_url,
+from source_io import (SourceError, parse_timestamp, public_url,
                        request_bytes, request_json, utc_now, validate_url)
 
 CACHE_TTL_SECONDS = 300
@@ -36,9 +36,8 @@ BUILTIN_SOURCES = {
     "social": {"id": "social", "kind": "social", "adapter": "bluesky"},
     "forum": {"id": "forum", "kind": "forum", "adapter": "hn"},
     "trends": {"id": "trends", "kind": "trend", "adapter": "hn_frontpage"},
-    "web": {"id": "web", "kind": "web", "adapter": "web"},
 }
-_ADAPTER_KEYS = {"rss": {"url"}, "web": {"sites"}, "bluesky": set(),
+_ADAPTER_KEYS = {"rss": {"url"}, "bluesky": set(),
                  "hn": set(), "hn_frontpage": set(),
                  "market": {"venue", "symbol", "depth", "feed"}, "file": {"path"}, "paper": set()}
 _KINDS = {"news", "social", "forum", "trend", "web"}
@@ -53,7 +52,7 @@ def _validate_definition(source, custom=False):
         _invalid("Each source definition must be an object.")
     adapter = source.get("adapter")
     if not isinstance(adapter, str) or adapter not in _ADAPTER_KEYS:
-        _invalid("Source adapter must be rss, web, bluesky, hn, hn_frontpage, file or market.")
+        _invalid("Source adapter must be rss, bluesky, hn, hn_frontpage, file or market.")
     if set(source) - ({"id", "kind", "adapter"} | _ADAPTER_KEYS[adapter]):
         _invalid("Source definition contains unsupported keys for its adapter.")
     identifier = source.get("id")
@@ -82,23 +81,6 @@ def _validate_definition(source, custom=False):
         validate_url(probe)
         if any(key.lower() in _SECRET_KEYS for key, _ in parse_qsl(urlsplit(probe).query)):
             _invalid("Source URLs cannot contain credential parameters; use public feed URLs.")
-    elif adapter == "web":
-        sites = source.get("sites", [])
-        if not isinstance(sites, list) or len(sites) > 20:
-            _invalid("Web sites must be a list of at most 20 domain/path selectors.")
-        normalized = []
-        for site in sites:
-            if not isinstance(site, str) or not re.fullmatch(
-                    r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?(?:/[A-Za-z0-9._~%/-]*)?", site):
-                _invalid("Web sites must be domain/path selectors without schemes, credentials or query operators.")
-            host, _, path = site.partition("/")
-            if "." not in host or any(not label or label.startswith("-") or label.endswith("-")
-                                      for label in host.split(".")):
-                _invalid("Web site selectors require a valid domain name.")
-            value = host.lower() + ("/" + path if "/" in site else "")
-            if value not in normalized:
-                normalized.append(value)
-        result["sites"] = normalized
     elif adapter == "file":
         value = source.get("path")
         if not isinstance(value, str) or not value.strip() or "\x00" in value:
@@ -142,7 +124,7 @@ def load_sources(path=None):
 def requires_query(source):
     """Whether the feed scheduler must create one job per topic."""
     adapter = source.get("adapter")
-    return adapter in {"paper", "web", "bluesky", "hn"} or (
+    return adapter in {"paper", "bluesky", "hn"} or (
         adapter == "rss" and "{query}" in source.get("url", ""))
 
 
@@ -478,69 +460,6 @@ def _hn(source, query, limit, timeout):
                    provider_total=_count(payload.get("nbHits")), provider_request_limit=min(limit, 100))
 
 
-def _web_query(source, query):
-    sites = source.get("sites", [])
-    selectors = " OR ".join("site:" + site for site in sites)
-    transformed = query + (" (" + selectors + ")" if len(sites) > 1 else " " + selectors if sites else "")
-    if len(transformed) > 128:
-        _invalid("DeepSeek queries, including site constraints, must fit the provider's 128-character limit.")
-    return transformed
-
-
-def _matches_site(url, sites):
-    parts = urlsplit(url)
-    for site in sites:
-        host, _, path = site.partition("/")
-        if (parts.hostname == host or (parts.hostname or "").endswith("." + host)) and (
-                not path or parts.path == "/" + path.rstrip("/") or parts.path.startswith("/" + path.rstrip("/") + "/")):
-            return True
-    return False
-
-
-def _web(source, query, limit, timeout):
-    import deepseek_search as ds
-    transformed = _web_query(source, query)
-    try:
-        rows, cached = ds.search_cached(research_paths.research_dir(), transformed, count=min(limit, 50),
-                                       need_content=False, ori_question=query, max_age_hours=0, timeout=timeout)
-    except ds.MissingSearchKey:
-        raise SourceError("AUTH_MISSING", "DeepSeek indexed search requires a configured key.",
-                          hint="Set DEEPSEEK_API_KEY or WEBSEARCH_API_KEY in the environment.") from None
-    except ds.DeepSeekSearchError as exc:
-        code = ("AUTH_REJECTED" if isinstance(exc, ds.SearchAuthError) else
-                "PAYMENT_REQUIRED" if isinstance(exc, ds.SearchInsufficientBalance) else
-                "RATE_LIMITED" if isinstance(exc, ds.SearchRateLimited) else
-                "ACCESS_BLOCKED" if isinstance(exc, ds.SearchBlocked) else "NETWORK_ERROR")
-        raise SourceError(code, "DeepSeek indexed search could not complete the request.") from None
-    except (ValueError, TypeError, AttributeError):
-        raise SourceError("FORMAT_ERROR", "DeepSeek indexed search returned an invalid response.") from None
-    if cached:
-        raise SourceError("FORMAT_ERROR", "DeepSeek returned a cached result without its original collection timestamp.")
-    if not isinstance(rows, list):
-        raise SourceError("FORMAT_ERROR", "DeepSeek indexed search must return a results array.")
-    collected = utc_now()
-    limitations = ["One page of indexed web results; private and unindexed communities are outside coverage.",
-                   "Search snippets are unverified claims; no linked content was fetched.",
-                   "Provider relevance scores are not evidence or alpha-validity scores."]
-    items, invalid, excluded = [], 0, 0
-    sites = source.get("sites", [])
-    for row in rows:
-        if not isinstance(row, dict) or not _text(row.get("title")) or not _url(row.get("url")):
-            invalid += 1
-            continue
-        link = _url(row["url"])
-        if sites and not _matches_site(link, sites):
-            excluded += 1
-            continue
-        items.append(_item(source, "deepseek", canonical_url(link), row["title"], link,
-                           row.get("snippet") or row.get("summary"), row.get("date"), collected,
-                           None, row, "search_snippet", limitations))
-    return _packet("deepseek", query, items, collected, limit, len(rows), invalid, ds.SEARCH_URL,
-                   "DeepSeek indexed web search", "provider_relevance", limitations,
-                   provider_query=transformed, sites=sites, excluded_by_site_count=excluded,
-                   provider_request_limit=min(limit, 50))
-
-
 def _cache_hit(path):
     try:
         entry = cache_store.read_entry(path)
@@ -584,12 +503,6 @@ def fetch_source(source, query=None, limit=5, timeout=30):
         from market_sources import fetch_market
         return fetch_market(source["venue"], source["symbol"], depth=source.get("depth", 10),
                             feed=source.get("feed", "iex"), timeout=timeout)
-    if adapter == "web":
-        import deepseek_search as ds
-        _web_query(source, query)
-        if not ds.available():
-            raise SourceError("AUTH_MISSING", "DeepSeek indexed search requires a configured key.",
-                              hint="Set DEEPSEEK_API_KEY or WEBSEARCH_API_KEY in the environment.")
     identity = {"version": 1, "source": source, "query": query, "limit": limit}
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     path = Path(research_paths.cache_root()) / "sources" / (digest + ".json")
@@ -605,7 +518,7 @@ def fetch_source(source, query=None, limit=5, timeout=30):
         cached = _cache_hit(path)
         if cached is not None:
             return cached
-        fetcher = {"rss": _rss, "bluesky": _bluesky, "hn": _hn, "hn_frontpage": _hn, "web": _web}[adapter]
+        fetcher = {"rss": _rss, "bluesky": _bluesky, "hn": _hn, "hn_frontpage": _hn}[adapter]
         packet = fetcher(source, query, limit, timeout)
         if cache_problem:
             packet["coverage"]["cache_unavailable"] = True

@@ -1567,11 +1567,6 @@ class _FakeResponse:
 class EnvExampleTests(unittest.TestCase):
     """`.env.example` must document every variable the code reads.
 
-    It did not. Four were missing - BRAIN_RESEARCH_DIR, which decides where the ledger
-    lives, the WEBSEARCH_API_KEY alias, and two tuning knobs - so a new user could not
-    discover where their results go or that the alias was accepted. It also carried a
-    dated promise about DeepSeek pricing, which rots silently.
-
     This test reads the variable names straight out of the source rather than keeping a
     second list, because a second list drifts in exactly the same way the example did.
     """
@@ -1600,12 +1595,9 @@ class EnvExampleTests(unittest.TestCase):
         return names
 
     def test_every_env_var_the_code_reads_is_documented(self):
-        # The obvious extractor - literals inside environ.get("...") - only found two of
-        # the seven, and would have reported success while four were undocumented. The
-        # rest are reached indirectly: BRAIN_RESEARCH_DIR through a module constant,
-        # DEEPSEEK_API_KEY and its alias through a loop over a tuple, and BRAIN_USERNAME /
-        # BRAIN_PASSWORD built from a prefix inside get_credentials(). So this scans every
-        # uppercase literal that looks like an environment name instead.
+        # BRAIN_RESEARCH_DIR is accessed through a module constant, and
+        # BRAIN_USERNAME and BRAIN_PASSWORD are built from a prefix inside
+        # get_credentials(). Scan uppercase literals to include these callers.
         #
         # Limitation worth knowing: a future variable with an unusual name (no _KEY, _DIR,
         # _TTL, _TIMEOUT, _PATH, _URL, _SECRET or _TOKEN suffix and not one of the

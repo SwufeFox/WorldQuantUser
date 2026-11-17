@@ -193,6 +193,8 @@ validation 视图日志；按冻结后的验证证据使用。命令只读，不
 ```bash
 python3 research_cli.py promote ALPHA_ID --note "冻结后验证通过" --cost-bps 5 10 20
 python3 research_cli.py promote ALPHA_ID --retention-floor 0.2 --dry-run
+python3 research_cli.py triage --ids ALPHA_ID --against-shelf --freeze choice.json
+python3 research_cli.py promote ALPHA_ID --selection choice.json --max-self-correlation 0.7
 ```
 
 最接近的现有入口是 `triage`，但它负责选择与验证，不负责平台检查或写入候选架。
@@ -206,6 +208,12 @@ python3 research_cli.py promote ALPHA_ID --retention-floor 0.2 --dry-run
 不满足条件返回 `ok: true`、`outcome: rejected`、`buffered: false` 和 `reasons`，退出 0。
 默认冻结文件为研究目录下 `promote-freeze-<ID>-<UTC timestamp>.json`；
 可用 `--freeze PATH` 和 `--buffer PATH` 指定位置，冻结文件保持原有不可变规则。
+已有单候选冻结文件时，`promote --selection PATH` 沿用里面的验收标准和成本情景。
+`--max-self-correlation` 要求实时检查给出的自相关有数值且严格低于指定上限。
+
+`triage --against-shelf` 在组合边际所用的训练窗内比较候选架，`--buffer PATH` 可指定候选架。
+回执附带 PnL 覆盖、样本交集和最相似的成员。Campaign 只对训练期证据齐全、边际为正且未与
+候选架重复的 Alpha 使用同一份冻结选择打开测试期。缺证据的候选留待复核。
 
 回执包含 `alpha_id`、`freeze_path`、`validate` 的训练/测试 Sharpe、retention、
 rho_book、max_member_rho，以及完整 `checks`、`buffered`、`outcome`、`reasons`。
@@ -250,8 +258,7 @@ python3 research_cli.py feed --topic "analyst forecast dispersion" --topic "earn
 `--min-citations` 默认 0，让新论文保留资格；引用量不替代相关性或经济解释。
 `provider_ranks` 记录各查询中的原始位置；兼容字段 `rank` 仍是旧分数，不代表选取顺序。
 
-OpenAlex 使用 `<research>/cache/papers/`；网页搜索使用 `<research>/search-cache/`。
-缓存键包含实际请求选项，全文开关、原问题和结果数量不同会分别保存。相同请求并发未命中时
+OpenAlex 使用 `<research>/cache/papers/`。缓存键包含实际请求选项。相同请求并发未命中时
 只由持锁者抓取；有效缓存直接复用，过期或损坏才重新读取。缓存写入失败仍保留成功获取的结果。
 论文输出包括可用的出版页、DOI 与 PDF 链接；来源未提供的全文保持未知。
 
@@ -272,7 +279,7 @@ python3 research_cli.py feed --market alpaca:AAPL --market-feed iex --summary --
 
 没有选择来源时沿用论文检索。`--source` 可重复，`all` 选择内置来源及配置文件中的来源；
 行情须由 `--market` 或配置文件明确指定市场与品种。`--limit` 限制每项任务的返回条数，
-`--total` 限制最终选取条数。六类信息共享 `items`，旧的 `papers` 数组已移除。
+`--total` 限制最终选取条数。各来源共享 `items`，旧的 `papers` 数组已移除。
 
 | 入口 | 实际来源 | 覆盖与访问条件 |
 | --- | --- | --- |
@@ -281,7 +288,6 @@ python3 research_cli.py feed --market alpaca:AAPL --market-feed iex --summary --
 | `--source social` | Bluesky 公共帖子搜索 | 公共端点可能拒绝访问；403 是来源失败，不是空结果 |
 | `--source forum` | Hacker News 索引搜索 | 特定社区的故事与讨论线索，不代表全部金融论坛 |
 | `--source trends` | Hacker News front_page 索引 | 当前社区注意力，不能推断全网热度或收益方向 |
-| `--source web` | DeepSeek 网页索引，可限定站点 | 需要 `DEEPSEEK_API_KEY` 或 `WEBSEARCH_API_KEY`，只覆盖被索引内容 |
 | `--market coinbase:BTC-USD` | Coinbase Exchange 聚合 L2 盘口 | 单一加密资产交易所；不是股票盘口，也不是逐笔委托队列 |
 | `--market alpaca:AAPL` | Alpaca 股票最佳买卖报价 | 需要 `APCA_API_KEY_ID`、`APCA_API_SECRET_KEY`；默认 IEX 仅一个交易所，其他 feed 取决于订阅权限 |
 
@@ -290,27 +296,25 @@ python3 research_cli.py feed --market alpaca:AAPL --market-feed iex --summary --
 原生数量单位、覆盖范围及价差/失衡等派生观察；缺失或非法档位不会被补成可用的统计量。
 这些是当前观察，不能直接冒充历史回测数据。
 
-自定义来源使用研究目录中的 JSON 文件；例如同时接入已有论坛摘录与一个站点索引：
+可以在研究目录的 JSON 配置中接入已有论坛摘录。
 
 ```json
 {
   "sources": [
-    {"id": "community-export", "kind": "forum", "adapter": "file", "path": "forum-excerpts.jsonl"},
-    {"id": "quant-forum", "kind": "forum", "adapter": "web", "sites": ["quant.stackexchange.com"]}
+    {"id": "community-export", "kind": "forum", "adapter": "file", "path": "forum-excerpts.jsonl"}
   ]
 }
 ```
 
 ```bash
 python3 research_cli.py feed --sources-file radar-sources.json --source community-export --summary --dry-run
-python3 research_cli.py feed --sources-file radar-sources.json --source quant-forum --topic "transaction costs" --summary --dry-run
 ```
 
 每个来源都要有唯一 `id`、`kind`、`adapter`；自定义 ID 不能覆盖内置 ID。
-`rss` 接受 `url`，支持 RSS/Atom 和可选的 `{query}` 占位符；`web` 接受最多 20 个 `sites`
-域名/路径；`file` 接受 `path`；`market` 接受 `venue`、`symbol` 和可选 `depth`、`feed`。
+`rss` 接受 `url`，支持 RSS/Atom 和可选的 `{query}` 占位符。`file` 接受 `path`。
+`market` 接受 `venue`、`symbol` 和可选 `depth`、`feed`。
 另可显式配置 `bluesky`、`hn`、`hn_frontpage`。固定适配器的 kind 分别为 `social`、`forum`、
-`trend`、`market`；RSS、网页和文件的 kind 可选 `news/social/forum/trend/web`。
+`trend`、`market`，RSS 和文件的 kind 可选 `news/social/forum/trend/web`。
 未知字段、重复 ID 或含凭据的来源 URL 会在任何请求前被拒绝。密钥只放环境或私有 `.env`。
 
 本地 `.jsonl` 每行一个对象，`text` 或 `content` 必填，其余字段可选：
@@ -465,6 +469,27 @@ if_else(is_nan(s), s, m)
 
 ### 写表达式、跑模拟
 
+Python Alpha 使用同一条 `probe` 流程。Spec 里用 `source_file` 引用相对于 JSON 文件的
+`.py`，或把完整源码放在 `expression` 中。给 Python 臂明确设置 `language: "PYTHON"`
+及所需的 `lookback`。用离线预览核对源码和请求，再用 `--check` 核对账户能力与字段目录。
+
+```json
+{
+  "name": "python-reversal",
+  "design": "explore",
+  "settings": {"language": "PYTHON", "lookback": 4, "testPeriod": "P1Y"},
+  "arms": [{"label": "reversal", "source_file": "reversal.py"}]
+}
+```
+
+`lint --file reversal.py --offline` 只做静态检查，`simulate reversal.py --setting lookback=4
+--dry-run` 可预览单文件。源码保存在 checkpoint，恢复沿用当时的版本。源码身份保留缩进和字符串内
+的空白，只统一换行符。Python 复用批次、台账、PnL 和训练期验证，FASTEXPR 专用的算子与结构分析
+仍依照原来的语言规则。
+
+Python REGULAR 请求会省略 FASTEXPR 的 `unitHandling` 和 `nanHandling`；预检回执会明确
+列出从请求中省略的设置。Python 需要自行决定缺失值和 dtype 的处理方式。
+
 | 问题 | 命令 |
 | --- | --- |
 | 我要跑一批臂（常态） | 写一个 sample-batch.spec.json，然后 `python3 research_cli.py probe sample-batch.spec.json`——lint、模拟、train-only 表格、对照差值、JSON、台账一次做完 |
@@ -483,9 +508,14 @@ if_else(is_nan(s), s, m)
 
 这里已使用 AST：`alpha_registry.expression_hash()` 先经 `fastexpr_ast.canonical()` 规范化，
 消除注释和冗余括号等差异；严格重复键再组合完整设置签名及已完成的历史结果。
-`exact_repeat_keys` 与 `structural_similarity_keys` 分列，骨架相似只提供线索。
-`--strict-gate` 拒绝精确重复并返回历史键，不自动替换成旧 `alpha_id`；已有结果通过
-`alpha get` / `compare` 读取。历史设置缺失时不补上今天的默认值来宣称命中。
+`gate.completed_refs` 给出精确匹配的台账标识、批次和现有训练指标。
+`gate.structural_refs` 给出同经济块、同骨架的台账线索，供回查历史。
+`--strict-gate` 继续按 `exact_repeat_keys` 拒绝精确重复。历史设置缺失时不补上今天的默认值。
+
+预览也会查看当前指定的批次路径。精确匹配的已完成记录见
+`gate.checkpoint_completed_refs`，能回读的任务见 `gate.checkpoint_recovery_refs`
+以及 `next_actions` 里的 `probe --recover`。这只检查当前默认路径或显式的
+`--batch-path`，可以用该选项指向以往的批次。预览不联系平台，给出的引用不会自动替换结果或重提任务。
 台账中旧的部分 `settings_fingerprint` 用于占位记录，不能拿来替代完整请求判重。
 文档中的 JSON 哈希 / Parquet 示例只作原理参考，继续沿用当前 AST 与台账机制。
 
@@ -759,7 +789,7 @@ python3 research_cli.py ledger sync --pnl
 | 工具 | 职责 |
 | --- | --- |
 | `tools/sim_queue.py` | 消费 `queue/` 中的 Probe spec，保存批次与回执 |
-| `tools/campaign_runner.py` | 消费 `backlog/`，在训练期初筛后复用 `promote`，并检查候选重复与组合边际 |
+| `tools/campaign_runner.py` | 消费 `backlog/`，冻结训练期去重与组合边际证据后调用 `promote` |
 | `tools/atom_runner.py` | 把 `label / expr / settings` 列表交给 `probe`，用可恢复批次保存进度，把全 IS 指标和 checks 写成 `atom-results.jsonl` |
 | `tools/atom_screen.py` | 从 ATOM 账本按平台子宇宙检查初筛，同一 Alpha 分数相同时采用最新记录 |
 | `tools/spc_client.py` | 独立预测竞赛接口，提供 `recon` / `validate` / `submit` |

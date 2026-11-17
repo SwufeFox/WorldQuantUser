@@ -37,6 +37,7 @@ def cmd_ledger_record(args, sink):
             "alpha_id": payload.get("id") or alpha_id,
             "expression": expression,
             "settings": payload.get("settings") or {},
+            "language": ml.alpha_language(payload),
             "metrics": in_sample,
             "checks": in_sample.get("checks") or {},
             "status": payload.get("status") or "UNSUBMITTED",
@@ -407,7 +408,7 @@ def cmd_ledger_format(args, _sink):
     rewritten = []
     for entry in entries:
         original = entry.get("expression") or ""
-        if not original.strip():
+        if not original.strip() or ml.is_python_language(alpha_registry.entry_language(entry)):
             rewritten.append(entry)
             continue
         formatted = expression_lint.pretty_expression(original)
@@ -426,7 +427,8 @@ def cmd_ledger_format(args, _sink):
         new_text = after.get("expression") or ""
         if not old_text.strip():
             continue
-        if alpha_registry.expression_hash(old_text) != alpha_registry.expression_hash(new_text):
+        language = alpha_registry.entry_language(before)
+        if alpha_registry.expression_hash(old_text, language) != alpha_registry.expression_hash(new_text, language):
             mismatches.append(after.get("alpha_id") or after.get("key"))
     if mismatches:
         raise CliError("INVALID_INPUT",
@@ -634,7 +636,7 @@ def cmd_ledger_decay(args, _sink):
             continue
         if abs(train) < args.min_train_sharpe:
             continue
-        block = mechanisms.block_of(expression)
+        block = mechanisms.block_of(expression, alpha_registry.entry_language(entry))
         rows_by_block.setdefault(block, []).append(
             (float(train), float(full), entry.get("status")))
 
@@ -700,7 +702,7 @@ def cmd_ledger_form(args, _sink):
             continue
         expression = entry.get("expression") or ""
         sharpe = (entry.get("metrics") or {}).get("sharpe")
-        if not expression or sharpe is None:
+        if not expression or sharpe is None or ml.is_python_language(alpha_registry.entry_language(entry)):
             continue
         block = mechanisms.block_of(expression)
         form = "change" if any(marker in expression for marker in _CHANGE_MARKERS) else "level"
@@ -856,7 +858,10 @@ def cmd_ledger_styles(args, _sink):
         wanted = {part.strip().upper() for part in str(args.status).split(",") if part.strip()}
         selected = [entry for entry in selected
                     if str(entry.get("status") or "").upper() in wanted]
-    data = styles.summarize(selected)
+    fast = [entry for entry in selected if not ml.is_python_language(ml.alpha_language(entry))]
+    data = styles.summarize(fast)
+    if len(fast) != len(selected):
+        data["python_skipped"] = len(selected) - len(fast)
     data["filter"] = {"where": getattr(args, "where", None),
                       "status": getattr(args, "status", None)}
     if args.list:
@@ -991,7 +996,7 @@ def _ask_panel(entries, axis, metrics):
     panels = {}
     for entry in entries:
         settings = entry.get("settings") or {}
-        key = (entry.get("expression_hash"), settings.get("region"),
+        key = (alpha_registry.entry_expression_hash(entry), settings.get("region"),
                settings.get("universe"), settings.get("neutralization"),
                settings.get("truncation"), settings.get("delay"))
         panels.setdefault(key, []).append(entry)
@@ -1041,7 +1046,7 @@ def _ask_matrix(entries, within, min_overlap):
         if within == "none":
             key = None
         elif within == "expr":
-            key = entry.get("expression_hash")
+            key = alpha_registry.entry_expression_hash(entry)
         elif within == "family":
             key = entry.get("family")
         else:

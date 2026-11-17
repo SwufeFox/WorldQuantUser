@@ -221,9 +221,9 @@ def settings_evidence(settings, snapshot):
                     matches = value in values or (type(value) is int and str(value) in values)
                     if not matches:
                         failures.append("choice_not_advertised")
-            for bound, compare in (("min_value", lambda a, b: a < b),
-                                   ("max_value", lambda a, b: a > b)):
-                limit = spec.get(bound)
+            for bound, native, compare in (("min_value", "minValue", lambda a, b: a < b),
+                                           ("max_value", "maxValue", lambda a, b: a > b)):
+                limit = spec.get(bound, spec.get(native))
                 if type(limit) is int or (type(limit) is float and math.isfinite(limit)):
                     if type(value) in (int, float):
                         constraints += 1

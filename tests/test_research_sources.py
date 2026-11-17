@@ -16,7 +16,6 @@ from urllib.parse import parse_qs, urlsplit
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cache_store
-import deepseek_search
 import research_sources as sources
 from source_io import SourceError
 
@@ -62,10 +61,10 @@ class SourceTests(unittest.TestCase):
         return caught.exception
 
     def test_registry_bom_custom_and_scheduling(self):
-        registry = sources.load_sources(self.config([RSS_SOURCE, {"id": "targeted", "kind": "forum", "adapter": "web",
-                                                                  "sites": ["Example.org/forum", "example.org/forum"]}], bom=True))
-        self.assertEqual(set(sources.BUILTIN_SOURCES), {"paper", "news", "social", "forum", "trends", "web"})
-        self.assertEqual(registry["targeted"]["sites"], ["example.org/forum"])
+        targeted = dict(RSS_SOURCE, id="targeted", url="https://example.org/feed?q={query}")
+        registry = sources.load_sources(self.config([RSS_SOURCE, targeted], bom=True))
+        self.assertEqual(set(sources.BUILTIN_SOURCES), {"paper", "news", "social", "forum", "trends"})
+        self.assertEqual(registry["targeted"]["url"], targeted["url"])
         self.assertFalse(sources.requires_query(registry["niche"]))
         self.assertFalse(sources.requires_query(registry["trends"]))
         self.assertTrue(sources.requires_query(registry["news"]))
@@ -77,8 +76,7 @@ class SourceTests(unittest.TestCase):
         bad = [dict(RSS_SOURCE, token="private-value"), dict(RSS_SOURCE, url="https://example.org/f?api_key=private-value"),
                dict(RSS_SOURCE, url="https://user:private-value@example.org/f"), dict(RSS_SOURCE, url="https://example.org/{topic}"),
                dict(RSS_SOURCE, id="news"), dict(RSS_SOURCE, kind="paper"),
-               {"id": "x", "adapter": "web", "kind": "web", "sites": ["example.org OR site:evil.org"]},
-               {"id": "x", "adapter": "web", "kind": "web", "sites": "example.org"},
+               {"id": "x", "adapter": "web", "kind": "forum", "sites": ["example.org/forum"]},
                {"id": "x", "adapter": "bluesky", "kind": "social", "sort": "top"}]
         with mock.patch.object(sources, "request_bytes") as network:
             for definition in bad:
@@ -210,47 +208,6 @@ class SourceTests(unittest.TestCase):
         for payload in [{}, [], {"posts": {}}, {"posts": [None]}]:
             with mock.patch.object(sources, "request_json", return_value=(payload, meta())):
                 self.assert_code("FORMAT_ERROR", lambda: sources.fetch_source(sources.BUILTIN_SOURCES["social"], "market"))
-
-    def test_missing_web_key_never_calls_search(self):
-        with mock.patch.object(deepseek_search, "available", return_value=False), mock.patch.object(deepseek_search, "search_cached") as search:
-            error = self.assert_code("AUTH_MISSING", lambda: sources.fetch_source(sources.BUILTIN_SOURCES["web"], "market"))
-        search.assert_not_called()
-        self.assertIn("DEEPSEEK_API_KEY", error.hint)
-
-    def test_web_constraints_original_topic_and_native_publication_time(self):
-        source = {"id": "obscure", "kind": "forum", "adapter": "web", "sites": ["example.org/forum", "other.org"]}
-        rows = [{"title": "Indexed claim", "url": "https://example.org/forum/thread", "snippet": "Unverified snippet",
-                 "date": "2026-11-15", "rerank_score": 2.9},
-                {"title": "Excluded", "url": "https://example.org/forum-elsewhere/post"}]
-        with mock.patch.object(deepseek_search, "available", return_value=True), \
-                mock.patch.object(deepseek_search, "search_cached", return_value=(rows, False)) as search:
-            packet = sources.fetch_source(source, "liquidity", timeout=7)
-        self.assertEqual(search.call_args.args[1], "liquidity (site:example.org/forum OR site:other.org)")
-        self.assertEqual(search.call_args.kwargs["ori_question"], "liquidity")
-        self.assertEqual(search.call_args.kwargs["timeout"], 7)
-        self.assertEqual(search.call_args.kwargs["max_age_hours"], 0)
-        self.assertEqual(packet["query"], "liquidity")
-        self.assertEqual(packet["coverage"]["excluded_by_site_count"], 1)
-        self.assertEqual(len(packet["items"]), 1)
-        self.assertEqual(packet["items"][0]["time_precision"], "date")
-        self.assertIsNone(packet["items"][0]["published_at"])
-        self.assertIsNone(packet["items"][0]["engagement"])
-
-    def test_web_overlong_transformed_query_and_safe_errors(self):
-        source = {"id": "obscure", "kind": "web", "adapter": "web", "sites": ["example.org"]}
-        with mock.patch.object(deepseek_search, "available", return_value=True), mock.patch.object(deepseek_search, "search_cached") as search:
-            self.assert_code("INVALID_INPUT", lambda: sources.fetch_source(source, "x" * 125))
-            search.assert_not_called()
-        failures = [(deepseek_search.SearchAuthError, "AUTH_REJECTED"),
-                    (deepseek_search.SearchInsufficientBalance, "PAYMENT_REQUIRED"),
-                    (deepseek_search.SearchRateLimited, "RATE_LIMITED"),
-                    (deepseek_search.SearchBlocked, "ACCESS_BLOCKED"),
-                    (deepseek_search.SearchServiceError, "NETWORK_ERROR")]
-        for error_type, code in failures:
-            with mock.patch.object(deepseek_search, "available", return_value=True), \
-                    mock.patch.object(deepseek_search, "search_cached", side_effect=error_type("secret response body")):
-                error = self.assert_code(code, lambda: sources.fetch_source(source, "market"))
-                self.assertNotIn("secret response body", json.dumps(error.public()))
 
     def test_source_urls_and_raw_links_redact_known_credentials(self):
         row = hn_row()

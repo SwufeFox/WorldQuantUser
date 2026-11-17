@@ -80,6 +80,11 @@ class SchemaContractTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(parse(proc)["error"]["code"], "USAGE")
 
+    def test_retired_web_search_command_is_rejected(self):
+        proc = run_cli("search", "market liquidity")
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(parse(proc)["error"]["code"], "USAGE")
+
 
 class BriefContractTests(unittest.TestCase):
     def test_nonpositive_limit_cannot_expand_the_startup_context(self):

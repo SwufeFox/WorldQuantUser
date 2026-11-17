@@ -110,6 +110,53 @@ def test_low_retention_is_rejected(flow, capsys):
     assert "buffer" not in flow["calls"]
 
 
+def test_existing_selection_reuses_frozen_criteria_without_refreezing(flow, capsys, tmp_path):
+    choice = tmp_path / "existing.json"
+    manifest = selection.freeze(choice, source="triage", rows=[{"alpha_id": "A1"}],
+                                criteria={"retention_floor": 0.45, "cost_bps": [5, 10]})
+    original = choice.read_bytes()
+    code, output = invoke(capsys, "--selection", choice)
+    assert code == 0 and output["data"]["buffered"]
+    assert flow["calls"] == ["validate", "checks", "buffer"]
+    assert flow["args"]["buffer"].cost_bps == [5, 10]
+    assert output["data"]["steps"]["freeze"]["evidence"]["selection_id"] == manifest["selection_id"]
+    assert choice.read_bytes() == original
+
+
+def test_saved_candidate_and_criteria_are_checked_before_validation(flow, capsys, tmp_path):
+    choice = tmp_path / "existing.json"
+    selection.freeze(choice, source="triage", rows=[{"alpha_id": "OTHER"}])
+    code, output = invoke(capsys, "--selection", choice)
+    assert code == 2 and "exactly this candidate" in output["error"]["message"]
+    choice = tmp_path / "different-criteria.json"
+    selection.freeze(choice, source="triage", rows=[{"alpha_id": "A1"}],
+                     criteria={"retention_floor": 0.45, "cost_bps": [5]})
+    code, output = invoke(capsys, "--selection", choice, "--retention-floor", 0.3)
+    assert code == 2 and "conflicts with the frozen selection" in output["error"]["message"]
+    assert not flow["calls"]
+
+
+def test_scoped_selection_rejects_a_different_shelf_before_validation(flow, capsys, tmp_path):
+    choice = tmp_path / "existing.json"
+    shelf = tmp_path / "scored-shelf.jsonl"
+    selection.freeze(choice, source="triage", rows=[{"alpha_id": "A1"}],
+                     inputs={"shelf": {"path": str(shelf)}})
+    code, output = invoke(capsys, "--selection", choice, "--buffer", tmp_path / "other-shelf.jsonl")
+    assert code == 2 and "conflicts with the frozen shelf" in output["error"]["message"]
+    assert not flow["calls"]
+
+
+@pytest.mark.parametrize("value,reason", [
+    (None, "self_correlation_missing_or_nonfinite"),
+    (0.7, "self_correlation_at_or_above_limit"),
+])
+def test_optional_live_correlation_cap_rejects_before_buffering(flow, capsys, value, reason):
+    flow["checked"]["results"][0]["self_correlation"]["value"] = value
+    code, output = invoke(capsys, "--max-self-correlation", 0.7)
+    assert code == 0 and reason in output["data"]["reasons"]
+    assert flow["calls"] == ["freeze", "validate", "checks"]
+
+
 @pytest.mark.parametrize("verdict", ["FAIL", "ERROR", "PENDING"])
 def test_failed_or_unresolved_checks_reject(flow, capsys, verdict):
     result = flow["checked"]["results"][0]

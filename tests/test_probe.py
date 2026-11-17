@@ -30,6 +30,17 @@ from research_app import parser as cli_parser
 from research_app import runtime as cli_runtime
 
 
+PYTHON_ALPHA = '''\nfrom brain.alphas import alpha
+
+@alpha(data=["close"])
+def example(data):
+    if data:
+        price = data.close
+    return price
+
+'''
+
+
 def record(alpha_id, sharpe, fitness, turnover=0.12, train=1.5, test=0.9, fails=()):
     checks = {name: {"result": "FAIL"} for name in fails}
     return {"alpha_id": alpha_id, "status": "COMPLETE",
@@ -522,6 +533,98 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(data["gate_blocking"], [])
         self.assertTrue(data["results"][0]["gate"]["already_simulated"])
 
+    def test_python_source_file_is_read_relative_to_spec_and_previewed_verbatim(self):
+        path = os.path.join(self.tmp, "example.py")
+        with open(path, "wb") as handle:
+            handle.write(PYTHON_ALPHA.replace("\n", "\r\n").encode("utf-8"))
+        self.spec["settings"]["language"] = "PYTHON"
+        self.spec["arms"] = [{"label": "source", "source_file": "example.py"}]
+        self._write(self.spec)
+
+        with mock.patch.object(expression_lint, "lint_all", side_effect=AssertionError("FastExpr lint")):
+            preview = self._run(dry_run=True)
+            args = cli_parser.build_parser().parse_args(["simulate", path, "--dry-run"])
+            simulated = cli_experiments.cmd_simulate(args, None)
+
+        arm = preview["results"][0]
+        self.assertEqual(arm["source_file"], path)
+        self.assertEqual(arm["payload"]["regular"], PYTHON_ALPHA)
+        self.assertEqual(arm["settings"]["language"], "PYTHON")
+        self.assertEqual(simulated["results"][0]["payload"]["regular"], PYTHON_ALPHA)
+        self.assertEqual(arm["gate"]["structural_refs"], [])
+        self.assertIsNone(arm["turnover_band"])
+        self.assertEqual(preview["lint"]["groups"][0]["results"][0]["declared_fields"], ["close"])
+        self.load_session.assert_not_called()
+
+    def test_python_source_file_rejects_fastexpr_and_conflicting_input(self):
+        self.spec["arms"] = [{"label": "source", "source_file": "example.py"}]
+        self._write(self.spec)
+        with self.assertRaisesRegex(cli_runtime.CliError, "requires language PYTHON"):
+            self._run(dry_run=True)
+        self.spec["arms"][0]["expression"] = "rank(close)"
+        self._write(self.spec)
+        with self.assertRaisesRegex(cli_runtime.CliError, "choose expression or source_file"):
+            self._run(dry_run=True)
+        self.load_session.assert_not_called()
+
+    def test_probe_keeps_language_changes_out_of_controlled_attribution(self):
+        self.spec.pop("design")
+        self.spec["arms"] = [{"label": "control", "expression": "rank(close)", "design": "control"},
+                             {"label": "python", "expression": PYTHON_ALPHA, "design": "parallel",
+                              "settings": {"language": "PYTHON"}}]
+        self._write(self.spec)
+        with self.assertRaisesRegex(cli_runtime.CliError, "changes alpha language"):
+            self._run(dry_run=True)
+        self.spec["design"] = "explore"
+        self._write(self.spec)
+        preview = self._run(dry_run=True)
+        self.assertEqual(preview["groups"], 2)
+        self.assertEqual(preview["comparisons"]["unavailable_reason"], "explore_no_attribution")
+        self.load_session.assert_not_called()
+
+    def test_python_history_and_recovery_match_source_whitespace_exactly(self):
+        indented = PYTHON_ALPHA.replace("    return price", "        return price")
+        settings = {**ml.DEFAULT_SETTINGS, "language": "PYTHON", "decay": 4}
+        exact = {**record("EXACT", 2.0, 1.5), "expression": PYTHON_ALPHA, "settings": settings}
+        variant = {**exact, "alpha_id": "INDENTED", "expression": indented}
+        self.spec["settings"]["language"] = "PYTHON"
+        self.spec["arms"] = [{"label": "source", "expression": PYTHON_ALPHA}]
+        self._write(self.spec)
+        with mock.patch.object(alpha_registry, "load_entries", return_value=[variant, exact]):
+            evidence = self._run(dry_run=True)["results"][0]["gate"]
+        self.assertEqual(evidence["exact_repeat_keys"], ["EXACT"])
+        self.assertEqual(evidence["structural_refs"], [])
+
+        def platform_entry(entry):
+            return {"id": entry["alpha_id"], "regular": entry["expression"], "settings": settings}
+
+        rows = [{"label": "source", "expression": PYTHON_ALPHA, "settings": settings}]
+        with mock.patch.object(ml, "list_alphas", return_value=[platform_entry(variant), platform_entry(exact)]), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=exact) as read, \
+                mock.patch.object(ml, "extract_split", return_value=exact["out_of_sample"]):
+            recovered = cli_experiments._recover_probe_rows(object(), rows)
+        self.assertEqual(recovered["matched"], {"source": "EXACT"})
+        self.assertEqual(read.call_args.args[1], "EXACT")
+
+    def test_history_refs_separate_exact_results_from_structural_ideas(self):
+        exact = {**record("OLD", 9.0, 8.0, train=1.2, test=7.0),
+                 "key": "OLD", "batch": "previous", "expression": "((rank(close)))",
+                 "settings": {**ml.DEFAULT_SETTINGS, "decay": 4}}
+        similar = {**exact, "alpha_id": "SIMILAR", "key": "SIMILAR", "expression": "rank(returns)"}
+        incomplete = {**exact, "alpha_id": "INCOMPLETE", "key": "INCOMPLETE",
+                      "settings": {"decay": 4}}
+        with mock.patch.object(alpha_registry, "load_entries", return_value=[exact, similar, incomplete]):
+            preview = self._run(dry_run=True)
+        evidence = preview["results"][0]["gate"]
+        self.assertEqual(evidence["exact_repeat_keys"], ["OLD"])
+        self.assertEqual(evidence["completed_refs"][0]["batch"], "previous")
+        self.assertEqual(evidence["completed_refs"][0]["train"]["sharpe"], 1.2)
+        self.assertNotIn("metrics", evidence["completed_refs"][0])
+        self.assertNotIn("out_of_sample", evidence["completed_refs"][0])
+        self.assertEqual([row["key"] for row in evidence["structural_refs"]], ["SIMILAR", "INCOMPLETE"])
+        self.assertEqual(evidence["structural_history_count"], 2)
+        self.load_session.assert_not_called()
+
     def test_explore_preserves_context_but_never_attributes_arms(self):
         self.spec["note"] = "why this scan matters"
         self._write(self.spec)
@@ -547,6 +650,54 @@ class ProbeDurabilityTests(unittest.TestCase):
         paths = list(Path(self.output_dir).glob("*.json"))
         self.assertEqual(len(paths), 1)
         return paths[0], json.loads(paths[0].read_text(encoding="utf-8"))
+
+    def test_python_resume_reuses_the_checkpoint_source_after_file_removal(self):
+        path = os.path.join(self.tmp, "example.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(PYTHON_ALPHA)
+        self.spec["settings"]["language"] = "PYTHON"
+        self.spec["arms"] = [{"label": "source", "source_file": "example.py"}]
+        self._write(self.spec)
+        with mock.patch.object(self.fake, "simulate", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self._run()
+        checkpoint, saved = self._saved()
+        self.assertEqual(saved["arms"][0]["source_file"], path)
+        os.unlink(path)
+        resumed = self._run(resume=checkpoint, spec=None, no_record=False)
+        self.assertEqual(resumed["rows"][0]["expression"], PYTHON_ALPHA)
+        self.assertEqual(self.fake.calls[0]["payloads"][0]["regular"], PYTHON_ALPHA)
+
+    def test_preview_points_to_known_job_at_the_requested_checkpoint(self):
+        def interrupted(expressions, settings=None, **kwargs):
+            kwargs["on_event"]("completed", {"index": 0, **record("DONE", 9.0, 8.0, train=1.2, test=7.0)})
+            kwargs["on_event"]("submitted", {"index": 1, "status": "PENDING",
+                "progress_url": "https://api.worldquantbrain.com/simulations/accepted"})
+            raise KeyboardInterrupt
+
+        with mock.patch.object(self.fake, "simulate", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self._run()
+        path, saved = self._saved()
+        before = path.read_bytes()
+        self.load_session.reset_mock()
+        preview = self._run(batch_path=path, dry_run=True)
+        finished, waiting = [arm["gate"] for arm in preview["results"]]
+        refs = finished["checkpoint_completed_refs"]
+        self.assertEqual(refs[0]["alpha_id"], "DONE")
+        self.assertEqual(refs[0]["train"]["sharpe"], 1.2)
+        self.assertNotIn("out_of_sample", refs[0])
+        self.assertEqual(waiting["checkpoint_recovery_refs"][0]["run_id"], saved["run_id"])
+        self.assertEqual(preview["next_actions"][0]["matching_arms"], ["b"])
+        self.assertEqual(preview["next_actions"][0]["argv"][-3:], ["probe", "--recover", str(path)])
+        self.assertEqual(path.read_bytes(), before)
+        self.load_session.assert_not_called()
+
+        self.spec["arms"][1]["settings"] = {"decay": 5}
+        self._write(self.spec)
+        changed = self._run(batch_path=path, dry_run=True)
+        self.assertEqual(changed["next_actions"][0]["action"], "check")
+        self.assertNotIn("checkpoint_recovery_refs", changed["results"][1]["gate"])
 
     def test_interruption_preserves_accepted_url_and_completed_evidence(self):
         def interrupted(expressions, settings=None, **kwargs):
