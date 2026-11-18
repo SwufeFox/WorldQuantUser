@@ -9,13 +9,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 import machine_lib as ml
 import research_paths
 from research_app import app
 
 
 def response(payload=None, status=200, headers=None):
-    result = ml.requests.Response()
+    result = requests.Response()
     result.status_code = status
     result.headers.update(headers or {})
     result._content = json.dumps(payload if payload is not None else {}).encode("utf-8")
@@ -119,7 +121,7 @@ class MergedPerformanceCLITests(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(self.root)})
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.session = ml.requests.Session()
+        self.session = requests.Session()
         patcher = mock.patch.object(ml, "load_session", return_value=self.session)
         self.login = patcher.start()
         self.addCleanup(patcher.stop)

@@ -111,6 +111,8 @@ def fetch_fields(session, region="USA", universe="TOP3000", delay=1,
 
 def required_field_scope(session, settings, required_fields):
     """Verify exact required IDs using bounded, live searches in the current scope."""
+    from requests.exceptions import RequestException
+
     scope, account = scope_settings(settings), simulation_capabilities.account_provenance(session)
     required = set(required_fields or ())
     catalogs, records = [], []
@@ -128,7 +130,7 @@ def required_field_scope(session, settings, required_fields):
         except ml.RateLimited as exc:
             search["error"] = exc.code
             break
-        except (ml.BrainError, ml.requests.RequestException) as exc:
+        except (ml.BrainError, RequestException) as exc:
             search["error"] = getattr(exc, "code", type(exc).__name__)
             continue
         matches = result["matches"]

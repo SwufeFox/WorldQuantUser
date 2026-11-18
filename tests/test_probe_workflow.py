@@ -8,6 +8,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 import machine_lib as ml
 from research_app import experiments as app
 from research_app.runtime import CliError
@@ -156,9 +158,9 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(recovered["summary"]["incentives"], summary["incentives"])
 
     def test_summary_preserves_daily_quota_pause_and_recovery_instruction(self):
-        session = ml.requests.Session()
+        session = requests.Session()
         session._brain_account_id = "offline-quota-summary"
-        accepted = ml.requests.Response()
+        accepted = requests.Response()
         accepted.status_code = 201
         accepted.headers.update({"Location": "/simulations/one", "X-Ratelimit-Limit": "100",
                                  "X-Ratelimit-Remaining": "0", "X-Ratelimit-Reset": "3600"})

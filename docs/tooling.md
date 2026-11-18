@@ -39,7 +39,8 @@ CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、
 这些是内部模块，入口仍是 `research_cli.py`；改命令时直接修改、测试所属模块。
 
 CLI 统一按需加载处理模块。执行具体命令时才导入它的处理模块，`help`、`--help` 和
-`schema` 直接从参数定义生成输出。
+`schema` 直接从参数定义生成输出。这些命令与离线 lint、Probe 预览可以在未安装
+HTTP 客户端 `requests` 的环境下运行。联网命令需要安装运行依赖。
 
 `catalog datasets`、`catalog fields`、`catalog find` 和 `catalog categories` 先按
 当前账户与查询范围查磁盘。命中时无需登录，缺少有效缓存时才建立会话，单次命令内复用。

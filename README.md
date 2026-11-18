@@ -32,7 +32,7 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `research_app/campaign.py` | Research briefs and train/test view history. |
 | `research_app/literature.py` | OpenAlex paper discovery and reading. |
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and research scripts. |
-| `machine_lib.py` | BRAIN API client + FASTEXPR factory helpers. No printing, typed errors. |
+| `machine_lib.py` | BRAIN API client, settings, cache policy and simulation execution. |
 | `simulation_capabilities.py` | Account identity and current settings evidence; unknown capabilities remain explicit. |
 | `simulation_slots.py` | Durable simulation reservations shared by the same account and research workspace. |
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |

@@ -1120,6 +1120,8 @@ def _recovery_expression_key(expression, language):
 def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.0,
                         on_progress=None):
     """Read known jobs first; use expression/settings lookup only for unidentified arms."""
+    from requests.exceptions import RequestException
+
     limit = min(100, max(1, limit))
     missing = [row for row in rows if row.get("train_fitness") is None or row.get("metrics_pending")]
     matched, still_missing, ambiguous = {}, [], []
@@ -1211,7 +1213,7 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
                 matched[label] = alpha_id
         except ml.AuthError:
             raise
-        except (ml.BrainError, ml.requests.RequestException) as exc:
+        except (ml.BrainError, RequestException) as exc:
             row["error"] = str(exc)
             still_missing.append(label)
             if on_progress:
@@ -1893,11 +1895,13 @@ def _probe_halves(session, records):
             continue
         if record.get("half_sharpes") and all(value is not None for value in record["half_sharpes"]):
             continue
+        from requests.exceptions import RequestException
+
         evidence = {}
         try:
             pnl = ml.fetch_daily_pnl(session, record["alpha_id"],
                 cache_dir=Path(research_paths.ensure_dir()) / "pnl", max_age_hours=24, report=evidence)
-        except (ml.BrainError, ml.requests.RequestException, OSError) as exc:
+        except (ml.BrainError, RequestException, OSError) as exc:
             record["half_sharpes"] = [None, None]
             record["half_sharpes_error"] = str(exc)
         else:

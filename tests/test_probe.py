@@ -18,6 +18,8 @@ import types
 import unittest
 from unittest import mock
 
+import requests
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
@@ -304,7 +306,7 @@ class ProbeTests(unittest.TestCase):
                 mock.patch.object(ml, "get_credentials", side_effect=AssertionError("credentials")), \
                 mock.patch.object(ml, "fetch_operators", side_effect=AssertionError("catalog")), \
                 mock.patch.object(self.fake, "check", side_effect=AssertionError("live lint")), \
-                mock.patch.object(ml.requests.sessions.Session, "request",
+                mock.patch.object(requests.sessions.Session, "request",
                                   side_effect=AssertionError("network")):
             data = self._run(dry_run=True)
         self.load_session.assert_not_called()

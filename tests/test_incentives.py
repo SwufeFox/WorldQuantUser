@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 import cache_store
 import machine_lib as ml
 from research_app import app, incentives
@@ -27,7 +29,7 @@ class CatalogIncentiveTests(unittest.TestCase):
         self.addCleanup(lambda: ml.configure_metadata_cache(max_age=policy["max_age"],
             refresh=policy["refresh"], enabled=policy["enabled"]))
         ml.configure_metadata_cache(max_age=3600, refresh=False, enabled=True)
-        self.session = ml.requests.Session()
+        self.session = requests.Session()
         self.session.auth = ("synthetic-catalog", "placeholder")
         patcher = mock.patch.object(ml, "load_session", return_value=self.session)
         patcher.start()

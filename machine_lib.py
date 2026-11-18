@@ -30,8 +30,8 @@ What is deliberately *not* here: no linting (that is ``expression_lint`` via
 about which alphas are worth running. A transport that also judges is a transport
 nobody can test.
 
-``pandas`` is optional: it is imported for the dataframe helpers only, so the CLI
-and the tests work on a machine without it.
+The HTTP client is imported where it is needed. Local CLI introspection and
+previews can run without it. ``pandas`` is optional for dataframe helpers.
 """
 
 import hashlib
@@ -50,8 +50,6 @@ from urllib.parse import quote, urljoin, urlsplit
 
 import sys
 from datetime import datetime, timezone
-
-import requests
 
 import cache_store
 import research_paths
@@ -279,7 +277,9 @@ def authenticate():
     not the ``/users/self`` payload, which carries account PII (email, phone).
     """
     username, password = get_credentials()
-    session = requests.Session()
+    from requests import Session
+
+    session = Session()
     session.auth = (username, password)
     response = session.post(BRAIN_API_URL + "/authentication", timeout=_request_timeout(None))
     if response.status_code != 201:
@@ -354,10 +354,12 @@ def session_cache_path():
 
 
 def _session_payload(session, info):
+    from requests.utils import dict_from_cookiejar
+
     auth = getattr(session, "auth", None)
     username = auth[0] if isinstance(auth, (tuple, list)) and auth else None
     return {
-        "cookies": requests.utils.dict_from_cookiejar(session.cookies),
+        "cookies": dict_from_cookiejar(session.cookies),
         "user_id": (info or {}).get("user_id"),
         "username": username.strip().casefold() if isinstance(username, str) else None,
         "permissions": (info or {}).get("permissions"),
@@ -384,7 +386,9 @@ def save_session(session, info=None, path=None):
 
 
 def _session_from_entry(payload, credentials):
-    session = requests.Session()
+    from requests import Session
+
+    session = Session()
     session.auth = credentials
     session.cookies.update(payload["cookies"])
     session._brain_account_id = payload.get("user_id")
@@ -1555,6 +1559,8 @@ def simulate_alphas(
             for index, (expression, decay) in enumerate(pairs)
         ]
 
+    from requests.exceptions import HTTPError, RequestException
+
     if initial_records is None:
         records = [
             {
@@ -1888,7 +1894,7 @@ def simulate_alphas(
                 records[index] = record
                 emit("pending", index, record)
                 break
-            except requests.HTTPError as exc:
+            except HTTPError as exc:
                 status_code = getattr(exc.response, "status_code", None)
                 refused = status_code is not None and 400 <= status_code < 500
                 record["status"] = "FAILED" if refused else "UNKNOWN_SUBMISSION"
@@ -1906,7 +1912,7 @@ def simulate_alphas(
                 if not refused:
                     break
                 continue
-            except requests.RequestException as exc:
+            except RequestException as exc:
                 record.update(status="UNKNOWN_SUBMISSION", error="submit transport failed: %s" % type(exc).__name__)
                 records[index] = record
                 emit("pending", index, record)
@@ -2236,6 +2242,8 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
 
     evidence = {"source": "platform", "complete": False, "pages": 0,
                 "points": 0, "as_of": None, "error": None, "missing_values": 0}
+    from requests.exceptions import RequestException
+
     deadline = time.monotonic() + max_wait_seconds
     out = {}
     offset = 0
@@ -2316,7 +2324,7 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
                 break
             elif not records:
                 raise ServiceError("daily PnL pagination did not advance")
-    except requests.RequestException as exc:
+    except RequestException as exc:
         evidence["error"] = "SERVICE_ERROR"
         publish()
         raise ServiceError("daily PnL transport failed: %s" % type(exc).__name__) from exc

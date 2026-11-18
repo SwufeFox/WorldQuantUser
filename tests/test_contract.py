@@ -25,6 +25,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
@@ -108,12 +110,12 @@ class ReferenceContractTests(unittest.TestCase):
                 flags = {flag for option in command["options"] for flag in option["flags"]}
                 self.assertTrue((expected | cache_flags) <= flags)
 
-    def test_help_and_schema_do_not_import_command_handlers(self):
+    def test_help_and_schema_do_not_import_command_handlers_or_http(self):
         script = """
 import sys
 from research_app import app
 
-for args in (["help", "docs", "get"], ["schema", "forum", "search"], ["schema", "alpha", "get"]):
+for args in (["help", "docs", "get"], ["schema", "forum", "search"], ["schema"]):
     assert app.main(args) == 0
 
 handlers = {
@@ -123,6 +125,28 @@ handlers = {
     )
 }
 assert handlers.isdisjoint(sys.modules), handlers.intersection(sys.modules)
+assert "requests" not in sys.modules
+"""
+        proc = subprocess.run([sys.executable, "-c", script], cwd=ROOT,
+                              capture_output=True, encoding="utf-8")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_offline_lint_and_probe_preview_work_without_http_client(self):
+        script = """
+import io
+import json
+import sys
+
+sys.modules["requests"] = None
+from research_app import app
+
+assert app.main(["lint", "--offline", "--expr", "rank(close)"]) == 0
+sys.stdin = io.StringIO(json.dumps({
+    "name": "offline-preview",
+    "design": "explore",
+    "arms": [{"label": "baseline", "expression": "rank(close)"}],
+}))
+assert app.main(["probe", "-", "--dry-run"]) == 0
 """
         proc = subprocess.run([sys.executable, "-c", script], cwd=ROOT,
                               capture_output=True, encoding="utf-8")
@@ -620,7 +644,7 @@ class ResearchLookupContractTests(unittest.TestCase):
                         "checks": {"SELF_CORRELATION": {"result": "PENDING", "value": None}}},
         }
         with tempfile.TemporaryDirectory() as directory, \
-                mock.patch.object(ml, "load_session", return_value=ml.requests.Session()), \
+                mock.patch.object(ml, "load_session", return_value=requests.Session()), \
                 mock.patch.object(ml, "fetch_alpha_checks", side_effect=lambda session, alpha_id, **kw: outcomes[alpha_id]), \
                 contextlib.redirect_stdout(io.StringIO()) as stdout, \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -719,7 +743,7 @@ class RequestTimeoutContractTests(unittest.TestCase):
                 release.wait(2)
 
         with socketserver.TCPServer(("127.0.0.1", 0), SilentPeer) as server, \
-                tempfile.TemporaryDirectory() as directory, ml.requests.Session() as session:
+                tempfile.TemporaryDirectory() as directory, requests.Session() as session:
             session.trust_env = False
             thread = threading.Thread(target=server.serve_forever,
                                       kwargs={"poll_interval": 0.01}, daemon=True)
@@ -734,7 +758,7 @@ class RequestTimeoutContractTests(unittest.TestCase):
                     stack.enter_context(mock.patch.object(ml, "get_credentials",
                                         return_value=("offline-user", "offline-secret")))
                     if authenticate:
-                        stack.enter_context(mock.patch.object(ml.requests, "Session", return_value=session))
+                        stack.enter_context(mock.patch.object(requests, "Session", return_value=session))
                         stack.enter_context(mock.patch.object(ml, "load_session",
                                             side_effect=lambda **kwargs: ml.authenticate()[0]))
                     else:
@@ -1462,7 +1486,7 @@ class CheckExtractionTests(unittest.TestCase):
         self.assertIsNone(ml._extract_checks({}))
 
     def test_cli_theme_metadata_cannot_rescue_a_failed_quality_check(self):
-        response = ml.requests.Response()
+        response = requests.Response()
         response.status_code = 200
         response._content = json.dumps({"is": {"checks": [
             {"name": "LOW_SHARPE", "result": "FAIL", "limit": 1.25, "value": 0.4},
@@ -1471,7 +1495,7 @@ class CheckExtractionTests(unittest.TestCase):
              "future_metadata": {"source": "fixture"}},
             {"name": "MATCHES_THEMES", "result": "WARNING", "themes": []},
         ]}}).encode("utf-8")
-        session = ml.requests.Session()
+        session = requests.Session()
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.object(ml, "load_session", return_value=session), \
                 mock.patch.object(session, "get", return_value=response), \
