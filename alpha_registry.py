@@ -28,6 +28,7 @@ Design notes:
 from __future__ import annotations
 
 import datetime
+import errno
 import hashlib
 import json
 import re
@@ -350,42 +351,36 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
 def load_entries(path=None):
     """Load the ledger, newest record per key winning.
 
-    Tolerates a missing file (returns ``[]``) and skips malformed lines rather
-    than failing the caller.
+    Tolerates a missing file (returns ``[]``) and skips malformed lines,
+    including a write interrupted in the middle of a UTF-8 character.
     """
     path = path or default_registry_path()
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            lines = handle.readlines()
+        handle = open(path, "rb")
     except FileNotFoundError:
         return []
     by_key = {}
-    order = []
-    for line_number, line in enumerate(lines, start=1):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            entry = json.loads(stripped)
-        except ValueError:
-            continue
-        if not isinstance(entry, dict):
-            continue
-        key = entry.get("key") or entry.get("alpha_id")
-        if not key:
-            expression = entry.get("expression") or ""
-            language = entry_language(entry)
-            if ml.is_python_language(language):
-                settings = {**(entry.get("settings") or {}), "language": language}
-                key = placeholder_key(expression, settings)
-            else:
-                key = expression_hash(expression, language)
-        entry.setdefault("key", key)
-        entry["role"] = evidence_role(by_key.get(key), entry)
-        if key not in by_key:
-            order.append(key)
-        by_key[key] = entry
-    return [by_key[key] for key in order]
+    with handle:
+        for line in handle:
+            try:
+                entry = json.loads(line.decode("utf-8").strip())
+            except ValueError:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("key") or entry.get("alpha_id")
+            if not key:
+                expression = entry.get("expression") or ""
+                language = entry_language(entry)
+                if ml.is_python_language(language):
+                    settings = {**(entry.get("settings") or {}), "language": language}
+                    key = placeholder_key(expression, settings)
+                else:
+                    key = expression_hash(expression, language)
+            entry.setdefault("key", key)
+            entry["role"] = evidence_role(by_key.get(key), entry)
+            by_key[key] = entry
+    return list(by_key.values())
 
 
 #: Fields that change on every append and therefore cannot signal "content changed".
@@ -441,12 +436,31 @@ def append_batch(path=None):
     Collect platform data before entering the batch.
     """
     path = os.fspath(path or default_registry_path())
-    with cache_store.file_lock(path + ".lock", timeout=30):
+    with cache_store.file_lock(path + ".lock", timeout=30), ExitStack() as stack:
         existing = {item["key"]: item for item in load_entries(path)}
-        yield existing, partial(_append_locked, path, existing)
+        handle = None
+        check_tail = True
+
+        def write_line(entry):
+            nonlocal handle, check_tail
+            data = (json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+            if handle is None:
+                handle = stack.enter_context(open(path, "a+b", buffering=0))
+            if check_tail and handle.seek(0, os.SEEK_END):
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    # Preserve a legacy final record or isolate a torn write.
+                    data = b"\n" + data
+            check_tail = True
+            if handle.write(data) != len(data):
+                raise OSError(errno.EIO, "short write to the alpha registry", path)
+            os.fsync(handle.fileno())
+            check_tail = False
+
+        yield existing, partial(_append_locked, existing, write_line)
 
 
-def _append_locked(path, existing, entry, *, skip_unchanged=True, allow_metrics_loss=False):
+def _append_locked(existing, write_line, entry, *, skip_unchanged=True, allow_metrics_loss=False):
     # Attach the rejection cause while the observed check and metrics are present.
     if entry.get("verdict") == "rejected" and not entry.get("reason_code"):
         try:
@@ -470,11 +484,7 @@ def _append_locked(path, existing, entry, *, skip_unchanged=True, allow_metrics_
             % (key,))
     if skip_unchanged and current is not None and _comparable(current) == _comparable(entry):
         return current, False
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    write_line(entry)
     existing[key] = entry
     return entry, True
 

@@ -163,7 +163,7 @@ class SyncDriftTests(unittest.TestCase):
                                   pages=1, order="-dateCreated", limit_record=10,
                                   dry_run=True, registry=registry)
         with mock.patch.object(cli_ledger, "with_session",
-                               lambda a, work: work(object())), \
+                               lambda a, work, **kw: work(object())), \
                 mock.patch.object(ml, "list_alphas", return_value=list(platform.values())):
             data = cli_ledger.cmd_ledger_sync(args, mock.MagicMock())
         self.assertEqual(data["missing"], [])

@@ -128,6 +128,10 @@ class ServiceError(BrainError):
     code = "SERVICE_ERROR"
 
 
+class ReadInterrupted(ServiceError):
+    """A read could not finish after transient transport or gateway errors."""
+
+
 class SessionBusy(ServiceError):
     """Another process is acquiring the shared account session."""
 
@@ -1096,16 +1100,63 @@ def _retry_after_seconds(response, cap_error_wait=True):
     return max(seconds, 0.0)
 
 
+_TRANSIENT_READ_STATUSES = {408, 502, 503, 504}
+
+
+def _transient_read_error(exc):
+    from requests.exceptions import ChunkedEncodingError, ConnectionError, ContentDecodingError, SSLError, Timeout
+
+    return (isinstance(exc, (ChunkedEncodingError, ConnectionError, ContentDecodingError, Timeout))
+            and not isinstance(exc, SSLError))
+
+
+def _wait_for_read_retry(attempt, attempts, deadline, retry_after=0):
+    wait = retry_after if math.isfinite(retry_after) and retry_after > 0 else min(2.0, 0.5 * attempt)
+    if attempt >= attempts or (deadline is not None and wait >= deadline - time.monotonic()):
+        return False
+    sleep(wait)
+    return True
+
+
+def _get_poll_response(s, url, deadline):
+    """Retry interrupted reads while leaving the endpoint's readiness protocol intact."""
+    from requests.exceptions import RequestException
+
+    attempts = 3
+    last = None
+    for attempt in range(1, attempts + 1):
+        if last is not None and deadline is not None and time.monotonic() >= deadline:
+            raise last
+        try:
+            response = s.get(url, timeout=_request_timeout(deadline))
+        except RequestException as exc:
+            last = ReadInterrupted(f"BRAIN read interrupted ({type(exc).__name__})")
+            if _transient_read_error(exc) and _wait_for_read_retry(attempt, attempts, deadline):
+                continue
+            raise last from exc
+        status = response.status_code
+        if status != 429 and status not in _TRANSIENT_READ_STATUSES:
+            return response
+        delay = _retry_after_seconds(response, cap_error_wait=False)
+        if status in (429, 503) and math.isfinite(delay) and delay > 0:
+            return response
+        last = ReadInterrupted(f"BRAIN read interrupted (HTTP {status})")
+        if not _wait_for_read_retry(attempt, attempts, deadline, delay):
+            raise last
+
+
 def request_json(s, method, path, params=None, json_body=None, max_retries=4, *, deadline=None):
     """Decode a BRAIN API response or raise a typed HTTP failure.
 
     Responses with status 429 use backoff within the attempt and time budgets.
+    Safe reads also retry interrupted transfers and transient gateway responses.
     Other failures raise AuthError, PermissionDenied, NotFound or ServiceError.
     Successful responses without decodable JSON yield an empty dict.
     """
     from requests.exceptions import RequestException
 
     url = path if path.startswith("http") else BRAIN_API_URL + path
+    read_only = method.upper() in {"GET", "HEAD"}
     if deadline is None:
         deadline = time.monotonic() + _request_timeout(None)
     last = None
@@ -1116,8 +1167,12 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4, *,
             response = s.request(method, url, params=params, json=json_body,
                                  timeout=_request_timeout(deadline))
         except RequestException as exc:
-            raise ServiceError("BRAIN request failed (%s) for %s %s"
-                               % (type(exc).__name__, method, url)) from exc
+            last = ServiceError("BRAIN request failed (%s) for %s %s"
+                                % (type(exc).__name__, method, url))
+            if (read_only and _transient_read_error(exc)
+                    and _wait_for_read_retry(attempt, max_retries, deadline)):
+                continue
+            raise last from exc
         if response.status_code == 401:
             raise AuthError("BRAIN rejected the session (HTTP 401) for %s %s" % (method, url))
         if response.status_code == 403:
@@ -1134,10 +1189,15 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4, *,
                 continue
             raise last
         if not response.ok:
-            raise ServiceError(
+            last = ServiceError(
                 "HTTP %s from %s %s: %s"
                 % (response.status_code, method, url, response.text[:300])
             )
+            if (read_only and response.status_code in _TRANSIENT_READ_STATUSES
+                    and _wait_for_read_retry(attempt, max_retries, deadline,
+                                             _retry_after_seconds(response, cap_error_wait=False))):
+                continue
+            raise last
         try:
             return response.json()
         except ValueError:
@@ -1195,12 +1255,14 @@ def poll_simulation(s, progress_url, on_event=None, deadline=None):
                 "progress_url": progress_url,
                 "next_poll_after_seconds": 0,
             }
-        progress = s.get(progress_url, timeout=_request_timeout(deadline))
+        progress = _get_poll_response(s, progress_url, deadline)
         if progress.status_code in (401, 403):
             raise AuthError(
                 "session rejected while polling (HTTP %s)" % progress.status_code
             )
         retry_after = _retry_after_seconds(progress, cap_error_wait=False)
+        if not math.isfinite(retry_after):
+            raise ReadInterrupted("simulation progress returned an invalid Retry-After")
         if progress.status_code in (429, 503) and retry_after:
             if deadline is not None:
                 remaining = max(0.0, deadline - time.monotonic())
@@ -1313,13 +1375,12 @@ def fetch_alpha_metrics(s, alpha_id, on_event=None, deadline=None):
     while True:
         if deadline is not None and deadline - time.monotonic() <= 0:
             return {"_deferred": True, "next_poll_after_seconds": 0}
-        response = s.get(
-            BRAIN_API_URL + "/alphas/" + alpha_id,
-            timeout=_request_timeout(deadline),
-        )
+        response = _get_poll_response(s, BRAIN_API_URL + "/alphas/" + alpha_id, deadline)
         if response.status_code == 404:
             raise NotFound("alpha %s not found" % alpha_id)
         retry_after = _retry_after_seconds(response, cap_error_wait=False)
+        if not math.isfinite(retry_after):
+            raise ReadInterrupted("alpha metrics returned an invalid Retry-After")
         if response.status_code in (429, 503) and retry_after:
             if deadline is not None:
                 remaining = max(0.0, deadline - time.monotonic())
@@ -1783,7 +1844,7 @@ def simulate_alphas(
                 on_event=metrics_event,
                 deadline=deadline,
             )
-        except AuthError as exc:
+        except (AuthError, ReadInterrupted) as exc:
             record["status"] = "PENDING"
             record["metrics_pending"] = True
             record["error"] = str(exc)
@@ -1795,6 +1856,7 @@ def simulate_alphas(
             if defer_alpha_metrics(record, payload):
                 emit("pending", index, record)
                 return
+            record["error"] = record.pop("simulation_error", None)
             record["metrics"] = payload.get("is")
             record["checks"] = _extract_checks(payload)
             split = extract_split(payload)
@@ -1854,21 +1916,26 @@ def simulate_alphas(
                 return
             simulation_slots.reconcile_record(record, plan["account"], outcome="terminal")
             shared_state()
+            record["error"] = None
             if progress.get("status") in simulation_slots.TERMINAL_FAILURE_STATUSES or progress.get("message"):
                 record["error"] = progress.get("message") or "simulation ended with %s" % record["status"]
                 if not is_python_language(settings.get("language")):
                     note_operator_rejection(record.get("expression"), record["error"])
             if record["alpha_id"]:
                 record["simulation_status"] = record["status"]
+                if record["error"]:
+                    record["simulation_error"] = record["error"]
+                record["status"] = "PENDING"
                 record["metrics_pending"] = True
             record.pop("progress_url", None)
             if record.get("metrics_pending"):
+                emit("pending", index, record)
                 fetch_metrics_record(index)
             else:
                 record.pop("next_poll_at", None)
                 record.pop("poll_after_seconds", None)
                 emit("completed", index, record)
-        except AuthError as exc:
+        except (AuthError, ReadInterrupted) as exc:
             record["status"] = "PENDING"
             record["error"] = str(exc)
             record["progress_url"] = progress_url
@@ -2022,7 +2089,7 @@ def simulate_alphas(
                 break
             except HTTPError as exc:
                 status_code = getattr(exc.response, "status_code", None)
-                refused = status_code is not None and 400 <= status_code < 500
+                refused = status_code is not None and 400 <= status_code < 500 and status_code != 408
                 record["status"] = "FAILED" if refused else "UNKNOWN_SUBMISSION"
                 record["error"] = "submit failed: %s" % exc
                 if refused:
@@ -2401,13 +2468,28 @@ def fetch_alpha_recordsets(s, alpha_id, names=(), max_wait_seconds=180.0):
             "discovery": discovery, "series": datasets}
 
 
+_PNL_EVIDENCE_FORMAT = "worldquantuser.pnl-evidence"
+
+
+def _pnl_digest(series):
+    return hashlib.sha256(json.dumps(series, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _matching_pnl_evidence(metadata, alpha_id, digest):
+    for candidate in (metadata, metadata.get("previous")):
+        if (isinstance(candidate, dict) and candidate.get("format") == _PNL_EVIDENCE_FORMAT
+                and candidate.get("alpha_id") == alpha_id and candidate.get("data_sha256") == digest):
+            return candidate
+    return None
+
+
 def pnl_cache_status(cache_dir, alpha_id, series=None):
     """Describe cache evidence without assuming a legacy file was fully fetched."""
     path = Path(cache_dir) / (alpha_id + ".json")
     metadata_path = Path(cache_dir) / ".meta" / (alpha_id + ".json")
-    metadata, error = cache_store.load_json(metadata_path)
     evidence = {"source": "cache", "path": str(path), "metadata_path": str(metadata_path),
-                "complete": None, "as_of": None, "error": error, "points": 0}
+                "complete": None, "as_of": None, "error": None, "points": 0}
     if series is None:
         series, data_error = cache_store.load_json(path)
         if data_error:
@@ -2417,21 +2499,41 @@ def pnl_cache_status(cache_dir, alpha_id, series=None):
         evidence.update(complete=False, error="invalid_pnl_cache")
         return evidence
     evidence["points"] = len(series)
-    if not isinstance(metadata, dict) or metadata.get("format") != "worldquantuser.pnl-evidence":
+    metadata, evidence["error"] = cache_store.load_json(metadata_path)
+    if not isinstance(metadata, dict) or metadata.get("format") != _PNL_EVIDENCE_FORMAT:
         return evidence
     try:
-        digest = hashlib.sha256(json.dumps(series, sort_keys=True, separators=(",", ":"),
-                                           allow_nan=False).encode("utf-8")).hexdigest()
+        digest = _pnl_digest(series)
     except (TypeError, ValueError):
         evidence.update(complete=False, error="invalid_pnl_values")
         return evidence
-    if metadata.get("alpha_id") != alpha_id or metadata.get("data_sha256") != digest:
+    metadata = _matching_pnl_evidence(metadata, alpha_id, digest)
+    if metadata is None:
         evidence.update(complete=False, error="pnl_metadata_mismatch")
         return evidence
     evidence.update({key: metadata.get(key) for key in
                      ("complete", "as_of", "pages", "start", "end", "missing_values")})
     evidence["error"] = None
     return evidence
+
+
+def _write_pnl_cache(path, metadata_path, series, metadata, deadline):
+    """Stage the next digest while retaining proof for the still-visible data file."""
+    lock_timeout = max(0, min(1, deadline - time.monotonic()))
+    with cache_store.file_lock(metadata_path.with_suffix(".lock"), timeout=lock_timeout):
+        prior, _ = cache_store.load_json(metadata_path)
+        if isinstance(prior, dict) and prior.get("format") == _PNL_EVIDENCE_FORMAT:
+            current, _ = cache_store.load_json(path)
+            if isinstance(current, dict):
+                try:
+                    match = _matching_pnl_evidence(prior, metadata["alpha_id"], _pnl_digest(current))
+                except (TypeError, ValueError):
+                    match = None
+                if match is not None and match["data_sha256"] != metadata["data_sha256"]:
+                    metadata = {**metadata, "previous": {key: value for key, value in match.items()
+                                                         if key != "previous"}}
+        cache_store.write_json_atomic(metadata_path, metadata)
+        cache_store.write_json_atomic(path, series)
 
 
 def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
@@ -2458,21 +2560,22 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
             report.clear()
             report.update(evidence)
 
-    if cache_dir:
+    if cache_dir and max_age_hours > 0:
         path = Path(cache_dir) / (alpha_id + ".json")
-        if path.is_file() and time.time() - path.stat().st_mtime < max_age_hours * 3600:
-            try:
-                cached = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(cached, dict) and cached and all(
-                    isinstance(value, (int, float)) and not isinstance(value, bool)
-                    and math.isfinite(value) for value in cached.values()
-                ):
-                    evidence = pnl_cache_status(cache_dir, alpha_id, cached)
-                    if evidence["complete"] is True:
-                        publish()
-                        return {key: float(value) for key, value in cached.items()}
-            except (OSError, ValueError, TypeError):
-                pass
+        try:
+            with path.open(encoding="utf-8") as handle:
+                age = time.time() - os.fstat(handle.fileno()).st_mtime
+                cached = json.load(handle) if age < max_age_hours * 3600 else None
+            if isinstance(cached, dict) and cached and all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) for value in cached.values()
+            ):
+                evidence = pnl_cache_status(cache_dir, alpha_id, cached)
+                if evidence["complete"] is True:
+                    publish()
+                    return {key: float(value) for key, value in cached.items()}
+        except (OSError, ValueError, TypeError):
+            pass
 
     evidence = {"source": "platform", "complete": False, "pages": 0,
                 "points": 0, "as_of": None, "error": None, "missing_values": 0}
@@ -2490,13 +2593,21 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
             for attempt in range(attempts):
                 if time.monotonic() >= deadline:
                     raise RateLimited("daily PnL read exceeded its wait budget")
-                response = s.get(url, params={"limit": page_limit, "offset": offset},
-                                 timeout=_request_timeout(deadline))
+                try:
+                    response = s.get(url, params={"limit": page_limit, "offset": offset},
+                                     timeout=_request_timeout(deadline))
+                except RequestException as exc:
+                    if (_transient_read_error(exc)
+                            and _wait_for_read_retry(attempt + 1, attempts, deadline)):
+                        continue
+                    raise
                 if response.status_code in (401, 403):
                     raise AuthError("session rejected while reading daily PnL")
                 if response.status_code == 404:
                     raise NotFound("daily PnL is unavailable for %s" % alpha_id)
                 retry_after = _retry_after_seconds(response, cap_error_wait=False)
+                if not math.isfinite(retry_after):
+                    raise ServiceError("daily PnL returned an invalid Retry-After")
                 if retry_after > 0:
                     evidence["retry_after_seconds"] = retry_after
                     if attempt + 1 == attempts or retry_after >= deadline - time.monotonic():
@@ -2530,7 +2641,8 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
                     raise ServiceError("daily PnL changed during pagination")
                 total = count
             more = bool(payload.get("next"))
-            signature = json.dumps(records, sort_keys=True, separators=(",", ":"))
+            encoded_page = json.dumps(records, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            signature = hashlib.sha256(encoded_page).digest()
             if records and signature in seen_pages:
                 raise ServiceError("daily PnL repeated a page")
             seen_pages.add(signature)
@@ -2573,15 +2685,12 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
     if cache_dir:
         path = Path(cache_dir) / (alpha_id + ".json")
         metadata_path = Path(cache_dir) / ".meta" / (alpha_id + ".json")
-        metadata = {**evidence, "format": "worldquantuser.pnl-evidence", "version": 1,
-                    "alpha_id": alpha_id,
-                    "data_sha256": hashlib.sha256(json.dumps(out, sort_keys=True, separators=(",", ":"),
-                                                              allow_nan=False).encode("utf-8")).hexdigest()}
+        metadata = {**evidence, "format": _PNL_EVIDENCE_FORMAT, "version": 1,
+                    "alpha_id": alpha_id, "data_sha256": _pnl_digest(out)}
         try:
-            cache_store.write_json_atomic(path, out)
-            cache_store.write_json_atomic(metadata_path, metadata)
+            _write_pnl_cache(path, metadata_path, out, metadata, deadline)
             evidence.update(path=str(path), metadata_path=str(metadata_path), cached=True)
-        except OSError as exc:
+        except (OSError, cache_store.CacheError) as exc:
             evidence.update(cached=False, cache_error=type(exc).__name__)
     publish()
     return out
@@ -2634,19 +2743,40 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
     deadline = time.monotonic() + (max_wait_seconds or 0)
     url = BRAIN_API_URL + "/alphas/" + alpha_id + "/submit"
     response = s.post(url, timeout=_request_timeout(deadline))
+    post_status = response.status_code
     retry_after = _retry_after_seconds(response, cap_error_wait=False)
+    outcome_error = None
     if on_event:
         on_event({"event": "submit_sent", "alpha_id": alpha_id,
-                  "status_code": response.status_code,
-                  "retry_after_seconds": retry_after})
-    while retry_after and time.monotonic() < deadline:
-        time.sleep(min(retry_after, max(0.0, deadline - time.monotonic())))
-        response = s.get(url, timeout=_request_timeout(deadline))
+                  "status_code": post_status,
+                  "retry_after_seconds": retry_after if math.isfinite(retry_after) else None})
+    while 200 <= post_status < 300 and 0 < retry_after < deadline - time.monotonic():
+        time.sleep(retry_after)
+        if time.monotonic() >= deadline:
+            break
+        try:
+            response = _get_poll_response(s, url, deadline)
+        except ReadInterrupted as exc:
+            outcome_error = str(exc)
+            break
+        if not 200 <= response.status_code < 300:
+            outcome_error = "submission status read returned HTTP %s" % response.status_code
+            break
         retry_after = _retry_after_seconds(response, cap_error_wait=False)
     try:
         payload = response.json()
     except ValueError:
         payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    if post_status >= 500 or post_status == 408 or 300 <= post_status < 400:
+        outcome_error = "submission request returned HTTP %s" % post_status
+    if outcome_error:
+        document.update(submission="UNCERTAIN", status_code=response.status_code,
+                        reason=outcome_error + "; verify platform status before another attempt",
+                        response=payload)
+        return document
 
     # Four outcomes, not two. A 2xx from this endpoint means "accepted for
     # evaluation", not "submitted": the platform answers 201 with an empty body while
@@ -2658,7 +2788,7 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
     failed = [check for check in checks
               if check.get("result") not in (None, "PASS", "PENDING")]
 
-    if response.status_code >= 400:
+    if post_status >= 400:
         document.update({
             "submission": "REJECTED",
             "submitted": False,

@@ -125,6 +125,47 @@ class SubmissionWorkflowTests(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertEqual(reads.call_count, 4)
 
+    def test_gateway_timeout_response_keeps_the_journal_unresolved(self):
+        session = mock.Mock()
+        response = requests.Response()
+        response.status_code = 504
+        response.headers["Retry-After"] = "1"
+        response._content = b"{}"
+        session.post.return_value = response
+        args = self.args(max_wait=10)
+        with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
+                mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()):
+            self.stage(alphas.cmd_alpha_submit, args, session.post)
+            first = alphas.cmd_alpha_submit(args, None)
+            second = alphas.cmd_alpha_submit(self.args(selection=None), None)
+        self.assertEqual(first["submission"], "UNCERTAIN")
+        self.assertEqual(first["status_code"], 504)
+        self.assertEqual(second["submission"], "UNCERTAIN")
+        self.assertFalse(second["post_attempted"])
+        session.post.assert_called_once()
+        session.get.assert_not_called()
+
+    def test_status_read_failure_does_not_turn_an_accepted_post_into_a_refusal(self):
+        session = mock.Mock()
+        accepted = requests.Response()
+        accepted.status_code = 201
+        accepted.headers["Retry-After"] = "1"
+        accepted._content = b"{}"
+        missing = requests.Response()
+        missing.status_code = 404
+        missing._content = b"{}"
+        session.post.return_value = accepted
+        session.get.return_value = missing
+        with mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()), \
+                mock.patch.object(ml.time, "sleep"):
+            result = ml.submit_alpha(session, "CANDIDATE", confirm=True, max_wait_seconds=10)
+        self.assertEqual(result["submission"], "UNCERTAIN")
+        self.assertEqual(result["status_code"], 404)
+        session.post.assert_called_once()
+        session.get.assert_called_once()
+
     def test_accepted_and_uncertain_are_not_reposted(self):
         for state in ("INTENT", "ACCEPTED", "UNCERTAIN"):
             with self.subTest(state=state):
@@ -141,7 +182,7 @@ class SubmissionWorkflowTests(unittest.TestCase):
         with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha(status="ACTIVE")), \
                 mock.patch.object(ml, "submit_alpha") as post, \
                 mock.patch.object(ml, "fetch_daily_pnl", side_effect=complete_pnl):
-            with mock.patch.object(alpha_registry, "record_entry", side_effect=OSError("disk unavailable")):
+            with mock.patch.object(alpha_registry, "append_batch", side_effect=OSError("disk unavailable")):
                 first = buffer_cmd.cmd_buffer_submit(self.args(selection=None), None)
             self.assertEqual(first["submission"], "CONFIRMED")
             self.assertIn("repair ledger", first["repair_actions"])

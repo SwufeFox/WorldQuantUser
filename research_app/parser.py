@@ -1291,6 +1291,8 @@ def build_parser():
     l_sync.add_argument("--pages", type=int, default=10)
     l_sync.add_argument("--order", default="-dateCreated")
     l_sync.add_argument("--limit-record", type=int, default=25, dest="limit_record")
+    l_sync.add_argument("--max-wait-seconds", type=float, default=300.0,
+                        help="Network wait budget shared by login, listing, metrics and PnL (default 300s).")
     l_sync.add_argument("--dry-run", action="store_true", dest="dry_run")
     l_sync.add_argument("--registry", default=None)
     l_sync.add_argument("--hidden", action="store_true", help="Select the platform's hidden-alpha scope.")

@@ -78,6 +78,15 @@ class SchemaContractTests(unittest.TestCase):
         payload = parse(run_cli("schema", "simulate"))["data"]
         self.assertEqual(payload["command"]["command"], "simulate")
 
+    def test_ledger_sync_advertises_a_finite_network_wait_budget(self):
+        options = parse(run_cli("schema", "ledger", "sync"))["data"]["command"]["options"]
+        budget = next(option for option in options if "--max-wait-seconds" in option["flags"])
+        self.assertEqual(budget["default"], 300.0)
+        self.assertEqual(budget["type"], "number")
+        invalid = run_cli("ledger", "sync", "--max-wait-seconds", "nan")
+        self.assertEqual(invalid.returncode, 2)
+        self.assertEqual(parse(invalid)["error"]["code"], "USAGE")
+
     def test_schema_rejects_unknown_command(self):
         proc = run_cli("schema", "nope")
         self.assertEqual(proc.returncode, 2)

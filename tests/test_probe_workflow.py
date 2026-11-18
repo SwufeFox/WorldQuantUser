@@ -212,6 +212,35 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(result["execution"]["unknown_submission"], 1)
         self.assertEqual(result["incomplete"], ["first"])
 
+    def test_saved_alpha_id_recovers_metrics_without_repolling_the_simulation(self):
+        def interrupted(_expressions, _settings, **kwargs):
+            emit = kwargs["on_event"]
+            emit("submitted", {"index": 0, "status": "PENDING", "progress_url": "/simulations/finished"})
+            emit("pending", {"index": 0, "status": "PENDING", "alpha_id": "KNOWN",
+                             "metrics_pending": True, "simulation_status": "COMPLETE"})
+            raise KeyboardInterrupt
+
+        with mock.patch.object(app.guarded_sim, "simulate", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_probe()
+        pending = json.loads(self.batch.read_text(encoding="utf-8"))["records"][0]
+        self.assertTrue(pending["metrics_pending"])
+        self.assertNotIn("progress_url", pending)
+
+        payload = {"is": {"fitness": 1.3}, "train": {"fitness": 1.1}}
+        with mock.patch.object(ml, "poll_simulation") as poll, mock.patch.object(ml, "list_alphas") as listing, \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=payload) as fetch:
+            result = app.cmd_probe(arguments(recover=str(self.batch)), None)
+        poll.assert_not_called()
+        listing.assert_not_called()
+        fetch.assert_called_once_with(mock.ANY, "KNOWN", deadline=mock.ANY)
+        self.assertEqual(result["matched"], {"first": "KNOWN"})
+        self.assertEqual(result["rows"][0]["status"], "COMPLETE")
+        self.assertEqual(result["recording"]["appended"], 1)
+        saved = json.loads(self.batch.read_text(encoding="utf-8"))["records"][0]
+        self.assertNotIn("metrics_pending", saved)
+        self.assertNotIn("simulation_status", saved)
+
     def test_resume_rejects_request_changes(self):
         with mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator):
             self.run_probe()

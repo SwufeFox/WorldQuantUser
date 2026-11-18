@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 
 import alpha_registry
@@ -15,6 +16,9 @@ import research_paths
 
 from . import experiments, mechanisms, styles
 from .runtime import CliError, with_session
+
+
+_SYNC_WRITE_BATCH_SIZE = 10
 
 
 def cmd_ledger_record(args, sink):
@@ -137,23 +141,24 @@ def cmd_ledger_label(args, _sink):
     The response contains the stored ``entry`` and whether a new history row was
     ``written``, alongside the changed judgement columns and their earlier values.
     """
-    path, entries = _ledger(args)
-    target = alpha_registry.resolve(entries, args.alpha_id)
-    if target is None:
-        raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id,
-                       "run `ledger list` to see what is recorded")
-    if all(getattr(args, name, None) is None
-           for name in ("family", "verdict", "mechanism", "idea", "note")):
-        raise CliError("USAGE", "nothing to change",
-                       "pass at least one of --family/--verdict/--mechanism/"
-                       "--idea/--note")
-    try:
-        updated = alpha_registry.relabel(
-            target, family=args.family, verdict=args.verdict,
-            mechanism=args.mechanism, idea=args.idea, note=args.note)
-    except ValueError as exc:
-        raise CliError("INVALID_INPUT", str(exc)) from exc
-    stored, written = alpha_registry.record_entry(updated, path)
+    path = getattr(args, "registry", None) or alpha_registry.default_registry_path()
+    with alpha_registry.append_batch(path) as (latest, append):
+        target = alpha_registry.resolve(latest.values(), args.alpha_id)
+        if target is None:
+            raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id,
+                           "run `ledger list` to see what is recorded")
+        if all(getattr(args, name, None) is None
+               for name in ("family", "verdict", "mechanism", "idea", "note")):
+            raise CliError("USAGE", "nothing to change",
+                           "pass at least one of --family/--verdict/--mechanism/"
+                           "--idea/--note")
+        try:
+            updated = alpha_registry.relabel(
+                target, family=args.family, verdict=args.verdict,
+                mechanism=args.mechanism, idea=args.idea, note=args.note)
+        except ValueError as exc:
+            raise CliError("INVALID_INPUT", str(exc)) from exc
+        stored, written = append(updated)
     data = {
         "registry": path,
         "written": written,
@@ -247,8 +252,12 @@ def cmd_ledger_sync(args, _sink):
     limit = int(args.limit)
     pages = int(args.pages)
     record_limit = int(args.limit_record)
+    max_wait = getattr(args, "max_wait_seconds", 300.0)
     if limit <= 0 or pages <= 0 or record_limit < 0:
         raise CliError("USAGE", "page size/pages must be positive and record limit non-negative")
+    if not math.isfinite(max_wait) or max_wait <= 0:
+        raise CliError("USAGE", "--max-wait-seconds must be finite and positive")
+    deadline = time.monotonic() + max_wait
     page_size = min(limit, 100)
     wanted = {part.strip().upper() for part in str(args.status or "").split(",") if part.strip()}
     status_text = getattr(args, "platform_status", "ACTIVE")
@@ -270,12 +279,17 @@ def cmd_ledger_sync(args, _sink):
             exhausted = False
             seen = set()
             for page in range(pages):
+                offset = page * page_size
+                if time.monotonic() >= deadline:
+                    errors.append({"status": status, "offset": offset,
+                                   "error": "ledger sync exceeded its network wait budget"})
+                    break
                 try:
-                    batch = ml.list_alphas(session, limit=page_size, offset=page * page_size,
+                    batch = ml.list_alphas(session, limit=page_size, offset=offset,
                                            order=args.order, status=status, hidden=hidden,
-                                           alpha_type_not=excluded_type)
+                                           alpha_type_not=excluded_type, deadline=deadline)
                 except Exception as exc:
-                    errors.append({"status": status, "offset": page * page_size, "error": str(exc)})
+                    errors.append({"status": status, "offset": offset, "error": str(exc)})
                     complete = False
                     break
                 ids = [row.get("id") for row in batch if row.get("id")]
@@ -284,7 +298,7 @@ def cmd_ledger_sync(args, _sink):
                     complete = False
                 seen.update(ids)
                 platform.update({row["id"]: row for row in batch if row.get("id")})
-                page_reports.append({"status": status, "offset": page * page_size,
+                page_reports.append({"status": status, "offset": offset,
                                      "count": len(batch), "duplicate_ids": duplicate})
                 if len(batch) < page_size:
                     exhausted = True
@@ -329,14 +343,14 @@ def cmd_ledger_sync(args, _sink):
         rows, repaired, reverse_drift, changed_during_capture = [], set(), [], []
         fetched = []
 
-        def persist_fetched():
-            if not fetched:
+        def persist_fetched(pending):
+            if not pending:
                 return
             try:
                 with alpha_registry.append_batch(registry) as (stored_by_key, append):
                     locked_latest = {row["alpha_id"]: row for row in stored_by_key.values()
                                      if row.get("alpha_id")}
-                    for row, current in fetched:
+                    for row, current in pending:
                         alpha_id = row["alpha_id"]
                         previous = locked_latest.get(alpha_id) or {}
                         try:
@@ -346,8 +360,6 @@ def cmd_ledger_sync(args, _sink):
                                     changed_during_capture.append(alpha_id)
                                 raise ValueError("local status changed during capture; refresh before writing")
                             entry = _platform_entry(current, alpha_id, previous, source="sync")
-                            if previous.get("verdict_manual") and previous.get("verdict"):
-                                entry["verdict"] = previous["verdict"]
                             stored, written = append(entry)
                         except Exception as exc:
                             row.update(complete=False, error=str(exc))
@@ -357,23 +369,32 @@ def cmd_ledger_sync(args, _sink):
                         if alpha_id in absent and str(stored.get("status") or "").upper() not in book_state.BOOK_STATUSES:
                             reverse_drift.append(alpha_id)
             except Exception as exc:
-                for row, _current in fetched:
+                for row, _current in pending:
                     if "complete" not in row:
                         row.update(complete=False, error=str(exc))
 
         try:
             for alpha_id in targets[:record_limit]:
+                if time.monotonic() >= deadline:
+                    break
                 row = {"alpha_id": alpha_id}
                 rows.append(row)
                 try:
-                    current = ml.fetch_alpha_metrics(session, alpha_id)
+                    current = ml.fetch_alpha_metrics(session, alpha_id, deadline=deadline)
+                    if current.get("_deferred"):
+                        row.update(complete=False, error="alpha metrics read deferred",
+                                   retry_after_seconds=current.get("next_poll_after_seconds"))
+                        continue
                     if alpha_id in platform and current.get("status") != platform[alpha_id].get("status"):
                         changed_during_capture.append(alpha_id)
                     fetched.append((row, current))
                 except Exception as exc:
                     row.update(complete=False, error=str(exc))
+                if len(fetched) >= _SYNC_WRITE_BATCH_SIZE:
+                    pending, fetched = fetched, []
+                    persist_fetched(pending)
         finally:
-            persist_fetched()
+            persist_fetched(fetched)
         if changed_during_capture:
             snapshot.update(invalidated=True, invalidation_reason="status changed during account capture",
                             changed_during_capture=changed_during_capture)
@@ -381,11 +402,13 @@ def cmd_ledger_sync(args, _sink):
         pnl_requested = bool(getattr(args, "pnl", False))
         if pnl_requested:
             for alpha_id in member_ids[:record_limit]:
+                if time.monotonic() >= deadline:
+                    break
                 report = {}
                 try:
                     series = ml.fetch_daily_pnl(session, alpha_id,
                                                 cache_dir=Path(research_paths.resolve("pnl")),
-                                                max_age_hours=0, report=report)
+                                                max_age_hours=0, report=report, deadline=deadline)
                     pnl_rows.append({**report, "alpha_id": alpha_id, "points": len(series or {}),
                                      "complete": report.get("complete") is True})
                 except Exception as exc:
@@ -394,6 +417,7 @@ def cmd_ledger_sync(args, _sink):
         membership_complete = (complete and not changed_during_capture
                                and membership_targets.issubset(repaired))
         result.update(recorded=sum(row.get("written", False) for row in rows), rows=rows,
+                      wait_budget_exhausted=time.monotonic() >= deadline,
                       reverse_drift=reverse_drift,
                       membership={"complete": membership_complete, "listing_complete": complete,
                                   "scope": scope, "unrepaired_ids": sorted(membership_targets - repaired)},
@@ -416,7 +440,7 @@ def cmd_ledger_sync(args, _sink):
             result.update(snapshot_persisted=False, snapshot_error=str(exc), fully_reconciled=False)
         return result
 
-    return with_session(args, work)
+    return with_session(args, work, deadline=deadline)
 
 
 def cmd_ledger_format(args, _sink):

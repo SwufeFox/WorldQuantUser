@@ -10,7 +10,7 @@ from unittest import mock
 import alpha_registry
 import cache_store
 import machine_lib as ml
-from research_app import book_state, buffer_cmd, ledger
+from research_app import alphas, book_state, buffer_cmd, ledger
 
 
 def alpha(alpha_id, status="ACTIVE"):
@@ -28,7 +28,7 @@ class BookStateTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
         self.registry = str(self.root / "ledger.jsonl")
-        patcher = mock.patch.object(ledger, "with_session", lambda args, work: work(object()))
+        patcher = mock.patch.object(ledger, "with_session", lambda args, work, **kw: work(object()))
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -107,7 +107,7 @@ class BookStateTests(unittest.TestCase):
     def test_truncated_listing_does_not_infer_reverse_drift(self):
         self.record("OLD_MEMBER")
         with mock.patch.object(ml, "list_alphas", return_value=[alpha("NEW_MEMBER")]), \
-                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=lambda session, aid: alpha(aid)) as reads:
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=lambda _session, aid, **kw: alpha(aid)) as reads:
             result = ledger.cmd_ledger_sync(self.args(limit=1, pages=1), None)
         self.assertFalse(result["snapshot"]["complete"])
         self.assertEqual(result["absent_from_scope"], [])
@@ -151,7 +151,7 @@ class BookStateTests(unittest.TestCase):
             return {"2025-01-01": 1.0}
 
         with mock.patch.object(ml, "list_alphas", return_value=rows), \
-                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=lambda session, aid: alpha(aid)), \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=lambda _session, aid, **kw: alpha(aid)), \
                 mock.patch.object(ml, "fetch_daily_pnl", side_effect=partial):
             result = ledger.cmd_ledger_sync(self.args(limit_record=1, pnl=True), None)
         self.assertTrue(result["snapshot"]["complete"])
@@ -176,7 +176,7 @@ class BookStateTests(unittest.TestCase):
         readbacks = {row["id"]: row for row in rows}
         readbacks["MEMBER_A"] = {**rows[0], "is": {}}
         with mock.patch.object(ml, "list_alphas", return_value=rows), \
-                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=lambda _session, aid: readbacks[aid]), \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=lambda _session, aid, **kw: readbacks[aid]), \
                 mock.patch.object(alpha_registry, "load_entries", wraps=alpha_registry.load_entries) as loads:
             result = ledger.cmd_ledger_sync(self.args(), None)
         self.assertEqual(loads.call_count, 2)  # initial listing comparison and locked write batch
@@ -191,7 +191,7 @@ class BookStateTests(unittest.TestCase):
         self.record("MEMBER_A", "COMPLETE")
         captured = alpha("MEMBER_A", "COMPLETE")
 
-        def readback(_session, _alpha_id):
+        def readback(_session, _alpha_id, **kw):
             self.record("MEMBER_A", "ACTIVE")
             return captured
 
@@ -204,6 +204,54 @@ class BookStateTests(unittest.TestCase):
         self.assertFalse(result["membership"]["complete"])
         self.assertEqual(alpha_registry.load_entries(self.registry)[0]["status"], "ACTIVE")
 
+    def test_sync_persists_finished_batches_while_more_network_reads_are_pending(self):
+        rows = [alpha("MEMBER_" + key) for key in "ABCD"]
+        committed_before_next_read = []
+
+        def readback(_session, alpha_id, **kw):
+            if alpha_id in {"MEMBER_C", "MEMBER_D"}:
+                committed_before_next_read.append(
+                    [row["key"] for row in alpha_registry.load_entries(self.registry)])
+            if alpha_id == "MEMBER_D":
+                raise KeyboardInterrupt
+            return alpha(alpha_id)
+
+        with mock.patch.object(ledger, "_SYNC_WRITE_BATCH_SIZE", 2), \
+                mock.patch.object(ml, "list_alphas", return_value=rows), \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=readback):
+            with self.assertRaises(KeyboardInterrupt):
+                ledger.cmd_ledger_sync(self.args(), None)
+        self.assertEqual(committed_before_next_read, [["MEMBER_A", "MEMBER_B"]] * 2)
+        self.assertEqual([row["key"] for row in alpha_registry.load_entries(self.registry)],
+                         ["MEMBER_A", "MEMBER_B", "MEMBER_C"])
+        self.assertFalse(book_state.snapshot_path(self.registry).exists())
+
+    def test_sync_keeps_finished_rows_when_readiness_wait_exhausts_the_budget(self):
+        rows = [alpha("MEMBER_" + key) for key in "ABC"]
+        clock = mock.Mock()
+        clock.monotonic.return_value = 100.0
+
+        def readback(_session, alpha_id, *, deadline):
+            self.assertEqual(deadline, 105.0)
+            if alpha_id == "MEMBER_B":
+                clock.monotonic.return_value = 105.0
+                return {"_deferred": True, "next_poll_after_seconds": 15.0}
+            return alpha(alpha_id)
+
+        with mock.patch.object(ledger, "time", clock), \
+                mock.patch.object(ml, "list_alphas", return_value=rows) as listing, \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=readback) as metrics, \
+                mock.patch.object(ml, "fetch_daily_pnl") as pnl:
+            result = ledger.cmd_ledger_sync(self.args(max_wait_seconds=5.0, pnl=True), None)
+        self.assertEqual(listing.call_args.kwargs["deadline"], 105.0)
+        self.assertEqual([call.args[1] for call in metrics.call_args_list], ["MEMBER_A", "MEMBER_B"])
+        pnl.assert_not_called()
+        self.assertTrue(result["wait_budget_exhausted"])
+        self.assertFalse(result["fully_reconciled"])
+        self.assertEqual(result["metadata"]["unrepaired_ids"], ["MEMBER_B", "MEMBER_C"])
+        self.assertEqual(result["rows"][1]["retry_after_seconds"], 15.0)
+        self.assertEqual([row["key"] for row in alpha_registry.load_entries(self.registry)], ["MEMBER_A"])
+
     def test_submission_invalidates_platform_capture_without_erasing_history(self):
         snapshot = {"complete": True, "as_of": "2026-01-01", "scope": {"statuses": ["ACTIVE"]},
                     "member_ids": ["MEMBER_A"], "member_digest": book_state.member_digest(["MEMBER_A"])}
@@ -213,6 +261,21 @@ class BookStateTests(unittest.TestCase):
         self.assertEqual(evidence["platform"]["as_of"], "2026-01-01")
         self.assertTrue(evidence["platform"]["complete"])
         self.assertFalse(evidence["platform"]["current_capture"])
+
+    def test_submission_ledger_refresh_preserves_manually_selected_verdict(self):
+        self.record("MEMBER_A", "COMPLETE")
+        previous = alpha_registry.load_entries(self.registry)[0]
+        alpha_registry.record_entry(alpha_registry.relabel(previous, verdict="watch", note="reviewed"),
+                                    self.registry)
+
+        with mock.patch.object(buffer_cmd, "consume_submission"), mock.patch.object(ml, "fetch_daily_pnl"):
+            report = alphas._reconcile_submission(object(), self.args(alpha_id="MEMBER_A"),
+                                                  alpha("MEMBER_A"), "selection")
+        self.assertTrue(report["ledger"]["complete"])
+        stored = alpha_registry.load_entries(self.registry)[0]
+        self.assertEqual(stored["status"], "ACTIVE")
+        self.assertEqual(stored["verdict"], "watch")
+        self.assertEqual(stored["note"], "reviewed")
 
 
 if __name__ == "__main__":

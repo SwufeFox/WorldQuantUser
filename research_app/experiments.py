@@ -9,6 +9,7 @@ import math
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 import ablation
@@ -130,20 +131,39 @@ def _write_simulation_checkpoint(path, checkpoint):
     cache_store.write_json_atomic(path, checkpoint, indent=2)
 
 
+_CHECKPOINT_EVENTS = {"submitting", "submitted", "pending", "completed", "failed", "deferred"}
+
+
+def _merge_checkpoint_record(previous, payload):
+    updated = {**previous, **{key: value for key, value in payload.items() if key != "index"}}
+    if payload.get("alpha_id") or payload.get("status") in simulation_slots.TERMINAL_STATUSES:
+        # Once a poll yields an Alpha ID, subsequent metrics reads use that ID.
+        # Missing transport markers in the new event supersede the old ones.
+        for key in ("progress_url", "next_poll_at", "poll_after_seconds", "metrics_pending",
+                    "simulation_status", "simulation_error"):
+            if key not in payload:
+                updated.pop(key, None)
+    return updated
+
+
 def _simulation_checkpoint_callback(path, checkpoint, sink):
     lock = threading.Lock()
 
     def on_event(kind, payload):
         with lock:
-            if kind in {"submitting", "submitted", "pending", "completed", "failed", "deferred"}:
+            if kind in _CHECKPOINT_EVENTS:
                 index = payload.get("index")
                 if isinstance(index, int) and 0 <= index < len(checkpoint["records"]):
                     previous = checkpoint["records"][index]
-                    checkpoint["records"][index] = {
-                        **previous, **{key: value for key, value in payload.items() if key != "index"},
-                        "role": alpha_registry.evidence_role(previous, payload),
-                    }
-                    _write_simulation_checkpoint(path, checkpoint)
+                    updated = _merge_checkpoint_record(previous, payload)
+                    updated["role"] = alpha_registry.evidence_role(previous, payload)
+                    if updated != previous:
+                        checkpoint["records"][index] = updated
+                        try:
+                            _write_simulation_checkpoint(path, checkpoint)
+                        except BaseException:
+                            checkpoint["records"][index] = previous
+                            raise
             if sink:
                 sink(kind, payload)
 
@@ -160,8 +180,7 @@ def _sort_simulation_results(records, args):
     return records
 
 
-def _simulation_result(records, settings, checkpoint_path=None, dry_run=False):
-    summary = summarize(records)
+def _simulation_result(records, settings, summary, checkpoint_path):
     if summary["pending"] or summary["queued"]:
         status = "PENDING"
     elif summary["failed"]:
@@ -170,7 +189,7 @@ def _simulation_result(records, settings, checkpoint_path=None, dry_run=False):
         status = "COMPLETE"
     result = {
         "status": status,
-        "dry_run": dry_run,
+        "dry_run": False,
         "settings": settings,
         "summary": summary,
         "results": records,
@@ -180,27 +199,11 @@ def _simulation_result(records, settings, checkpoint_path=None, dry_run=False):
     return result
 
 
-def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg,
-                            labels=None, families=None, candidates=None, metadata=None, roles=None):
-    if checkpoint_arg:
-        path = Path(checkpoint_arg).expanduser().resolve()
-        if path.exists():
-            raise CliError(
-                "INVALID_INPUT",
-                "checkpoint already exists; use `resume` or choose another path",
-                str(path),
-            )
-    else:
-        path = Path(".brain_checkpoints") / ("simulate-%s.json" % uuid.uuid4().hex)
-        path = path.resolve()
+def _simulation_checkpoint_document(settings, pairs, batch_size, labels, families, candidates, roles):
     # The label columns must be written here, not only in the dry-run branch.
     # These records are handed to simulate_alphas as initial_records, so anything
     # omitted from this dict is lost for the whole real run: mechanism tags
     # arrived empty in the ledger for exactly this reason.
-    labels = labels or [None] * len(pairs)
-    families = families or [None] * len(pairs)
-    candidates = candidates or [None] * len(pairs)
-    roles = roles or [None] * len(pairs)
     records = [
         {
             "expression": expression,
@@ -217,17 +220,31 @@ def _prepare_simulation_run(settings, pairs, batch_size, checkpoint_arg,
         }
         for index, (expression, decay) in enumerate(pairs)
     ]
-    checkpoint = {
+    return {
         "format": "worldquantuser.simulation-checkpoint",
         "version": 1,
         "settings": settings,
         "concurrency": batch_size,
         "records": records,
     }
-    if metadata:
-        checkpoint["metadata"] = dict(metadata)
-    _write_simulation_checkpoint(path, checkpoint)
-    return path, checkpoint
+
+
+@contextmanager
+def _locked_simulation_checkpoint(path, args):
+    lock_path = path.with_name(path.name + ".lock")
+    protect_output(args, path, lock_path)
+    try:
+        with cache_store.file_lock(lock_path, timeout=0):
+            try:
+                yield
+            except KeyboardInterrupt as exc:
+                if not path.is_file():
+                    raise
+                raise CliError("INTERRUPTED", "cancelled", "run `resume` with the saved checkpoint",
+                               details={"checkpoint": str(path)}) from exc
+    except cache_store.LockTimeout as exc:
+        raise CliError("SERVICE_ERROR", "this simulation checkpoint is already being updated",
+                       details={"checkpoint": str(path)}) from exc
 
 
 def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, explicit):
@@ -241,50 +258,62 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
         or record.get("status") in {"PENDING", "QUEUED", "UNKNOWN_SUBMISSION"}
         for record in records
     )
-    if not explicit and not has_unfinished:
-        Path(checkpoint_path).unlink(missing_ok=True)
-        checkpoint_path = None
+    discard_checkpoint = not explicit and not has_unfinished
 
     # The display view honours --sort/--top; the batch, the summary and the ledger
     # must not. Truncating before recording lost every arm outside the top N - and
     # with the checkpoint deleted at the end, those alphas had been paid for and
     # left no trace, which is both wasted quota and a selection bias in the archive.
-    every = list(records)
-    display = _sort_simulation_results(records, args)
-    summary = summarize(every)
+    display = _sort_simulation_results([dict(record) for record in records], args)
+    summary = summarize(records)
+    unknown = [index for index, record in enumerate(records) if record.get("status") == "UNKNOWN_SUBMISSION"]
     if summary["completed"] == 0 and summary["total"] and not (
-        summary["pending"] or summary["queued"] or any(
-            record.get("status") == "UNKNOWN_SUBMISSION" for record in every)
+        summary["pending"] or summary["queued"] or unknown
     ):
+        if discard_checkpoint:
+            Path(checkpoint_path).unlink(missing_ok=True)
         first_error = next(
-            (r.get("error") for r in every if r.get("error")), "unknown error"
+            (r.get("error") for r in records if r.get("error")), "unknown error"
         )
         raise CliError(
             "SIMULATION_FAILED",
             "all %d simulations failed" % summary["total"],
             str(first_error),
         )
-    result = _simulation_result(every, settings, checkpoint_path)
-    result["results"] = display
+    recording = None
+    if getattr(args, "record", False):
+        try:
+            recording = _record_simulation(records, settings, args)
+        except (OSError, cache_store.CacheError) as exc:
+            raise CliError("SERVICE_ERROR", "cannot record simulation results: %s" % exc,
+                           "run `resume` with the saved checkpoint to retry recording",
+                           details={"checkpoint": str(checkpoint_path)}) from exc
+    if discard_checkpoint:
+        Path(checkpoint_path).unlink(missing_ok=True)
+        checkpoint_path = None
+    result = _simulation_result(display, settings, summary, checkpoint_path)
     result.update({key: checkpoint[key] for key in ("concurrency", "scheduling", "capability_snapshot")
                    if key in checkpoint})
-    result["unknown_submission"] = [index for index, record in enumerate(every)
-                                    if record.get("status") == "UNKNOWN_SUBMISSION"]
-    result["results_total"] = len(every)
+    result["unknown_submission"] = unknown
+    result["results_total"] = len(records)
     for key in ("legs", "legend", "note"):
         value = (checkpoint.get("metadata") or {}).get(key)
         if value is not None:
             result[key] = value
     pending_ids = [record.get("alpha_id") or record.get("candidate_id")
-                   for record in every
+                   for record in records
                    if (record.get("status") or "").upper() in {"PENDING", "QUEUED"}]
     if pending_ids:
         result["pending"] = pending_ids
+    if unknown:
+        result["status"] = "PENDING"
+        result["next"] = "submission outcome is unknown; reconcile it using the saved checkpoint"
+    elif pending_ids:
         result["next"] = ("some arms are still running; the checkpoint was kept - "
                           "run `resume %s` before judging them"
                           % (checkpoint_path or "<checkpoint>"))
-    if getattr(args, "record", False):
-        result["registry"] = _record_simulation(every, settings, args)
+    if recording is not None:
+        result["registry"] = recording
     return result
 
 
@@ -1221,7 +1250,8 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
             train = split.get("train") or {}
             if train.get("fitness") is None:
                 still_missing.add(label)
-            row.update({"status": payload.get("status") or row.get("status"), "train_sharpe": train.get("sharpe"),
+            row.update({"status": payload.get("status") or row.get("simulation_status") or row.get("status"),
+                        "train_sharpe": train.get("sharpe"),
                         "train_fitness": train.get("fitness"), "train_turnover": train.get("turnover"),
                         "train_returns": train.get("returns"), "error": None,
                         "settings_signature": _settings_signature(row.get("settings"))})
@@ -1373,20 +1403,22 @@ def _recover_probe_batch(args, path):
                 _probe_document_update(document, path)
                 cache_store.write_json_atomic(path, document, indent=1)
         active_rows = document["rows"]
+        for row, record in zip(active_rows, records):
+            if "simulation_status" in record:
+                row["simulation_status"] = record["simulation_status"]
         positions = {id(row): index for index, row in enumerate(active_rows)}
 
         def save_recovered(row, raw=None):
-            record = records[positions[id(row)]]
+            index = positions[id(row)]
+            record = records[index]
             if raw is not None:
-                record.update(raw)
+                record = records[index] = _merge_checkpoint_record(record, raw)
             for key in ("alpha_id", "status", "progress_url", "next_poll_at", "poll_after_seconds", "error"):
                 if key in row:
                     record[key] = row[key]
                 elif key in {"progress_url", "next_poll_at", "poll_after_seconds"}:
                     record.pop(key, None)
-            if raw is not None:
-                record.pop("metrics_pending", None)
-            elif row.get("metrics_pending"):
+            if raw is None and row.get("metrics_pending"):
                 record["metrics_pending"] = True
             simulation_slots.reconcile_record(record, account)
             _probe_document_update(document, path)
@@ -1978,7 +2010,7 @@ def _execute_probe(args, document, target, groups):
         cache_store.write_json_atomic(target, document, indent=1)
 
     def update(index, payload, kind=None):
-        merged = {**records[index], **{key: value for key, value in payload.items() if key != "index"}}
+        merged = _merge_checkpoint_record(records[index], payload)
         arm = document["arms"][index]
         merged.update({"settings": dict(arm["settings"]), "expression": arm["expression"],
                        "mechanism": arm["label"], "decay": arm["settings"]["decay"]})
@@ -1995,7 +2027,7 @@ def _execute_probe(args, document, target, groups):
 
     def progress(indices, kind, payload):
         index = payload.get("index")
-        if kind in {"submitting", "submitted", "pending", "completed", "failed", "deferred"} \
+        if kind in _CHECKPOINT_EVENTS \
                 and isinstance(index, int) and 0 <= index < len(indices):
             with state_lock:
                 update(indices[index], payload, kind)
@@ -2168,68 +2200,65 @@ def cmd_simulate(args, sink):
             **metadata,
         }
 
-    # Real submission: lint against the operator catalog first. An unknown
-    # operator would otherwise burn a submission slot and a polling wait before
-    # BRAIN rejected it -- exactly how `regression_neut` cost a round trip.
-    deadline = _simulation_deadline(args)
-    run = session_reader(args, deadline=deadline)
+    checkpoint_path = Path(args.checkpoint or ".brain_checkpoints/simulate-%s.json" % uuid.uuid4().hex)
+    checkpoint_path = checkpoint_path.expanduser().resolve()
+    with _locked_simulation_checkpoint(checkpoint_path, args):
+        if checkpoint_path.exists():
+            raise CliError("INVALID_INPUT", "checkpoint already exists; use `resume` or choose another path",
+                           str(checkpoint_path))
 
-    def preflight(session):
-        snapshot = _invocation_capabilities(session, args, deadline=deadline)
-        _preflight_lint(session, pairs, settings, args, deadline=deadline)
-        return session, snapshot
+        deadline = _simulation_deadline(args)
+        run = session_reader(args, deadline=deadline)
 
-    validated_session, snapshot = run(preflight)
+        def preflight(session):
+            snapshot = _invocation_capabilities(session, args, deadline=deadline)
+            _preflight_lint(session, pairs, settings, args, deadline=deadline)
+            return session, snapshot
 
-    checkpoint_path, checkpoint = _prepare_simulation_run(
-        settings, pairs, concurrency, args.checkpoint,
-        labels=labels, families=families, candidates=candidates, metadata=metadata, roles=roles,
-    )
-    checkpoint["capability_snapshot"] = snapshot
-    checkpoint["scheduling"] = {}
-    checkpoint["recording_policy"] = {key: getattr(args, key, None)
-        for key in ("record", "registry", "idea", "mechanism", "family", "note")}
-    _write_simulation_checkpoint(checkpoint_path, checkpoint)
-    on_event = _simulation_checkpoint_callback(checkpoint_path, checkpoint, sink)
-    def simulate(session):
-        if session is not validated_session:
-            _, checkpoint["capability_snapshot"] = preflight(session)
-            _write_simulation_checkpoint(checkpoint_path, checkpoint)
-        return ml.simulate_alphas(
-            session,
-            pairs,
-            settings=settings,
-            concurrency=concurrency, capability_snapshot=checkpoint["capability_snapshot"],
-            scheduling_report=checkpoint["scheduling"],
-            on_event=on_event,
-            deadline=deadline,
-            initial_records=checkpoint["records"],
-            labels=labels,
-            families=families,
-            candidates=candidates,
-        )
+        validated_session, snapshot = run(preflight)
+        checkpoint = _simulation_checkpoint_document(settings, pairs, concurrency, labels, families, candidates, roles)
+        if metadata:
+            checkpoint["metadata"] = metadata
+        checkpoint["capability_snapshot"] = snapshot
+        checkpoint["scheduling"] = {}
+        if getattr(args, "record", False):
+            registry = getattr(args, "registry", None) or alpha_registry.default_registry_path()
+            args.registry = str(Path(registry).expanduser().resolve())
+        checkpoint["recording_policy"] = {key: getattr(args, key, None)
+            for key in ("record", "registry", "idea", "mechanism", "family", "note")}
+        _write_simulation_checkpoint(checkpoint_path, checkpoint)
+        note("simulation checkpoint %s" % checkpoint_path)
+        on_event = _simulation_checkpoint_callback(checkpoint_path, checkpoint, sink)
 
-    records = run(simulate)
-    return _finalize_simulation(
-        records,
-        settings,
-        args,
-        checkpoint_path,
-        checkpoint,
-        explicit=bool(args.checkpoint),
-    )
+        def simulate(session):
+            if session is not validated_session:
+                _, checkpoint["capability_snapshot"] = preflight(session)
+                _write_simulation_checkpoint(checkpoint_path, checkpoint)
+            return ml.simulate_alphas(
+                session,
+                pairs,
+                settings=settings,
+                concurrency=concurrency, capability_snapshot=checkpoint["capability_snapshot"],
+                scheduling_report=checkpoint["scheduling"],
+                on_event=on_event,
+                deadline=deadline,
+                initial_records=checkpoint["records"],
+                labels=labels,
+                families=families,
+                candidates=candidates,
+            )
+
+        records = run(simulate)
+        return _finalize_simulation(records, settings, args, checkpoint_path, checkpoint,
+                                    explicit=bool(args.checkpoint))
 
 
 def cmd_resume(args, sink):
     """Resume pending, queued or unpolled simulations from an atomic checkpoint file."""
     _reject_saved_overrides(args)
     path = Path(args.checkpoint).expanduser().resolve()
-    try:
-        with cache_store.file_lock(str(path) + ".lock", timeout=0):
-            return _resume_simulation(args, sink, path)
-    except cache_store.LockTimeout as exc:
-        raise CliError("SERVICE_ERROR", "this simulation checkpoint is already being resumed",
-                       str(path)) from exc
+    with _locked_simulation_checkpoint(path, args):
+        return _resume_simulation(args, sink, path)
 
 
 def _resume_simulation(args, sink, path):
@@ -2270,6 +2299,9 @@ def _resume_simulation(args, sink, path):
     if isinstance(policy, dict):
         for key, value in policy.items():
             requested = getattr(args, key, None)
+            if key == "registry" and requested is not None and value is not None:
+                requested = str(Path(requested).expanduser().resolve())
+                value = str(Path(value).expanduser().resolve())
             if requested is not None and requested is not False and requested != value:
                 raise CliError("USAGE", "resume uses the saved recording policy; %s cannot change" % key)
             setattr(args, key, value)

@@ -11,11 +11,14 @@ loud; an archive that is missing rows is not.
 from __future__ import annotations
 
 import argparse
+import errno
+import json
 import os
 import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -27,7 +30,9 @@ import placebo_controls  # noqa: E402
 import ablation
 from research_app import experiments as cli_experiments
 from research_app import ledger as cli_ledger
+from research_app import parser as cli_parser
 from research_app import substitution  # noqa: E402
+from research_app.runtime import CliError
 
 
 def record(alpha_id="A1", status="COMPLETE", sharpe=2.0, fitness=1.5):
@@ -99,6 +104,116 @@ class TopTruncationTests(unittest.TestCase):
         self.assertEqual(result["summary"]["total"], 5)
         self.assertEqual(len(result["results"]), 2)          # display view keeps --top
         self.assertEqual(result["results_total"], 5)
+
+
+class SimulationCheckpointTests(unittest.TestCase):
+    def test_interrupted_run_blocks_other_checkpoint_writers_and_reports_path(self):
+        parser = cli_parser.build_parser()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            argv = ["simulate", "--expr", "rank(close)", "--checkpoint", str(path), "--no-record"]
+
+            def simulate(_session, _pairs, **kwargs):
+                kwargs["on_event"]("submitted", {"index": 0, "status": "PENDING",
+                                                "progress_url": "/simulations/synthetic"})
+                contenders = [(cli_experiments.cmd_simulate, argv),
+                              (cli_experiments.cmd_resume, ["resume", str(path)])]
+                for command, arguments in contenders:
+                    with self.assertRaises(CliError) as blocked:
+                        command(parser.parse_args(arguments), None)
+                    self.assertEqual(blocked.exception.code, "SERVICE_ERROR")
+                    self.assertEqual(blocked.exception.details["checkpoint"], str(path))
+                raise KeyboardInterrupt
+
+            with mock.patch.object(cli_experiments.ml, "load_session") as login, \
+                    mock.patch.object(cli_experiments, "_invocation_capabilities", return_value={}), \
+                    mock.patch.object(cli_experiments, "_preflight_lint"), \
+                    mock.patch.object(cli_experiments.ml, "simulate_alphas", side_effect=simulate) as launched:
+                with self.assertRaises(CliError) as interrupted:
+                    cli_experiments.cmd_simulate(parser.parse_args(argv), None)
+            login.assert_called_once()
+            launched.assert_called_once()
+            self.assertEqual(interrupted.exception.code, "INTERRUPTED")
+            self.assertEqual(interrupted.exception.details["checkpoint"], str(path))
+            self.assertEqual(json.loads(path.read_text())["records"][0]["progress_url"], "/simulations/synthetic")
+
+    def test_implicit_checkpoint_survives_partial_ledger_failure_and_resumes_offline(self):
+        parser = cli_parser.build_parser()
+        real_record = cli_experiments._record_simulation
+
+        def record_until_disk_full(records, settings, args):
+            real_record(records[:1], settings, args)
+            raise OSError(errno.ENOSPC, "synthetic disk full")
+
+        original_directory = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            original_research = Path(directory) / "original"
+            other_research = Path(directory) / "other"
+            original_research.mkdir()
+            other_research.mkdir()
+            args = parser.parse_args(["simulate", "--expr", "rank(close)", "--expr", "rank(open)"])
+            try:
+                os.chdir(original_research)
+                with mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(original_research)}), \
+                        mock.patch.object(cli_experiments.ml, "load_session"), \
+                        mock.patch.object(cli_experiments, "_invocation_capabilities", return_value={}), \
+                        mock.patch.object(cli_experiments, "_preflight_lint"), \
+                        mock.patch.object(cli_experiments.ml, "simulate_alphas",
+                                          return_value=[record(alpha_id="A1"), record(alpha_id="A2")]), \
+                        mock.patch.object(cli_experiments, "_record_simulation", side_effect=record_until_disk_full):
+                    with self.assertRaises(CliError) as failure:
+                        cli_experiments.cmd_simulate(args, None)
+                checkpoint = Path(failure.exception.details["checkpoint"])
+                registry = original_research / "alpha-registry.jsonl"
+                self.assertEqual(failure.exception.code, "SERVICE_ERROR")
+                self.assertEqual([entry["alpha_id"] for entry in alpha_registry.load_entries(registry)], ["A1"])
+                self.assertEqual(json.loads(checkpoint.read_text())["recording_policy"]["registry"], str(registry))
+
+                os.chdir(other_research)
+                with mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(other_research)}), \
+                        mock.patch.object(cli_experiments, "with_session") as online:
+                    result = cli_experiments.cmd_resume(parser.parse_args(["resume", str(checkpoint)]), None)
+                online.assert_not_called()
+                self.assertEqual(result["registry"]["appended"], 1)
+                self.assertEqual({entry["alpha_id"] for entry in alpha_registry.load_entries(registry)}, {"A1", "A2"})
+                self.assertFalse((other_research / registry.name).exists())
+            finally:
+                os.chdir(original_directory)
+
+    def test_metrics_checkpoint_replaces_old_poll_route_and_skips_identical_writes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            previous = {"status": "PENDING", "progress_url": "/simulations/synthetic", "next_poll_at": 100}
+            checkpoint = {"records": [previous]}
+            cli_experiments._write_simulation_checkpoint(path, checkpoint)
+            callback = cli_experiments._simulation_checkpoint_callback(path, checkpoint, None)
+            event = {"index": 0, "status": "PENDING", "alpha_id": "A1", "metrics_pending": True}
+
+            with mock.patch.object(cli_experiments, "_write_simulation_checkpoint", side_effect=OSError):
+                with self.assertRaises(OSError):
+                    callback("pending", event)
+            self.assertEqual(checkpoint["records"], [previous])
+
+            with mock.patch.object(cli_experiments, "_write_simulation_checkpoint",
+                                   wraps=cli_experiments._write_simulation_checkpoint) as write:
+                callback("pending", event)
+                callback("pending", event)
+                write.assert_called_once()
+            saved = json.loads(path.read_text())["records"][0]
+            self.assertEqual(saved["alpha_id"], "A1")
+            self.assertTrue(saved["metrics_pending"])
+            self.assertNotIn("progress_url", saved)
+            self.assertNotIn("next_poll_at", saved)
+
+    def test_unknown_submission_keeps_checkpoint_and_is_pending(self):
+        args = argparse.Namespace(sort="none", top=None, record=False)
+        records = [{**record(alpha_id=None, status="UNKNOWN_SUBMISSION"), "metrics": None}]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            result = cli_experiments._finalize_simulation(records, {}, args, path, {"records": []}, explicit=False)
+            self.assertEqual(result["status"], "PENDING")
+            self.assertEqual(result["unknown_submission"], [0])
+            self.assertEqual(result["checkpoint"], str(path))
 
 
 class JudgementInheritanceTests(unittest.TestCase):

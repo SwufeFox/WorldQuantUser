@@ -386,8 +386,9 @@ def _platform_entry(current, alpha_id, existing=None, selection_id=None, source=
              "metrics": current.get("is") or {}, "checks": checks,
              "status": current.get("status"),
              "out_of_sample": ml.extract_split(current) or {}}
+    verdict = existing.get("verdict") if existing.get("verdict_manual") else None
     entry = alpha_registry.build_entry(
-        facts, verdict=alpha_registry.auto_verdict(facts), source=source,
+        facts, verdict=verdict or alpha_registry.auto_verdict(facts), source=source,
         idea=existing.get("idea"), mechanism=existing.get("mechanism"),
         family=existing.get("family"), batch=existing.get("batch"),
         note=existing.get("note"), extra=extra)
@@ -399,10 +400,10 @@ def _reconcile_submission(session, args, current, selection_id):
     registry = str(getattr(args, "registry", None) or alpha_registry.default_registry_path())
     report = {}
     try:
-        entries = alpha_registry.load_entries(registry)
-        existing = next((row for row in entries if row.get("alpha_id") == args.alpha_id), None)
-        entry = _platform_entry(current, args.alpha_id, existing, selection_id)
-        stored, written = alpha_registry.record_entry(entry, registry)
+        with alpha_registry.append_batch(registry) as (entries, append):
+            existing = next((row for row in entries.values() if row.get("alpha_id") == args.alpha_id), None)
+            entry = _platform_entry(current, args.alpha_id, existing, selection_id)
+            stored, written = append(entry)
         report["ledger"] = {"complete": True, "written": written,
                             "key": stored.get("key"), "status": stored.get("status"),
                             "date_submitted": current.get("dateSubmitted")}

@@ -240,6 +240,80 @@ class LedgerCliTests(unittest.TestCase):
         self.assertEqual(data["matched"], 1)
         self.assertEqual(data["entries"][0]["metrics"]["fitness"], 1.6)
 
+    def test_interrupted_utf8_append_does_not_hide_old_or_new_rows(self):
+        self.store("BEFORE", note="先写入")
+        path = Path(self.registry)
+        torn = b'{"key": "TORN", "note": "\xe4\xb8'
+        with path.open("ab") as handle:
+            handle.write(torn)
+        self.assertEqual([row["key"] for row in ar.load_entries(path)], ["BEFORE"])
+
+        with ar.append_batch(path) as (_, append):
+            append(entry(alpha_id="AFTER_1", note="继续写入"))
+            append(entry(alpha_id="AFTER_2"))
+        self.assertEqual([row["key"] for row in ar.load_entries(path)],
+                         ["BEFORE", "AFTER_1", "AFTER_2"])
+        self.assertEqual(path.read_bytes().splitlines()[1], torn)
+
+    def test_append_keeps_an_old_valid_record_without_a_final_newline(self):
+        self.store("BEFORE")
+        path = Path(self.registry)
+        path.write_bytes(path.read_bytes().rstrip(b"\n"))
+        self.store("AFTER")
+        self.assertEqual([row["key"] for row in ar.load_entries(path)], ["BEFORE", "AFTER"])
+
+    def test_batch_ignores_short_write_and_isolates_it_before_next_append(self):
+        self.store("BEFORE")
+
+        @contextlib.contextmanager
+        def short_first_write(path, mode, **options):
+            with open(path, mode, **options) as handle:
+                writer = mock.Mock(wraps=handle)
+                short_write_pending = True
+
+                def write(data):
+                    nonlocal short_write_pending
+                    if short_write_pending:
+                        short_write_pending = False
+                        return handle.write(data[:10])
+                    return handle.write(data)
+
+                writer.write.side_effect = write
+                yield writer
+
+        def open_with_short_write(path, mode, **options):
+            if mode == "a+b":
+                return short_first_write(path, mode, **options)
+            return open(path, mode, **options)
+
+        with mock.patch.object(ar, "open", side_effect=open_with_short_write, create=True):
+            with ar.append_batch(self.registry) as (latest, append):
+                with self.assertRaisesRegex(OSError, "short write"):
+                    append(entry(alpha_id="INTERRUPTED"))
+                self.assertNotIn("INTERRUPTED", latest)
+                append(entry(alpha_id="AFTER"))
+        self.assertEqual([row["key"] for row in ar.load_entries(self.registry)], ["BEFORE", "AFTER"])
+
+    def test_label_merges_the_row_at_lock_acquisition(self):
+        self.store("A", sharpe=1.2, status="COMPLETE")
+        lock = ar.cache_store.file_lock
+        update_pending = True
+
+        @contextlib.contextmanager
+        def lock_after_update(path, **options):
+            nonlocal update_pending
+            if update_pending and str(path) == str(self.registry) + ".lock":
+                update_pending = False
+                self.store("A", sharpe=2.4, status="ACTIVE")
+            with lock(path, **options):
+                yield
+
+        with mock.patch.object(ar.cache_store, "file_lock", side_effect=lock_after_update):
+            data = self.ledger("label", "A", "--note", "new note")["data"]
+        self.assertEqual(data["entry"]["note"], "new note")
+        self.assertEqual(data["entry"]["metrics"]["sharpe"], 2.4)
+        self.assertEqual(data["entry"]["status"], "ACTIVE")
+
     def test_record_fetches_current_metrics_and_persists_labels_and_split(self):
         payload = {
             "id": "ONLINE", "regular": {"code": "rank(close)"},

@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -31,6 +32,37 @@ def quota_headers(remaining, reset="60"):
     if reset is not None:
         headers["X-RATELIMIT-RESET"] = reset
     return headers
+
+
+class TransportRetryTests(unittest.TestCase):
+    def test_get_retries_partial_transfer_and_gateway_failure(self):
+        session = mock.Mock()
+        session.request.side_effect = [requests.exceptions.ChunkedEncodingError(),
+                                       response(502), response(200, payload={"results": [1]})]
+        with mock.patch.object(ml, "sleep") as wait:
+            payload = ml.request_json(session, "GET", "/data-sets")
+        self.assertEqual(payload, {"results": [1]})
+        self.assertEqual(session.request.call_count, 3)
+        self.assertEqual(wait.call_args_list, [mock.call(0.5), mock.call(1.0)])
+
+    def test_read_retry_stops_before_wait_budget_expires(self):
+        session = mock.Mock()
+        session.request.side_effect = requests.exceptions.ReadTimeout()
+        with mock.patch.object(ml, "sleep") as wait, self.assertRaises(ml.ServiceError):
+            ml.request_json(session, "GET", "/data-sets", deadline=time.monotonic() + 0.2)
+        session.request.assert_called_once()
+        wait.assert_not_called()
+
+    def test_post_transport_error_and_bad_tls_are_not_retried(self):
+        for method, failure in (("POST", requests.exceptions.ReadTimeout()),
+                                ("GET", requests.exceptions.SSLError())):
+            with self.subTest(method=method):
+                session = mock.Mock()
+                session.request.side_effect = failure
+                with mock.patch.object(ml, "sleep") as wait, self.assertRaises(ml.ServiceError):
+                    ml.request_json(session, method, "/simulations")
+                session.request.assert_called_once()
+                wait.assert_not_called()
 
 
 class SimulationQuotaTests(unittest.TestCase):
@@ -179,6 +211,56 @@ class SimulationQuotaTests(unittest.TestCase):
         self.assertEqual(events[0][1]["remaining"], 0)
         self.assertEqual(events[0][1]["storage_error"], "OSError")
 
+    def test_simulation_resume_keeps_known_progress_and_then_retries_metrics_only(self):
+        expression = "rank(cap)"
+        progress_url = "https://api.worldquantbrain.com/simulations/accepted"
+        initial = [{"expression": expression, "decay": 0, "status": "PENDING",
+                    "submission_attempted": True, "progress_url": progress_url}]
+        session = mock.Mock()
+        events = []
+        options = {"concurrency": 1, "max_wait_seconds": 10,
+                   "on_event": lambda kind, payload: events.append((kind, payload))}
+        session.get.side_effect = requests.exceptions.ReadTimeout()
+        with mock.patch.object(ml, "sleep"):
+            pending = ml.simulate_alphas(session, [expression], initial_records=initial, **options)
+        self.assertEqual(pending[0]["status"], "PENDING")
+        self.assertEqual(pending[0]["progress_url"], progress_url)
+        self.assertEqual(session.get.call_count, 3)
+
+        session.get.reset_mock()
+        session.get.side_effect = [response(200, payload={"status": "COMPLETE", "alpha": "A1"}),
+                                   response(502), requests.exceptions.ChunkedEncodingError(), response(504)]
+        with mock.patch.object(ml, "sleep"):
+            pending = ml.simulate_alphas(session, [expression], initial_records=pending, **options)
+        self.assertEqual(pending[0]["status"], "PENDING")
+        self.assertTrue(pending[0]["metrics_pending"])
+        self.assertEqual(pending[0]["alpha_id"], "A1")
+        self.assertNotIn("progress_url", pending[0])
+        event, discovered = events[-2]
+        self.assertEqual(event, "pending")
+        self.assertEqual(discovered["alpha_id"], "A1")
+        self.assertTrue(discovered["metrics_pending"])
+        self.assertIsNone(discovered["error"])
+
+        session.get.reset_mock()
+        session.get.side_effect = None
+        session.get.return_value = response(200, payload={"is": {"fitness": 1.2}})
+        completed = ml.simulate_alphas(session, [expression], initial_records=pending, **options)
+        self.assertEqual(completed[0]["status"], "COMPLETE")
+        self.assertEqual(completed[0]["metrics"], {"fitness": 1.2})
+        self.assertIsNone(completed[0]["error"])
+        session.get.assert_called_once()
+        self.assertEqual(session.get.call_args.args[0], f"{ml.BRAIN_API_URL}/alphas/A1")
+        session.post.assert_not_called()
+
+    def test_simulation_http_timeout_is_an_unresolved_submission(self):
+        session = mock.Mock()
+        session.post.return_value = response(408)
+        result = ml.simulate_alphas(session, ["rank(cap)"], concurrency=1, max_wait_seconds=10)
+        self.assertEqual(result[0]["status"], "UNKNOWN_SUBMISSION")
+        session.post.assert_called_once()
+        session.get.assert_not_called()
+
 
     def test_documented_terminal_states_release_slots_and_classify_outcomes(self):
         from research_app import experiments
@@ -199,6 +281,50 @@ class SimulationQuotaTests(unittest.TestCase):
 
 
 class RecordsetReadinessTests(unittest.TestCase):
+    def test_interrupted_cache_publication_keeps_previous_verified_series(self):
+        session = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "A.json"
+            previous = {"2020-01-01": 1.0}
+            session.get.return_value = response(200, payload={"records": [["2020-01-01", 1]], "count": 1})
+            self.assertEqual(ml.fetch_daily_pnl(session, "A", cache_dir=directory), previous)
+            write = ml.cache_store.write_json_atomic
+
+            def interrupt_data(filename, content, **kwargs):
+                if Path(filename) == path:
+                    raise KeyboardInterrupt
+                return write(filename, content, **kwargs)
+
+            # Repeated interruptions must carry the proof for the data still on disk,
+            # even if the sidecar already advertises a staged update from the last run.
+            for value in (2, 3):
+                session.get.return_value = response(200, payload={"records": [["2020-01-01", value]], "count": 1})
+                with mock.patch.object(ml.cache_store, "write_json_atomic", side_effect=interrupt_data), \
+                        self.assertRaises(KeyboardInterrupt):
+                    ml.fetch_daily_pnl(session, "A", cache_dir=directory, max_age_hours=0)
+                offline = mock.Mock()
+                self.assertEqual(ml.fetch_daily_pnl(offline, "A", cache_dir=directory), previous)
+                offline.get.assert_not_called()
+            self.assertEqual(ml.fetch_daily_pnl(session, "A", cache_dir=directory, max_age_hours=0),
+                             {"2020-01-01": 3.0})
+            self.assertTrue(ml.pnl_cache_status(directory, "A")["complete"])
+
+    def test_interrupted_pnl_page_retries_same_offset(self):
+        session = mock.Mock()
+        session.get.side_effect = [
+            response(200, payload={"records": [["2020-01-01", 1]], "count": 2}),
+            requests.exceptions.ChunkedEncodingError(),
+            response(200, payload={"records": [["2020-01-02", 2]], "count": 2}),
+        ]
+        report = {}
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(ml, "sleep") as wait:
+            result = ml.fetch_daily_pnl(session, "A", cache_dir=directory, page_limit=1, report=report)
+        self.assertEqual(result, {"2020-01-01": 1.0, "2020-01-02": 2.0})
+        self.assertEqual(report["pages"], 2)
+        self.assertTrue(report["complete"])
+        self.assertEqual([call.kwargs["params"]["offset"] for call in session.get.call_args_list], [0, 1, 1])
+        wait.assert_called_once_with(0.5)
+
     def test_retry_after_overrides_nonempty_body_and_only_ready_values_are_cached(self):
         session = mock.Mock()
         session.get.side_effect = [
