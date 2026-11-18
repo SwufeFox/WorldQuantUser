@@ -7,8 +7,16 @@ import field_index
 import field_search
 import machine_lib as ml
 
-from .runtime import CliError, with_session
+from .runtime import CliError, session_reader, with_session
 from . import capabilities, incentives
+
+
+def _catalog_access(args):
+    run = session_reader(args)
+    access = ml.CatalogAccess(ml.configured_username(), run)
+    if getattr(args, "no_cache", False) or getattr(args, "relogin", False):
+        run(lambda _session: None)
+    return access
 
 
 def cmd_catalog_operators(args, _sink):
@@ -57,12 +65,12 @@ def cmd_catalog_operators(args, _sink):
 def cmd_catalog_datasets(args, _sink):
     """List accessible datasets for a region, universe, delay and instrument type."""
     cache_report = {}
-    datasets = with_session(args, lambda s: ml.get_datasets(
-        s, instrument_type=args.instrument_type, region=args.region,
+    datasets = ml.get_datasets(
+        _catalog_access(args), instrument_type=args.instrument_type, region=args.region,
         delay=args.delay, universe=args.universe, limit=args.limit,
         report=cache_report,
         theme=None if getattr(args, "theme", None) is None else args.theme == "true",
-    ))
+    )
     data = {
         "region": args.region, "universe": args.universe, "delay": args.delay,
         "instrument_type": args.instrument_type, "theme": getattr(args, "theme", None),
@@ -85,12 +93,12 @@ def cmd_catalog_fields(args, _sink):
     each hit matched.
     """
     cache_report = {}
-    everything = with_session(args, lambda s: ml.get_datafields(
-        s, instrument_type=args.instrument_type, region=args.region,
+    everything = ml.get_datafields(
+        _catalog_access(args), instrument_type=args.instrument_type, region=args.region,
         delay=args.delay, universe=args.universe, dataset_id=args.dataset,
         search="", field_type=args.field_type, limit=None,
         report=cache_report,
-    ))
+    )
 
     fields = everything
     search_note = None
@@ -162,16 +170,17 @@ def cmd_catalog_find(args, _sink):
     in practice - a field that exists for 12% of the universe cannot carry an alpha.
     """
     cache_report = {}
-    datasets = with_session(args, lambda s: ml.get_datasets(
-        s, instrument_type=args.instrument_type, region=args.region,
+    access = _catalog_access(args)
+    datasets = ml.get_datasets(
+        access, instrument_type=args.instrument_type, region=args.region,
         delay=args.delay, universe=args.universe, limit=None, report=cache_report,
-    ))
+    )
     wanted = [part.strip() for part in (args.dataset or "").split(",") if part.strip()]
     if wanted:
         datasets = [d for d in datasets if d.get("id") in wanted]
     if not datasets:
         raise CliError("INVALID_INPUT", "no datasets for %s/%s/delay %s"
-                       % (args.region, args.universe, args.delay))
+                       % (args.region, args.universe, args.delay), details={"cache": cache_report})
 
     rows, scanned = [], 0
     catalogs = []
@@ -179,10 +188,10 @@ def cmd_catalog_find(args, _sink):
         dataset_id = dataset.get("id")
         metadata = {}
         try:
-            fields = with_session(args, lambda s, d=dataset_id: ml.get_datafields(
-                s, instrument_type=args.instrument_type, region=args.region,
-                delay=args.delay, universe=args.universe, dataset_id=d,
-                search="", field_type=None, limit=None, report=metadata))
+            fields = ml.get_datafields(
+                access, instrument_type=args.instrument_type, region=args.region,
+                delay=args.delay, universe=args.universe, dataset_id=dataset_id,
+                search="", field_type=None, limit=None, report=metadata)
         except ml.AuthError:
             raise
         except Exception as exc:  # noqa: BLE001 - retain unavailable discovery evidence
@@ -349,17 +358,14 @@ def cmd_catalog_unused(args, _sink):
     Operator names are excluded by the same rule the block classifier uses: a field is an
     identifier that is not followed by `(`.
     """
-    import glob
     import json
-    import os
     import re
 
     import alpha_registry
-    import research_paths
 
     fields = {}
-    cache_dir = os.path.join(research_paths.metadata_root(), "datafields")
-    for path in glob.glob(os.path.join(cache_dir, "*.json")):
+    bound_fields = set()
+    for path, account_bound in ml.catalog_field_cache_paths():
         try:
             with open(path, encoding="utf-8") as handle:
                 payload = json.load(handle).get("payload") or []
@@ -367,8 +373,10 @@ def cmd_catalog_unused(args, _sink):
             continue
         for row in payload:
             field_id = row.get("id")
-            if field_id:
+            if field_id and (account_bound or field_id not in bound_fields):
                 fields[field_id] = row
+                if account_bound:
+                    bound_fields.add(field_id)
     if not fields:
         raise ValueError("no cached catalog fields; run `catalog fields` first")
 
@@ -408,15 +416,18 @@ def cmd_catalog_unused(args, _sink):
     rows.sort(key=lambda r: -r["unused"])
     return {"catalog_fields": len(fields), "used_fields": len(used_fields),
             "unused_fields": len(fields) - len(used_fields),
+            "catalog_evidence": {"account_matched": len(bound_fields),
+                                 "account_unknown": len(fields) - len(bound_fields),
+                                 "live_verified": False},
             "datasets": rows}
 
 
 def cmd_catalog_categories(args, _sink):
     """List data categories with field and alpha counts indicating namespace crowding."""
     cache_report = {}
-    categories = with_session(args, lambda s: ml.fetch_data_categories(
-        s, region=args.region, universe=args.universe, delay=args.delay,
-        report=cache_report))
+    categories = ml.fetch_data_categories(
+        _catalog_access(args), region=args.region, universe=args.universe, delay=args.delay,
+        report=cache_report)
     data = {
         "region": args.region, "universe": args.universe, "delay": args.delay,
         "count": len(categories), "categories": categories, "cache": cache_report,

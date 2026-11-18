@@ -41,6 +41,12 @@ CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、
 CLI 统一按需加载处理模块。执行具体命令时才导入它的处理模块，`help`、`--help` 和
 `schema` 直接从参数定义生成输出。
 
+`catalog datasets`、`catalog fields`、`catalog find` 和 `catalog categories` 先按
+当前账户与查询范围查磁盘。命中时无需登录，缺少有效缓存时才建立会话，单次命令内复用。
+`--relogin` 和 `--no-cache` 按命令刷新会话，`--refresh-meta` 刷新目录内容。
+`--meta-max-age` 可收紧可接受的缓存年龄，`0` 跳过目录缓存。刷新失败时，同账户旧快照
+可以降级返回，回执标明 `stale`、`degraded` 和错误类型。在线预检仍单独核实目录。
+
 在线 lint 和模拟预检通过字段目录核对账户数据范围。FASTEXPR 还检查字段类型与算子，
 Python 检查源码的字段声明。`probe` 将预检报告交给 `tools.guarded_sim`，
 仅在完整设置与源码匹配时复用。用 `pip install -r requirements.txt` 安装运行依赖。
@@ -544,7 +550,7 @@ python3 research_cli.py mine --dataset fundamental2 --limit 5
 python3 research_cli.py mine --dataset news18 --expr 'vec_sum(reviewed_event_field)' --emit draft.json
 ```
 
-`mine` 是离线复核，不会登录。`catalog` 展示默认模拟范围、缓存新鲜度及范围不匹配的排除数量；每个字段的 `source` 保留选中快照、年龄和范围状态。旧缓存未声明范围时保持 unknown，不冒充当前账户可用性。
+`mine` 是离线复核，不会登录。`catalog` 展示默认模拟范围、缓存新鲜度及范围不匹配的排除数量。每个字段的 `source` 保留选中快照、年龄、范围和账户状态。`mine` 和 `catalog unused` 跳过属于其他账户的快照。未绑定账户的历史字段目录只作为 `account_unknown` 的研究线索，在线目录查询会建立新的账户缓存。
 
 每个数据集的 `top` 是数值 MATRIX 待审线索；`needs_definition` 单列分类编码、日期、缺说明、VECTOR/EVENT 聚合，以及与已用字段同描述的项目。`related_history` 给出对应台账记录；同描述只提示需要复核，不证明 alias 等价。`unused` 只指最新台账可解析表达式没引用过该 id，不含旧报告/未入账实验，更不是新机制数量。字段提取走 AST，不把注释、字符串、局部变量当数据。
 

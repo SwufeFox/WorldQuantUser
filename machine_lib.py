@@ -17,8 +17,7 @@ What lives here, in the order a request flows through it:
   automated caller, so every failure raises with what the caller would need.
 * **the metadata cache** -- datasets, operators and datafields, with a TTL, because
   the catalogue changes slowly and a field list is not worth a request per run.
-  ``cached_metadata`` is the single door; a stale entry is usable, an absent one is
-  fetched once (single-flight, so two concurrent runs do not both fetch).
+  ``cached_metadata`` handles freshness and marks stale fallback explicitly.
 * **JSON transport** -- ``request_json`` applies the retry policy, honours
   ``Retry-After``, and raises ``RateLimited`` only when the budget is spent. Every
   endpoint wrapper below goes through it.
@@ -551,7 +550,8 @@ def metadata_cache_path(kind, params):
     return Path(research_paths.metadata_root()) / label / (digest + ".json")
 
 
-def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None):
+def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None, *,
+                    use_cache=True, account=None):
     """Return ``{"data": ..., "cache": {...}}`` for one catalog query.
 
     ``fetch`` runs only on a miss, on an expired entry, or when ``refresh`` is
@@ -565,10 +565,12 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
     policy = _metadata_policy
     ttl = policy["max_age"] if max_age is None else float(max_age)
     do_refresh = policy["refresh"] if refresh is None else bool(refresh)
-    path = metadata_cache_path(kind, params)
+    path = metadata_cache_path(kind, params) if use_cache else None
+    if path is not None and account is not None:
+        path = path.with_name(f"{account}-{path.name}")
     status = {
         "kind": kind,
-        "path": str(path),
+        "path": None if path is None else str(path),
         "hit": False,
         "stale": False,
         "degraded": False,
@@ -577,7 +579,8 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
         "expires_in_seconds": None,
         "refreshed_at": None,
         "error": None,
-        "complete": None,
+        "complete": not bool(params.get("limit")),
+        "account_bound": account is not None,
     }
 
     def done(data):
@@ -586,46 +589,82 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
             report.update(status)
         return {"data": data, "cache": status}
 
-    if not policy["enabled"] or ttl <= 0:
+    if path is None or not policy["enabled"] or ttl <= 0:
         status["disabled"] = True
         data = fetch()
-        status["complete"] = not bool(params.get("limit"))
         status["refreshed_at"] = datetime.now(timezone.utc).isoformat()
         return done(data)
 
     entry = cache_store.read_entry(path)
-    if entry["present"] and not do_refresh:
-        age = entry.get("age_seconds")
-        status["age_seconds"] = None if age is None else round(age, 1)
-        remaining = entry.get("expires_in")
-        status["expires_in_seconds"] = None if remaining is None else round(remaining, 1)
-        if entry["fresh"]:
-            status["hit"] = True
-            return done(entry["payload"])
-        status["stale"] = True
-    elif entry.get("error") not in (None, "missing"):
+    usable = entry["present"] and entry["kind"] == kind
+    age = entry["age_seconds"]
+
+    def cached_result(error=None):
+        remaining = entry["expires_in"]
+        status.update(hit=True, stale=error is not None, degraded=error is not None,
+                      age_seconds=round(age, 1), refreshed_at=entry["created_at"],
+                      expires_in_seconds=None if remaining is None else round(remaining, 1),
+                      error=error)
+        return done(entry["payload"])
+
+    if usable and not do_refresh and entry["fresh"] and age <= ttl:
+        return cached_result()
+    if entry.get("error") not in (None, "missing"):
         cache_store.quarantine(path)
 
     try:
         data = fetch()
     except BrainError as exc:
-        if entry["present"]:
-            status.update({"hit": True, "stale": True, "degraded": True,
-                           "error": exc.code})
+        if usable:
             note("metadata cache: serving stale %s snapshot (%s)" % (kind, exc.code))
-            return done(entry["payload"])
+            return cached_result(exc.code)
         raise
-    status["complete"] = not bool(params.get("limit"))
-    status["refreshed_at"] = datetime.now(timezone.utc).isoformat()
+    entry = cache_store.build_entry(kind, data, ttl=ttl, source="brain-api")
     try:
-        cache_store.write_json_atomic(
-            path, cache_store.build_entry(kind, data, ttl=ttl, source="brain-api"))
+        cache_store.write_json_atomic(path, entry)
     except OSError as exc:
         note("metadata cache: could not write %s (%s)" % (path, exc))
-    status["refreshed_at"] = cache_store.read_entry(path).get("created_at") or status["refreshed_at"]
-    status["age_seconds"] = 0.0
-    status["expires_in_seconds"] = ttl
+    status.update(refreshed_at=entry["_cache"]["created_at"], age_seconds=0.0,
+                  expires_in_seconds=ttl)
     return done(data)
+
+
+class CatalogAccess:
+    """Read account metadata through a loader invoked on a cache miss."""
+
+    def __init__(self, username, run):
+        self.username = username
+        self.run = run
+
+
+def _catalog_account(username):
+    name = username.strip().casefold() if isinstance(username, str) else ""
+    return hashlib.sha256(name.encode()).hexdigest() if name else None
+
+
+def catalog_field_cache_paths():
+    """Yield current-account snapshots and legacy files of unknown provenance."""
+    account = _catalog_account(configured_username())
+    directory = Path(research_paths.metadata_root()) / "datafields"
+    for path in sorted(directory.glob("*.json")):
+        namespace, separator, _ = path.stem.partition("-")
+        if not separator or namespace == account:
+            yield path, bool(separator)
+
+
+def _cached_account_catalog(session, kind, params, fetch, refresh, report):
+    if isinstance(session, CatalogAccess):
+        username, run = session.username, session.run
+    else:
+        auth = getattr(session, "auth", None)
+        username = auth[0] if isinstance(auth, (tuple, list)) and auth else None
+
+        def run(work):
+            return work(session)
+
+    account = _catalog_account(username)
+    return cached_metadata(kind, params, lambda: run(fetch), refresh=refresh, report=report,
+                           use_cache=account is not None, account=account)["data"]
 
 
 def get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
@@ -642,11 +681,11 @@ def get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
               "delay": delay, "universe": universe, "limit": limit}
     if theme is not None:
         params["theme"] = theme
-    return cached_metadata(
-        "datasets", params,
-        lambda: _get_datasets(s, instrument_type, region, delay, universe, limit, theme),
-        refresh=refresh, report=report,
-    )["data"]
+    return _cached_account_catalog(
+        s, "datasets", params,
+        lambda session: _get_datasets(session, instrument_type, region, delay, universe, limit, theme),
+        refresh, report,
+    )
 
 
 def _get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
@@ -794,11 +833,11 @@ def fetch_data_categories(s, region="USA", universe="TOP3000", delay=1,
     have already mined that category. Cached.
     """
     params = {"region": region, "universe": universe, "delay": delay}
-    return cached_metadata(
-        "data-categories", params,
-        lambda: _fetch_data_categories(s, region, universe, delay),
-        refresh=refresh, report=report,
-    )["data"]
+    return _cached_account_catalog(
+        s, "data-categories", params,
+        lambda session: _fetch_data_categories(session, region, universe, delay),
+        refresh, report,
+    )
 
 
 def _fetch_data_categories(s, region="USA", universe="TOP3000", delay=1):
@@ -826,12 +865,12 @@ def get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
     params = {"instrumentType": instrument_type, "region": region, "delay": delay,
               "universe": universe, "dataset": dataset_id, "search": search,
               "type": field_type, "limit": limit}
-    return cached_metadata(
-        "datafields", params,
-        lambda: _get_datafields(s, instrument_type, region, delay, universe,
-                                dataset_id, search, field_type, limit),
-        refresh=refresh, report=report,
-    )["data"]
+    return _cached_account_catalog(
+        s, "datafields", params,
+        lambda session: _get_datafields(session, instrument_type, region, delay, universe,
+                                        dataset_id, search, field_type, limit),
+        refresh, report,
+    )
 
 
 def _get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,

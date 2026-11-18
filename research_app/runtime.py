@@ -139,19 +139,31 @@ def make_event_sink(stream, verbose):
     return sink
 
 
-def with_session(args, work):
-    """Run ``work(session)``, re-authenticating once if the session died.
+def session_reader(args):
+    """Return a lazy operation runner sharing one BRAIN session and one retry."""
+    session = None
+    retried = False
 
-    BRAIN sessions expire, and a cached cookie can go stale between calls.
-    Retrying once with a forced login keeps every caller from handling that.
-    """
-    session = ml.load_session(use_cache=not getattr(args, "no_cache", False),
-                              refresh=getattr(args, "relogin", False))
-    try:
-        return work(session)
-    except ml.AuthError:
-        session = ml.load_session(use_cache=False, refresh=True)
-        return work(session)
+    def run(work):
+        nonlocal session, retried
+        if session is None:
+            session = ml.load_session(use_cache=not getattr(args, "no_cache", False),
+                                      refresh=getattr(args, "relogin", False))
+        try:
+            return work(session)
+        except ml.AuthError:
+            if retried:
+                raise
+            retried = True
+            session = ml.load_session(use_cache=False, refresh=True)
+            return work(session)
+
+    return run
+
+
+def with_session(args, work):
+    """Run ``work(session)``, re-authenticating once if the session died."""
+    return session_reader(args)(work)
 
 
 def collect_alphas(args, metadata=None):

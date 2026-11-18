@@ -19,7 +19,8 @@ class CatalogIncentiveTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
-        patcher = mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(self.root)})
+        patcher = mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(self.root),
+                                               "BRAIN_USERNAME": "synthetic-catalog"})
         patcher.start()
         self.addCleanup(patcher.stop)
         policy = ml.metadata_cache_policy()
@@ -27,6 +28,7 @@ class CatalogIncentiveTests(unittest.TestCase):
             refresh=policy["refresh"], enabled=policy["enabled"]))
         ml.configure_metadata_cache(max_age=3600, refresh=False, enabled=True)
         self.session = ml.requests.Session()
+        self.session.auth = ("synthetic-catalog", "placeholder")
         patcher = mock.patch.object(ml, "load_session", return_value=self.session)
         patcher.start()
         self.addCleanup(patcher.stop)

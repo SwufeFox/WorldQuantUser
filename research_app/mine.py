@@ -6,7 +6,6 @@ turnover is a train-only historical heuristic, not a field's update cadence.
 """
 
 import collections
-import glob
 import json
 import math
 import os
@@ -66,11 +65,10 @@ def _moment(value):
 def load_catalog(report=None):
     """``{field_id: {dataset, type, coverage, description}}`` from the disk cache."""
     fields = {}
-    pattern = os.path.join(research_paths.metadata_root(), "datafields", "*.json")
     scope = _scope()
     ignored = 0
     now = cache_store.utc_now()
-    for path in sorted(glob.glob(pattern)):
+    for path, account_bound in ml.catalog_field_cache_paths():
         try:
             with open(path, encoding="utf-8") as handle:
                 document = json.load(handle)
@@ -94,12 +92,14 @@ def load_catalog(report=None):
                 ignored += 1
                 continue
             scope_known = all(key in declared for key in ("region", "universe", "delay"))
-            source = {"path": path, "scope_state": "matched" if scope_known else "unknown",
+            source = {"path": str(path), "scope_state": "matched" if scope_known else "unknown",
+                      "account_state": "matched" if account_bound else "unknown",
                       "freshness": freshness, "created_at": envelope.get("created_at"),
                       "expires_at": envelope.get("expires_at"),
                       "age_seconds": max(0, (now - created).total_seconds()) if created else None}
             # Prefer explicitly scoped, fresh, newest metadata; never depend on glob order.
-            priority = (scope_known, freshness == "fresh", created.timestamp() if created else 0, path)
+            priority = (scope_known, account_bound, freshness == "fresh",
+                        created.timestamp() if created else 0, path)
             previous = fields.get(field_id)
             if previous and priority <= previous["_priority"]:
                 continue
