@@ -86,7 +86,7 @@ def _to_iso(moment):
 
 
 def _from_iso(text):
-    if not text:
+    if not isinstance(text, str) or not text:
         return None
     cleaned = text[:-1] + "+00:00" if text.endswith("Z") else text
     try:
@@ -159,7 +159,7 @@ def load_json(path, default=None):
         return default, "missing"
     except PermissionError as exc:
         return default, "permission denied: %s" % exc
-    except json.JSONDecodeError as exc:
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         return default, "malformed json: %s" % exc
     except OSError as exc:
         return default, "unreadable: %s" % exc
@@ -203,9 +203,9 @@ def read_entry(path, now=None):
     Returns a dict with:
 
     ``payload``       the stored payload, or ``None``
-    ``present``       a file exists and parsed
+    ``present``       a valid envelope with the current version was found
     ``fresh``         present, right version, and not past ``expires_at``
-    ``age_seconds``   how long ago the entry was created (``None`` if unknown)
+    ``age_seconds``   how long ago the entry was created
     ``expires_at``    ISO timestamp or ``None``
     ``expires_in``    seconds until expiry (negative when already stale)
     ``kind``/``version``/``source``  envelope metadata
@@ -229,14 +229,15 @@ def read_entry(path, now=None):
         "source": None,
         "error": error,
     }
-    if data is None:
+    if error is not None:
         return result
 
-    if not isinstance(data, dict) or "_cache" not in data or "payload" not in data:
+    if (not isinstance(data, dict) or not isinstance(data.get("_cache"), dict)
+            or "payload" not in data):
         result["error"] = "not a cache envelope"
         return result
 
-    meta = data.get("_cache") or {}
+    meta = data["_cache"]
     version = meta.get("version")
     result.update({
         "payload": data.get("payload"),
@@ -251,12 +252,15 @@ def read_entry(path, now=None):
             version, CACHE_VERSION)
         return result
 
+    created = _from_iso(result["created_at"])
+    expires = _from_iso(result["expires_at"])
+    if created is None or (result["expires_at"] is not None and expires is None):
+        result["error"] = "invalid cache timestamps"
+        return result
+
     result["present"] = True
     moment = now or utc_now()
-    created = _from_iso(meta.get("created_at"))
-    if created is not None:
-        result["age_seconds"] = max(0.0, (moment - created).total_seconds())
-    expires = _from_iso(meta.get("expires_at"))
+    result["age_seconds"] = max(0.0, (moment - created).total_seconds())
     if expires is None:
         result["fresh"] = True
     else:

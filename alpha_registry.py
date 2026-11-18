@@ -39,6 +39,7 @@ import machine_lib as ml
 
 __all__ = [
     "VERDICTS",
+    "QUERY_FIELDS",
     "default_registry_path",
     "expression_hash",
     "same_expression",
@@ -57,6 +58,10 @@ __all__ = [
 #                 which control killed it.
 # ``no_go``     - abandoned before a fair test (data blocked, unusable fields).
 VERDICTS = ("candidate", "watch", "rejected", "falsified", "no_go")
+
+# Ledger columns available for filtering and grouping.
+QUERY_FIELDS = ("status", "verdict", "family", "region", "universe", "neutralization",
+                "delay", "decay", "month")
 
 #: Statuses that mean the platform finished the run and every number is final.
 #: ``WARNING`` belongs here: BRAIN uses it when a check warns without failing

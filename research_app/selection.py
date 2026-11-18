@@ -11,6 +11,7 @@ import alpha_registry
 FORMAT = "research.train-selection"
 VERSION = 1
 IDENTITY_FIELDS = ("alpha_id", "source_file", "label", "candidate_id")
+DEFAULT_PROMOTION_RETENTION = 0.2
 
 
 def _canonical(value):

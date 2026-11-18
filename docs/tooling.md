@@ -38,6 +38,9 @@ CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、
 文献检索分别在 `account.py`、`campaign.py`、`literature.py`。
 这些是内部模块，入口仍是 `research_cli.py`；改命令时直接修改、测试所属模块。
 
+CLI 统一按需加载处理模块。执行具体命令时才导入它的处理模块，`help`、`--help` 和
+`schema` 直接从参数定义生成输出。
+
 在线 lint 和模拟预检通过字段目录核对账户数据范围。FASTEXPR 还检查字段类型与算子，
 Python 检查源码的字段声明。`probe` 将预检报告交给 `tools.guarded_sim`，
 仅在完整设置与源码匹配时复用。用 `pip install -r requirements.txt` 安装运行依赖。
@@ -115,6 +118,9 @@ python3 tools/aqp_strategy_maps.py --cycle 202611 --output-dir /path/to/another-
 合法股票池和 delay 查询目录，不再给所有地区套美股默认股票池。`data_scope_evidence`
 保留实际查询范围、目录时效及 available / empty / unknown；它只证明抽查的组合。
 错误、旧目录回退和未查询组合不能作为“该地区无数据”的证据。
+
+BRAIN 会话缓存跟随当前配置的账户。只有用户名一致且仍有效的会话才会复用。
+旧缓存缺少用户名绑定时会跳过，下次正常登录后自动写入绑定当前账户的会话。
 
 账户设置证据由核心模块 `simulation_capabilities.py` 统一管理，保留原生 schema、账户指纹、
 来源、时效和 capability ID；每次在线模拟/核验刷新一次，批次内复用。`schema` 的

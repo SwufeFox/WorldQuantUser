@@ -130,7 +130,6 @@ def cmd_auth_check(args, _sink):
             "expires_at": info.get("expires_at"),
             "expires_in_seconds": info.get("expires_in_seconds"),
             "age_seconds": info.get("age_seconds"),
-            "migrated_from": meta.get("migrated_from"),
         },
         "metadata_cache": ml.metadata_cache_policy(),
         "note": "data_regions confirms only sampled live equity scopes; empty, unknown and unprobed scopes are distinct",

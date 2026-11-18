@@ -103,8 +103,23 @@ class EnvelopeTests(TempCacheCase):
 
     def test_non_envelope_file_is_reported(self):
         target = self.path("e.json")
-        cache_store.write_json_atomic(target, {"just": "data"})
-        self.assertIn("not a cache envelope", cache_store.read_entry(target)["error"])
+        for data in (None, {"just": "data"}, {"_cache": ["invalid"], "payload": {}}):
+            with self.subTest(data=data):
+                cache_store.write_json_atomic(target, data)
+                self.assertIn("not a cache envelope", cache_store.read_entry(target)["error"])
+
+    def test_invalid_timestamps_make_entry_unusable(self):
+        target = self.path("e.json")
+        for key, value in (("created_at", None), ("created_at", 1),
+                           ("expires_at", "invalid"), ("expires_at", ["invalid"])):
+            with self.subTest(key=key, value=value):
+                document = cache_store.build_entry("demo", {"x": 1}, ttl=60)
+                document["_cache"][key] = value
+                cache_store.write_json_atomic(target, document)
+                entry = cache_store.read_entry(target)
+                self.assertFalse(entry["present"])
+                self.assertFalse(entry["fresh"])
+                self.assertEqual(entry["error"], "invalid cache timestamps")
 
     def test_quarantine_keeps_a_sample_and_prunes_old_ones(self):
         target = self.path("session.json")
@@ -288,6 +303,7 @@ class SessionCacheTests(TempCacheCase):
         def fake_authenticate():
             self.calls.append(time.time())
             session = FakeSession()
+            session.auth = ("u", "p")
             session.cookies.set("t", "token-value")
             return session, {"user_id": "U1", "permissions": ["TUTORIAL"],
                                    "token_expiry": 3600}
@@ -295,14 +311,11 @@ class SessionCacheTests(TempCacheCase):
         originals = {
             "authenticate": ml.authenticate,
             "session_cache_path": ml.session_cache_path,
-            "legacy_session_cache_path": ml.legacy_session_cache_path,
             "lock_path": research_paths.lock_path,
             "get_credentials": ml.get_credentials,
         }
         ml.authenticate = fake_authenticate
         ml.session_cache_path = lambda: self.cache_path
-        ml.legacy_session_cache_path = lambda: os.path.join(
-            self._tmpdir.name, "legacy.json")
         research_paths.lock_path = lambda name: os.path.join(
             self._tmpdir.name, "locks", name + ".lock")
         ml.get_credentials = lambda: ("u", "p")
@@ -310,7 +323,6 @@ class SessionCacheTests(TempCacheCase):
         def restore():
             ml.authenticate = originals["authenticate"]
             ml.session_cache_path = originals["session_cache_path"]
-            ml.legacy_session_cache_path = originals["legacy_session_cache_path"]
             research_paths.lock_path = originals["lock_path"]
             ml.get_credentials = originals["get_credentials"]
 
@@ -340,7 +352,7 @@ class SessionCacheTests(TempCacheCase):
             self.cache_path,
             cache_store.build_entry("brain-session",
                                     {"cookies": {"s": "other-token"}, "username": "other"}, ttl=3600))
-        session = ml.load_session(expected_username="u")
+        session = ml.load_session()
         self.assertEqual(len(self.calls), 1)
         self.assertIsNone(session.cookies.get("s"))
         self.assertEqual(session.cookies.get("t"), "token-value")
@@ -368,20 +380,14 @@ class SessionCacheTests(TempCacheCase):
         self.assertTrue(samples, "a corrupt cache must be kept for diagnosis")
         self.assertTrue(cache_store.read_entry(self.cache_path)["present"])
 
-    def test_legacy_file_is_migrated_without_logging_in(self):
-        legacy = ml.legacy_session_cache_path()
-        os.makedirs(os.path.dirname(legacy), exist_ok=True)
-        with open(legacy, "w") as handle:
-            json.dump({"cookies": {"s": "legacy"}, "saved_at": time.time(),
-                       "expiry_seconds": 3600, "user_id": "U1",
-                       "permissions": ["TUTORIAL"]}, handle)
-        meta = {}
-        session = ml.load_session(meta=meta)
-        self.assertEqual(len(self.calls), 0, "migration must not force a login")
-        self.assertEqual(meta["migrated_from"], legacy)
-        self.assertEqual(session.cookies.get("s"), "legacy")
-        self.assertFalse(os.path.exists(legacy), "legacy file should be moved")
-        self.assertTrue(os.path.isfile(self.cache_path))
+    def test_session_without_account_binding_is_replaced(self):
+        cache_store.write_json_atomic(
+            self.cache_path,
+            cache_store.build_entry("brain-session", {"cookies": {"s": "unbound"}}, ttl=3600))
+        session = ml.load_session()
+        self.assertEqual(len(self.calls), 1)
+        self.assertIsNone(session.cookies.get("s"))
+        self.assertEqual(cache_store.read_entry(self.cache_path)["payload"]["username"], "u")
 
     def test_concurrent_callers_log_in_once(self):
         errors = []

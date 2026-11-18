@@ -46,7 +46,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
                 mock.patch.object(requests.Session, "post", return_value=response):
             session, info = ml.authenticate()
             payload = ml._session_payload(session, info)
-            restored = ml._session_from_entry(payload)
+            restored = ml._session_from_entry(payload, session.auth)
         self.assertEqual(session._brain_account_id, "offline-user")
         self.assertEqual(restored._brain_account_id, "offline-user")
         self.assertEqual(payload["username"], "offline@example.com")

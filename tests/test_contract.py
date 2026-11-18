@@ -108,7 +108,7 @@ class ReferenceContractTests(unittest.TestCase):
                 flags = {flag for option in command["options"] for flag in option["flags"]}
                 self.assertTrue((expected | cache_flags) <= flags)
 
-    def test_help_and_schema_do_not_import_reference_readers(self):
+    def test_help_and_schema_do_not_import_command_handlers(self):
         script = """
 import sys
 from research_app import app
@@ -116,8 +116,13 @@ from research_app import app
 for args in (["help", "docs", "get"], ["schema", "forum", "search"], ["schema", "alpha", "get"]):
     assert app.main(args) == 0
 
-readers = {"research_app.docs_reader", "research_app.reference", "research_app.support_reader"}
-assert readers.isdisjoint(sys.modules), readers.intersection(sys.modules)
+handlers = {
+    "research_app." + name for name in (
+        "account", "alphas", "benchmark", "docs_reader", "experiments", "feed",
+        "ledger", "promote", "reference", "support_reader", "triage",
+    )
+}
+assert handlers.isdisjoint(sys.modules), handlers.intersection(sys.modules)
 """
         proc = subprocess.run([sys.executable, "-c", script], cwd=ROOT,
                               capture_output=True, encoding="utf-8")
@@ -1482,59 +1487,6 @@ class CheckExtractionTests(unittest.TestCase):
         self.assertEqual(row["incentives"]["checks"]["MATCHES_THEMES"]["result"], "WARNING")
         self.assertEqual(row["incentives"]["basis"], "live_check_endpoint")
 
-    def test_legacy_submission_check_returns_correlation_or_fail(self):
-        for status, expected in (("PASS", 0.24), ("PENDING", 0.24), ("FAIL", "fail")):
-            with self.subTest(status=status):
-                session = mock.Mock()
-                session.get.return_value.headers = {}
-                session.get.return_value.json.return_value = {"is": {"checks": [
-                    {"name": "SELF_CORRELATION", "value": 0.24, "result": "PASS"},
-                    {"name": "LOW_SHARPE", "value": 1.5, "result": status},
-                    {"name": "WAITING_CHECK"},
-                ]}}
-                self.assertEqual(ml.get_check_submission(session, "alpha-1"), expected)
-
-    def test_legacy_submission_check_keeps_missing_correlation_value_as_nan(self):
-        session = mock.Mock()
-        session.get.return_value.headers = {}
-        session.get.return_value.json.return_value = {"is": {"checks": [
-            {"name": "SELF_CORRELATION", "result": "PENDING"},
-            {"name": "LOW_SHARPE", "value": 1.5, "result": "PASS"},
-        ]}}
-        value = ml.get_check_submission(session, "alpha-1")
-        self.assertIsInstance(value, float)
-        self.assertNotEqual(value, value)  # NaN, as in the former DataFrame result.
-
-    def test_legacy_submission_check_preserves_sleep_and_error_results(self):
-        for payload, expected in (
-                ({}, "sleep"),
-                ({"is": {"checks": []}}, "error"),
-                ({"is": {"checks": [{"name": "SELF_CORRELATION", "value": 0.24}]}},
-                 "error"),
-                ({"is": {"checks": [{"name": "SELF_CORRELATION"}]}},
-                 "error")):
-            with self.subTest(payload=payload):
-                session = mock.Mock()
-                session.get.return_value.headers = {}
-                session.get.return_value.json.return_value = payload
-                stdout = io.StringIO()
-                with mock.patch.object(sys, "stdout", stdout):
-                    self.assertEqual(ml.get_check_submission(session, "alpha-1"), expected)
-
-    def test_legacy_submission_check_keeps_retry_after_polling(self):
-        pending, complete = mock.Mock(), mock.Mock()
-        pending.headers = ml.requests.structures.CaseInsensitiveDict({"Retry-After": "0.25"})
-        complete.headers = {}
-        complete.json.return_value = {"is": {"checks": [
-            {"name": "SELF_CORRELATION", "value": 0.24, "result": "PASS"},
-        ]}}
-        session = mock.Mock()
-        session.get.side_effect = [pending, complete]
-        with mock.patch.object(ml.time, "sleep") as sleep:
-            self.assertEqual(ml.get_check_submission(session, "alpha-1"), 0.24)
-        sleep.assert_called_once_with(0.25)
-
-
 class SummaryTests(unittest.TestCase):
     def test_ranking_prefers_sharpe_and_records_failures(self):
         records = [
@@ -1647,7 +1599,7 @@ class SimulationResumeTests(unittest.TestCase):
             ml.simulate_alphas(
                 session,
                 [("rank(cap)", 1), ("rank(volume)", 1)],
-                batch_size=2,
+                concurrency=2,
                 max_wait_seconds=10,
             )
         self.assertEqual(len(session.post_calls), 1)

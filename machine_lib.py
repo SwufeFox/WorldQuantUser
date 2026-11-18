@@ -39,14 +39,11 @@ import hashlib
 import json
 import math
 import os
-import pickle
 import random
 import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from collections import defaultdict
-from itertools import combinations, product
 from os import environ
 from pathlib import Path
 from time import sleep
@@ -241,21 +238,26 @@ def _load_dotenv(path=None):
         _DOTENV_LOADED = True
 
 
-def get_credentials(prefix="BRAIN"):
+def configured_username():
+    """Return the configured login name without requiring a password or session."""
+    _load_dotenv()
+    return environ.get("BRAIN_USERNAME", "").strip()
+
+
+def get_credentials():
     """Return (username, password) for the WorldQuant BRAIN API.
 
-    Reads <prefix>_USERNAME / <prefix>_PASSWORD from the environment, after
+    Reads BRAIN_USERNAME / BRAIN_PASSWORD from the environment, after
     loading a .env file next to this module when present. Never hardcode
     credentials in the source tree.
     """
-    _load_dotenv()
-    username = environ.get(prefix + "_USERNAME", "").strip()
-    password = environ.get(prefix + "_PASSWORD", "").strip()
+    username = configured_username()
+    password = environ.get("BRAIN_PASSWORD", "").strip()
     if not username or not password:
         raise MissingCredentials(
-            "Missing credentials: set {}_USERNAME and {}_PASSWORD in the "
+            "Missing credentials: set BRAIN_USERNAME and BRAIN_PASSWORD in the "
             "environment, or copy .env.example to .env next to machine_lib.py "
-            "and fill it in.".format(prefix, prefix)
+            "and fill it in."
         )
     return username, password
 
@@ -352,11 +354,6 @@ def session_cache_path():
     return Path(research_paths.session_path())
 
 
-def legacy_session_cache_path():
-    """Pre-2.0 location, kept only so an existing session can be migrated."""
-    return Path(__file__).resolve().parent / ".brain_session.json"
-
-
 def _session_payload(session, info):
     auth = getattr(session, "auth", None)
     username = auth[0] if isinstance(auth, (tuple, list)) and auth else None
@@ -387,57 +384,10 @@ def save_session(session, info=None, path=None):
     return target
 
 
-def _migrate_legacy_session(target):
-    """Move a pre-2.0 session file into the new location without re-logging in.
-
-    The old file was a flat ``{cookies, saved_at, expiry_seconds, ...}`` record.
-    Converting it is worth the few lines: dropping it would force one extra
-    login, and that is exactly the request that gets captcha-challenged.
-    """
-    legacy = Path(legacy_session_cache_path())
-    if target.exists() or not legacy.is_file():
-        return None
-    data, error = cache_store.load_json(legacy)
-    if error or not isinstance(data, dict) or not data.get("cookies"):
-        cache_store.quarantine(legacy)
-        return None
-    saved_at = data.get("saved_at")
-    expiry = data.get("expiry_seconds")
-    try:
-        created = (datetime.fromtimestamp(float(saved_at), timezone.utc)
-                   if saved_at else cache_store.utc_now())
-    except (TypeError, ValueError, OSError):
-        created = cache_store.utc_now()
-    ttl = None
-    if isinstance(expiry, (int, float)) and expiry > 0:
-        ttl = float(expiry)
-    entry = cache_store.build_entry(
-        "brain-session",
-        {
-            "cookies": data.get("cookies") or {},
-            "user_id": data.get("user_id"),
-            "permissions": data.get("permissions"),
-            "token_expiry": expiry,
-        },
-        ttl=ttl,
-        source="legacy-migration",
-        now=created,
-    )
-    try:
-        cache_store.write_json_atomic(target, entry, mode=0o600)
-    except OSError:
-        return None
-    try:
-        legacy.unlink()
-    except OSError:
-        pass
-    return str(legacy)
-
-
-def _session_from_entry(payload):
+def _session_from_entry(payload, credentials):
     session = requests.Session()
-    session.auth = get_credentials()
-    session.cookies.update(payload.get("cookies") or {})
+    session.auth = credentials
+    session.cookies.update(payload["cookies"])
     session._brain_account_id = payload.get("user_id")
     return session
 
@@ -451,7 +401,9 @@ def session_status(cache_path=None):
     """
     path = Path(cache_path or session_cache_path())
     entry = cache_store.read_entry(path)
-    payload = entry.get("payload") or {}
+    payload = entry["payload"]
+    if entry["kind"] != "brain-session" or not isinstance(payload, dict):
+        payload = {}
     expires_in = entry.get("expires_in")
     status = {
         "path": str(path),
@@ -467,7 +419,6 @@ def session_status(cache_path=None):
         "has_cookies": bool(payload.get("cookies")),
         "source": entry.get("source"),
         "error": entry.get("error"),
-        "legacy_present": Path(legacy_session_cache_path()).is_file(),
     }
     return status
 
@@ -477,59 +428,65 @@ def invalidate_session(cache_path=None):
     return cache_store.remove(Path(cache_path or session_cache_path()))
 
 
-def load_session(cache_path=None, use_cache=True, refresh=False, meta=None,
-                 *, expected_username=None):
+def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
     """Return an authenticated session, reusing a cached cookie when still valid.
 
     BRAIN issues sessions that last hours but challenges repeated logins with a
     captcha, so re-authenticating on every CLI call is both slow and fragile.
-    With ``use_cache`` a saved cookie is reused until just before it expires and
-    ``refresh`` forces a fresh login.
+    A saved cookie is reusable only for the configured account, until it
+    expires. ``refresh`` forces a fresh login.
 
     The login itself is single-flight: concurrent callers take a file lock, and
     the ones that lose the race re-check the cache and reuse the winner's
     session instead of adding a second login. Pass ``meta`` (a dict) to receive
-    ``cached``/``migrated_from``/``reason`` for diagnostics. An expected username
-    restricts reuse to cookies already bound to that account.
+    ``cached`` and ``reason`` for diagnostics.
     """
     meta = meta if meta is not None else {}
     path = Path(cache_path or session_cache_path())
-    if cache_path is None and expected_username is None:
-        migrated = _migrate_legacy_session(path)
-        if migrated:
-            meta["migrated_from"] = migrated
-            note("session cache: migrated %s -> %s" % (migrated, path))
+    reuse_cache = use_cache and not refresh
+    credentials = get_credentials() if reuse_cache else None
 
-    def _reuse():
+    def _reuse(*, locked=False):
         entry = cache_store.read_entry(path)
         if entry["present"] and entry["fresh"]:
             payload = entry["payload"]
-            if expected_username is not None and (
-                    not isinstance(payload, dict) or payload.get("username") != expected_username):
+            if (entry["kind"] != "brain-session" or not isinstance(payload, dict)
+                    or not isinstance(payload.get("cookies"), dict) or not payload["cookies"]):
+                meta["cache_state"] = "invalid"
+                return None
+            if payload.get("username") != credentials[0].casefold():
                 meta["cache_state"] = "account-mismatch"
                 return None
             meta.update({"cached": True, "reason": "reused-cache",
                          "cache_state": "fresh",
                          "expires_in": entry.get("expires_in")})
-            return _session_from_entry(payload)
+            return _session_from_entry(payload, credentials)
         if entry["present"]:
             meta.setdefault("cache_state", "expired")
         elif entry.get("error") not in (None, "missing"):
             # Keep a sample instead of quietly dropping it: a truncated file is
             # a bug worth seeing, not a fact to hide behind a fresh login.
-            quarantined = cache_store.quarantine(path)
-            # setdefault: the retry inside the lock sees the file gone and would
-            # otherwise relabel a corrupt cache as an empty one.
-            meta.setdefault("cache_state", "corrupt")
-            if quarantined:
-                meta["quarantined_to"] = quarantined
-                note("session cache was unusable (%s); moved to %s"
-                     % (entry.get("error"), quarantined))
+            meta["cache_state"] = "corrupt"
+            if locked:
+                quarantined = cache_store.quarantine(path)
+                if quarantined:
+                    meta["quarantined_to"] = quarantined
+                    note("session cache was unusable (%s); moved to %s"
+                         % (entry["error"], quarantined))
         else:
             meta.setdefault("cache_state", "empty")
         return None
 
-    if use_cache and not refresh:
+    def _login_and_save(reason):
+        session, info = authenticate()
+        try:
+            save_session(session, info, path)
+        except OSError:
+            pass  # a read-only volume must not break a working session
+        meta.update({"cached": False, "reason": reason, "user_id": (info or {}).get("user_id")})
+        return session
+
+    if reuse_cache:
         reused = _reuse()
         if reused is not None:
             return reused
@@ -538,28 +495,15 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None,
     try:
         with cache_store.file_lock(research_paths.lock_path("brain-session"),
                                    timeout=timeout):
-            if use_cache and not refresh:
-                reused = _reuse()  # someone else may have logged in while we waited
+            if reuse_cache:
+                reused = _reuse(locked=True)  # another caller may have refreshed the cache
                 if reused is not None:
                     meta["reason"] = "waited-for-other-login"
                     return reused
-            session, info = authenticate()
-            try:
-                save_session(session, info, path)
-            except OSError:
-                pass  # a read-only volume must not break a working session
-            meta.update({"cached": False, "reason": "logged-in",
-                         "user_id": (info or {}).get("user_id")})
-            return session
+            return _login_and_save("logged-in")
     except cache_store.LockTimeout as exc:
         note("session cache: %s; logging in anyway" % exc)
-        session, info = authenticate()
-        try:
-            save_session(session, info, path)
-        except OSError:
-            pass
-        meta.update({"cached": False, "reason": "lock-timeout-login"})
-        return session
+        return _login_and_save("lock-timeout-login")
 
 
 
@@ -973,33 +917,6 @@ def process_datafields(fields):
         for f in fields if f.get("type") == "VECTOR" and f.get("id")
     ]
     return matrix + vector
-
-
-def ts_factory(op, field):
-    output = []
-    #days = [3, 5, 10, 20, 60, 120, 240]
-    days = [5, 22, 66, 120, 240]
-    
-    for day in days:
-    
-        alpha = "%s(%s, %d)"%(op, field, day)
-        output.append(alpha)
-    
-    return output
-
-def load_task_pool_single(alpha_list, limit_of_single_simulations):
-
-    '''
-    Input:
-        alpha_list : list of (alpha, decay) tuples
-        limit_of_single_simulations : number of concurrent single simulations
-    Output:
-        task : [3 * (alpha, decay)] for 3 single simulations
-        pool : [ alpha_num/3 * [3 * (alpha, decay)] ] 
-    '''
-
-    pool = [alpha_list[i:i + limit_of_single_simulations] for i in range(0, len(alpha_list), limit_of_single_simulations)]
-    return pool
 
 
 BRAIN_API_URL = "https://api.worldquantbrain.com"
@@ -1512,7 +1429,7 @@ def simulate_alphas(
     s,
     alphas,
     settings=None,
-    batch_size=None,
+    *,
     dry_run=False,
     on_event=None,
     max_wait_seconds=None,
@@ -1540,9 +1457,9 @@ def simulate_alphas(
     (and requires no credentials). ``on_event(kind, payload)`` receives
     ``submitted`` / ``polling`` / ``quota`` / ``rate_limited`` / ``completed`` events.
     Feeding it the result of ``resolve_settings`` is the caller's job.
-    ``concurrency`` (or the legacy ``batch_size`` argument) is a positive local
-    budget, clamped only by verified account capacity. A full shared workspace
-    journal leaves work queued until the current wave can release a slot.
+    ``concurrency`` is a positive local budget, clamped only by verified account
+    capacity. A full shared workspace journal leaves work queued until the
+    current wave can release a slot.
     Reservations survive interruptions and are
     reconciled by ``simulation_slots.reconcile_record``; other workspaces and
     unidentified accounts cannot share these reservations.
@@ -1561,15 +1478,12 @@ def simulate_alphas(
     elif len(families) != len(pairs):
         families = [None] * len(pairs)
 
-    if concurrency is not None and batch_size is not None and concurrency != batch_size:
-        raise ValueError("concurrency and batch_size specify conflicting budgets")
-    requested = concurrency if concurrency is not None else batch_size
     import simulation_capabilities
     import simulation_slots
 
     if capability_snapshot is None and not dry_run:
         capability_snapshot = simulation_capabilities.cached()
-    plan = concurrency_plan(None if dry_run else s, requested,
+    plan = concurrency_plan(None if dry_run else s, concurrency,
                             (capability_snapshot or {}) if dry_run else capability_snapshot)
     batch_size = max(1, plan["effective"])
     if scheduling_report is not None:
@@ -2546,157 +2460,6 @@ def list_alphas(s, limit=100, offset=0, order="-is.sharpe", status="UNSUBMITTED"
     return _as_results(payload, "alphas")
 
 
-def alpha_record_fields(record):
-    """Return ``(expression, sharpe, decay)`` from a :func:`list_alphas` record.
-
-    Also accepts the legacy tuples the old ``get_alphas`` returned, so old
-    notebooks keep working.
-    """
-    if isinstance(record, dict):
-        expression, _, _ = regular_expression(record)
-        metrics = record.get("is") or {}
-        settings = record.get("settings") or {}
-        return expression, metrics.get("sharpe"), settings.get("decay")
-    if isinstance(record, (list, tuple)) and len(record) >= 3:
-        return record[1], record[2], record[-1]
-    return None, None, None
-
-
-def prune(alpha_records, prefix, keep_num):
-    """Keep the top ``keep_num`` alphas per datafield, ordered by sharpe.
-
-    ``alpha_records`` is what :func:`list_alphas` returns. Fields are read out
-    of the expression after ``prefix`` (e.g. ``fnd6``, ``anl4``); a negative
-    sharpe goes into a separate ``-field`` bucket so one bad field cannot crowd
-    out a good one. Returns ``[[expression, decay], ...]``.
-    """
-    output = []
-    counts = defaultdict(int)
-    for record in alpha_records:
-        expression, sharpe, decay = alpha_record_fields(record)
-        if not expression:
-            continue
-        field = expression.split(prefix)[-1].split(",")[0]
-        if sharpe is not None and sharpe < 0:
-            field = "-%s" % field
-        if counts[field] < keep_num:
-            counts[field] += 1
-            output.append([expression, decay])
-    return output
-
-
-def group_factory(op, field, region):
-    output = []
-    vectors = ["cap"] 
-    
-    usa_group_13 = ['pv13_h_min2_3000_sector','pv13_r2_min20_3000_sector','pv13_r2_min2_3000_sector',
-                    'pv13_r2_min2_3000_sector', 'pv13_h_min2_focused_pureplay_3000_sector']
-    
-    cap_group = "bucket(rank(cap), range='0.1, 1, 0.1')"
-    asset_group = "bucket(rank(assets),range='0.1, 1, 0.1')"
-    sector_cap_group = "bucket(group_rank(cap, sector),range='0.1, 1, 0.1')"
-    sector_asset_group = "bucket(group_rank(assets, sector),range='0.1, 1, 0.1')"
-
-    vol_group = "bucket(rank(ts_std_dev(returns,20)),range = '0.1, 1, 0.1')"
-
-    liquidity_group = "bucket(rank(close*volume),range = '0.1, 1, 0.1')"
-
-    groups = ["market","sector", "industry", "subindustry",
-              cap_group, asset_group, sector_cap_group, sector_asset_group, vol_group, liquidity_group]
-    
-    groups += usa_group_13
-        
-    for group in groups:
-        if op.startswith("group_vector"):
-            for vector in vectors:
-                alpha = "%s(%s,%s,densify(%s))"%(op, field, vector, group)
-                output.append(alpha)
-        elif op.startswith("group_percentage"):
-            alpha = "%s(%s,densify(%s),percentage=0.5)"%(op, field, group)
-            output.append(alpha)
-        else:
-            alpha = "%s(%s,densify(%s))"%(op, field, group)
-            output.append(alpha)
-        
-    return output
-
-def get_check_submission(s, alpha_id):
-    while True:
-        result = s.get("https://api.worldquantbrain.com/alphas/" + alpha_id + "/check")
-        if "retry-after" in result.headers:
-            time.sleep(float(result.headers["Retry-After"]))
-        else:
-            break
-    try:
-        if result.json().get("is", 0) == 0:
-            print("logged out")
-            return "sleep"
-        checks = result.json()["is"]["checks"]
-        if not any("value" in check for check in checks) or not any("result" in check for check in checks):
-            raise KeyError("checks require value and result columns")
-        pc = next(check.get("value", math.nan) for check in checks
-                  if check.get("name") == "SELF_CORRELATION")
-        if not any(check.get("result") == "FAIL" for check in checks):
-            return pc
-        else:
-            return "fail"
-    except:
-        print("catch: %s"%(alpha_id))
-        return "error"
-    
-def locate_alpha(s, alpha_id):
-    while True:
-        alpha = s.get("https://api.worldquantbrain.com/alphas/" + alpha_id)
-        if "retry-after" in alpha.headers:
-            time.sleep(float(alpha.headers["Retry-After"]))
-        else:
-            break
-    string = alpha.content.decode('utf-8')
-    metrics = json.loads(string)
-    #print(metrics["regular"]["code"])
-    
-    dateCreated = metrics["dateCreated"]
-    sharpe = metrics["is"]["sharpe"]
-    fitness = metrics["is"]["fitness"]
-    turnover = metrics["is"]["turnover"]
-    margin = metrics["is"]["margin"]
-    decay = metrics["settings"]["decay"]
-    exp = metrics['regular']['code']
-    
-    triple = [alpha_id, exp, sharpe, turnover, fitness, margin, dateCreated, decay]
-    return triple
-            
-
-# Consultant methods
-# some other factory for other operators
-def vector_factory(op, field):
-    output = []
-    vectors = ["cap"]
-    
-    for vector in vectors:
-    
-        alpha = "%s(%s, %s)"%(op, field, vector)
-        output.append(alpha)
-    
-    return output
- 
-def ts_comp_factory(op, field, factor, paras):
-    output = []
-    #l1, l2 = [3, 5, 10, 20, 60, 120, 240], paras
-    l1, l2 = [5, 22, 66, 240], paras
-    comb = list(product(l1, l2))
-    
-    for day,para in comb:
-        
-        if type(para) == float:
-            alpha = "%s(%s, %d, %s=%.1f)"%(op, field, day, factor, para)
-        elif type(para) == int:
-            alpha = "%s(%s, %d, %s=%d)"%(op, field, day, factor, para)
-            
-        output.append(alpha)
-    
-    return output
- 
 # ---------------------------------------------------------------------------
 # Out-of-sample split
 # ---------------------------------------------------------------------------

@@ -7,6 +7,7 @@ import difflib
 import json
 import math
 import os
+from functools import partial
 from importlib import import_module
 
 import alpha_registry
@@ -15,8 +16,14 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 
-from . import account, alphas, benchmark, feed, independence, triage, legs, mine, pairs, promote, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
+from .selection import DEFAULT_PROMOTION_RETENTION
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
+
+
+def _dispatch_handler(target, args, sink):
+    module_name, handler_name = target.split(".")
+    module = import_module(f".{module_name}", __package__)
+    return getattr(module, handler_name)(args, sink)
 
 
 class HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
@@ -38,6 +45,10 @@ class JsonArgumentParser(argparse.ArgumentParser):
         self.set_defaults(_parser=self)
         if common:
             _add_common_args(self)
+
+    def bind_handler(self, target):
+        """Bind a command without importing its implementation while parsing."""
+        self.set_defaults(func=partial(_dispatch_handler, target))
 
     def add_argument(self, *args, **kwargs):
         action = super().add_argument(*args, **kwargs)
@@ -218,19 +229,13 @@ def _add_settings_args(parser):
 
 def _add_reference_commands(sub):
     def add(group, name, target, help_text):
-        module_name, handler_name = target.split(".")
-
-        def dispatch(args, sink):
-            module = import_module(f".{module_name}", __package__)
-            return getattr(module, handler_name)(args, sink)
-
         command = group.add_parser(name, help=help_text)
         _add_session_args(command, reference=True)
         command.add_argument("--offline", action="store_true",
                              help="Read only a fresh cache entry for the current account. "
                                   "A cache miss returns NOT_FOUND without a network request. "
                                   "Incompatible with --refresh-meta, --no-cache and --relogin.")
-        command.set_defaults(func=dispatch)
+        command.bind_handler(target)
         return command
 
     def paginate(command, *, cursor=False):
@@ -282,12 +287,12 @@ def build_parser():
                        "arguments, research-file format, error codes).")
     schema.add_argument("name", nargs="*", metavar="COMMAND",
                         help="Restrict to a command path, e.g. catalog fields or alpha get.")
-    schema.set_defaults(func=cmd_schema)
+    schema.set_defaults(func=partial(cmd_schema, parser))
 
     help_command = sub.add_parser("help", help="Show a concise guide or help for a command path.")
     help_command.add_argument("path", nargs="*", metavar="COMMAND",
                               help="Command path, e.g. help catalog fields.")
-    help_command.set_defaults(func=cmd_help)
+    help_command.set_defaults(func=partial(cmd_help, parser))
 
     auth = sub.add_parser("auth", help="Credential and session checks.")
     auth_sub = auth.add_subparsers(dest="subcommand", metavar="<check>",
@@ -295,11 +300,11 @@ def build_parser():
     auth_check = auth_sub.add_parser(
         "check", help="Verify credentials and report account permissions.")
     _add_session_args(auth_check)
-    auth_check.set_defaults(func=account.cmd_auth_check)
+    auth_check.bind_handler("account.cmd_auth_check")
 
     auth_logout = auth_sub.add_parser(
         "logout", help="Forget the cached session cookie (local only).")
-    auth_logout.set_defaults(func=account.cmd_auth_logout)
+    auth_logout.bind_handler("account.cmd_auth_logout")
 
     pairs_parser = sub.add_parser(
         "pairs", help="Screen cached alphas for a combination worth simulating.",
@@ -334,7 +339,7 @@ def build_parser():
                                    "they would add to the book.")
     pairs_parser.add_argument("--limit", type=int, default=12)
     pairs_parser.add_argument("--registry", default=None)
-    pairs_parser.set_defaults(func=pairs.cmd_pairs)
+    pairs_parser.bind_handler("pairs.cmd_pairs")
 
     marginal_parser = sub.add_parser(
         "marginal",
@@ -344,7 +349,7 @@ def build_parser():
                     "differ, and only the second one happened.")
     marginal_parser.add_argument("alpha_id")
     marginal_parser.add_argument("--registry", default=None)
-    marginal_parser.set_defaults(func=independence.cmd_marginal)
+    marginal_parser.bind_handler("independence.cmd_marginal")
 
     independence_parser = sub.add_parser(
         "independence", help="Are the book's alphas one bet or many, calm and stressed?",
@@ -353,7 +358,7 @@ def build_parser():
                     "independence is not independence when the book is losing.")
     independence_parser.add_argument("--threshold", type=float, default=0.7)
     independence_parser.add_argument("--registry", default=None)
-    independence_parser.set_defaults(func=independence.cmd_independence)
+    independence_parser.bind_handler("independence.cmd_independence")
 
     legs_parser = sub.add_parser(
         "legs", help="Did a composite behave like the sum of its legs? (cached PnL only)",
@@ -370,7 +375,7 @@ def build_parser():
     legs_parser.add_argument("--composite", default=None, metavar="ID",
                              help="The simulated composite to compare against.")
     legs_parser.add_argument("--registry", default=None)
-    legs_parser.set_defaults(func=legs.cmd_legs)
+    legs_parser.bind_handler("legs.cmd_legs")
 
     mine_parser = sub.add_parser(
         "mine",
@@ -405,7 +410,7 @@ def build_parser():
                                   "never silently aggregate vectors or overwrite an existing spec.")
     mine_parser.add_argument("--name", default=None, help="Spec batch name.")
     mine_parser.add_argument("--registry", default=None)
-    mine_parser.set_defaults(func=mine.cmd_mine)
+    mine_parser.bind_handler("mine.cmd_mine")
 
     prune_parser = sub.add_parser(
         "prune", help="Drop cached results that fail today's bar (dry run by default).",
@@ -423,7 +428,7 @@ def build_parser():
                               help="Print the criteria in force and stop.")
     prune_parser.add_argument("--limit", type=int, default=20)
     prune_parser.add_argument("--registry", default=None)
-    prune_parser.set_defaults(func=prune.cmd_prune)
+    prune_parser.bind_handler("prune.cmd_prune")
 
     bench_parser = sub.add_parser(
         "benchmark",
@@ -436,7 +441,7 @@ def build_parser():
     bench_parser.add_argument("--criteria", default=None,
                               help="Weights file (default: built-in priors).")
     bench_parser.add_argument("--registry", default=None)
-    bench_parser.set_defaults(func=benchmark.cmd_benchmark)
+    bench_parser.bind_handler("benchmark.cmd_benchmark")
     _add_selection_args(bench_parser, freeze=False)
     _add_cost_args(bench_parser)
 
@@ -476,7 +481,7 @@ def build_parser():
                                help="Candidate shelf used by --against-shelf.")
     _add_selection_args(triage_parser)
     _add_cost_args(triage_parser)
-    triage_parser.set_defaults(func=triage.cmd_triage)
+    triage_parser.bind_handler("triage.cmd_triage")
 
     promote_parser = sub.add_parser(
         "promote", help="Freeze, validate, check and shelve one candidate.",
@@ -487,8 +492,8 @@ def build_parser():
     promote_parser.add_argument("--note", default=None)
     retention_option = promote_parser.add_argument(
         "--retention-floor", type=float, default=None,
-        help=f"Minimum test/train Sharpe retention (new selections default to {promote.DEFAULT_RETENTION_FLOOR}).")
-    retention_option.documented_default = promote.DEFAULT_RETENTION_FLOOR
+        help=f"Minimum test/train Sharpe retention (new selections default to {DEFAULT_PROMOTION_RETENTION}).")
+    retention_option.documented_default = DEFAULT_PROMOTION_RETENTION
     promote_parser.add_argument("--max-self-correlation", type=float, default=None, metavar="RHO",
                                 help="Require a measured live self-correlation below this value.")
     promote_source = promote_parser.add_mutually_exclusive_group()
@@ -502,7 +507,7 @@ def build_parser():
                                 help="Run validation and platform checks. Report would_buffer without "
                                      "writing the shelf if eligible.")
     _add_cost_args(promote_parser)
-    promote_parser.set_defaults(func=promote.cmd_promote)
+    promote_parser.bind_handler("promote.cmd_promote")
 
     feed_parser = sub.add_parser(
         "feed",
@@ -562,8 +567,8 @@ def build_parser():
     feed_parser.add_argument("--meta-max-age", type=_non_negative_seconds, default=None,
                              metavar="SECONDS", help="Maximum age of local scoped capability evidence.")
     def _feed_dispatch(args, sink):
-        return feed.cmd_feed_action(args, sink) if getattr(args, "action", False) \
-            else feed.cmd_feed(args, sink)
+        target = "feed.cmd_feed_action" if args.action else "feed.cmd_feed"
+        return _dispatch_handler(target, args, sink)
 
     feed_parser.set_defaults(func=_feed_dispatch)
 
@@ -575,7 +580,7 @@ def build_parser():
         "probe", help="GET a fixed list of endpoints and report status codes.")
     api_probe.add_argument("--alpha", default=None,
                            help="An alpha id for the per-alpha endpoints.")
-    api_probe.set_defaults(func=account.cmd_api_probe)
+    api_probe.bind_handler("account.cmd_api_probe")
 
     _add_reference_commands(sub)
 
@@ -585,12 +590,12 @@ def build_parser():
                                      parser_class=JsonArgumentParser)
     cache_info = cache_sub.add_parser(
         "info", help="Where caches live, what they hold, and how stale they are.")
-    cache_info.set_defaults(func=account.cmd_cache_info)
+    cache_info.bind_handler("account.cmd_cache_info")
     cache_clear = cache_sub.add_parser(
         "clear", help="Drop cached data. Locks are kept for running processes.")
     cache_clear.add_argument("--kind", choices=["session", "metadata", "all"],
                              default="all", help="What to clear (default: all).")
-    cache_clear.set_defaults(func=account.cmd_cache_clear)
+    cache_clear.bind_handler("account.cmd_cache_clear")
 
     catalog_parser = sub.add_parser(
         "catalog", help="Quota-free metadata: operators, datasets, fields.")
@@ -611,7 +616,7 @@ def build_parser():
                         help="Also fetch full documentation for these operators.")
 
     _add_session_args(cat_op)
-    cat_op.set_defaults(func=catalog.cmd_catalog_operators)
+    cat_op.bind_handler("catalog.cmd_catalog_operators")
 
     cat_ds = cat.add_parser("datasets", help="Datasets for a region/universe/delay.")
     cat_ds.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
@@ -625,7 +630,7 @@ def build_parser():
                         help="Bound catalog rows and show reported Pyramid/Theme metadata.")
 
     _add_session_args(cat_ds)
-    cat_ds.set_defaults(func=catalog.cmd_catalog_datasets)
+    cat_ds.bind_handler("catalog.cmd_catalog_datasets")
 
     cat_find = cat.add_parser(
         "find", help="Search every dataset's fields at once (offline once cached).")
@@ -642,7 +647,7 @@ def build_parser():
     cat_find.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
     cat_find.add_argument("--limit", type=int, default=25)
     _add_session_args(cat_find)
-    cat_find.set_defaults(func=catalog.cmd_catalog_find)
+    cat_find.bind_handler("catalog.cmd_catalog_find")
 
     cat_unused = cat.add_parser(
         "unused",
@@ -650,7 +655,7 @@ def build_parser():
     cat_unused.add_argument("--top", type=int, default=4,
                             help="Highest-coverage unused fields to show per dataset.")
     cat_unused.add_argument("--registry", default=None)
-    cat_unused.set_defaults(func=catalog.cmd_catalog_unused)
+    cat_unused.bind_handler("catalog.cmd_catalog_unused")
 
     cat_f = cat.add_parser("fields", help="Datafields of one dataset.")
     cat_f.add_argument("--dataset", required=True, help="Dataset id, e.g. fundamental6.")
@@ -674,7 +679,7 @@ def build_parser():
                        help="Bound field rows and show reported Pyramid/Theme metadata.")
 
     _add_session_args(cat_f)
-    cat_f.set_defaults(func=catalog.cmd_catalog_fields)
+    cat_f.bind_handler("catalog.cmd_catalog_fields")
 
     cat_cc = cat.add_parser(
         "concepts",
@@ -709,7 +714,7 @@ def build_parser():
     cat_cc.add_argument("--limit", type=int, default=40)
 
     _add_session_args(cat_cc)
-    cat_cc.set_defaults(func=catalog.cmd_catalog_concepts)
+    cat_cc.bind_handler("catalog.cmd_catalog_concepts")
 
     cat_vf = cat.add_parser(
         "verify",
@@ -724,7 +729,7 @@ def build_parser():
                         help="Exit with INVALID_INPUT when any name is unknown.")
 
     _add_session_args(cat_vf)
-    cat_vf.set_defaults(func=catalog.cmd_catalog_verify)
+    cat_vf.bind_handler("catalog.cmd_catalog_verify")
 
     cat_c = cat.add_parser("categories", help="Data categories with crowding stats.")
     cat_c.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
@@ -732,7 +737,7 @@ def build_parser():
     cat_c.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
 
     _add_session_args(cat_c)
-    cat_c.set_defaults(func=catalog.cmd_catalog_categories)
+    cat_c.bind_handler("catalog.cmd_catalog_categories")
 
     cat_audit = cat.add_parser(
         "field-audit",
@@ -754,7 +759,7 @@ def build_parser():
     cat_audit.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
 
     _add_session_args(cat_audit)
-    cat_audit.set_defaults(func=catalog.cmd_catalog_field_audit)
+    cat_audit.bind_handler("catalog.cmd_catalog_field_audit")
 
     lint = sub.add_parser(
         "lint",
@@ -778,7 +783,7 @@ def build_parser():
                       help="Override the learned denylist path.")
 
     _add_session_args(lint)
-    lint.set_defaults(func=validation.cmd_lint)
+    lint.bind_handler("validation.cmd_lint")
 
     papers = sub.add_parser(
         "paper",
@@ -803,7 +808,7 @@ def build_parser():
     papers.add_argument("--min-citations", type=int, default=None,
                         help="Drop papers with fewer citations than this.")
 
-    papers.set_defaults(func=literature.cmd_paper)
+    papers.bind_handler("literature.cmd_paper")
 
     sim = sub.add_parser(
         "simulate", help="Simulate alphas; preview with --dry-run before using platform capacity.")
@@ -851,7 +856,7 @@ def build_parser():
     sim.add_argument("--verbose", action="store_true",
                      help="With --stream, also emit per-poll events.")
     _add_session_args(sim)
-    sim.set_defaults(func=experiments.cmd_simulate)
+    sim.bind_handler("experiments.cmd_simulate")
 
     resume = sub.add_parser(
         "resume", help="Resume pending/queued simulations from a checkpoint.")
@@ -868,7 +873,7 @@ def build_parser():
     resume.add_argument("--verbose", action="store_true",
                         help="With --stream, also emit per-poll events.")
     _add_session_args(resume)
-    resume.set_defaults(func=experiments.cmd_resume)
+    resume.bind_handler("experiments.cmd_resume")
 
     abl = sub.add_parser(
         "ablate",
@@ -892,7 +897,7 @@ def build_parser():
     abl.add_argument("--out", default=None,
                      help="Write the research file here instead of only reporting it.")
 
-    abl.set_defaults(func=experiments.cmd_ablate)
+    abl.bind_handler("experiments.cmd_ablate")
 
     cmp_ = sub.add_parser(
         "compare",
@@ -922,7 +927,7 @@ def build_parser():
     cmp_.add_argument("--format", choices=("json", "markdown"), default="json",
                       help="Include a Markdown table inside the JSON result; missing evidence stays unknown.")
 
-    cmp_.set_defaults(func=experiments.cmd_compare)
+    cmp_.bind_handler("experiments.cmd_compare")
 
     brief = sub.add_parser(
         "brief",
@@ -936,7 +941,7 @@ def build_parser():
                        help="Maximum items per list: scores, setbacks, write-ups, and each thread state (at least 1).")
     brief.add_argument("--registry", default=None)
 
-    brief.set_defaults(func=campaign.cmd_brief)
+    brief.bind_handler("campaign.cmd_brief")
 
     ask = sub.add_parser(
         "ask",
@@ -945,10 +950,10 @@ def build_parser():
                     "or correlate cached PnL without network requests.")
     ask.add_argument("--where", default="",
                      help="Comma list of field=value / field!=value; fields: " +
-                          ", ".join(ledger._ASK_FIELDS) +
+                          ", ".join(alpha_registry.QUERY_FIELDS) +
                           " plus check=NAME:RESULT and has=metrics|pnl|checks.")
     ask.add_argument("--by", default=None,
-                     help="Grouping axis; one of " + ", ".join(ledger._ASK_FIELDS) + ".")
+                     help="Grouping axis; one of " + ", ".join(alpha_registry.QUERY_FIELDS) + ".")
     ask.add_argument("--stat", default="n",
                      help="Comma list: n, floor_share, median:METRIC, mean:METRIC, "
                           "p25:METRIC, p75:METRIC, min:METRIC, max:METRIC.")
@@ -981,7 +986,7 @@ def build_parser():
     ask.add_argument("--limit", type=int, default=20,
                      help="Maximum listed entries or correlation pairs.")
     ask.add_argument("--registry", default=None)
-    ask.set_defaults(func=ledger.cmd_ask)
+    ask.bind_handler("ledger.cmd_ask")
 
     probe = sub.add_parser(
         "probe",
@@ -1032,7 +1037,7 @@ def build_parser():
     _add_selection_args(probe, freeze=False)
     _add_cost_args(probe)
 
-    probe.set_defaults(func=experiments.cmd_probe)
+    probe.bind_handler("experiments.cmd_probe")
 
     views = sub.add_parser(
         "views",
@@ -1041,7 +1046,7 @@ def build_parser():
     views.add_argument("--alpha", default=None, help="Only entries naming this alpha id.")
     views.add_argument("--limit", type=int, default=50)
 
-    views.set_defaults(func=campaign.cmd_views)
+    views.bind_handler("campaign.cmd_views")
 
     alpha = sub.add_parser("alpha", help="Inspect the account's alphas (quota-free).")
     alpha_sub = alpha.add_subparsers(dest="subcommand", metavar="<action>",
@@ -1058,7 +1063,7 @@ def build_parser():
                        help="Maximum seconds to wait for asynchronous merged performance (default 180).")
     _add_session_args(a_get)
 
-    a_get.set_defaults(func=alphas.cmd_alpha_get)
+    a_get.bind_handler("alphas.cmd_alpha_get")
 
     a_near = alpha_sub.add_parser(
         "near", help="Book alphas closest in structure to an expression (offline).",
@@ -1071,7 +1076,7 @@ def build_parser():
     a_near.add_argument("--status", default=None, help="Filter candidates by status, e.g. ACTIVE.")
     a_near.add_argument("--limit", type=int, default=8)
     a_near.add_argument("--registry", default=None)
-    a_near.set_defaults(func=alphas.cmd_alpha_near)
+    a_near.bind_handler("alphas.cmd_alpha_near")
 
     a_chk = alpha_sub.add_parser(
         "check",
@@ -1083,7 +1088,7 @@ def build_parser():
                        help="Seconds to wait for each alpha's async check job (default 180).")
     _add_session_args(a_chk)
 
-    a_chk.set_defaults(func=alphas.cmd_alpha_check)
+    a_chk.bind_handler("alphas.cmd_alpha_check")
 
     a_sc = alpha_sub.add_parser(
         "self-corr",
@@ -1096,7 +1101,7 @@ def build_parser():
     a_sc.add_argument("--sharpe-margin", type=float, default=1.10)
 
     _add_session_args(a_sc)
-    a_sc.set_defaults(func=alphas.cmd_alpha_self_corr)
+    a_sc.bind_handler("alphas.cmd_alpha_self_corr")
 
     a_desc = alpha_sub.add_parser(
         "describe",
@@ -1114,7 +1119,7 @@ def build_parser():
                              "the payload rather than as a top-level property.")
 
     _add_session_args(a_desc)
-    a_desc.set_defaults(func=alphas.cmd_alpha_describe)
+    a_desc.bind_handler("alphas.cmd_alpha_describe")
 
     a_sub = alpha_sub.add_parser(
         "submit",
@@ -1130,7 +1135,7 @@ def build_parser():
     _add_cost_args(a_sub)
     _add_session_args(a_sub)
 
-    a_sub.set_defaults(func=alphas.cmd_alpha_submit)
+    a_sub.bind_handler("alphas.cmd_alpha_submit")
 
     a_expl = alpha_sub.add_parser(
         "explain",
@@ -1141,7 +1146,7 @@ def build_parser():
                              "<research>/pnl, which is a few hundred small files)")
     _add_session_args(a_expl)
 
-    a_expl.set_defaults(func=alphas.cmd_alpha_explain)
+    a_expl.bind_handler("alphas.cmd_alpha_explain")
 
     a_list = alpha_sub.add_parser("list", help="List the account's alphas.")
     a_list.add_argument("--limit", type=int, default=20)
@@ -1160,7 +1165,7 @@ def build_parser():
                              "offset/limit apply to the combined sorted page.")
     _add_session_args(a_list)
 
-    a_list.set_defaults(func=alphas.cmd_alpha_list)
+    a_list.bind_handler("alphas.cmd_alpha_list")
 
     ledger_parser = sub.add_parser(
         "ledger", help="Record and explore the durable local research ledger.",
@@ -1185,7 +1190,7 @@ def build_parser():
                        help="Return-source grouping; declared, never inferred.")
     l_rec.add_argument("--registry", default=None)
     _add_session_args(l_rec)
-    l_rec.set_defaults(func=ledger.cmd_ledger_record)
+    l_rec.bind_handler("ledger.cmd_ledger_record")
 
     l_list = ledger_sub.add_parser(
         "list", help="List or search the durable ledger (offline).",
@@ -1219,7 +1224,7 @@ def build_parser():
     l_list.add_argument("--format", choices=["json", "markdown"], default="json",
                         help="Markdown adds a table inside the JSON envelope.")
     l_list.add_argument("--registry", default=None)
-    l_list.set_defaults(func=ledger.cmd_ledger_list)
+    l_list.bind_handler("ledger.cmd_ledger_list")
 
     l_lbl = ledger_sub.add_parser(
         "label",
@@ -1233,7 +1238,7 @@ def build_parser():
     l_lbl.add_argument("--idea", default=None)
     l_lbl.add_argument("--note", default=None)
     l_lbl.add_argument("--registry", default=None)
-    l_lbl.set_defaults(func=ledger.cmd_ledger_label)
+    l_lbl.bind_handler("ledger.cmd_ledger_label")
 
     l_imp = ledger_sub.add_parser(
         "impact",
@@ -1244,7 +1249,7 @@ def build_parser():
     l_imp.add_argument("--min-shared", type=int, default=1)
     l_imp.add_argument("--limit", type=int, default=25)
     l_imp.add_argument("--registry", default=None)
-    l_imp.set_defaults(func=ledger.cmd_ledger_impact)
+    l_imp.bind_handler("ledger.cmd_ledger_impact")
 
     for parser_name in ("l_lst",):
         pass
@@ -1254,7 +1259,7 @@ def build_parser():
         description="Shows where a variant came from and by which operation.")
     l_lin.add_argument("alpha_id")
     l_lin.add_argument("--registry", default=None)
-    l_lin.set_defaults(func=ledger.cmd_ledger_lineage)
+    l_lin.bind_handler("ledger.cmd_ledger_lineage")
 
     l_cov = ledger_sub.add_parser(
         "coverage",
@@ -1265,7 +1270,7 @@ def build_parser():
     l_cov.add_argument("--list-missing", action="store_true",
                        help="Also list keys missing a family, most recent first.")
     l_cov.add_argument("--limit", type=int, default=40)
-    l_cov.set_defaults(func=ledger.cmd_ledger_coverage)
+    l_cov.bind_handler("ledger.cmd_ledger_coverage")
 
     l_sync = ledger_sub.add_parser(
         "sync",
@@ -1287,7 +1292,7 @@ def build_parser():
                         help="Explicit type exclusion; omitted means no type exclusion.")
     l_sync.add_argument("--pnl", action="store_true",
                         help="Refresh daily PnL and record pagination/coverage evidence.")
-    l_sync.set_defaults(func=ledger.cmd_ledger_sync)
+    l_sync.bind_handler("ledger.cmd_ledger_sync")
 
     l_fmt = ledger_sub.add_parser(
         "fmt", help="Reformat stored expressions in the book's multi-line style.",
@@ -1296,7 +1301,7 @@ def build_parser():
                     "keeps its canonical expression_hash, and it backs the file up first.")
     l_fmt.add_argument("--registry", default=None)
     l_fmt.add_argument("--dry-run", action="store_true", dest="dry_run")
-    l_fmt.set_defaults(func=ledger.cmd_ledger_format)
+    l_fmt.bind_handler("ledger.cmd_ledger_format")
 
     l_decay = ledger_sub.add_parser(
         "decay", help="How much train Sharpe survives to the full window, per block.")
@@ -1304,7 +1309,7 @@ def build_parser():
                          dest="min_train_sharpe")
     l_decay.add_argument("--min-arms", type=int, default=15, dest="min_arms")
     l_decay.add_argument("--registry", default=None)
-    l_decay.set_defaults(func=ledger.cmd_ledger_decay)
+    l_decay.bind_handler("ledger.cmd_ledger_decay")
 
     l_form = ledger_sub.add_parser(
         "form", help="Level vs change construction, measured per information block.")
@@ -1312,7 +1317,7 @@ def build_parser():
     l_form.add_argument("--min-per-form", type=int, default=10, dest="min_per_form")
     l_form.add_argument("--include-book", action="store_true", dest="include_book")
     l_form.add_argument("--registry", default=None)
-    l_form.set_defaults(func=ledger.cmd_ledger_form)
+    l_form.bind_handler("ledger.cmd_ledger_form")
 
     l_cards = ledger_sub.add_parser(
         "cards", help="Mechanism cards: the queue of external knowledge (offline).",
@@ -1328,7 +1333,7 @@ def build_parser():
                          help="Filter by status, e.g. UNTESTED,TESTING.")
     l_cards.add_argument("--limit", type=int, default=20)
     l_cards.add_argument("--cards", default=None, help="Card store path.")
-    l_cards.set_defaults(func=ledger.cmd_ledger_cards)
+    l_cards.bind_handler("ledger.cmd_ledger_cards")
 
     l_mech = ledger_sub.add_parser(
         "mechanisms", help="Independent mechanisms and their outcomes (offline).",
@@ -1342,7 +1347,7 @@ def build_parser():
     l_mech.add_argument("--list", action="store_true", help="Show every mechanism.")
     l_mech.add_argument("--limit", type=int, default=15)
     l_mech.add_argument("--registry", default=None)
-    l_mech.set_defaults(func=ledger.cmd_ledger_mechanisms)
+    l_mech.bind_handler("ledger.cmd_ledger_mechanisms")
 
     l_conv = ledger_sub.add_parser(
         "convergence", help="Per-batch novelty and output, for divergence decisions.",
@@ -1352,7 +1357,7 @@ def build_parser():
     l_conv.add_argument("--batches", type=int, default=8)
     l_conv.add_argument("--no-marginal", action="store_true", dest="no_marginal")
     l_conv.add_argument("--registry", default=None)
-    l_conv.set_defaults(func=ledger.cmd_ledger_convergence)
+    l_conv.bind_handler("ledger.cmd_ledger_convergence")
 
     l_stab = ledger_sub.add_parser(
         "stability",
@@ -1367,7 +1372,7 @@ def build_parser():
                         help="Both halves must exceed this |Sharpe| to count as a flip.")
     l_stab.add_argument("--limit", type=int, default=10)
     l_stab.add_argument("--list", action="store_true", help="Also list every flip.")
-    l_stab.set_defaults(func=ledger.cmd_ledger_stability)
+    l_stab.bind_handler("ledger.cmd_ledger_stability")
 
     l_sty = ledger_sub.add_parser(
         "styles",
@@ -1382,7 +1387,7 @@ def build_parser():
                        help="Bare status filter, e.g. ACTIVE (comma separated).")
     l_sty.add_argument("--list", action="store_true",
                        help="Also list the level-only alphas in full.")
-    l_sty.set_defaults(func=ledger.cmd_ledger_styles)
+    l_sty.bind_handler("ledger.cmd_ledger_styles")
 
     buf = sub.add_parser(
         "buffer", help="Hold alphas that passed every check but were not submitted.",
@@ -1401,20 +1406,20 @@ def build_parser():
     b_add.add_argument("--registry", default=None)
     _add_selection_args(b_add, freeze=False)
     _add_cost_args(b_add)
-    b_add.set_defaults(func=buffer_cmd.cmd_buffer_add)
+    b_add.bind_handler("buffer_cmd.cmd_buffer_add")
 
     b_list = buf_sub.add_parser("list", help="Show the shelf and how stale it is.")
     b_list.add_argument("--buffer", default=None)
     b_list.add_argument("--registry", default=None)
     _add_cost_args(b_list)
-    b_list.set_defaults(func=buffer_cmd.cmd_buffer_list)
+    b_list.bind_handler("buffer_cmd.cmd_buffer_list")
 
     b_drop = buf_sub.add_parser("drop", help="Take an alpha off the shelf.")
     b_drop.add_argument("alpha_id")
     b_drop.add_argument("--note", default=None)
     b_drop.add_argument("--buffer", default=None)
     b_drop.add_argument("--registry", default=None)
-    b_drop.set_defaults(func=buffer_cmd.cmd_buffer_drop)
+    b_drop.bind_handler("buffer_cmd.cmd_buffer_drop")
 
     b_sub = buf_sub.add_parser("submit", help="Submit a shelved alpha (irreversible).")
     b_sub.add_argument("alpha_id")
@@ -1426,7 +1431,7 @@ def build_parser():
     b_sub.add_argument("--registry", default=None)
     _add_selection_args(b_sub, freeze=False)
     _add_cost_args(b_sub)
-    b_sub.set_defaults(func=buffer_cmd.cmd_buffer_submit)
+    b_sub.bind_handler("buffer_cmd.cmd_buffer_submit")
 
     fmt = sub.add_parser(
         "fmt", help="Format an alpha expression (or every arm in a spec file).",
@@ -1437,7 +1442,7 @@ def build_parser():
     fmt.add_argument("target", help="An expression string, or the path to a spec JSON.")
     fmt.add_argument("--write", action="store_true",
                      help="Rewrite the spec file in place (only for spec paths).")
-    fmt.set_defaults(func=experiments.cmd_fmt)
+    fmt.bind_handler("experiments.cmd_fmt")
 
     health = sub.add_parser(
         "health",
@@ -1463,7 +1468,7 @@ def build_parser():
     health.add_argument("--limit", type=int, default=8)
     health.add_argument("--min-overlap", type=int, default=500, dest="min_overlap")
     health.add_argument("--registry", default=None)
-    health.set_defaults(func=campaign.cmd_health)
+    health.bind_handler("campaign.cmd_health")
 
     br = sub.choices["brief"]
     br.add_argument("--drift", action="store_true",
@@ -1499,7 +1504,7 @@ def build_parser():
     a_self.add_argument("--max-age-hours", type=float, default=168.0,
                         help="Trust a cached PnL series younger than this (default 168).")
     _add_session_args(a_self)
-    a_self.set_defaults(func=alphas.cmd_alpha_self_check)
+    a_self.bind_handler("alphas.cmd_alpha_self_check")
 
     a_corr = alpha_sub.add_parser(
         "corr",
@@ -1523,7 +1528,7 @@ def build_parser():
                         help="Reuse cached PnL younger than this (default 24).")
 
     _add_session_args(a_corr)
-    a_corr.set_defaults(func=alphas.cmd_alpha_corr)
+    a_corr.bind_handler("alphas.cmd_alpha_corr")
 
     a_book = alpha_sub.add_parser(
         "book",
@@ -1538,7 +1543,7 @@ def build_parser():
     a_book.add_argument("--registry", default=None)
     _add_session_args(a_book)
 
-    a_book.set_defaults(func=alphas.cmd_alpha_book)
+    a_book.bind_handler("alphas.cmd_alpha_book")
 
     _attach_examples(parser)
     return parser
@@ -1658,9 +1663,8 @@ def _attach_examples(parser):
         _attach_examples(child)
 
 
-def _find_command_parser(path):
-    parser = build_parser()
-    parts = path.split() if isinstance(path, str) else [word for part in path or [] for word in part.split()]
+def _find_command_parser(parser, path):
+    parts = [word for part in path for word in part.split()]
     for part in parts:
         children = _command_children(parser)
         if part not in children:
@@ -1726,19 +1730,19 @@ def _help_document(parser):
     return document
 
 
-def cmd_help(args, _sink):
+def cmd_help(parser, args, _sink):
     """Return structured usage and command options for a command path."""
-    return _help_document(_find_command_parser(getattr(args, "path", [])))
+    return _help_document(_find_command_parser(parser, args.path))
 
 
-def cmd_schema(args, _sink):
+def cmd_schema(parser, args, _sink):
     """Emit the full machine-readable call contract or one command's schema."""
     if args.name:
-        selected = _find_command_parser(args.name)
+        selected = _find_command_parser(parser, args.name)
         return {"tool": "research_cli.py", "version": VERSION,
                 "exit_codes": EXIT_CODES, "error_codes": ERROR_CODES,
                 "command": describe_parser(selected, " ".join(selected.prog.split()[1:]))}
-    described = describe_parser(build_parser())
+    described = describe_parser(parser)
     contract = {
         "tool": "research_cli.py",
         "version": VERSION,

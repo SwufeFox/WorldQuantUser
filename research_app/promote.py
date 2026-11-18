@@ -15,9 +15,6 @@ from . import alphas, buffer_cmd, selection, triage
 from .experiments import _selection_call
 from .runtime import CliError, note, protect_output
 
-DEFAULT_RETENTION_FLOOR = 0.2
-
-
 def _finite(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
@@ -65,12 +62,13 @@ def cmd_promote(args, sink):
             for key, provided in (("retention_floor", retention_floor), ("cost_bps", cost_bps)):
                 if provided is not None and provided != saved_criteria.get(key):
                     raise CliError("INVALID_INPUT", f"{key} conflicts with the frozen selection")
-            retention_floor = saved_criteria.get("retention_floor", DEFAULT_RETENTION_FLOOR)
+            retention_floor = saved_criteria.get("retention_floor", selection.DEFAULT_PROMOTION_RETENTION)
             cost_bps = saved_criteria.get("cost_bps")
             frozen = {"selection_id": manifest["selection_id"], "rows": manifest["rows"],
                       "criteria": saved_criteria, "window": manifest["window"]}
         else:
-            retention_floor = DEFAULT_RETENTION_FLOOR if retention_floor is None else retention_floor
+            if retention_floor is None:
+                retention_floor = selection.DEFAULT_PROMOTION_RETENTION
         if not _finite(retention_floor):
             raise CliError("INVALID_INPUT", "retention floor must be finite")
         if not saved_choice:

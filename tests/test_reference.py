@@ -232,7 +232,7 @@ def test_forum_cache_is_lazy_and_account_scoped(support_transport, monkeypatch, 
     assert error.value.code == "NOT_FOUND"
     assert get.call_count == 1
     assert reference.cmd_forum_get(opts, None)["post"]["details"] == "<p>Account two</p>"
-    assert load.call_args.kwargs["expected_username"] == "second-reference-account"
+    assert load.call_count == 2
 
     cache_files = list(tmp_path.glob("cache/metadata/reference-support/*.json"))
     assert len(cache_files) == 2

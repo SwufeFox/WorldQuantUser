@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import re
 
-from .reference_cache import read_cached, with_reference_session
-from .runtime import CliError
+from .reference_cache import read_cached
+from .runtime import CliError, with_session
 from .support_reader import support_get, support_pagination, with_support
 
 
@@ -42,9 +42,8 @@ def _read(args, path, params, project):
         with with_support(brain_session) as support_session:
             return project(support_get(support_session, path, params=params))
 
-    result = read_cached(args, "support", {"path": path, "params": params or {}},
-                         lambda: with_reference_session(args, read))
-    return {**result["data"], "cache": result["cache"]}
+    return read_cached(args, "support", {"path": path, "params": params or {}},
+                       lambda: with_session(args, read))
 
 
 def _records(payload, key, fields):

@@ -5,32 +5,22 @@ from __future__ import annotations
 from contextlib import ExitStack
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import cache_store
 import machine_lib as ml
 import research_paths
 
-from .runtime import CliError, protect_output, with_session
+from .runtime import CliError, protect_output
 
 
 _KIND_PREFIX = "reference-"
 
 
-def _configured_username():
-    ml._load_dotenv()
-    return os.environ.get("BRAIN_USERNAME", "").strip().casefold() or None
-
-
-def with_reference_session(args, work):
-    return with_session(args, work, expected_username=_configured_username())
-
-
 def _result(data, entry=None, *, hit=False):
     entry = entry or {}
-    return {"data": data, "cache": {"hit": hit, "age_seconds": entry.get("age_seconds"),
-                                    "created_at": entry.get("created_at")}}
+    return {**data, "cache": {"hit": hit, "age_seconds": entry.get("age_seconds"),
+                              "created_at": entry.get("created_at")}}
 
 
 def _content_digest(data):
@@ -51,10 +41,7 @@ def _protect_cache_output(args):
 
 
 def _hit(path, kind, params, max_age):
-    try:
-        entry = cache_store.read_entry(path)
-    except (AttributeError, TypeError, ValueError):
-        return None
+    entry = cache_store.read_entry(path)
     payload = entry["payload"]
     age = entry["age_seconds"]
     if (entry["present"] and entry["fresh"] and entry["kind"] == kind
@@ -79,7 +66,8 @@ def read_cached(args, kind, key, fetch):
     max_age = getattr(args, "meta_max_age", None)
     if max_age is None:
         max_age = policy["max_age"]
-    username = _configured_username()
+    username = ml.configured_username().casefold()
+    path = None
     if username and not bypass and policy["enabled"] and max_age > 0:
         account = hashlib.sha256(username.encode()).hexdigest()
         kind = _KIND_PREFIX + kind
@@ -89,26 +77,27 @@ def read_cached(args, kind, key, fetch):
             cached = _hit(path, kind, params, max_age)
             if cached is not None:
                 return cached
-        if not offline:
-            with ExitStack() as stack:
-                try:
-                    stack.enter_context(cache_store.file_lock(path.with_suffix(".lock")))
-                except (OSError, cache_store.CacheError):
-                    return _result(fetch())
-                if not refresh:
-                    cached = _hit(path, kind, params, max_age)
-                    if cached is not None:
-                        return cached
-                data = fetch()
-                entry = cache_store.build_entry(
-                    kind, {"request": params, "data": data, "digest": _content_digest(data)},
-                    ttl=max_age, source="brain-reference")
-                try:
-                    cache_store.write_json_atomic(path, entry)
-                except OSError:
-                    return _result(data)
-                return _result(data, {**entry["_cache"], "age_seconds": 0.0})
     if offline:
         raise CliError("NOT_FOUND", "no fresh cached reference response for this account and request",
                        "run the command online once to populate the cache")
-    return _result(fetch())
+    if path is None:
+        return _result(fetch())
+
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(cache_store.file_lock(path.with_suffix(".lock")))
+        except (OSError, cache_store.CacheError):
+            return _result(fetch())
+        if not refresh:
+            cached = _hit(path, kind, params, max_age)
+            if cached is not None:
+                return cached
+        data = fetch()
+        entry = cache_store.build_entry(
+            kind, {"request": params, "data": data, "digest": _content_digest(data)},
+            ttl=max_age, source="brain-reference")
+        try:
+            cache_store.write_json_atomic(path, entry)
+        except OSError:
+            return _result(data)
+        return _result(data, {**entry["_cache"], "age_seconds": 0.0})

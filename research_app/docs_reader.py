@@ -8,8 +8,8 @@ import requests
 
 import machine_lib as ml
 
-from .reference_cache import read_cached, with_reference_session
-from .runtime import CliError
+from .reference_cache import read_cached
+from .runtime import CliError, with_session
 
 
 _CATALOG = "/tutorials"
@@ -54,7 +54,7 @@ def _cached_catalog(args, session=None):
         try:
             if session is not None:
                 return _fetch_catalog(session)
-            return with_reference_session(args, _fetch_catalog)
+            return with_session(args, _fetch_catalog)
         except requests.RequestException as exc:
             raise CliError("SERVICE_ERROR", "BRAIN tutorial catalog request failed") from exc
 
@@ -72,7 +72,7 @@ def cmd_docs_list(args, _sink):
 
     cached = _cached_catalog(args)
     categories = []
-    for section in cached["data"]["categories"]:
+    for section in cached["categories"]:
         section_matches = needle is None or _matches(
             needle, section["id"], section.get("title"), section.get("category"))
         pages = [page for page in section["pages"]
@@ -88,7 +88,7 @@ def _document_url(args, session, slug):
     # The article endpoint supplies a grouping label (e.g. Getting Started).
     # The web URL also needs the catalog section ID (e.g. discover-brain).
     try:
-        categories = _cached_catalog(args, session)["data"]["categories"]
+        categories = _cached_catalog(args, session)["categories"]
     except (CliError, ml.BrainError):
         # A failed metadata lookup should still leave the successfully read
         # article and its authoritative API URL available.
@@ -115,9 +115,8 @@ def cmd_docs_get(args, _sink):
 
     def fetch():
         try:
-            return with_reference_session(args, work)
+            return with_session(args, work)
         except requests.RequestException as exc:
             raise CliError("SERVICE_ERROR", "BRAIN tutorial document request failed") from exc
 
-    cached = read_cached(args, "brain-tutorial-page", {"slug": slug}, fetch)
-    return {**cached["data"], "cache": cached["cache"]}
+    return read_cached(args, "brain-tutorial-page", {"slug": slug}, fetch)

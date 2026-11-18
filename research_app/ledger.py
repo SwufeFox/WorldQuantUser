@@ -872,11 +872,6 @@ def cmd_ledger_styles(args, _sink):
     return data
 
 
-#: Columns the ledger can be filtered and grouped by. Everything here is read from
-#: an entry, so a new axis is one line rather than a new command.
-_ASK_FIELDS = ("status", "verdict", "family", "region", "universe", "neutralization",
-               "delay", "decay", "month")
-
 #: Aggregations --stat understands. ``floor_share`` is separate from the metric
 #: aggregations because it answers a question about the sample rather than about a
 #: column: how much of it is paying the ``max(turnover, 0.125)`` tax.
@@ -919,9 +914,9 @@ def _ask_filters(text):
         op = "!=" if "!=" in item else "="
         field, _, value = item.partition(op)
         field, value = field.strip(), value.strip()
-        if field not in _ASK_FIELDS + ("check", "has"):
+        if field not in alpha_registry.QUERY_FIELDS + ("check", "has"):
             raise CliError("USAGE", "unknown --where field %r" % field,
-                           "supported: " + ", ".join(_ASK_FIELDS + ("check", "has")))
+                           "supported: " + ", ".join(alpha_registry.QUERY_FIELDS + ("check", "has")))
         filters.append((field, op, value))
     return filters
 
@@ -1177,9 +1172,9 @@ def cmd_ask(args, _sink):
         "rows_matched": len(matched),
     }
     if args.by:
-        if args.by not in _ASK_FIELDS:
+        if args.by not in alpha_registry.QUERY_FIELDS:
             raise CliError("USAGE", "unknown --by axis %r" % args.by,
-                           "supported: " + ", ".join(_ASK_FIELDS))
+                           "supported: " + ", ".join(alpha_registry.QUERY_FIELDS))
         buckets = {}
         for entry in matched:
             buckets.setdefault(_ask_field(entry, args.by), []).append(entry)
