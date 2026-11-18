@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -301,6 +302,61 @@ class ProbeWorkflowTests(unittest.TestCase):
         first = next(row for row in result["rows"] if row["label"] == "first")
         self.assertEqual(first["alpha_id"], "SYNTHETIC_first")
         self.assertTrue(result["complete"])
+
+    def test_probe_restores_progress_saved_only_in_slot_journal(self):
+        self.spec.write_text(json.dumps({"name": "synthetic", "design": "explore",
+            "arms": [{"label": "first", "expression": "rank(close)"}]}), encoding="utf-8")
+        account = {"fingerprint": "synthetic-probe-recovery"}
+        progress_url = "https://api.worldquantbrain.com/simulations/synthetic"
+
+        def interrupted(expressions, settings, **kwargs):
+            reservation, _ = app.simulation_slots.reserve(account, 1)
+            attempt = {"index": 0, "status": "UNKNOWN_SUBMISSION", "submission_attempted": True,
+                       "slot_reservation": reservation}
+            kwargs["on_event"]("submitting", attempt)
+            app.simulation_slots.reconcile_record(attempt, account, outcome="accepted",
+                                                  progress_url=progress_url)
+            raise KeyboardInterrupt
+
+        for mode in ("resume", "recover"):
+            with self.subTest(mode=mode), mock.patch.dict(
+                    os.environ, {"BRAIN_RESEARCH_DIR": str(self.root)}):
+                self.batch = self.root / (mode + ".json")
+                with mock.patch.object(app.guarded_sim, "simulate", side_effect=interrupted):
+                    with self.assertRaises(KeyboardInterrupt):
+                        self.run_probe(no_record=True)
+                saved = json.loads(self.batch.read_text(encoding="utf-8"))
+                self.assertEqual(saved["records"][0]["status"], "UNKNOWN_SUBMISSION")
+                self.assertNotIn("progress_url", saved["records"][0])
+                if mode == "resume":
+                    with mock.patch.object(app, "with_session", side_effect=AssertionError("offline")):
+                        preview = app.cmd_probe(arguments(resume=str(self.batch), dry_run=True), None)
+                    self.assertEqual(preview["continuing"], ["first"])
+                    self.assertEqual(preview["rows"][0]["progress_url"], progress_url)
+                    self.assertEqual(json.loads(self.batch.read_text(encoding="utf-8")), saved)
+                else:
+                    with mock.patch.object(app.simulation_capabilities, "account_provenance",
+                                           return_value={"fingerprint": "another-account"}), \
+                            mock.patch.object(ml, "poll_simulation") as wrong_account_poll:
+                        with self.assertRaisesRegex(CliError, "another or unidentified account"):
+                            app.cmd_probe(arguments(recover=str(self.batch)), None)
+                    wrong_account_poll.assert_not_called()
+                    self.assertEqual(json.loads(self.batch.read_text(encoding="utf-8")), saved)
+
+                with mock.patch.object(app.simulation_capabilities, "account_provenance",
+                                       return_value=account), \
+                        mock.patch.object(ml, "poll_simulation", return_value={
+                            "status": "COMPLETE", "alpha": "SYNTHETIC_first"}) as poll, \
+                        mock.patch.object(ml, "fetch_alpha_metrics", return_value={
+                            "status": "COMPLETE", "is": {"fitness": 1.1}, "train": {"fitness": 1.0}}), \
+                        mock.patch.object(ml, "submit_single_simulation") as post, \
+                        mock.patch.object(ml, "list_alphas") as search:
+                    result = app.cmd_probe(arguments(**{mode: str(self.batch)}), None)
+                self.assertEqual(poll.call_args.args[1], progress_url)
+                post.assert_not_called()
+                search.assert_not_called()
+                self.assertEqual(result["rows"][0]["alpha_id"], "SYNTHETIC_first")
+                self.assertEqual(app.simulation_slots.snapshot(account, 1)["active"], 0)
 
     def test_incomplete_pnl_does_not_produce_train_halves(self):
         record = finished("SYNTHETIC_A")

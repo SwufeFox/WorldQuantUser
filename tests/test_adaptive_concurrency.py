@@ -234,15 +234,23 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
 
     def test_recovery_reuses_progress_without_repost_and_preserves_role(self):
         identity, _ = simulation_slots.reserve(ACCOUNT, 1)
-        record = {"expression": "rank(cap)", "decay": 0, "status": "UNKNOWN_SUBMISSION",
-                  "submission_attempted": True, "slot_reservation": identity, "role": "diagnostic"}
-        simulation_slots.reconcile_record(record, ACCOUNT, outcome="accepted",
-            progress_url="https://api.worldquantbrain.com/simulations/recovered")
+        saved = {"expression": "rank(cap)", "decay": 0, "status": "UNKNOWN_SUBMISSION",
+                 "submission_attempted": True, "slot_reservation": identity, "role": "diagnostic"}
+        progress_url = "https://api.worldquantbrain.com/simulations/recovered"
+        simulation_slots.reconcile_record(dict(saved), ACCOUNT, outcome="accepted",
+                                          progress_url=progress_url)
+        with self.assertRaisesRegex(ValueError, "another or unidentified account"):
+            simulation_slots.restore_record(dict(saved), UNKNOWN_ACCOUNT)
+        merged = simulation_slots.reconcile_record(dict(saved), ACCOUNT)
+        self.assertEqual(merged["progress_url"], progress_url)
+        self.assertEqual(merged["slot_reservation_state"], "accepted")
         with mock.patch.object(ml, "submit_single_simulation") as post, \
-                mock.patch.object(ml, "poll_simulation", return_value={"status": "COMPLETE", "alpha": "offline-result"}), \
+                mock.patch.object(ml, "poll_simulation", return_value={
+                    "status": "COMPLETE", "alpha": "offline-result"}) as poll, \
                 mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {}}):
-            records = self.simulate(initial_records=[record], concurrency=4)
+            records = self.simulate(initial_records=[saved], concurrency=4)
         post.assert_not_called()
+        self.assertEqual(poll.call_args.args[1], progress_url)
         self.assertEqual(records[0]["role"], "diagnostic")
         self.assertEqual(records[0]["alpha_id"], "offline-result")
         self.assertEqual(simulation_slots.snapshot(ACCOUNT, 1)["active"], 0)

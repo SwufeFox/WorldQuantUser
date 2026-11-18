@@ -96,18 +96,7 @@ def reserve(account, limit):
         return identity, _report(account, limit, active + 1)
 
 
-def reconcile_record(record, account=None, *, outcome=None, progress_url=None, alpha_id=None):
-    """Reconcile one saved attempt using authoritative recovery evidence.
-
-    ``accepted`` preserves the reservation and may attach a progress URL.
-    ``terminal`` releases it; ``refused`` releases and makes the record retryable.
-    With no explicit outcome, infer only a terminal platform status/alpha ID or
-    an accepted progress URL. A generic FAILED/unknown record is never released.
-    A record copied from another workspace cannot reconcile this workspace.
-    Mutates and returns the record; the caller must persist it afterwards.
-    """
-    if outcome not in {None, "accepted", "terminal", "refused"}:
-        raise ValueError("unknown simulation reservation outcome %r" % outcome)
+def _reservation_identity(record, account):
     identity = record.get("slot_reservation")
     if identity:
         if identity.get("workspace") != _workspace():
@@ -117,12 +106,59 @@ def reconcile_record(record, account=None, *, outcome=None, progress_url=None, a
             raise ValueError("simulation reservation identity is incomplete")
         if account is not None and _fingerprint(account) != fingerprint:
             raise ValueError("simulation reservation belongs to another or unidentified account")
-    else:
-        fingerprint = _fingerprint(account)
-    effective_alpha = alpha_id or record.get("alpha_id")
+    return identity
+
+
+def _has_terminal_result(record):
+    status = record.get("simulation_status", record.get("status"))
+    return bool(record.get("alpha_id") or status in TERMINAL_STATUSES)
+
+
+def _restore_progress(record, entry):
+    url = entry.get("progress_url")
+    if entry.get("state") != "accepted" or not isinstance(url, str) or not url:
+        return None
+    if record.get("progress_url") != url or record.get("status") == "UNKNOWN_SUBMISSION":
+        record.update(status="PENDING", submission_attempted=True, progress_url=url,
+                      slot_reservation_state="accepted", error=None)
+    return url
+
+
+def restore_record(record, account=None):
+    """Restore a missing progress URL from the same durable reservation.
+
+    Return whether the supplied record changed. This only reads disk state.
+    Pass the session's account before using the record for a remote operation.
+    """
+    terminal = _has_terminal_result(record)
+    if terminal and account is None:
+        return False
+    identity = _reservation_identity(record, account)
+    if not identity or record.get("progress_url") or terminal:
+        return False
+    fingerprint = identity["account_fingerprint"]
+    path, _ = _paths(fingerprint)
+    # Writers replace the complete journal atomically.
+    journal = _load(path, fingerprint)
+    return bool(_restore_progress(record, journal["reservations"].get(identity["id"], {})))
+
+
+def reconcile_record(record, account=None, *, outcome=None, progress_url=None, alpha_id=None):
+    """Reconcile one saved attempt using authoritative recovery evidence.
+
+    ``accepted`` preserves the reservation and may attach a progress URL.
+    ``terminal`` releases it; ``refused`` releases and makes the record retryable.
+    An accepted journal entry supplies its progress URL to an older snapshot.
+    A generic FAILED/unknown record is never released.
+    Mutates and returns the record; the caller must persist it afterwards.
+    """
+    if outcome not in {None, "accepted", "terminal", "refused"}:
+        raise ValueError("unknown simulation reservation outcome %r" % outcome)
+    identity = _reservation_identity(record, account)
+    fingerprint = identity["account_fingerprint"] if identity else _fingerprint(account)
     effective_url = progress_url or record.get("progress_url")
     if outcome is None:
-        if effective_alpha or record.get("simulation_status", record.get("status")) in TERMINAL_STATUSES:
+        if alpha_id or _has_terminal_result(record):
             outcome = "terminal"
         elif effective_url:
             outcome = "accepted"
@@ -133,18 +169,26 @@ def reconcile_record(record, account=None, *, outcome=None, progress_url=None, a
         identity = {"id": uuid.uuid4().hex, "account_fingerprint": fingerprint,
                     "workspace": _workspace()}
         record["slot_reservation"] = identity
-    if identity and (outcome or unresolved):
+    if identity:
         path, lock = _paths(fingerprint)
         with cache_store.file_lock(lock):
             journal = _load(path, fingerprint)
             if outcome in {"terminal", "refused"}:
                 journal["reservations"].pop(identity["id"], None)
             else:
-                entry = journal["reservations"].setdefault(identity["id"], {})
-                entry.update(state="accepted" if outcome == "accepted" else "unknown",
-                             progress_url=effective_url)
-            cache_store.write_json_atomic(path, journal)
-    if progress_url:
+                entry = journal["reservations"].get(identity["id"], {})
+                effective_url = _restore_progress(record, entry) or effective_url
+                if entry.get("state") == "accepted":
+                    outcome = "accepted"
+                if outcome or unresolved:
+                    entry.update(state="accepted" if outcome == "accepted" else "unknown",
+                                 progress_url=effective_url)
+                    journal["reservations"][identity["id"]] = entry
+            if outcome or unresolved:
+                cache_store.write_json_atomic(path, journal)
+    if outcome == "accepted" and effective_url:
+        record["progress_url"] = effective_url
+    elif progress_url:
         record["progress_url"] = progress_url
     if alpha_id:
         record["alpha_id"] = alpha_id

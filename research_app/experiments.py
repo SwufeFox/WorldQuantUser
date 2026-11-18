@@ -1331,28 +1331,38 @@ def _recover_probe_batch(args, path):
         raise CliError("USAGE", "--show-test requires --selection")
     manifest = _selection_call(selection.load, args.selection) if show_test else None
     rows = document["rows"]
-    positions = {id(row): index for index, row in enumerate(rows)}
-
-    def save_recovered(row, raw=None):
-        index = positions[id(row)]
-        record = document["records"][index]
-        if raw is not None:
-            record.update(raw)
-        for key in ("alpha_id", "status", "progress_url", "next_poll_at", "error"):
-            if key in row:
-                record[key] = row[key]
-            elif key in {"progress_url", "next_poll_at"}:
-                record.pop(key, None)
-        if raw is not None:
-            record.pop("metrics_pending", None)
-        simulation_slots.reconcile_record(record)
-        _probe_document_update(document, path)
-        cache_store.write_json_atomic(path, document, indent=1)
 
     def recover(session):
-        outcome = _recover_probe_rows(session, rows, on_progress=save_recovered,
+        records = document["records"]
+        account = None
+        if session is not None and any(record.get("slot_reservation") for record in records):
+            account = simulation_capabilities.account_provenance(session)
+            restored = [_selection_call(simulation_slots.restore_record, record, account)
+                        for record in records]
+            if any(restored):
+                _probe_document_update(document, path)
+                cache_store.write_json_atomic(path, document, indent=1)
+        active_rows = document["rows"]
+        positions = {id(row): index for index, row in enumerate(active_rows)}
+
+        def save_recovered(row, raw=None):
+            record = records[positions[id(row)]]
+            if raw is not None:
+                record.update(raw)
+            for key in ("alpha_id", "status", "progress_url", "next_poll_at", "error"):
+                if key in row:
+                    record[key] = row[key]
+                elif key in {"progress_url", "next_poll_at"}:
+                    record.pop(key, None)
+            if raw is not None:
+                record.pop("metrics_pending", None)
+            simulation_slots.reconcile_record(record, account)
+            _probe_document_update(document, path)
+            cache_store.write_json_atomic(path, document, indent=1)
+
+        outcome = _recover_probe_rows(session, active_rows, on_progress=save_recovered,
                                      max_wait_seconds=getattr(args, "max_wait_seconds", 300.0))
-        _probe_halves(session, document["records"])
+        _probe_halves(session, records)
         return outcome
 
     needs_platform = any((row.get("train_fitness") is None or row.get("metrics_pending"))
@@ -2015,6 +2025,7 @@ def _cmd_probe_resume(args):
     def groups_for(saved):
         groups = {}
         for arm, record in zip(saved["arms"], saved["records"]):
+            _selection_call(simulation_slots.restore_record, record)
             if _submission_state(record) == "unknown_submission" or _has_finished_result(record):
                 continue
             if not arm.get("settings") or not arm.get("expression"):
@@ -2191,6 +2202,8 @@ def _resume_simulation(args, sink, path):
             if requested is not None and requested is not False and requested != value:
                 raise CliError("USAGE", "resume uses the saved recording policy; %s cannot change" % key)
             setattr(args, key, value)
+    for record in records:
+        _selection_call(simulation_slots.restore_record, record)
     if not any(
         record.get("progress_url")
         or record.get("metrics_pending")

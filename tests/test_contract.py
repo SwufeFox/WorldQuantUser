@@ -1865,6 +1865,43 @@ class SimulationResumeTests(unittest.TestCase):
             finally:
                 os.chdir(original_directory)
 
+    def test_cli_resume_restores_progress_saved_only_in_slot_journal(self):
+        account = {"fingerprint": "synthetic-checkpoint-recovery"}
+        progress_url = "https://api.worldquantbrain.com/simulations/synthetic"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(
+                os.environ, {"BRAIN_RESEARCH_DIR": directory}):
+            slots = cli_experiments.simulation_slots
+            reservation, _ = slots.reserve(account, 1)
+            record = {"expression": "rank(cap)", "decay": 0, "status": "UNKNOWN_SUBMISSION",
+                      "submission_attempted": True, "slot_reservation": reservation}
+            path = Path(directory) / "checkpoint.json"
+            cli_experiments._write_simulation_checkpoint(path, {
+                "format": "worldquantuser.simulation-checkpoint", "version": 1,
+                "settings": ml.DEFAULT_SETTINGS, "records": [record],
+                "recording_policy": {"no_record": True}})
+            slots.reconcile_record(dict(record), account, outcome="accepted",
+                                   progress_url=progress_url)
+            args = cli_parser.build_parser().parse_args(["resume", str(path)])
+            session = self.Session([self.Response(payload={"status": "COMPLETE", "alpha": "A123"})])
+            with mock.patch.object(cli_experiments, "with_session", side_effect=lambda _, run: run(session)), \
+                    mock.patch.object(cli_experiments, "_invocation_capabilities", return_value={}), \
+                    mock.patch.object(cli_experiments.simulation_capabilities, "account_provenance",
+                                      return_value=account), \
+                    mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {"fitness": 1.0}}):
+                result = cli_experiments.cmd_resume(args, None)
+            self.assertEqual(session.get_calls, [progress_url])
+            self.assertEqual(session.post_calls, [])
+            self.assertEqual(result["results"][0]["alpha_id"], "A123")
+            self.assertEqual(slots.snapshot(account, 1)["active"], 0)
+            with tempfile.TemporaryDirectory() as other, mock.patch.dict(
+                    os.environ, {"BRAIN_RESEARCH_DIR": other}), mock.patch.object(
+                        cli_experiments, "with_session", side_effect=AssertionError("network")):
+                copy = Path(other) / path.name
+                copy.write_bytes(path.read_bytes())
+                copied_args = cli_parser.build_parser().parse_args(["resume", str(copy)])
+                copied = cli_experiments.cmd_resume(copied_args, None)
+            self.assertEqual(copied["results"][0]["alpha_id"], "A123")
+
 
 if __name__ == "__main__":
     unittest.main()
