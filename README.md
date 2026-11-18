@@ -27,7 +27,8 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `research_app/catalog.py` | Dataset, datafield and operator discovery. |
 | `research_app/validation.py` | FASTEXPR lint, Python Alpha static checks and simulation preflight. |
 | `research_app/experiments.py` | Simulation, resumption, labelled probes, ablation and comparison. |
-| `research_app/alphas.py` | Platform alpha inspection, metadata, submission and correlation. |
+| `research_app/alphas.py` | Platform alpha inspection, native recordsets, submission and correlation. |
+| `research_app/simulation_import.py` | Read existing BRAIN simulations and recover their Alpha IDs. |
 | `research_app/ledger.py` | Local ledger recording, labels, lineage, coverage, shared legs and offline queries. |
 | `research_app/campaign.py` | Research briefs and train/test view history. |
 | `research_app/literature.py` | OpenAlex paper discovery and reading. |
@@ -103,9 +104,9 @@ flowchart TD
     runtime --> core
 ```
 
-Command modules return data or raise a typed error; the execution boundary owns
-stdout, saving, workspace overrides and exit codes. The parser binds handlers
-explicitly and generates help/schema from those same declarations.
+Command modules return data or raise a typed error. The execution boundary owns
+stdout, saving, workspace overrides and exit codes. The parser generates help
+and schema from the argument declarations and loads handlers on demand.
 
 Each CLI invocation restores the caller's diagnostic handler, metadata cache policy
 and workspace settings when it exits, including on command failures.
@@ -142,14 +143,12 @@ pattern-matching the string.
 pip install -r requirements.txt
 ```
 
-`pandas` is imported only when `fields_to_df()` is called. Install it separately
-for DataFrame helpers or notebooks:
+`requests` is loaded on demand. Help, schema, offline lint and Probe previews
+can run without it. Install `pandas` separately for `fields_to_df()` or notebooks.
 
 ```bash
 pip install "pandas>=2.0"
 ```
-
-The CLI, list-based field processing and submission checks run without it.
 
 ## Credentials
 
@@ -177,22 +176,19 @@ export BRAIN_PASSWORD=...
 `machine_lib.get_credentials()` raises `MissingCredentials` when either is
 absent — nothing silently sends an empty login.
 
-BRAIN sessions last hours but challenges rapid repeated logins with a captcha,
-so the session cookie is cached and reused. It lives in
-`<research_dir>/cache/session.json` — outside the git working tree, mode `0600`,
-written atomically so a killed run cannot leave a truncated file behind.
-Concurrent CLI calls take a file lock and share one login instead of racing
-each other into a captcha. Use `--relogin` to force a new login, `--no-cache` to
-ignore the cache for one call, or `auth logout` to forget it.
+The CLI reuses an unexpired session only if its account matches the configured
+username. The CLI writes `<research_dir>/cache/session.json` atomically in mode
+`0600` and coordinates concurrent logins with a file lock. Use `--relogin` for a
+fresh login or `auth logout` to clear the session.
 
-Catalog metadata (operators, fields, datasets, categories, operator docs) is
-cached too, under `<research_dir>/cache/metadata/`. It is quota-free but slow —
-the USA field catalog is 4367 rows over fourteen paginated calls — and it
-changes on the order of days. Default TTL is 24 h (`--meta-max-age`, or
-`BRAIN_METADATA_TTL=0` to disable); `--refresh-meta` refetches. Every catalog
-response carries a `cache` report (`hit`, `age_seconds`,
-`expires_in_seconds`), and if a refetch fails while an older snapshot exists the
-cached copy is served with `stale: true` instead of failing the command.
+`catalog datasets`, `fields`, `find` and `categories` check account-scoped
+metadata under `<research_dir>/cache/metadata/` before login. They open a session
+on a cache miss and reuse it within the call. `--relogin` and `--no-cache` refresh
+the session for these commands. `--refresh-meta` refreshes catalog data. The
+default catalog TTL is 24 hours, configurable with `BRAIN_METADATA_TTL`.
+`--meta-max-age` can tighten the accepted age and zero bypasses the cache.
+A failed refetch can return a matching stale snapshot with `stale`, `degraded`
+and an error code in the cache report.
 
 ```bash
 python research_cli.py cache info                  # what is cached, how stale
@@ -397,6 +393,7 @@ python research_cli.py catalog datasets --region USA
 python research_cli.py catalog datasets --region USA --theme true --summary
 python research_cli.py catalog fields --dataset fundamental6 --type MATRIX \
     --search liability --limit 20 --expressions
+python research_cli.py catalog find "short term debt"
 ```
 
 `--expressions` also emits ready-to-paste snippets, already winsorized and
@@ -409,6 +406,10 @@ stay unknown; they are never replaced with 0 or 1. `--expressions` follows the
 displayed field rows. Omit `--summary` for the native catalog records.
 `catalog datasets --theme true|false` sets the platform filter; omitting it leaves
 the filter unset. These three queries use separate metadata-cache entries.
+
+`catalog find` preserves native cross-sectional `coverage` and temporal
+`dateCoverage` separately. The latter appears as `date_coverage`, with
+`null` for an unavailable value. Ranking and `--min-coverage` use `coverage`.
 
 `--search` is ranked, not a substring filter, and it runs locally over the
 fetched catalogue so it can do what the endpoint cannot:
@@ -472,15 +473,12 @@ contains one record per expression (`expression`, `decay`, `alpha_id`,
 `status`, `metrics`, `checks`, `error`) plus a `summary` with counts, a
 `ranking` sorted by sharpe, and `best`.
 
-Simulation commands have a 5-minute wall-time budget by default. If a server
-`Retry-After` would exceed that budget, the command returns `PENDING` rather
-than sleeping past the four-hour session-cache lifetime. Accepted jobs and
-unsubmitted expressions are atomically saved in a mode-0600 checkpoint under
-`.brain_checkpoints/` (or the path passed to `--checkpoint`); continue later
-with `python research_cli.py resume <checkpoint>`. Resume polls accepted jobs
-before submitting queued work. Each POST first saves its intent; a transport failure
-without a job identity remains `UNKNOWN_SUBMISSION` and is never silently reposted.
-`--max-wait-seconds` adjusts the budget for either command.
+Simulation commands have a five-minute wait budget by default, configurable with
+`--max-wait-seconds`. If `Retry-After` exceeds the remaining budget, accepted jobs
+stay `PENDING`. The tool writes a mode-0600 checkpoint under `.brain_checkpoints/`
+or to `--checkpoint`. Continue with `python research_cli.py resume CHECKPOINT`
+to poll accepted jobs before sending queued work. An uncertain attempt without a
+confirmed job identity stays `UNKNOWN_SUBMISSION` and requires reconciliation.
 
 `--batch-size N` sets the requested concurrency on `simulate`, `probe` and `resume`, with no
 fixed upper bound of three. A verified account limit clamps the request. When capacity is
@@ -494,6 +492,10 @@ age alone never frees them. Observed completion or definite refusal releases a s
 workspaces and jobs launched outside this tool are not coordinated. Resume may change
 `--batch-size` without changing the saved expressions, settings or research fingerprint;
 accepted jobs can still be recovered after launch permissions shrink.
+
+Before each POST, the tool checkpoints the submission intent. If the shared slot
+journal saved the accepted job URL just before an interruption, `resume`,
+`probe --resume` and `probe --recover` restore it through the matching reservation.
 
 Daily simulation quota is separate from concurrency and transient HTTP throttling.
 Successful repeats and every successful multi-simulation child count; Alpha creation-date
@@ -543,7 +545,7 @@ source. For a spec read from stdin, use inline `expression`.
 ```
 
 ```bash
-python research_cli.py lint --file signal.py --offline
+python research_cli.py lint --file signal.py --setting lookback=0 --offline
 python research_cli.py simulate signal.py --setting lookback=0 --dry-run
 python research_cli.py probe python-reversal.spec.json --dry-run
 python research_cli.py probe python-reversal.spec.json --check
@@ -560,8 +562,9 @@ missing values and output dtype. Preflight reports omitted settings under
 Python preflight failures.
 
 The runtime passes up to `lookback + 1` rows per field, with the latest row last.
-Warm-up windows may be shorter. Return a one-dimensional `float32` array with
-one value per instrument.
+Warm-up windows may be shorter. Static checks warn when a direct literal
+`data.FIELD[-N]` or `data.FIELD[-N:]` exceeds the configured maximum. Return a
+one-dimensional `float32` array with one value per instrument.
 
 Python shares the existing ledger, PnL, checkpoint and recovery workflow.
 The checkpoint contains the source itself, so resuming uses the captured version.
@@ -657,8 +660,7 @@ For stored batches, use `compare sample-batch.json --summary --format markdown`.
 is a field inside the same JSON envelope, so neither tailing stdout nor a parsing script
 is needed to assemble it.
 
-Probe batches save each arm's intent before POST and its accepted job identity before
-waiting. `--max-wait-seconds` bounds simulation waiting across groups (default 300).
+For Probe, `--max-wait-seconds` bounds simulation waiting across groups (default 300).
 Use `probe --recover sample-batch.json` for platform reads and idempotent local recording;
 it accepts the canonical batch or a saved response. Use `probe --resume sample-batch.json
 --dry-run` to preview continuation offline, then omit `--dry-run` to explicitly continue
@@ -669,6 +671,18 @@ Execution failures and missing evidence remain deferred, separate from scientifi
 verdicts. Legacy batches with an unknown recording policy do not silently opt into
 recording. Recovery preserves labels, settings, existing metrics and ACTIVE membership.
 Train-half Sharpe stays unknown without both the train boundary and complete PnL evidence.
+
+### Read a simulation launched elsewhere
+
+```bash
+python research_cli.py probe --from-simulation SIMULATION_ID --save external-simulation.json
+```
+
+Pass a simulation ID or its BRAIN API URL. The receipt lists child tasks in
+platform order and exposes completed `alpha_ids`. Pending jobs report their
+retry info. The command reads existing jobs and leaves the ledger unchanged.
+To work with these IDs, explicitly record missing entries with `ledger record`
+and pass the receipt to `triage --batch`. [Probe details](docs/tooling.md#批次流程与复用)
 
 
 ### Freeze a training choice, then validate it
@@ -755,11 +769,20 @@ waiting. Pending reads remain incomplete and report when to poll again.
 evidence. Successful reads are logged as validation views. This is a read-only
 comparison and does not submit the alpha.
 
-The daily-PnL reader honors `Retry-After` even on a nonempty HTTP 200 response.
-It bounds total waiting to 180 seconds by default and reports pending reads as `RATE_LIMITED`
-with incomplete evidence, preserving any previous cache. Platform `TIMEOUT`/`FAIL`/`ERROR`
-and cancellation are terminal failures; `WARNING` is terminal completion. Transport uncertainty
-remains resumable and is never treated as a definite refusal or silently reposted.
+```bash
+python research_cli.py alpha get ALPHA_ID --recordsets
+python research_cli.py alpha get ALPHA_ID --recordsets yearly-stats coverage turnover
+```
+
+`--recordsets` discovers native names and reads only those explicitly requested.
+Responses preserve the native schema and rows with source and completeness
+evidence. Series reads are validation views with unverified train boundaries.
+Use `--save` to keep the response in the research directory.
+[Availability and wait behavior](docs/tooling.md#读取-alpha-的诊断记录集)
+
+The daily-PnL reader used by the ledger and correlation tools honors `Retry-After`
+even on a nonempty HTTP 200. It defaults to a 180-second budget and preserves the
+previous cache when a pending read ends as `RATE_LIMITED`.
 
 `alpha list` filters on `status=UNSUBMITTED` by default, so it will not show
 what you have already submitted. Read the live book with:

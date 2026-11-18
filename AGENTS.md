@@ -65,8 +65,9 @@ section when needed, rather than loading every recipe.
    Probe preview can point to past results and a recoverable job in the
    expected batch file. References do not start jobs or substitute results.
    If a run stops, inspect its saved progress first: `resume CHECKPOINT` for
-   simulation jobs, `probe --recover BATCH` for probe evidence. Never rerun a
-   whole spec merely because its stdout was lost.
+   simulation jobs, `probe --recover BATCH` for probe evidence. To inspect a
+   platform task started elsewhere, use `probe --from-simulation ID` for child
+   states and Alpha IDs. Reuse saved evidence when stdout was lost.
 2. Check `auth check` before designing around an unfamiliar account or region.
    Reuse the session cache; use `--relogin` only when it is actually stale.
 3. Prefer `catalog fields --expressions` for field wrappers. Inspect structured
@@ -94,6 +95,7 @@ section when needed, rather than loading every recipe.
 | Arguments, help, generated schema | `research_app/parser.py` |
 | Shared errors, output, settings, sessions | `research_app/runtime.py` |
 | Simulation, probe, resume, ablation, comparisons | `research_app/experiments.py` |
+| Read-only inspection of existing simulation tasks | `research_app/simulation_import.py` |
 | Catalog and validation | `research_app/catalog.py`, `research_app/validation.py` |
 | Training selection, promotion, candidate shelf | `research_app/triage.py`, `research_app/selection.py`, `research_app/promote.py`, `research_app/buffer_cmd.py` |
 | Platform alphas and local ledger | `research_app/alphas.py`, `research_app/ledger.py` |

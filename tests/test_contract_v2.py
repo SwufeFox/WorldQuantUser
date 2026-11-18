@@ -1605,14 +1605,8 @@ class EnvExampleTests(unittest.TestCase):
         return names
 
     def test_every_env_var_the_code_reads_is_documented(self):
-        # BRAIN_RESEARCH_DIR is accessed through a module constant, and
-        # BRAIN_USERNAME and BRAIN_PASSWORD are built from a prefix inside
-        # get_credentials(). Scan uppercase literals to include these callers.
-        #
-        # Limitation worth knowing: a future variable with an unusual name (no _KEY, _DIR,
-        # _TTL, _TIMEOUT, _PATH, _URL, _SECRET or _TOKEN suffix and not one of the
-        # explicit names) would escape the scan. Collapsing that risk entirely means a
-        # declared contract in each module, which is a larger change than this test needs.
+        # Scan uppercase literals, including constants used by environment reads.
+        # The suffixes and explicit names define the scope of this heuristic.
         suffixes = ("_KEY", "_DIR", "_TTL", "_TIMEOUT", "_PATH", "_URL", "_SECRET", "_TOKEN")
         explicit = {"BRAIN_USERNAME", "BRAIN_PASSWORD"}
         literal = re.compile(r"""["']([A-Z][A-Z0-9_]{4,})["']""")

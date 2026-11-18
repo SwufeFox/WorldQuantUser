@@ -1,37 +1,14 @@
-"""The BRAIN transport: sessions, the metadata cache, and the simulation loop.
+"""BRAIN account sessions, catalog metadata, simulations and Alpha results.
 
-This module is the only place that talks HTTP to BRAIN. Everything above it --
-`research_cli`, `guarded_sim`, `tools/*` -- is policy, and the split is deliberate:
-a rule about *what* to simulate belongs where it can be read in ten lines, not
-buried in a 2,000-line client.
+Use load_session to reuse a private, account-bound session. Catalog datasets,
+fields and categories are cached per account and query scope.
 
-What lives here, in the order a request flows through it:
+request_json handles ordinary API requests. Simulation progress and Alpha
+recordsets have endpoint-specific readiness protocols. simulate_alphas uses
+durable reservations to continue accepted work after interruption.
 
-* **errors** -- one ``BrainError`` family, so a caller can catch the class instead
-  of matching strings. ``CaptchaRequired`` is separate because it is the one
-  failure a retry makes worse.
-* **credentials and the session cache** -- ``login`` / ``authenticate`` read the
-  configured account and cache the session so repeated invocations do not re-login;
-  BRAIN answers rapid logins with a captcha, so a cache miss is cheaper than a
-  second POST. Nothing here prompts: an interactive prompt is a hang for an
-  automated caller, so every failure raises with what the caller would need.
-* **the metadata cache** -- datasets, operators and datafields, with a TTL, because
-  the catalogue changes slowly and a field list is not worth a request per run.
-  ``cached_metadata`` handles freshness and marks stale fallback explicitly.
-* **JSON transport** -- ``request_json`` applies the retry policy, honours
-  ``Retry-After``, and raises ``RateLimited`` only when the budget is spent. Every
-  endpoint wrapper below goes through it.
-* **the simulation loop** -- ``simulate_alphas`` submits in batches, polls, and
-  checkpoints, so an interrupted batch resumes instead of re-spending quota. This is
-  the expensive call; ``guarded_sim`` is what decides whether it may run.
-
-What is deliberately *not* here: no linting (that is ``expression_lint`` via
-``guarded_sim``), no record keeping (that is ``alpha_registry``), and no opinion
-about which alphas are worth running. A transport that also judges is a transport
-nobody can test.
-
-The HTTP client is imported where it is needed. Local CLI introspection and
-previews can run without it. ``pandas`` is optional for dataframe helpers.
+Connection setup imports the HTTP client on demand. Command help and offline
+previews can run without it. DataFrame helpers import optional pandas.
 """
 
 import hashlib
@@ -368,12 +345,7 @@ def _session_payload(session, info):
 
 
 def save_session(session, info=None, path=None):
-    """Persist an authenticated session's cookies so later calls can reuse it.
-
-    Atomic and mode ``0600``. Research runs do get killed mid-write, and a
-    half-written cache used to look like "no session", which in turn triggered a
-    fresh login -- and repeated logins are what BRAIN answers with a captcha.
-    """
+    """Atomically store the authenticated user's cookies in a private envelope."""
     target = Path(path or session_cache_path())
     ttl = None
     expiry = (info or {}).get("token_expiry")
@@ -396,12 +368,7 @@ def _session_from_entry(payload, credentials):
 
 
 def session_status(cache_path=None):
-    """Describe the cached session without touching the network.
-
-    Used by `auth check` and `cache info` so a caller can see whether a session
-    is cached, how long it has left, and why it would be re-created -- instead
-    of inferring all that from a file mtime.
-    """
+    """Report cached session metadata and local expiry for auth and cache diagnostics."""
     path = Path(cache_path or session_cache_path())
     entry = cache_store.read_entry(path)
     payload = entry["payload"]
@@ -467,8 +434,7 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
         if entry["present"]:
             meta.setdefault("cache_state", "expired")
         elif entry.get("error") not in (None, "missing"):
-            # Keep a sample instead of quietly dropping it: a truncated file is
-            # a bug worth seeing, not a fact to hide behind a fresh login.
+            # Keep corrupt samples under the login lock for later diagnosis.
             meta["cache_state"] = "corrupt"
             if locked:
                 quarantined = cache_store.quarantine(path)
@@ -556,15 +522,12 @@ def metadata_cache_path(kind, params):
 
 def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None, *,
                     use_cache=True, account=None):
-    """Return ``{"data": ..., "cache": {...}}`` for one catalog query.
+    """Read catalog data and return it with cache evidence.
 
-    ``fetch`` runs only on a miss, on an expired entry, or when ``refresh`` is
-    set. If it raises :class:`BrainError` while a stale snapshot exists, the
-    stale snapshot wins and the report says ``stale``/``degraded``: the catalog
-    is descriptive, so yesterday's copy is worth more than no answer.
-
-    Pass ``report`` (a dict) to also receive the cache report, so a CLI command
-    can tell its caller whether the answer was cached and how old it is.
+    A hit must satisfy both the stored expiry and the requested maximum age.
+    Read the source on a miss, a forced refresh, or when caching is disabled.
+    On BrainError, reuse an available snapshot from the same cache key and mark
+    it stale and degraded. Pass a report dict to receive the cache metadata.
     """
     policy = _metadata_policy
     ttl = policy["max_age"] if max_age is None else float(max_age)
@@ -634,7 +597,7 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
 
 
 class CatalogAccess:
-    """Read account metadata through a loader invoked on a cache miss."""
+    """Pair the catalog account identity with a runner that opens the session on demand."""
 
     def __init__(self, username, run):
         self.username = username
@@ -647,7 +610,7 @@ def _catalog_account(username):
 
 
 def catalog_field_cache_paths():
-    """Yield current-account snapshots and legacy files of unknown provenance."""
+    """Yield (path, account_bound) for current-account and legacy field snapshots."""
     account = _catalog_account(configured_username())
     directory = Path(research_paths.metadata_root()) / "datafields"
     for path in sorted(directory.glob("*.json")):
@@ -1052,11 +1015,11 @@ def _retry_after_seconds(response, cap_error_wait=True):
 
 
 def request_json(s, method, path, params=None, json_body=None, max_retries=4, *, deadline=None):
-    """Call BRAIN and return decoded JSON, translating failures into typed errors.
+    """Decode a BRAIN API response or raise a typed HTTP failure.
 
-    The single HTTP choke point, so every caller sees the same behaviour:
-    401/403 -> AuthError, 404 -> NotFound, repeated 429 -> RateLimited (with
-    backoff), other errors -> requests.HTTPError.
+    Responses with status 429 use backoff within the attempt and time budgets.
+    Other HTTP failures raise AuthError, NotFound or ServiceError.
+    Successful responses without decodable JSON yield an empty dict.
     """
     url = path if path.startswith("http") else BRAIN_API_URL + path
     last = None
@@ -1092,7 +1055,7 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4, *,
 
 
 def read_simulation_snapshot(s, simulation_id, *, deadline):
-    """GET one simulation response without polling or following redirects."""
+    """Read one simulation payload and return its suggested retry time."""
     from requests.exceptions import RequestException
 
     if not valid_simulation_id(simulation_id):
@@ -2239,6 +2202,7 @@ def _recordset_paths(alpha_id, names):
 
 
 def _read_recordset(s, url, deadline, *, one_shot=False):
+    """Read a native response within the shared wait budget or in one attempt."""
     from requests.exceptions import RequestException
 
     result = {"source": url, "state": "unavailable", "payload": None}
@@ -2282,10 +2246,11 @@ def _read_recordset(s, url, deadline, *, one_shot=False):
 
 
 def fetch_alpha_recordsets(s, alpha_id, names=(), max_wait_seconds=180.0):
-    """Discover native series and read explicitly requested recordsets.
+    """Discover native series and read explicitly named recordsets.
 
-    Each result describes one native response. Completeness is unknown without
-    pagination evidence, and the server's dates and units are left untouched.
+    The discovery response and each named read have separate availability
+    evidence. Schemas and rows retain platform dates and units. Completeness
+    stays unknown when the response has no pagination evidence.
     """
     base, paths = _recordset_paths(alpha_id, names)
     if (type(max_wait_seconds) not in (int, float) or not math.isfinite(max_wait_seconds)
@@ -2314,6 +2279,7 @@ def fetch_alpha_recordsets(s, alpha_id, names=(), max_wait_seconds=180.0):
     advertised_names = {row["name"] for row in advertised or []}
     datasets = {}
     for name, url in paths.items():
+        # A catalog can omit an available series, including yearly statistics.
         entry = _read_recordset(s, url, deadline, one_shot=one_shot)
         payload = entry.pop("payload")
         entry.update(advertised=True if name in advertised_names else False if discovery["complete"] else None,

@@ -1,4 +1,4 @@
-"""Read existing BRAIN simulations into an identity-only Probe receipt."""
+"""Read parent and child simulation status and Alpha IDs for Probe."""
 
 import math
 import re
@@ -23,6 +23,7 @@ def _unknown(simulation_id, reason, status=None):
 
 
 def _row(simulation_id, payload, retry_after, parent_id=None):
+    """Extract the task state and check any identity echoed by the platform."""
     if payload.get("id") not in (None, simulation_id):
         return _unknown(simulation_id, "simulation_id_mismatch")
     if parent_id is not None and payload.get("parent") not in (None, parent_id):
@@ -32,6 +33,7 @@ def _row(simulation_id, payload, retry_after, parent_id=None):
     status = status.upper() if isinstance(status, str) else ""
     status = status if _STATUS_TOKEN.fullmatch(status) else None
     row = {"simulation_id": simulation_id, "status": status, "alpha_id": None}
+    # The retry header takes precedence over status in the response body.
     if retry_after is not None:
         return {**row, "state": "pending", "retry_after_seconds": retry_after}
     if status in _PENDING:
@@ -75,6 +77,7 @@ def _read_children(read, children, parent_id, deadline):
 
 
 def read_existing_simulation(args, reference):
+    """Read the parent and each declared child within one request budget."""
     try:
         simulation_id = ml.simulation_reference_id(reference)
     except ValueError as exc:

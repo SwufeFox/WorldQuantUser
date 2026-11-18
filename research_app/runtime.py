@@ -140,7 +140,7 @@ def make_event_sink(stream, verbose):
 
 
 def session_reader(args):
-    """Return a lazy operation runner sharing one BRAIN session and one retry."""
+    """Open BRAIN on first use and share one re-login after an operation rejects the session."""
     session = None
     retried = False
 

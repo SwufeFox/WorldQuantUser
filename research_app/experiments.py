@@ -1662,6 +1662,7 @@ def _request_fingerprint(arms):
 
 
 def cmd_probe(args, sink):
+    """Read existing tasks or run a spec through the saved-batch workflow."""
     reference = getattr(args, "from_simulation", None)
     if reference is not None:
         from .simulation_import import read_existing_simulation

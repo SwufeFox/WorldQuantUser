@@ -54,7 +54,7 @@ def _merged_performance_view(result, detail):
 
 
 def cmd_alpha_get(args, _sink):
-    """Fetch one alpha's metrics, checks, metadata and out-of-sample split from BRAIN."""
+    """Read the Alpha snapshot and any explicitly requested platform evidence."""
     detail = getattr(args, "performance", None)
     recordset_names = getattr(args, "recordsets", None)
     max_wait = getattr(args, "max_wait", 180.0)
@@ -94,10 +94,7 @@ def cmd_alpha_get(args, _sink):
     code, description, operator_count = ml.regular_expression(payload)
     document = {
         "alpha_id": payload.get("id", args.alpha_id),
-        # Name, category and tags are what a submission carries and what makes an
-        # alpha attributable later. They live at the top of the payload, not under
-        # `is`, so they were invisible here - the submit path even refuses an alpha
-        # without them, and the only way to see why was to read the raw payload.
+        # Keep the metadata needed to diagnose submission readiness.
         "name": payload.get("name"),
         "category": payload.get("category"),
         "tags": payload.get("tags") or [],
@@ -122,6 +119,7 @@ def cmd_alpha_get(args, _sink):
             research_paths.log_view("alpha get --performance", "validation", [args.alpha_id])
     if recordsets is not None:
         document["recordsets"] = recordsets
+        # Native series have no verified training boundary.
         viewed = [name for name, entry in recordsets["series"].items() if entry["records"]]
         if viewed:
             research_paths.log_view("alpha get --recordsets", "validation", [args.alpha_id],

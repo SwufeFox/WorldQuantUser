@@ -23,7 +23,7 @@ def _python_finding(code, message, severity="error", **location):
 
 
 def _python_history_warnings(function, data_argument, fields, lookback):
-    """Compare direct, literal history access to the maximum available window."""
+    """Warn on direct access beyond the full window. Warm-up can provide fewer rows."""
     if type(lookback) is not int or lookback < 0:
         return []
     available = lookback + 1
@@ -31,7 +31,7 @@ def _python_history_warnings(function, data_argument, fields, lookback):
     pending = list(reversed(function.body))
     while pending:
         node = pending.pop()
-        # Nested scopes may shadow the decorated function's data parameter.
+        # A nested scope can bind its own names. Check the decorated function's body only.
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
                              ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
             if getattr(node, "name", None) == data_argument:
@@ -159,7 +159,7 @@ def _attach_python_fields(result, known_fields):
 
 
 def lint_python_source(source, known_fields=None, *, lookback=None):
-    """Parse and check declared Python Alpha fields without loading the code."""
+    """Check the declared fields and literal history access without executing source."""
     return _attach_python_fields(_parse_python_source(source, lookback=lookback), known_fields)
 
 

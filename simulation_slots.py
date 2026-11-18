@@ -127,8 +127,9 @@ def _restore_progress(record, entry):
 def restore_record(record, account=None):
     """Restore a missing progress URL from the same durable reservation.
 
-    Return whether the supplied record changed. This only reads disk state.
-    Pass the session's account before using the record for a remote operation.
+    Return whether the in-memory record changed. Local inspection can read
+    completed copies across workspaces. Pass the authenticated account before
+    querying BRAIN for an unresolved attempt.
     """
     terminal = _has_terminal_result(record)
     if terminal and account is None:
@@ -146,11 +147,10 @@ def restore_record(record, account=None):
 def reconcile_record(record, account=None, *, outcome=None, progress_url=None, alpha_id=None):
     """Reconcile one saved attempt using authoritative recovery evidence.
 
-    ``accepted`` preserves the reservation and may attach a progress URL.
-    ``terminal`` releases it; ``refused`` releases and makes the record retryable.
-    An accepted journal entry supplies its progress URL to an older snapshot.
-    A generic FAILED/unknown record is never released.
-    Mutates and returns the record; the caller must persist it afterwards.
+    Accepted jobs keep their slot and recover a missing URL from the journal.
+    Observed terminal outcomes release the slot. Definite refusals also make
+    the job retryable. Indeterminate failures keep their reservation.
+    Persist the returned record with the batch checkpoint.
     """
     if outcome not in {None, "accepted", "terminal", "refused"}:
         raise ValueError("unknown simulation reservation outcome %r" % outcome)

@@ -42,11 +42,10 @@ CLI 统一按需加载处理模块。执行具体命令时才导入它的处理�
 `schema` 直接从参数定义生成输出。这些命令与离线 lint、Probe 预览可以在未安装
 HTTP 客户端 `requests` 的环境下运行。联网命令需要安装运行依赖。
 
-`catalog datasets`、`catalog fields`、`catalog find` 和 `catalog categories` 先按
-当前账户与查询范围查磁盘。命中时无需登录，缺少有效缓存时才建立会话，单次命令内复用。
-`--relogin` 和 `--no-cache` 按命令刷新会话，`--refresh-meta` 刷新目录内容。
-`--meta-max-age` 可收紧可接受的缓存年龄，`0` 跳过目录缓存。刷新失败时，同账户旧快照
-可以降级返回，回执标明 `stale`、`degraded` 和错误类型。在线预检仍单独核实目录。
+`catalog datasets`、`fields`、`find` 和 `categories` 优先使用匹配当前账户与查询范围的
+磁盘缓存，未命中时在同一次命令中复用会话。`--relogin` 和 `--no-cache` 强制刷新会话。
+`--refresh-meta` 刷新目录内容，`--meta-max-age` 可缩短允许的缓存年龄，取 `0` 时跳过
+目录缓存。刷新失败时，同账户旧快照可以降级返回，回执标明 `stale`、`degraded` 和错误类型。
 
 在线 lint 和模拟预检通过字段目录核对账户数据范围。FASTEXPR 还检查字段类型与算子，
 Python 检查源码的字段声明。`probe` 将预检报告交给 `tools.guarded_sim`，
@@ -250,14 +249,9 @@ python research_cli.py alpha get ALPHA_ID --performance full --team TEAM_ID
 python research_cli.py alpha get ALPHA_ID --performance --competition COMPETITION_ID --max-wait 0
 ```
 
-默认读取个人范围，团队和比赛范围互斥；指定范围必须同时使用 `--performance`。
-摘要保留平台 before/after 统计和 score，只对两侧均有有限数值的统计量计算 after-minus-before，
-缺失值不补零；默认省略 `pnl`、`yearlyStats`，`full` 保留完整原生响应。
-结果带范围、来源 URL 和取得时间。`Retry-After` 等待默认最多 180 秒，`--max-wait 0`
-只请求一次；尚未就绪会保留 incomplete 状态和下次读取时间信息。
-
-这份统计的训练期边界未经核验，输出明确标记 `train_only_verified: false`，成功读取记入
-validation 视图日志；按冻结后的验证证据使用。命令只读，不触发提交。
+默认读取个人范围。团队和比赛范围互斥，且需要 `--performance`。摘要保留平台原生
+before/after 统计和 score，对两侧均为有限数值的统计量计算差值。缺失值保持未知。
+需要 `pnl`、`yearlyStats` 等完整原生响应时，使用 `--performance full`。
 
 ### 读取 Alpha 的诊断记录集
 
@@ -267,15 +261,18 @@ python research_cli.py alpha get ALPHA_ID --recordsets yearly-stats coverage tur
 python research_cli.py alpha get ALPHA_ID --recordsets pnl-by-sector --max-wait 0
 ```
 
-`--recordsets` 单独使用时只发现平台公布的记录集。明确给出名称时，读取各名称的原生
-`schema` 和 `records`。有些 Alpha 的目录为空，按名称仍可能读到年度统计。每条结果带
-来源、读取时间和可用状态。等待 `Retry-After` 的时间计入 `--max-wait`。预算为零时每个
-端点只请求一次。输出保留原生单次响应的记录与声明行数，缺少分页证据时完整性为未知。
+`--recordsets` 单独使用时列出平台公布的记录集。传入名称时，还会读取相应的原生
+`schema` 和 `records`。目录缺失时仍可按名称显式读取，例如某些 Alpha 的年度统计。
+每条结果携带来源、读取时间和可用状态，保留单次响应。无法根据声明行数或分页标记判断
+完整性时，`complete` 为 `null`。
 
-日覆盖、换手和分组图表依赖平台为该 Alpha 保留的 Visualization 数据。
-原生覆盖列反映平台定义的 Alpha 覆盖，不能直接定位原始字段的缺失原因。
-读取的原生序列没有核验训练边界，实际返回数据时记入验证视图日志。
-需要复用时用 `--save` 将结果保存到研究目录。
+日覆盖、换手和分组图表取决于该 Alpha 是否有可读取的 Visualization 数据。平台文档说明
+图表数据在模拟后保留一周。Alpha 覆盖衡量按日变化的股票数，字段缺失原因仍需另行核查。
+
+`--performance` 和 `--recordsets` 都是只读诊断，训练边界未经核验，回执标明
+`train_only_verified: false`。前后表现已就绪或记录集返回非空序列时，写入验证视图日志。
+每类视图单独使用一份 `--max-wait` 预算，默认 180 秒，包含 `Retry-After` 等待。取
+`--max-wait 0` 时每个端点只请求一次。用 `--save` 将回执保存到研究目录供后续复用。
 [官方 API](https://platform.worldquantbrain.com/learn/documentation/brain-api/brain-api) ·
 [Visualization 说明](https://platform.worldquantbrain.com/learn/documentation/consultant-information/visualization-tool)
 
@@ -676,11 +673,10 @@ region/universe/delay/instrumentType 的字段目录。语言证据不足时会�
 `--allow-lint-errors` 对 Python 预检无效。
 FASTEXPR 算子目录、结构匹配、换手估计和自动消融均不适用于 Python 源码。
 
-设置按平台字典透传。例如 `lookback` 是额外历史行数，完整窗口长度为 `lookback + 1`。
-静态检查会按每臂实际设置提醒超出这个窗口的直接字段访问。`data.close[-N]` 可能越界，
-`data.close[-N:]` 会截短。检查仅覆盖字面量下标和无结束位置、无步长的字面量切片，
-结果是警告，供研究者核对源码中的保护逻辑。
-热身阶段行数可能更少。源码负责处理 NaN、原生 dtype、热身与返回形状。
+Python 的 `lookback` 是额外历史行数，最多可用 `lookback + 1` 行，热身阶段可能更少。
+静态检查用每臂的生效设置比较直接字段访问。`data.close[-N]` 所需行数超过上限时
+提示越界风险，`data.close[-N:]` 提示切片可能截短。两项都是警告，用来复核源码的
+保护逻辑，检查范围限于上述字面量访问。源码负责处理 NaN、原生 dtype、热身与返回形状。
 REGULAR 请求统一省略 `selectionHandling` 和 `selectionLimit`，Python 还省略
 `unitHandling` 和 `nanHandling`。核对实际请求看预览的 `payload.settings`，
 在线预检与执行器都按实际发送的设置验证。`settings_capabilities.omitted_from_payload`
@@ -696,7 +692,7 @@ REGULAR 请求统一省略 `selectionHandling` 和 `selectionLimit`，Python 还
 | 我要跑一批臂（常态） | 写一个 sample-batch.spec.json，然后 `python3 research_cli.py probe sample-batch.spec.json`——lint、模拟、train-only 表格、对照差值、JSON、台账一次做完 |
 | 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe sample-batch.spec.json --dry-run`；输出完整 payload、设计上下文和精确重复证据，正式模拟前再做实时目录检查 |
 | 按当前账户核验这份 spec，但不模拟 | `python3 research_cli.py probe sample-batch.spec.json --check`；使用与正式运行相同的臂和生效设置 |
-| 已经在网页或其他客户端跑过 Multi-Simulation | `python3 research_cli.py probe --from-simulation SIMULATION_ID`；读取父任务、子任务状态和现有 Alpha ID |
+| 已经在网页或其他客户端跑过模拟 | `python3 research_cli.py probe --from-simulation SIMULATION_ID`，读取任务状态和已有 Alpha ID |
 | 我要开一个单次实验 | 直接写一个两三条臂的 spec，`python3 research_cli.py probe sample-batch.spec.json`（没有模板文件了） |
 | 这批臂相对对照变了多少 | 看 `comparisons.rows`：arm 减 control 的训练期差值；缺失项列在 `unavailable`，explore 批次不计算归因 |
 | 换字段 / 换窗口 / 换权重的批量实验 | `research_app/substitution.py` 的 `expand()` 生成 `(label, expression)` 对，再落成 spec |
@@ -738,12 +734,14 @@ python3 research_cli.py resume checkpoint.json --batch-size 6 --max-wait-seconds
 写入受保护文件。读取保存回执恢复时，同样保护其指向的实际批次。
 
 `probe --from-simulation` 接受已有任务 ID 或
-`https://api.worldquantbrain.com/simulations/ID`。它按父任务返回顺序读各子任务，
-在 `rows` 保留完成、失败、进行中及无法确认的状态，`alpha_ids` 收录完成任务的 Alpha ID。
-平台还未提供子任务列表时，`children_state` 为 `unavailable`。遇到 `Retry-After` 时回执报告
-平台建议的等待时间，这次读取不等待该任务。可用 `--save` 保存回执，再用
-`triage --batch PATH` 对照本地训练证据。若 Alpha 尚未入账，先显式用 `ledger record ALPHA_ID`
-建立条目。`--from-simulation` 只读取平台任务和标识，不启动模拟或自动写台账。
+`https://api.worldquantbrain.com/simulations/ID`。多模拟按父任务返回顺序读取子任务，
+单模拟沿用同一回执结构。`rows` 保留任务状态，`alpha_ids` 收录已取得的 Alpha ID。
+任务返回 `Retry-After` 时记录建议等待时间并结束该任务的读取。子任务列表暂不可取时，
+`children_state` 为 `unavailable`。
+
+需要进一步分析时，用 `--save` 保存回执，对未入账的 Alpha 显式执行
+`ledger record ALPHA_ID`，再用 `triage --batch PATH` 读取对应训练证据。
+`--from-simulation` 本身只读现有任务，回执以任务身份和状态为主。
 [BRAIN API 的父子任务说明](https://platform.worldquantbrain.com/learn/documentation/brain-api/brain-api)
 
 `probe --summary` 返回训练期表格：label、role、执行状态、S/F、换手、margin_bps、
@@ -755,14 +753,14 @@ python3 research_cli.py resume checkpoint.json --batch-size 6 --max-wait-seconds
 diagnostic 保留用于归因，但不能进入候选冻结、候选架、晋级或新提交；恢复和刷新不抹掉角色。
 旧记录没有声明时保持 unspecified，不从 C1 之类的标签或备注猜测。
 
-每个 POST 之前保存提交意图，拿到任务身份后立即保存。如果中断发生在槽位账本已保存任务地址、
-批次尚未保存地址之间，`resume`、`probe --resume` 和 `probe --recover` 会用同一预约补回地址，
-并由对应账户继续查询。没有身份的未知提交不会自动重发。
-`--max-wait-seconds` 默认 300。每组预检完成后按剩余时间启动仿真，预算耗尽的请求保留排队状态。
-前组未完成时后组保持排队。`--recover` 只读平台并幂等补账，
-接受批次或保存的回执；`--resume` 才显式继续已知排队/已接受任务，支持离线预览。
-执行失败、未完成和证据缺失列为 deferred，不自动判成研究失败；旧批次的记账策略不明时
-不会推测为允许记账。同批次运行/恢复互斥，`--force` 不能覆盖正在运行的批次。
+每个 POST 之前保存提交意图，拿到任务身份后立即保存。若槽位账本比批次先保存了任务地址，
+中断后 `resume`、`probe --resume` 和 `probe --recover` 会用同一预约补回地址，
+由对应账户继续查询。没有确切任务身份的发单尝试保持结果未知，需先核对身份。
+
+`--max-wait-seconds` 默认 300 秒。每组预检完成后按剩余时间启动模拟，预算耗尽或前组未完成时，
+后续工作保持排队。`--recover` 接受批次或保存的回执，只读取现有任务并幂等补账。
+`--resume` 继续已排队或已接受的任务，支持离线预览。同批次的运行和恢复持有互斥锁。
+执行失败、未完成和证据缺失列为 deferred。旧批次的记账策略不明确时，保持未补账。
 
 模拟并发统一使用 `--batch-size N`，不再硬编码上限 3。已验证的账户上限会约束请求；
 平台没有公布上限时，默认 3 只是有来源标记的保守本地策略，可显式提高请求预算，
