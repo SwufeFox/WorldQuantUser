@@ -460,7 +460,7 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
         if reused is not None:
             return reused
 
-    timeout = float(environ.get("BRAIN_LOGIN_LOCK_TIMEOUT", "60") or 60)
+    timeout = float(environ.get("BRAIN_LOGIN_LOCK_TIMEOUT", "5") or 5)
     try:
         with cache_store.file_lock(research_paths.lock_path("brain-session"),
                                    timeout=timeout):
@@ -471,6 +471,14 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
                     return reused
             return _login_and_save("logged-in")
     except cache_store.LockTimeout as exc:
+        # Do not pay for a login until the cache has been re-read: the holder may
+        # have finished writing it a moment ago, and a duplicate login is what
+        # triggers the captcha the lock exists to avoid.
+        if reuse_cache:
+            reused = _reuse(locked=False)
+            if reused is not None:
+                meta["reason"] = "cache-after-lock-timeout"
+                return reused
         note("session cache: %s; logging in anyway" % exc)
         return _login_and_save("lock-timeout-login")
 
