@@ -139,18 +139,19 @@ def make_event_sink(stream, verbose):
     return sink
 
 
-def with_session(args, work):
+def with_session(args, work, *, expected_username=None):
     """Run ``work(session)``, re-authenticating once if the session died.
 
     BRAIN sessions expire, and a cached cookie can go stale between calls.
     Retrying once with a forced login keeps every caller from handling that.
     """
+    options = {"expected_username": expected_username} if expected_username is not None else {}
     session = ml.load_session(use_cache=not getattr(args, "no_cache", False),
-                              refresh=getattr(args, "relogin", False))
+                              refresh=getattr(args, "relogin", False), **options)
     try:
         return work(session)
     except ml.AuthError:
-        session = ml.load_session(use_cache=False, refresh=True)
+        session = ml.load_session(use_cache=False, refresh=True, **options)
         return work(session)
 
 

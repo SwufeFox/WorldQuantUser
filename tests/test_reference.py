@@ -1,6 +1,7 @@
 """Offline regressions for BRAIN documents and isolated Zendesk reads."""
 
 import json
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -8,14 +9,23 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 import requests
 
+import cache_store
 import machine_lib as ml
-from research_app import docs_reader, support_reader
-from research_app.runtime import CliError
+import research_paths
+from research_app import docs_reader, reference, support_reader
+from research_app.runtime import CliError, OutputConflict
 
 SUPPORT = "https://support.worldquantbrain.com"
 IDENTITY = SUPPORT + "/api/v2/users/me.json"
 BODY_PATH = "/api/v2/community/posts/42.json"
 SIGNED_ENTRY = "https://worldquantbrain.zendesk.com/access/jwt?jwt=PRIVATE_FIXTURE"
+
+
+@pytest.fixture(autouse=True)
+def reference_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv(research_paths.ENV_VAR, str(tmp_path))
+    monkeypatch.setenv("BRAIN_USERNAME", "fixture-reference-account")
+    monkeypatch.setattr(ml, "_load_dotenv", lambda: None)
 
 
 def response(status=200, payload=None, location=None):
@@ -158,3 +168,157 @@ def test_platform_doc_slug_rejects_an_absolute_url_before_authentication():
         docs_reader.cmd_docs_get(SimpleNamespace(slug="https://outside.invalid/file"), None)
     load.assert_not_called()
     assert error.value.code == "INVALID_INPUT"
+
+
+def test_platform_docs_share_catalog_across_queries_and_canonical_urls():
+    detail = {"id": "workflow", "content": []}
+    directory = {"count": 1, "next": None, "results": [
+        {"id": "getting-started", "pages": [
+            {"id": "workflow", "title": "Workflow"}, {"id": "glossary", "title": "Glossary"}]},
+    ]}
+    with mock.patch.object(ml, "load_session", return_value=object()) as load, \
+            mock.patch.object(ml, "request_json", side_effect=[directory, detail]) as request:
+        first = docs_reader.cmd_docs_list(SimpleNamespace(query="workflow"), None)
+        other = docs_reader.cmd_docs_list(SimpleNamespace(query="glossary", offline=True), None)
+        article = docs_reader.cmd_docs_get(SimpleNamespace(slug="workflow"), None)
+        warm = docs_reader.cmd_docs_get(SimpleNamespace(slug="workflow", offline=True), None)
+
+    assert first["cache"]["hit"] is False
+    assert other["cache"]["hit"] is True
+    assert [p["id"] for p in other["categories"][0]["pages"]] == ["glossary"]
+    assert article["url"].endswith("/getting-started/workflow")
+    assert warm["url"] == article["url"]
+    assert warm["cache"]["hit"] is True
+    assert load.call_count == 2    # catalog and article, neither hit
+    assert [call.args[2] for call in request.call_args_list] == ["/tutorials", "/tutorial-pages/workflow"]
+
+
+def test_doc_save_cannot_overwrite_the_shared_catalog(monkeypatch, tmp_path):
+    load = mock.Mock(side_effect=AssertionError("cache output is protected before login"))
+    monkeypatch.setattr(ml, "load_session", load)
+    catalog = tmp_path / "cache/metadata/reference-brain-tutorial-catalog/existing.json"
+    opts = SimpleNamespace(slug="workflow", save=str(catalog))
+    with pytest.raises(OutputConflict):
+        docs_reader.cmd_docs_get(opts, None)
+    load.assert_not_called()
+
+
+@pytest.fixture
+def support_transport(monkeypatch):
+    load = mock.Mock(return_value=object())
+    sso = mock.MagicMock()
+    get = mock.Mock()
+    monkeypatch.setattr(ml, "load_session", load)
+    monkeypatch.setattr(reference, "with_support", sso)
+    monkeypatch.setattr(reference, "support_get", get)
+    return load, sso, get
+
+
+def test_forum_cache_is_lazy_and_account_scoped(support_transport, monkeypatch, tmp_path):
+    load, sso, get = support_transport
+    get.side_effect = [
+        {"post": {"id": 42, "details": "<p>Account one</p>", "extra_private": "IGNORE_ME"}},
+        {"post": {"id": 42, "details": "<p>Account two</p>"}},
+    ]
+    opts = SimpleNamespace(post_id="42")
+    cached_only = SimpleNamespace(post_id="42", offline=True)
+    assert reference.cmd_forum_get(opts, None)["cache"]["hit"] is False
+    assert reference.cmd_forum_get(cached_only, None)["post"]["details"] == "<p>Account one</p>"
+    assert (load.call_count, sso.call_count, get.call_count) == (1, 1, 1)
+
+    monkeypatch.setenv("BRAIN_USERNAME", "second-reference-account")
+    with pytest.raises(CliError) as error:
+        reference.cmd_forum_get(cached_only, None)
+    assert error.value.code == "NOT_FOUND"
+    assert get.call_count == 1
+    assert reference.cmd_forum_get(opts, None)["post"]["details"] == "<p>Account two</p>"
+    assert load.call_args.kwargs["expected_username"] == "second-reference-account"
+
+    cache_files = list(tmp_path.glob("cache/metadata/reference-support/*.json"))
+    assert len(cache_files) == 2
+    for path in cache_files:
+        saved = path.read_text()
+        assert "fixture-reference-account" not in saved
+        assert "second-reference-account" not in saved
+        assert "IGNORE_ME" not in saved
+
+
+def test_forum_pagination_and_refresh_use_exact_cache_keys(support_transport):
+    load, sso, get = support_transport
+    get.side_effect = [{"results": [{"id": value}]} for value in (1, 2, 3, 4)]
+
+    def search(page, **kwargs):
+        return reference.cmd_forum_search(SimpleNamespace(query="alpha", limit=10, page=page, **kwargs), None)
+
+    assert search(1)["results"] == [{"id": 1}]
+    assert search(2)["results"] == [{"id": 2}]
+    assert search(1, refresh_meta=True)["results"] == [{"id": 3}]
+    assert search(1, no_cache=True)["results"] == [{"id": 4}]
+    assert search(1, offline=True)["results"] == [{"id": 3}]
+    assert search(2, offline=True)["results"] == [{"id": 2}]
+    assert [call.kwargs["params"]["page"] for call in get.call_args_list] == [1, 2, 1, 1]
+    assert load.call_args.kwargs["use_cache"] is False
+    assert sso.call_count == 4
+
+
+def test_offline_cache_miss_and_expiry_never_authenticate(support_transport, monkeypatch):
+    load, _, get = support_transport
+    current = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(cache_store, "utc_now", lambda: current)
+    get.side_effect = [{"article": {"id": 42, "body": text}} for text in ("first", "second")]
+    opts = SimpleNamespace(article_id="42", meta_max_age=10)
+    offline = SimpleNamespace(article_id="42", meta_max_age=10, offline=True)
+
+    with pytest.raises(CliError) as missing:
+        reference.cmd_docs_article(offline, None)
+    assert missing.value.code == "NOT_FOUND"
+    load.assert_not_called()
+    assert reference.cmd_docs_article(opts, None)["article"]["body"] == "first"
+
+    current += timedelta(seconds=11)
+    with pytest.raises(CliError) as expired:
+        reference.cmd_docs_article(offline, None)
+    assert expired.value.code == "NOT_FOUND"
+    assert load.call_count == 1
+    assert reference.cmd_docs_article(opts, None)["article"]["body"] == "second"
+    assert load.call_count == 2
+
+
+@pytest.mark.parametrize("flag", ["refresh_meta", "relogin", "no_cache"])
+def test_offline_cache_rejects_network_flags(support_transport, flag):
+    load, sso, get = support_transport
+    opts = SimpleNamespace(post_id="42", offline=True, **{flag: True})
+    with pytest.raises(CliError) as error:
+        reference.cmd_forum_get(opts, None)
+    assert error.value.code == "INVALID_INPUT"
+    load.assert_not_called()
+    sso.assert_not_called()
+    get.assert_not_called()
+
+
+def test_invalid_forum_response_is_not_cached(support_transport):
+    load, _, get = support_transport
+    opts = SimpleNamespace(post_id="42")
+    get.side_effect = [{"post": None}, {"post": {"id": 42, "details": "example"}}]
+
+    with pytest.raises(CliError) as invalid:
+        reference.cmd_forum_get(opts, None)
+    assert invalid.value.code == "SERVICE_ERROR"
+    assert reference.cmd_forum_get(opts, None)["cache"]["hit"] is False
+    assert reference.cmd_forum_get(opts, None)["cache"]["hit"] is True
+    assert load.call_count == 2
+
+
+def test_corrupted_cached_data_is_an_offline_miss(support_transport, tmp_path):
+    load, _, get = support_transport
+    get.return_value = {"post": {"id": 42, "details": "valid"}}
+    reference.cmd_forum_get(SimpleNamespace(post_id="42"), None)
+    path, = tmp_path.glob("cache/metadata/reference-support/*.json")
+    entry = json.loads(path.read_text())
+    entry["payload"]["data"] = {}
+    path.write_text(json.dumps(entry))
+
+    with pytest.raises(CliError) as missing:
+        reference.cmd_forum_get(SimpleNamespace(post_id="42", offline=True), None)
+    assert missing.value.code == "NOT_FOUND"
+    assert load.call_count == 1

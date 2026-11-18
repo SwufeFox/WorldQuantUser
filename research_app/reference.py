@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import re
 
-from .runtime import CliError, with_session
+from .reference_cache import read_cached, with_reference_session
+from .runtime import CliError
 from .support_reader import support_get, support_pagination, with_support
 
 
@@ -36,12 +37,14 @@ def _page_params(args, maximum):
     return {"page": args.page, "per_page": args.limit}
 
 
-def _read(args, path, params=None):
+def _read(args, path, params, project):
     def read(brain_session):
         with with_support(brain_session) as support_session:
-            return support_get(support_session, path, params=params)
+            return project(support_get(support_session, path, params=params))
 
-    return with_session(args, read)
+    result = read_cached(args, "support", {"path": path, "params": params or {}},
+                         lambda: with_reference_session(args, read))
+    return {**result["data"], "cache": result["cache"]}
 
 
 def _records(payload, key, fields):
@@ -69,8 +72,8 @@ _ARTICLE_FIELDS = (*_TITLE_FIELDS, "section_id", "locale")
 
 
 def cmd_forum_topics(args, _sink):
-    payload = _read(args, "/api/v2/community/topics.json", _cursor_params(args))
-    return _records(payload, "topics", ("id", "name", "html_url", "description"))
+    return _read(args, "/api/v2/community/topics.json", _cursor_params(args),
+                 lambda payload: _records(payload, "topics", ("id", "name", "html_url", "description")))
 
 
 def cmd_forum_search(args, _sink):
@@ -78,31 +81,31 @@ def cmd_forum_search(args, _sink):
     if not query:
         raise CliError("INVALID_INPUT", "forum search needs a non-empty query")
     params = {**_page_params(args, 25), "query": query}
-    payload = _read(args, "/api/v2/help_center/community_posts/search.json", params)
-    return {"query": query, **_records(payload, "results", (*_POST_FIELDS, "snippet"))}
+    return _read(args, "/api/v2/help_center/community_posts/search.json", params,
+                 lambda payload: {"query": query, **_records(payload, "results", (*_POST_FIELDS, "snippet"))})
 
 
 def cmd_forum_get(args, _sink):
     post_id = _resource_id(args.post_id)
-    payload = _read(args, f"/api/v2/community/posts/{post_id}.json")
-    return _record(payload, "post", (*_POST_FIELDS, "details"))
+    return _read(args, f"/api/v2/community/posts/{post_id}.json", None,
+                 lambda payload: _record(payload, "post", (*_POST_FIELDS, "details")))
 
 
 def cmd_forum_comments(args, _sink):
     post_id = _resource_id(args.post_id)
-    payload = _read(args, f"/api/v2/community/posts/{post_id}/comments.json", _cursor_params(args))
-    return {"post_id": post_id, **_records(
-        payload, "comments", ("id", "post_id", "html_url", "body", "official", "created_at", "updated_at"))}
+    fields = ("id", "post_id", "html_url", "body", "official", "created_at", "updated_at")
+    return _read(args, f"/api/v2/community/posts/{post_id}/comments.json", _cursor_params(args),
+                 lambda payload: {"post_id": post_id, **_records(payload, "comments", fields)})
 
 
 def cmd_docs_articles(args, _sink):
     category_id = _resource_id(args.category_id)
     path = f"/api/v2/help_center/en-us/categories/{category_id}/articles.json"
-    payload = _read(args, path, _page_params(args, 100))
-    return {"category_id": category_id, **_records(payload, "articles", _ARTICLE_FIELDS)}
+    return _read(args, path, _page_params(args, 100),
+                 lambda payload: {"category_id": category_id, **_records(payload, "articles", _ARTICLE_FIELDS)})
 
 
 def cmd_docs_article(args, _sink):
     article_id = _resource_id(args.article_id)
-    payload = _read(args, f"/api/v2/help_center/en-us/articles/{article_id}.json")
-    return _record(payload, "article", (*_ARTICLE_FIELDS, "body"))
+    return _read(args, f"/api/v2/help_center/en-us/articles/{article_id}.json", None,
+                 lambda payload: _record(payload, "article", (*_ARTICLE_FIELDS, "body")))

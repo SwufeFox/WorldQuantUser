@@ -283,6 +283,7 @@ python research_cli.py docs list --query python
 python research_cli.py docs get how-translate-fast-expression-alpha-python-alpha
 python research_cli.py forum search "Systematic Predictions Challenge" --limit 5
 python research_cli.py forum get 41113878259479
+python research_cli.py forum get 41113878259479 --offline
 ```
 
 These commands read with the current BRAIN account. The tutorial and support
@@ -291,8 +292,10 @@ developer contract for those routes. Forum and Help Center reads use the
 documented Zendesk APIs once signed in.
 
 Documentation retains the original content blocks. Forum and Help Center reads
-retain the HTML body and source URL. See comment pagination and Help Center
-commands in [the tool map](docs/tooling.md#读平台文档和论坛).
+retain the HTML body and source URL. Responses are cached per account. A fresh
+hit skips authentication and remote requests. Use `--offline` for a cache-only
+read or `--refresh-meta` to refresh the response. See pagination and cache
+options in [the tool map](docs/tooling.md#读平台文档和论坛).
 
 ### Collect research leads across sources
 
@@ -1501,7 +1504,9 @@ python -m pip install pytest
 python -m pytest -q
 ```
 
-The suite runs offline with local fixtures and mocked platform responses.
+The pytest suite uses local fixtures and mocked platform responses. It blocks
+remote Python socket connections and DNS lookups in tests and their Python CLI
+subprocesses. Loopback stays available for local fixtures.
 
 | What changed | Relevant tests |
 | --- | --- |

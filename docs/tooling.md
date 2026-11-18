@@ -54,6 +54,8 @@ python research_cli.py forum topics --limit 5
 python research_cli.py forum search "Systematic Predictions Challenge" --limit 5
 python research_cli.py forum get 41113878259479
 python research_cli.py forum comments 41996433774359 --limit 5
+python research_cli.py forum get 41113878259479 --offline
+python research_cli.py docs get how-translate-fast-expression-alpha-python-alpha --refresh-meta
 ```
 
 `docs list` 筛选 BRAIN 文档目录中的标题、分类和 ID。`docs get` 返回原始 `content`
@@ -62,6 +64,16 @@ python research_cli.py forum comments 41996433774359 --limit 5
 
 论坛搜索和 Help Center 分类用 `--page` 翻页。论坛主题和评论用 `--cursor` 接收
 上页的 `pagination.after_cursor`。列表每次返回一页，`--limit` 控制当前页大小。
+
+`docs` 和 `forum` 按账户、读取对象和分页参数缓存。文档列表的 `--query` 在本地过滤，
+`docs get` 解析页面链接时也复用文档目录。默认缓存有效期为 24 小时，命中时直接从磁盘读取，
+只有缺失、过期或主动刷新才建立平台会话和发请求。
+响应的 `data.cache` 给出命中状态、保存时间和缓存年龄。
+
+`--offline` 只读当前账户的有效缓存，缺失或过期返回 `NOT_FOUND`。
+`--meta-max-age SECONDS` 控制允许的缓存年龄，`0` 停用内容缓存。
+`--refresh-meta` 刷新内容，`--relogin` 同时刷新登录，`--no-cache` 跳过内容缓存并重新登录。
+后三项与 `--offline` 互斥。
 
 这些是账户内的只读入口。平台文档的 `/tutorials`、`/tutorial-pages/{slug}` 和
 论坛登录的 `/authentication/support` 来自 BRAIN 网页自身的调用。当前未核实到

@@ -7,6 +7,7 @@ import difflib
 import json
 import math
 import os
+from importlib import import_module
 
 import alpha_registry
 import field_contract
@@ -15,7 +16,6 @@ import research_config as config_io
 import research_paths
 
 from . import account, alphas, benchmark, feed, independence, triage, legs, mine, pairs, promote, prune, buffer_cmd, campaign, catalog, experiments, ledger, literature, validation
-from . import docs_reader, reference
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
 
 
@@ -85,19 +85,21 @@ def _add_common_args(parser):
                        help="Use this research directory for this invocation, overriding BRAIN_RESEARCH_DIR.")
 
 
-def _add_session_args(parser, *, metadata=True):
+def _add_session_args(parser, *, reference=False):
     parser.add_argument("--no-cache", action="store_true",
-                        help="Ignore the cached session and re-authenticate.")
+                        help=("Bypass the response cache and re-authenticate." if reference else
+                              "Ignore the cached session and re-authenticate."))
     parser.add_argument("--relogin", action="store_true",
-                        help="Force a fresh login even if the cache looks valid.")
-    if not metadata:
-        return
+                        help=("Refresh the response with a fresh login." if reference else
+                              "Force a fresh login even if the cache looks valid."))
+    cached = "reference content" if reference else "catalog metadata"
+    cache_name = "reference cache" if reference else "catalog cache"
     parser.add_argument("--meta-max-age", type=_non_negative_seconds, default=None,
                         metavar="SECONDS",
-                        help="Accept cached catalog metadata up to this age "
-                             "(default 86400; 0 disables the catalog cache).")
+                        help=f"Accept cached {cached} up to this age "
+                             f"(default 86400; 0 disables the {cache_name}).")
     parser.add_argument("--refresh-meta", action="store_true",
-                        help="Ignore cached catalog metadata and refetch it.")
+                        help=f"Ignore cached {cached} and refetch it.")
 
 
 def _non_negative_seconds(value):
@@ -215,10 +217,20 @@ def _add_settings_args(parser):
 
 
 def _add_reference_commands(sub):
-    def add(group, name, func, help_text):
+    def add(group, name, target, help_text):
+        module_name, handler_name = target.split(".")
+
+        def dispatch(args, sink):
+            module = import_module(f".{module_name}", __package__)
+            return getattr(module, handler_name)(args, sink)
+
         command = group.add_parser(name, help=help_text)
-        _add_session_args(command, metadata=False)
-        command.set_defaults(func=func)
+        _add_session_args(command, reference=True)
+        command.add_argument("--offline", action="store_true",
+                             help="Read only a fresh cache entry for the current account. "
+                                  "A cache miss returns NOT_FOUND without a network request. "
+                                  "Incompatible with --refresh-meta, --no-cache and --relogin.")
+        command.set_defaults(func=dispatch)
         return command
 
     def paginate(command, *, cursor=False):
@@ -230,26 +242,26 @@ def _add_reference_commands(sub):
 
     docs = sub.add_parser("docs", help="Read official BRAIN documentation and Help Center articles.")
     docs_sub = docs.add_subparsers(dest="subcommand", metavar="<action>", parser_class=JsonArgumentParser)
-    docs_list = add(docs_sub, "list", docs_reader.cmd_docs_list, "List BRAIN documentation by category.")
+    docs_list = add(docs_sub, "list", "docs_reader.cmd_docs_list", "List BRAIN documentation by category.")
     docs_list.add_argument("--query", help="Filter category titles, page titles and IDs.")
-    docs_get = add(docs_sub, "get", docs_reader.cmd_docs_get, "Read a BRAIN documentation page's original content blocks.")
+    docs_get = add(docs_sub, "get", "docs_reader.cmd_docs_get", "Read a BRAIN documentation page's original content blocks.")
     docs_get.add_argument("slug", help="Page ID from docs list.")
-    articles = add(docs_sub, "articles", reference.cmd_docs_articles, "List English Help Center articles in a category.")
+    articles = add(docs_sub, "articles", "reference.cmd_docs_articles", "List English Help Center articles in a category.")
     articles.add_argument("category_id", help="Numeric ID from the Help Center category link.")
     paginate(articles)
-    article = add(docs_sub, "article", reference.cmd_docs_article, "Read a Help Center article's HTML body.")
+    article = add(docs_sub, "article", "reference.cmd_docs_article", "Read a Help Center article's HTML body.")
     article.add_argument("article_id", help="Numeric ID from the Help Center article link.")
 
     forum = sub.add_parser("forum", help="Search and read the signed-in BRAIN community.")
     forum_sub = forum.add_subparsers(dest="subcommand", metavar="<action>", parser_class=JsonArgumentParser)
-    topics = add(forum_sub, "topics", reference.cmd_forum_topics, "List forum topics visible to this account.")
+    topics = add(forum_sub, "topics", "reference.cmd_forum_topics", "List forum topics visible to this account.")
     paginate(topics, cursor=True)
-    search = add(forum_sub, "search", reference.cmd_forum_search, "Search forum posts by relevance.")
+    search = add(forum_sub, "search", "reference.cmd_forum_search", "Search forum posts by relevance.")
     search.add_argument("query", help="Search phrase.")
     paginate(search)
-    post = add(forum_sub, "get", reference.cmd_forum_get, "Read a forum post's HTML body.")
+    post = add(forum_sub, "get", "reference.cmd_forum_get", "Read a forum post's HTML body.")
     post.add_argument("post_id", help="Numeric ID from the forum post link.")
-    comments = add(forum_sub, "comments", reference.cmd_forum_comments, "Read forum comments and their HTML bodies.")
+    comments = add(forum_sub, "comments", "reference.cmd_forum_comments", "Read forum comments and their HTML bodies.")
     comments.add_argument("post_id", help="Numeric ID from the forum post link.")
     paginate(comments, cursor=True)
 
@@ -1542,13 +1554,14 @@ _COMMAND_EXAMPLES = {
     "auth logout": ["auth logout"],
     "docs": ["docs list --query python", "docs articles 41681062887191 --limit 5"],
     "docs list": ["docs list --query python"],
-    "docs get": ["docs get how-translate-fast-expression-alpha-python-alpha"],
+    "docs get": ["docs get how-translate-fast-expression-alpha-python-alpha",
+                 "docs get how-translate-fast-expression-alpha-python-alpha --offline"],
     "docs articles": ["docs articles 41681062887191 --limit 5"],
     "docs article": ["docs article 41681217386903"],
     "forum": ['forum search "Systematic Predictions Challenge" --limit 5'],
     "forum topics": ["forum topics --limit 5"],
     "forum search": ['forum search "Systematic Predictions Challenge" --limit 5'],
-    "forum get": ["forum get 41113878259479"],
+    "forum get": ["forum get 41113878259479", "forum get 41113878259479 --refresh-meta"],
     "forum comments": ["forum comments 41996433774359 --limit 5"],
     "cache": ["cache info"],
     "cache info": ["cache info"],

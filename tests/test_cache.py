@@ -335,6 +335,16 @@ class SessionCacheTests(TempCacheCase):
         ml.load_session(refresh=True)
         self.assertEqual(len(self.calls), 2)
 
+    def test_account_bound_session_skips_a_different_users_cookie(self):
+        cache_store.write_json_atomic(
+            self.cache_path,
+            cache_store.build_entry("brain-session",
+                                    {"cookies": {"s": "other-token"}, "username": "other"}, ttl=3600))
+        session = ml.load_session(expected_username="u")
+        self.assertEqual(len(self.calls), 1)
+        self.assertIsNone(session.cookies.get("s"))
+        self.assertEqual(session.cookies.get("t"), "token-value")
+
     def test_expired_cache_triggers_login(self):
         cache_store.write_json_atomic(
             self.cache_path,

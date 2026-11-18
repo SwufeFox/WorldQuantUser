@@ -97,6 +97,7 @@ class BriefContractTests(unittest.TestCase):
 
 class ReferenceContractTests(unittest.TestCase):
     def test_schema_exposes_documentation_and_forum_read_options(self):
+        cache_flags = {"--offline", "--meta-max-age", "--refresh-meta", "--no-cache", "--relogin"}
         for path, expected in ((["docs", "get"], {"slug", "--relogin"}),
                                (["forum", "search"], {"query", "--limit", "--page"}),
                                (["forum", "comments"], {"post_id", "--limit", "--cursor"})):
@@ -105,7 +106,22 @@ class ReferenceContractTests(unittest.TestCase):
                 self.assertEqual(proc.returncode, 0, proc.stderr)
                 command = parse(proc)["data"]["command"]
                 flags = {flag for option in command["options"] for flag in option["flags"]}
-                self.assertTrue(expected <= flags)
+                self.assertTrue((expected | cache_flags) <= flags)
+
+    def test_help_and_schema_do_not_import_reference_readers(self):
+        script = """
+import sys
+from research_app import app
+
+for args in (["help", "docs", "get"], ["schema", "forum", "search"], ["schema", "alpha", "get"]):
+    assert app.main(args) == 0
+
+readers = {"research_app.docs_reader", "research_app.reference", "research_app.support_reader"}
+assert readers.isdisjoint(sys.modules), readers.intersection(sys.modules)
+"""
+        proc = subprocess.run([sys.executable, "-c", script], cwd=ROOT,
+                              capture_output=True, encoding="utf-8")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
     def test_invalid_reference_input_fails_before_login(self):
         cases = (["docs", "get", "../other"], ["docs", "article", "not-an-id"],
@@ -119,6 +135,17 @@ class ReferenceContractTests(unittest.TestCase):
                     self.assertEqual(cli_app.main(args), 2)
                 self.assertEqual(json.loads(stdout.getvalue())["error"]["code"], "INVALID_INPUT")
                 load.assert_not_called()
+
+    def test_offline_reference_cache_miss_does_not_load_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for command in (["docs", "list"], ["forum", "get", "42"]):
+                with self.subTest(command=command):
+                    stdout = io.StringIO()
+                    with mock.patch.object(ml, "load_session", side_effect=AssertionError("network")) as load, \
+                            contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+                        self.assertEqual(cli_app.main([*command, "--offline", "--research-dir", directory]), 5)
+                    self.assertEqual(json.loads(stdout.getvalue())["error"]["code"], "NOT_FOUND")
+                    load.assert_not_called()
 
 
 class TriageContractTests(unittest.TestCase):

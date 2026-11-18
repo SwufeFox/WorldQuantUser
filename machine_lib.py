@@ -477,7 +477,8 @@ def invalidate_session(cache_path=None):
     return cache_store.remove(Path(cache_path or session_cache_path()))
 
 
-def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
+def load_session(cache_path=None, use_cache=True, refresh=False, meta=None,
+                 *, expected_username=None):
     """Return an authenticated session, reusing a cached cookie when still valid.
 
     BRAIN issues sessions that last hours but challenges repeated logins with a
@@ -488,11 +489,12 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
     The login itself is single-flight: concurrent callers take a file lock, and
     the ones that lose the race re-check the cache and reuse the winner's
     session instead of adding a second login. Pass ``meta`` (a dict) to receive
-    ``cached``/``migrated_from``/``reason`` for diagnostics.
+    ``cached``/``migrated_from``/``reason`` for diagnostics. An expected username
+    restricts reuse to cookies already bound to that account.
     """
     meta = meta if meta is not None else {}
     path = Path(cache_path or session_cache_path())
-    if cache_path is None:
+    if cache_path is None and expected_username is None:
         migrated = _migrate_legacy_session(path)
         if migrated:
             meta["migrated_from"] = migrated
@@ -501,10 +503,15 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
     def _reuse():
         entry = cache_store.read_entry(path)
         if entry["present"] and entry["fresh"]:
+            payload = entry["payload"]
+            if expected_username is not None and (
+                    not isinstance(payload, dict) or payload.get("username") != expected_username):
+                meta["cache_state"] = "account-mismatch"
+                return None
             meta.update({"cached": True, "reason": "reused-cache",
                          "cache_state": "fresh",
                          "expires_in": entry.get("expires_in")})
-            return _session_from_entry(entry["payload"])
+            return _session_from_entry(payload)
         if entry["present"]:
             meta.setdefault("cache_state", "expired")
         elif entry.get("error") not in (None, "missing"):
