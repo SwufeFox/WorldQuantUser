@@ -141,9 +141,82 @@ class MergedPerformanceCLITests(unittest.TestCase):
         self.assertEqual(code, 0, document)
         self.assertEqual(get.call_count, 1)
         self.assertNotIn("merged_performance", document["data"])
+        self.assertNotIn("recordsets", document["data"])
         self.assertEqual(document["data"]["metrics"]["sharpe"], 0.4)
         self.assertEqual(document["data"]["checks"]["MATCHES_PYRAMID"]["pyramids"][0]["name"], "Synthetic pyramid")
         self.assertEqual(document["data"]["incentives"]["basis"], "alpha_snapshot")
+
+    def test_recordset_discovery_lists_native_names_without_reading_series(self):
+        items = [{"name": "coverage", "title": "Coverage of Universe"}]
+        with mock.patch.object(self.session, "get", side_effect=[response(self.alpha), response(items)]) as get:
+            code, document = self.invoke("--recordsets")
+        self.assertEqual(code, 0, document)
+        result = document["data"]["recordsets"]
+        self.assertEqual(result["discovery"]["available"], items)
+        self.assertEqual(result["series"], {})
+        self.assertEqual(get.call_count, 2)
+        self.assertFalse(Path(research_paths.views_log_path()).exists())
+
+    def test_explicit_yearly_stats_can_work_without_discovery_and_logs_validation(self):
+        native = {"schema": {"properties": [{"name": "year"}, {"name": "sharpe"}]},
+                  "records": [[2024, 1.25]]}
+        with mock.patch.object(self.session, "get", side_effect=[
+                response(self.alpha), response({}), response(native)]) as get:
+            code, document = self.invoke("--recordsets", "yearly-stats")
+        self.assertEqual(code, 0, document)
+        result = document["data"]["recordsets"]
+        self.assertEqual(result["discovery"]["reason"], "missing_catalog")
+        self.assertFalse(result["train_only_verified"])
+        yearly = result["series"]["yearly-stats"]
+        self.assertIsNone(yearly["advertised"])
+        self.assertIsNone(yearly["complete"])
+        self.assertEqual(yearly["schema"], native["schema"])
+        self.assertEqual(yearly["records"], native["records"])
+        self.assertTrue(get.call_args.args[0].endswith("/alphas/A1/recordsets/yearly-stats"))
+        self.assertFalse(get.call_args.kwargs["allow_redirects"])
+        view = json.loads(Path(research_paths.views_log_path()).read_text())
+        self.assertEqual((view["tool"], view["view"], view["note"]),
+                         ("alpha get --recordsets", "validation", "yearly-stats"))
+
+    def test_pending_and_unavailable_recordsets_keep_alpha_metrics(self):
+        with mock.patch.object(self.session, "get", side_effect=[
+                response(self.alpha), response([]),
+                response({"records": [["provisional"]]}, headers={"Retry-After": "120"}),
+                response(status=403)]) as get, mock.patch.object(ml, "sleep") as sleep:
+            code, document = self.invoke("--recordsets", "coverage", "turnover", "--max-wait", "0")
+        self.assertEqual(code, 0, document)
+        self.assertEqual(document["data"]["metrics"]["sharpe"], 0.4)
+        sets = document["data"]["recordsets"]["series"]
+        self.assertEqual(sets["coverage"]["state"], "pending")
+        self.assertIsNone(sets["coverage"]["records"])
+        self.assertEqual(sets["coverage"]["next_poll_after_seconds"], 120)
+        self.assertEqual(sets["turnover"]["reason"], "access_denied")
+        self.assertTrue(all(call.kwargs["timeout"] > 1 for call in get.call_args_list[1:]))
+        sleep.assert_not_called()
+
+    def test_invalid_recordset_name_is_rejected_before_network_use(self):
+        code, document = self.invoke("--recordsets", "../checks")
+        self.assertEqual(code, 2, document)
+        self.assertEqual(document["error"]["code"], "INVALID_INPUT")
+        self.login.assert_not_called()
+
+    def test_partial_recordset_discovery_does_not_rule_out_other_names(self):
+        items = {"count": 2, "results": [{"name": "coverage"}]}
+        with mock.patch.object(self.session, "get", side_effect=[
+                response(self.alpha), response(items), response({"records": [], "count": 0})]):
+            code, document = self.invoke("--recordsets", "turnover")
+        self.assertEqual(code, 0, document)
+        sets = document["data"]["recordsets"]
+        self.assertFalse(sets["discovery"]["complete"])
+        self.assertIsNone(sets["series"]["turnover"]["advertised"])
+
+    def test_recordset_wait_budget_exhaustion_does_not_start_more_reads(self):
+        session = mock.Mock()
+        session.get.return_value = response([])
+        with mock.patch.object(ml.time, "monotonic", side_effect=[0, 0, 2]):
+            result = ml.fetch_alpha_recordsets(session, "A1", ["coverage"], max_wait_seconds=1)
+        self.assertEqual(session.get.call_count, 1)
+        self.assertEqual(result["series"]["coverage"]["reason"], "wait_budget_exhausted")
 
     def test_summary_keeps_native_stats_and_zero_based_deltas_but_omits_series(self):
         with mock.patch.object(self.session, "get", side_effect=[response(self.alpha), response(comparison())]):

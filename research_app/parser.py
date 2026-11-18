@@ -994,7 +994,8 @@ def build_parser():
         description="Prepare, check, run and recover labelled experiments from the same spec. "
                     "--dry-run is offline; --check verifies live metadata without simulations. "
                     "Results include durable path, run identity, per-arm outcomes and next actions. "
-                    "--recover only reads platform jobs; --resume explicitly starts unsubmitted work.")
+                    "--recover and --from-simulation only read platform jobs; "
+                    "--resume explicitly starts unsubmitted work.")
     probe.add_argument("--allow-lint-errors", action="store_true", dest="allow_lint_errors",
                        help="Permit a FASTEXPR launch with lint findings. Python preflight and "
                             "unsupported setting errors still block.")
@@ -1007,10 +1008,12 @@ def build_parser():
     probe_source.add_argument("--resume", default=None, metavar="BATCH_JSON",
                               help="Continue a saved batch, including definitely unsubmitted arms; "
                                    "use --dry-run to preview first.")
+    probe_source.add_argument("--from-simulation", metavar="ID_OR_LINK",
+                              help="Read an existing BRAIN multi-simulation and list its Alpha IDs.")
     probe.add_argument("spec", nargs="?", default=None,
                        help="JSON experiment spec. Arms take an inline expression or a relative Python "
                             "source_file. Use design=explore for scans or mixed-language batches. "
-                            "Omitted with --recover or --resume.")
+                            "Omitted with --recover, --resume or --from-simulation.")
     _add_settings_args(probe)
     _add_session_args(probe)
     _add_concurrency_args(probe)
@@ -1056,11 +1059,13 @@ def build_parser():
     a_get.add_argument("alpha_id")
     a_get.add_argument("--performance", nargs="?", const="summary", choices=["summary", "full"],
                        help="Also read platform merged before/after performance; full includes all native series.")
+    a_get.add_argument("--recordsets", nargs="*", metavar="NAME",
+                       help="Discover native diagnostic recordsets and optionally read names such as yearly-stats.")
     a_get_scope = a_get.add_mutually_exclusive_group()
     a_get_scope.add_argument("--team", dest="team_id", help="Team scope for --performance; default is the current user.")
     a_get_scope.add_argument("--competition", dest="competition_id", help="Competition scope for --performance.")
     a_get.add_argument("--max-wait", type=_non_negative_seconds, default=180.0,
-                       help="Maximum seconds to wait for asynchronous merged performance (default 180).")
+                       help="Wait budget for each requested evidence view (performance or recordsets).")
     _add_session_args(a_get)
 
     a_get.bind_handler("alphas.cmd_alpha_get")
@@ -1613,11 +1618,12 @@ _COMMAND_EXAMPLES = {
               "probe python.spec.json --batch-path PYTHON_BATCH.json --dry-run",
               "probe batch.spec.json --batch-path BATCH.json --save response.json",
               "probe --recover BATCH.json --max-wait-seconds 60",
-              "probe --resume BATCH.json --dry-run"],
+              "probe --resume BATCH.json --dry-run", "probe --from-simulation SIMULATION_ID"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],
     "alpha get": ["alpha get ALPHA_ID", "alpha get ALPHA_ID --performance",
-                  "alpha get ALPHA_ID --performance full --competition COMPETITION_ID"],
+                  "alpha get ALPHA_ID --performance full --competition COMPETITION_ID",
+                  "alpha get ALPHA_ID --recordsets yearly-stats"],
     "alpha check": ["alpha check ALPHA_ID", "alpha check ALPHA_A ALPHA_B --workers 2"],
     "alpha self-corr": ["alpha self-corr ALPHA_ID"],
     "alpha describe": ['alpha describe ALPHA_ID --name "quality signal" --category FUNDAMENTAL'],

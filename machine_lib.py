@@ -963,6 +963,33 @@ def process_datafields(fields):
 
 
 BRAIN_API_URL = "https://api.worldquantbrain.com"
+_SIMULATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}")
+
+
+def valid_simulation_id(value):
+    """Check the shape of a bare id before using it as a path segment."""
+    return isinstance(value, str) and bool(_SIMULATION_ID.fullmatch(value))
+
+
+def simulation_reference_id(reference):
+    """Extract a bare id or the id from one exact BRAIN API simulation URL."""
+    if valid_simulation_id(reference):
+        return reference
+    message = "expected a simulation id or https://api.worldquantbrain.com/simulations/ID"
+    if not isinstance(reference, str) or any(
+            character.isspace() or ord(character) < 32 or character in "\\?#"
+            for character in reference):
+        raise ValueError(message)
+    try:
+        url = urlsplit(reference)
+    except ValueError as exc:
+        raise ValueError(message) from exc
+    base, separator, simulation_id = url.path.removesuffix("/").rpartition("/")
+    if (url.scheme != "https" or url.netloc.lower() not in {
+            "api.worldquantbrain.com", "api.worldquantbrain.com:443"}
+            or not separator or base != "/simulations" or not valid_simulation_id(simulation_id)):
+        raise ValueError(message)
+    return simulation_id
 
 
 def _validated_progress_url(location):
@@ -1062,6 +1089,41 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4, *,
         except ValueError:
             return {}
     raise last or RateLimited("%s %s" % (method, url))
+
+
+def read_simulation_snapshot(s, simulation_id, *, deadline):
+    """GET one simulation response without polling or following redirects."""
+    from requests.exceptions import RequestException
+
+    if not valid_simulation_id(simulation_id):
+        raise ValueError("invalid simulation id")
+    if time.monotonic() >= deadline:
+        raise ServiceError("simulation inspection wait budget expired")
+    try:
+        response = s.get(f"{BRAIN_API_URL}/simulations/{simulation_id}",
+                         timeout=_request_timeout(deadline), allow_redirects=False)
+    except RequestException as exc:
+        raise ServiceError("simulation inspection request failed") from exc
+    status = response.status_code
+    if status in (401, 403):
+        raise AuthError("BRAIN denied access to this simulation")
+    if status == 404:
+        raise NotFound("simulation not found")
+    if status == 429:
+        raise RateLimited("simulation inspection rate limited")
+    if status != 200:
+        raise ServiceError(f"simulation inspection returned HTTP {status}")
+    seconds = _retry_after_seconds(response, cap_error_wait=False)
+    retry_after = seconds if math.isfinite(seconds) and seconds > 0 else None
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        if retry_after is None:
+            raise ServiceError("simulation inspection returned an invalid response")
+        payload = {}
+    return payload, retry_after
 
 
 def poll_simulation(s, progress_url, on_event=None, deadline=None):
@@ -2165,6 +2227,111 @@ def fetch_merged_performance(s, alpha_id, team_id=None, competition_id=None,
         ):
             raise ServiceError("merged performance response has no usable before/after statistics object")
         return {**observed, "complete": True, "payload": payload, "next_poll_after_seconds": None}
+
+
+def _recordset_paths(alpha_id, names):
+    if not isinstance(alpha_id, str) or not re.fullmatch(r"[A-Za-z0-9]+", alpha_id):
+        raise ValueError("recordset reads require a BRAIN alpha ID")
+    if any(not isinstance(name, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name) for name in names):
+        raise ValueError("invalid recordset name; use e.g. yearly-stats")
+    base = f"{BRAIN_API_URL}/alphas/{alpha_id}/recordsets"
+    return base, {name: f"{base}/{name}" for name in names}
+
+
+def _read_recordset(s, url, deadline, *, one_shot=False):
+    from requests.exceptions import RequestException
+
+    result = {"source": url, "state": "unavailable", "payload": None}
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 and not one_shot:
+            return {**result, "reason": "wait_budget_exhausted"}
+        timeout = 12.0 if one_shot else min(12.0, remaining)
+        try:
+            response = s.get(url, timeout=timeout, allow_redirects=False)
+        except RequestException:
+            return {**result, "reason": "transport_error"}
+        status = response.status_code
+        result.update(http_status=status, retrieved_at=cache_store.utc_now().isoformat())
+        if status == 401:
+            raise AuthError("BRAIN rejected the session while reading alpha recordsets")
+        if status in (403, 404):
+            return {**result, "reason": "access_denied" if status == 403 else "not_found"}
+        delay = _retry_after_seconds(response, cap_error_wait=False)
+        if not math.isfinite(delay):
+            return {**result, "reason": "invalid_retry_after"}
+        if delay > 0 and (200 <= status < 300 or status in (429, 503)):
+            if delay >= deadline - time.monotonic():
+                return {**result, "state": "pending", "reason": "retry_after",
+                        "next_poll_after_seconds": delay}
+            sleep(delay)
+            if time.monotonic() >= deadline:
+                return {**result, "state": "pending", "reason": "retry_after",
+                        "next_poll_after_seconds": 0.0}
+            continue
+        if not 200 <= status < 300:
+            return {**result, "reason": "rate_limited" if status == 429 else "http_error"}
+        if not response.content.strip():
+            return {**result, "reason": "empty_response"}
+        try:
+            payload = response.json()
+            json.dumps(payload, allow_nan=False)
+        except (TypeError, ValueError):
+            return {**result, "reason": "invalid_json"}
+        return {**result, "state": "available", "payload": payload}
+
+
+def fetch_alpha_recordsets(s, alpha_id, names=(), max_wait_seconds=180.0):
+    """Discover native series and read explicitly requested recordsets.
+
+    Each result describes one native response. Completeness is unknown without
+    pagination evidence, and the server's dates and units are left untouched.
+    """
+    base, paths = _recordset_paths(alpha_id, names)
+    if (type(max_wait_seconds) not in (int, float) or not math.isfinite(max_wait_seconds)
+            or max_wait_seconds < 0):
+        raise ValueError("max_wait_seconds must be a finite, non-negative number")
+    deadline = time.monotonic() + max_wait_seconds
+    one_shot = max_wait_seconds == 0
+    discovery = _read_recordset(s, base, deadline, one_shot=one_shot)
+    payload = discovery.pop("payload")
+    rows = payload if isinstance(payload, list) else (payload.get("results") if isinstance(payload, dict) else None)
+    discovery["complete"] = None
+    if isinstance(rows, list) and all(isinstance(row, dict) and isinstance(row.get("name"), str)
+                                     and row["name"] for row in rows):
+        discovery["available"] = rows
+        if isinstance(payload, list):
+            discovery["complete"] = True
+        elif payload.get("next"):
+            discovery["complete"] = False
+        elif type(payload.get("count")) is int:
+            discovery["complete"] = payload["count"] == len(rows)
+    else:
+        if discovery["state"] == "available":
+            discovery.update(state="unavailable", reason="missing_catalog" if not payload else "invalid_catalog")
+        discovery["available"] = None
+    advertised = discovery["available"]
+    advertised_names = {row["name"] for row in advertised or []}
+    datasets = {}
+    for name, url in paths.items():
+        entry = _read_recordset(s, url, deadline, one_shot=one_shot)
+        payload = entry.pop("payload")
+        entry.update(advertised=True if name in advertised_names else False if discovery["complete"] else None,
+                     schema=None, records=None, records_returned=None, reported_count=None, complete=None)
+        if entry["state"] == "available":
+            if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+                entry.update(state="unavailable", reason="missing_records" if not payload else "invalid_records")
+            else:
+                records = payload["records"]
+                count = payload.get("count")
+                count = count if type(count) is int and count >= 0 else None
+                complete = False if payload.get("next") else (
+                    count == len(records) if count is not None else None)
+                entry.update(schema=payload.get("schema"), records=records, records_returned=len(records),
+                             reported_count=count, complete=complete)
+        datasets[name] = entry
+    return {"alpha_id": alpha_id, "train_only_verified": False,
+            "discovery": discovery, "series": datasets}
 
 
 def pnl_cache_status(cache_dir, alpha_id, series=None):

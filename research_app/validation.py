@@ -22,7 +22,56 @@ def _python_finding(code, message, severity="error", **location):
     return {"code": code, "message": message, "severity": severity, **location}
 
 
-def _parse_python_source(source):
+def _python_history_warnings(function, data_argument, fields, lookback):
+    """Compare direct, literal history access to the maximum available window."""
+    if type(lookback) is not int or lookback < 0:
+        return []
+    available = lookback + 1
+    findings = []
+    pending = list(reversed(function.body))
+    while pending:
+        node = pending.pop()
+        # Nested scopes may shadow the decorated function's data parameter.
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda,
+                             ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+            if getattr(node, "name", None) == data_argument:
+                return []
+            continue
+        if (isinstance(node, ast.Name) and node.id == data_argument
+                and isinstance(node.ctx, (ast.Store, ast.Del))):
+            return []
+        pending.extend(reversed(list(ast.iter_child_nodes(node))))
+        if not isinstance(node, ast.Subscript) or not isinstance(node.ctx, ast.Load):
+            continue
+        field = node.value
+        if not (isinstance(field, ast.Attribute) and field.attr in fields
+                and isinstance(field.value, ast.Name) and field.value.id == data_argument):
+            continue
+        bound = node.slice
+        slice_access = isinstance(bound, ast.Slice)
+        if slice_access:
+            if bound.upper is not None or bound.step is not None:
+                continue
+            bound = bound.lower
+        if not (isinstance(bound, ast.UnaryOp) and isinstance(bound.op, ast.USub)
+                and isinstance(bound.operand, ast.Constant) and type(bound.operand.value) is int):
+            continue
+        required = bound.operand.value
+        if required <= available:
+            continue
+        if slice_access:
+            code = "python_history_slice_truncated"
+            message = f"{field.attr}[-{required}:] requests {required} rows but can return at most {available}"
+        else:
+            code = "python_history_index_out_of_range"
+            message = f"{field.attr}[-{required}] needs {required} rows but can have at most {available}"
+        findings.append(_python_finding(
+            code, message, "warning", identifier=field.attr, line=node.lineno,
+            column=node.col_offset + 1, lookback=lookback, required_rows=required, available_rows=available))
+    return findings
+
+
+def _parse_python_source(source, *, lookback=None):
     """Read the static BRAIN Alpha interface without importing analyst code.
 
     Literal data declarations allow the online preflight to verify the exact
@@ -59,7 +108,8 @@ def _parse_python_source(source):
 
     function, decorator = decorators[0]
     arguments = function.args
-    if (len(arguments.posonlyargs) + len(arguments.args) != 2 or arguments.kwonlyargs
+    positional = arguments.posonlyargs + arguments.args
+    if (len(positional) != 2 or arguments.kwonlyargs
             or arguments.vararg or arguments.kwarg):
         result["errors"].append(_python_finding(
             "python_alpha_signature", "the @alpha function requires exactly two positional arguments",
@@ -82,6 +132,9 @@ def _parse_python_source(source):
             line=literal.lineno, identifier="universe"))
     else:
         result["declared_fields"] = sorted(set(declared))
+    if not result["errors"]:
+        result["warnings"].extend(_python_history_warnings(
+            function, positional[0].arg, set(declared), lookback))
     return result
 
 
@@ -105,9 +158,9 @@ def _attach_python_fields(result, known_fields):
     return result
 
 
-def lint_python_source(source, known_fields=None):
+def lint_python_source(source, known_fields=None, *, lookback=None):
     """Parse and check declared Python Alpha fields without loading the code."""
-    return _attach_python_fields(_parse_python_source(source), known_fields)
+    return _attach_python_fields(_parse_python_source(source, lookback=lookback), known_fields)
 
 
 def _python_batch(results, known_fields):
@@ -154,7 +207,8 @@ def _preflight_lint(session, pairs, settings, args, capability_snapshot=None):
         # Python declarations provide field names directly; operator metadata
         # and FASTEXPR type inference do not apply.
         operator_evidence.update(state="not_applicable")
-        results = [_parse_python_source(expression) for expression, _ in pairs]
+        results = [_parse_python_source(expression, lookback=settings.get("lookback"))
+                   for expression, _ in pairs]
         required = {field for result in results for field in (result["declared_fields"] or [])}
         if required:
             fields = _field_scope(session, settings, required_fields=required)
@@ -284,7 +338,8 @@ def _cmd_lint_python(args, settings, pairs):
     offline = bool(getattr(args, "offline", False))
     if offline:
         fields = cached_field_scope(settings, getattr(args, "meta_max_age", None))
-        reports = [_parse_python_source(expression) for expression, _ in pairs]
+        reports = [_parse_python_source(expression, lookback=settings.get("lookback"))
+                   for expression, _ in pairs]
         result = _python_batch(reports, fields["known_fields"])
         result["field_catalog"] = fields["evidence"]
         result["language_capability"] = {"state": "unknown", "source": None}

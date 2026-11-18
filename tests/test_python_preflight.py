@@ -1,11 +1,15 @@
 """Python Alpha checks parse source and verify account evidence without executing code."""
 
+import json
+import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
 import machine_lib as ml
 import simulation_capabilities
-from research_app import capabilities, validation
+from research_app import capabilities, experiments, validation
 from research_app.runtime import CliError
 from tools import guarded_sim
 
@@ -40,6 +44,38 @@ class PythonPreflightTests(TestCase):
         self.assertEqual(result["fields_state"], "unknown")
         self.assertEqual([item["code"] for item in result["warnings"]], ["python_fields_unverified"])
         self.assertIsNone(result["operator_count"])
+
+    def test_history_warnings_distinguish_index_from_truncated_slice(self):
+        source = SOURCE.replace("data, store", "frame, store").replace(
+            "data.close[-1]", "frame.close[-4], frame.close[-5:]")
+        result = validation.lint_python_source(source, known_fields={"close"}, lookback=2)
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            [(item["code"], item["required_rows"], item["available_rows"])
+             for item in result["warnings"]],
+            [("python_history_index_out_of_range", 4, 3),
+             ("python_history_slice_truncated", 5, 3)],
+        )
+        self.assertEqual({item["line"] for item in result["warnings"]}, {6})
+        self.assertEqual({item["identifier"] for item in result["warnings"]}, {"close"})
+
+    def test_history_warning_stays_with_direct_literal_declared_data_access(self):
+        source = SOURCE.replace("return data.close[-1]", """
+    def helper(data):
+        return data.close[-99]
+    alias = data
+    indices = 99
+    return (data.close[-3], data.close[-3:], data.close[-indices],
+            data.close[-99:1], data.close[-99::2], data.undeclared[-99],
+            store.close[-99], alias.close[-99],
+            [data.close[-99] for data in []])
+""")
+        result = validation.lint_python_source(source, known_fields={"close"}, lookback=2)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["warnings"], [])
+        rebound = SOURCE.replace("return data.close[-1]", "data = store\n    return data.close[-99]")
+        self.assertEqual(validation.lint_python_source(
+            rebound, known_fields={"close"}, lookback=2)["warnings"], [])
 
     def test_bad_static_sources_fail_before_field_verification(self):
         cases = [
@@ -143,10 +179,41 @@ class PythonPreflightTests(TestCase):
         dispatch.assert_not_called()
 
     def test_offline_lint_never_opens_a_session(self):
-        args = SimpleNamespace(expr=[SOURCE], setting=[("language", "PYTHON"), ("lookback", 2)], offline=True)
+        source = SOURCE.replace("data.close[-1]", "data.close[-4:]")
+        args = SimpleNamespace(expr=[source], setting=[("language", "PYTHON"), ("lookback", 2)], offline=True)
         with mock.patch.object(validation, "with_session") as session:
             result = validation.cmd_lint(args, None)
         session.assert_not_called()
         self.assertTrue(result["ok"])
         self.assertFalse(result["catalog_checked"])
         self.assertEqual(result["language_capability"]["state"], "unknown")
+        self.assertIn("python_history_slice_truncated", [item["code"] for item in result["warnings"]])
+
+    def test_probe_preview_and_preflight_use_each_arms_resolved_lookback(self):
+        source = SOURCE.replace("data.close[-1]", "data.close[-4]")
+        spec = {"design": "explore", "settings": {"language": "PYTHON", "lookback": 2}, "arms": [
+            {"label": "short", "expression": source},
+            {"label": "long", "expression": source, "settings": {"lookback": 3}},
+        ]}
+        evidence = capabilities.field_scope([], {"state": "unknown"})
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": directory}),
+            mock.patch.object(experiments, "cached_field_scope", return_value=evidence),
+            mock.patch.object(experiments, "with_session") as session,
+        ):
+            path = Path(directory) / "windows.json"
+            path.write_text(json.dumps(spec), encoding="utf-8")
+            result = experiments.cmd_probe(SimpleNamespace(spec=str(path), dry_run=True), None)
+        session.assert_not_called()
+        self.assertTrue(result["lint"]["ok"])
+        self.assertEqual(
+            [item["lookback"] for item in result["lint"]["warnings"] if "lookback" in item], [2],
+        )
+        with mock.patch.object(validation, "_field_scope", return_value=self.fields):
+            report = validation._preflight_lint(
+                self.session, [(source, 6)], self.settings, SimpleNamespace(),
+                capability_snapshot=self.snapshot)
+        self.assertTrue(report["ok"])
+        self.assertEqual([item["code"] for item in report["warnings"]],
+                         ["python_history_index_out_of_range"])

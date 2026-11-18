@@ -214,6 +214,7 @@ def cmd_catalog_find(args, _sink):
                 "category": (dataset.get("category") or {}).get("name")
                 if isinstance(dataset.get("category"), dict) else dataset.get("category"),
                 "type": hit.get("type"), "coverage": coverage,
+                "date_coverage": hit.get("dateCoverage"),
                 "description": (hit.get("description") or "").strip()[:120],
             })
     lowered = args.query.strip().lower()

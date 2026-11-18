@@ -56,6 +56,8 @@ def _merged_performance_view(result, detail):
 def cmd_alpha_get(args, _sink):
     """Fetch one alpha's metrics, checks, metadata and out-of-sample split from BRAIN."""
     detail = getattr(args, "performance", None)
+    recordset_names = getattr(args, "recordsets", None)
+    max_wait = getattr(args, "max_wait", 180.0)
     team_id, competition_id = getattr(args, "team_id", None), getattr(args, "competition_id", None)
     if detail is None and (team_id is not None or competition_id is not None):
         raise CliError("INVALID_INPUT", "--team and --competition require --performance")
@@ -66,17 +68,28 @@ def cmd_alpha_get(args, _sink):
             ml._performance_request(args.alpha_id, team_id, competition_id)
         except ValueError as exc:
             raise CliError("INVALID_INPUT", str(exc)) from exc
+    if recordset_names is not None:
+        try:
+            ml._recordset_paths(args.alpha_id, recordset_names)
+        except ValueError as exc:
+            raise CliError("INVALID_INPUT", str(exc)) from exc
 
-        def read_with_performance(session):
-            alpha = ml.fetch_alpha_metrics(session, args.alpha_id)
+    def read(session):
+        alpha = ml.fetch_alpha_metrics(session, args.alpha_id)
+        comparison = recordsets = None
+        if detail is not None:
             comparison = ml.fetch_merged_performance(session, args.alpha_id,
-                team_id=team_id, competition_id=competition_id,
-                max_wait_seconds=getattr(args, "max_wait", 180.0), on_event=_sink)
-            return alpha, comparison
+                team_id=team_id, competition_id=competition_id, max_wait_seconds=max_wait, on_event=_sink)
+        if recordset_names is not None:
+            recordsets = ml.fetch_alpha_recordsets(session, args.alpha_id, recordset_names,
+                max_wait_seconds=max_wait)
+        return alpha, comparison, recordsets
 
-        payload, comparison = with_session(args, read_with_performance)
-    else:
+    if detail is None and recordset_names is None:
         payload = with_session(args, lambda s: ml.fetch_alpha_metrics(s, args.alpha_id))
+        comparison = recordsets = None
+    else:
+        payload, comparison, recordsets = with_session(args, read)
     in_sample = payload.get("is") or {}
     code, description, operator_count = ml.regular_expression(payload)
     document = {
@@ -107,6 +120,12 @@ def cmd_alpha_get(args, _sink):
         document["merged_performance"] = _merged_performance_view(comparison, detail)
         if comparison.get("complete"):
             research_paths.log_view("alpha get --performance", "validation", [args.alpha_id])
+    if recordsets is not None:
+        document["recordsets"] = recordsets
+        viewed = [name for name, entry in recordsets["series"].items() if entry["records"]]
+        if viewed:
+            research_paths.log_view("alpha get --recordsets", "validation", [args.alpha_id],
+                                    note=", ".join(viewed))
 
     return document
 

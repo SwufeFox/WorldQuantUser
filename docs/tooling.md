@@ -259,6 +259,26 @@ python research_cli.py alpha get ALPHA_ID --performance --competition COMPETITIO
 这份统计的训练期边界未经核验，输出明确标记 `train_only_verified: false`，成功读取记入
 validation 视图日志；按冻结后的验证证据使用。命令只读，不触发提交。
 
+### 读取 Alpha 的诊断记录集
+
+```bash
+python research_cli.py alpha get ALPHA_ID --recordsets
+python research_cli.py alpha get ALPHA_ID --recordsets yearly-stats coverage turnover
+python research_cli.py alpha get ALPHA_ID --recordsets pnl-by-sector --max-wait 0
+```
+
+`--recordsets` 单独使用时只发现平台公布的记录集。明确给出名称时，读取各名称的原生
+`schema` 和 `records`。有些 Alpha 的目录为空，按名称仍可能读到年度统计。每条结果带
+来源、读取时间和可用状态。等待 `Retry-After` 的时间计入 `--max-wait`。预算为零时每个
+端点只请求一次。输出保留原生单次响应的记录与声明行数，缺少分页证据时完整性为未知。
+
+日覆盖、换手和分组图表依赖平台为该 Alpha 保留的 Visualization 数据。
+原生覆盖列反映平台定义的 Alpha 覆盖，不能直接定位原始字段的缺失原因。
+读取的原生序列没有核验训练边界，实际返回数据时记入验证视图日志。
+需要复用时用 `--save` 将结果保存到研究目录。
+[官方 API](https://platform.worldquantbrain.com/learn/documentation/brain-api/brain-api) ·
+[Visualization 说明](https://platform.worldquantbrain.com/learn/documentation/consultant-information/visualization-tool)
+
 ### 候选冻结、验证、检查与入库一次完成
 
 ```bash
@@ -546,6 +566,10 @@ Windows 使用系统字节锁，POSIX 使用 flock；进程退出后系统释放
 
 ### 字段挖掘：先看缺什么定义
 
+`catalog find` 的每条命中分别保留平台目录的 `coverage` 和 `dateCoverage`，后者在
+输出中为 `date_coverage`，缺失时为 `null`。先对照截面覆盖和日期覆盖，再决定是否
+需要查具体日期的数据。排序和 `--min-coverage` 仍使用 `coverage`。
+
 ```bash
 python3 research_cli.py mine --dataset fundamental2 --limit 5
 python3 research_cli.py mine --dataset news18 --expr 'vec_sum(reviewed_event_field)' --emit draft.json
@@ -653,6 +677,9 @@ region/universe/delay/instrumentType 的字段目录。语言证据不足时会�
 FASTEXPR 算子目录、结构匹配、换手估计和自动消融均不适用于 Python 源码。
 
 设置按平台字典透传。例如 `lookback` 是额外历史行数，完整窗口长度为 `lookback + 1`。
+静态检查会按每臂实际设置提醒超出这个窗口的直接字段访问。`data.close[-N]` 可能越界，
+`data.close[-N:]` 会截短。检查仅覆盖字面量下标和无结束位置、无步长的字面量切片，
+结果是警告，供研究者核对源码中的保护逻辑。
 热身阶段行数可能更少。源码负责处理 NaN、原生 dtype、热身与返回形状。
 REGULAR 请求统一省略 `selectionHandling` 和 `selectionLimit`，Python 还省略
 `unitHandling` 和 `nanHandling`。核对实际请求看预览的 `payload.settings`，
@@ -669,6 +696,7 @@ REGULAR 请求统一省略 `selectionHandling` 和 `selectionLimit`，Python 还
 | 我要跑一批臂（常态） | 写一个 sample-batch.spec.json，然后 `python3 research_cli.py probe sample-batch.spec.json`——lint、模拟、train-only 表格、对照差值、JSON、台账一次做完 |
 | 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe sample-batch.spec.json --dry-run`；输出完整 payload、设计上下文和精确重复证据，正式模拟前再做实时目录检查 |
 | 按当前账户核验这份 spec，但不模拟 | `python3 research_cli.py probe sample-batch.spec.json --check`；使用与正式运行相同的臂和生效设置 |
+| 已经在网页或其他客户端跑过 Multi-Simulation | `python3 research_cli.py probe --from-simulation SIMULATION_ID`；读取父任务、子任务状态和现有 Alpha ID |
 | 我要开一个单次实验 | 直接写一个两三条臂的 spec，`python3 research_cli.py probe sample-batch.spec.json`（没有模板文件了） |
 | 这批臂相对对照变了多少 | 看 `comparisons.rows`：arm 减 control 的训练期差值；缺失项列在 `unavailable`，explore 批次不计算归因 |
 | 换字段 / 换窗口 / 换权重的批量实验 | `research_app/substitution.py` 的 `expand()` 生成 `(label, expression)` 对，再落成 spec |
@@ -708,6 +736,15 @@ python3 research_cli.py resume checkpoint.json --batch-size 6 --max-wait-seconds
 原始 `arm_order`、逐臂状态、`execution`、`recording` 和 `next_actions`。
 `--save` 与批次、checkpoint、恢复输入或冻结选择同路径时会在执行前拒绝；错误回执也不会
 写入受保护文件。读取保存回执恢复时，同样保护其指向的实际批次。
+
+`probe --from-simulation` 接受已有任务 ID 或
+`https://api.worldquantbrain.com/simulations/ID`。它按父任务返回顺序读各子任务，
+在 `rows` 保留完成、失败、进行中及无法确认的状态，`alpha_ids` 收录完成任务的 Alpha ID。
+平台还未提供子任务列表时，`children_state` 为 `unavailable`。遇到 `Retry-After` 时回执报告
+平台建议的等待时间，这次读取不等待该任务。可用 `--save` 保存回执，再用
+`triage --batch PATH` 对照本地训练证据。若 Alpha 尚未入账，先显式用 `ledger record ALPHA_ID`
+建立条目。`--from-simulation` 只读取平台任务和标识，不启动模拟或自动写台账。
+[BRAIN API 的父子任务说明](https://platform.worldquantbrain.com/learn/documentation/brain-api/brain-api)
 
 `probe --summary` 返回训练期表格：label、role、执行状态、S/F、换手、margin_bps、
 两段训练 Sharpe 和 alpha_id。展示和预检明细最多 20 条，并给出总数、略去数量与完整批次路径。

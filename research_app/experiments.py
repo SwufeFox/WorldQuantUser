@@ -1662,6 +1662,18 @@ def _request_fingerprint(arms):
 
 
 def cmd_probe(args, sink):
+    reference = getattr(args, "from_simulation", None)
+    if reference is not None:
+        from .simulation_import import read_existing_simulation
+
+        _reject_saved_overrides(args, mode="--from-simulation")
+        incompatible = ("spec", "recover", "resume", "dry_run", "check", "show_test", "selection",
+                        "name", "batch_path", "registry", "cost_bps", "concurrency", "force",
+                        "allow_lint_errors", "strict_gate")
+        if any(getattr(args, key, None) is not None and getattr(args, key) is not False
+               for key in incompatible):
+            raise CliError("USAGE", "--from-simulation is a read-only operation on existing simulations")
+        return read_existing_simulation(args, reference)
     _requested_concurrency(args)
     result = _cmd_probe(args, sink)
     if getattr(args, "summary", False):
@@ -1672,7 +1684,8 @@ def cmd_probe(args, sink):
 def _offline_simulation_lint(pairs, settings, scoped=None):
     if ml.is_python_language(settings.get("language")):
         known_fields = (scoped or {}).get("known_fields")
-        reports = [lint_python_source(source, known_fields=known_fields) for source, _ in pairs]
+        reports = [lint_python_source(source, known_fields=known_fields, lookback=settings.get("lookback"))
+                   for source, _ in pairs]
         return {"ok": all(report["ok"] for report in reports), "language": "PYTHON",
                 "errors": [error for report in reports for error in report["errors"]],
                 "warnings": [warning for report in reports for warning in report["warnings"]],
@@ -2009,11 +2022,11 @@ def _run_probe(args, spec, name, groups, design, gate, target):
     return _execute_probe(args, document, target, groups)
 
 
-def _reject_saved_overrides(args):
+def _reject_saved_overrides(args, mode="resume/recover"):
     changing = ("setting", "region", "universe", "instrument_type", "neutralization",
                 "decay", "delay", "truncation", "pasteurization", "nan_handling", "test_period")
     if any(getattr(args, key, None) is not None for key in changing):
-        raise CliError("USAGE", "resume/recover uses saved settings; explicit overrides are not allowed")
+        raise CliError("USAGE", f"{mode} uses saved settings; explicit overrides are not allowed")
 
 
 def _cmd_probe_resume(args):

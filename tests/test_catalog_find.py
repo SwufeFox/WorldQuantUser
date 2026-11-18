@@ -75,6 +75,16 @@ class CatalogFindTests(unittest.TestCase):
         data = self._run()
         self.assertEqual(data["fields"][0]["id"], "debt")
 
+    def test_date_coverage_preserves_native_value_and_missing(self):
+        self.fields["fundamental6"][0]["dateCoverage"] = 0
+        self.fields["fundamental2"].append(
+            {**_field("debt_issued", 0.85), "dateCoverage": 0.76}
+        )
+        rows = self._run()["fields"]
+        self.assertEqual([row["id"] for row in rows],
+                         ["debt", "debt_issued", "debt_repayments_total"])
+        self.assertEqual([row["date_coverage"] for row in rows], [0, 0.76, None])
+
     def test_a_dataset_filter_limits_the_scan(self):
         data = self._run(dataset="fundamental2")
         self.assertEqual(data["datasets_scanned"], 1)
