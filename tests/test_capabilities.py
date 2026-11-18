@@ -112,16 +112,17 @@ class ScopedCacheTests(unittest.TestCase):
     def test_preflight_searches_only_fields_extracted_from_ast(self):
         path = self.capture()
         before = Path(path).read_bytes()
+        expression = "x = sample_matrix; if_else(true, rank(x), NaN) /* unrelated_news_field */"
 
         def operators(session, **kwargs):
             kwargs["report"].update(complete=True)
-            return [{"name": "rank"}]
+            return [{"name": "rank"}, {"name": "if_else"}]
 
         with mock.patch.object(ml, "get_datasets", side_effect=AssertionError("full discovery")), \
                 mock.patch.object(ml, "request_json", return_value={"results": FIELDS, "count": len(FIELDS)}) as fetched, \
                 mock.patch.object(ml, "fetch_operators", side_effect=operators):
             report = validation._preflight_lint(
-                self.session, [("x = sample_matrix; rank(x) /* unrelated_news_field */", 0)],
+                self.session, [(expression, 0)],
                 SETTINGS, SimpleNamespace(allow_lint_errors=False))
         self.assertTrue(report["ok"])
         fetched.assert_called_once()

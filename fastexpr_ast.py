@@ -52,10 +52,18 @@ __all__ = [
     "expand",
     "skeleton",
     "field_names",
+    "is_named_literal",
     "operator_names",
     "substitute",
     "map_fields",
 ]
+
+_NAMED_LITERALS = frozenset({"true", "false", "nan", "inf", "null", "none"})
+
+
+def is_named_literal(name: str) -> bool:
+    """Return whether a bare identifier is a case-insensitive literal."""
+    return name.lower() in _NAMED_LITERALS
 
 
 class ParseError(ValueError):
@@ -549,11 +557,11 @@ def _bound_names(program: Program):
 
 
 def field_names(program: Program):
-    """Field identifiers used by the signal, excluding locals bound in-program."""
+    """Field identifiers used by the signal, excluding locals and literals."""
     locals_ = _bound_names(program)
     seen, ordered = set(), []
     for node in program.walk():
-        if isinstance(node, Field) and node.name not in locals_:
+        if isinstance(node, Field) and node.name not in locals_ and not is_named_literal(node.name):
             if node.name not in seen:
                 seen.add(node.name)
                 ordered.append(node.name)

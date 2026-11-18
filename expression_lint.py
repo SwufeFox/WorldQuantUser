@@ -48,7 +48,6 @@ __all__ = [
 ]
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-_LITERALS = frozenset({"true", "false", "nan", "inf", "null", "none"})
 
 # Variable names the simulator refuses to let an expression assign to. The
 # catalog documents none of these; the entry below came from a live rejection
@@ -958,7 +957,7 @@ def lint_expression(expression, operator_index=None, denylist=None,
         seen = set()
         for identifier in extract_identifiers(expression):
             name = identifier["name"]
-            if name in seen or name.lower() in _LITERALS or name in locals_:
+            if name in seen or fastexpr_ast.is_named_literal(name) or name in locals_:
                 continue
             if tree_fields is not None and name not in tree_fields:
                 continue
