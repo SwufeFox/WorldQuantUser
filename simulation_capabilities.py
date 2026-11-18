@@ -11,6 +11,7 @@ import hashlib
 import json
 import math
 import os
+import time
 
 import cache_store
 
@@ -130,7 +131,7 @@ def cached(max_age_seconds=None):
     return _cached(account_provenance(), max_age_seconds)
 
 
-def fetch(session, refresh=False, max_age_seconds=None):
+def fetch(session, refresh=False, max_age_seconds=None, *, deadline=None):
     """Read one native settings schema, caching only account-bound live evidence."""
     import machine_lib as ml
 
@@ -140,8 +141,9 @@ def fetch(session, refresh=False, max_age_seconds=None):
         previous = _cached(account, max_age_seconds)
         if previous["state"] == "verified":
             return previous
+    request_limits = {} if deadline is None else {"deadline": deadline, "max_retries": 1}
     try:
-        options = ml.request_json(session, "OPTIONS", "/simulations")
+        options = ml.request_json(session, "OPTIONS", "/simulations", **request_limits)
     except ml.AuthError:
         raise
     except ml.BrainError as exc:
@@ -164,7 +166,8 @@ def fetch(session, refresh=False, max_age_seconds=None):
     if snapshot["state"] == "verified" and ttl > 0 and policy.get("enabled", True):
         path = _path(account)
         try:
-            with cache_store.file_lock(str(path) + ".lock"):
+            lock_limits = {} if deadline is None else {"timeout": max(0.0, deadline - time.monotonic())}
+            with cache_store.file_lock(str(path) + ".lock", **lock_limits):
                 cache_store.write_json_atomic(path, cache_store.build_entry(
                     "simulation-capabilities", snapshot, ttl=ttl, source=_SOURCE), mode=0o600)
         except (OSError, cache_store.CacheError) as exc:

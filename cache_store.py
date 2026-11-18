@@ -347,10 +347,11 @@ def file_lock(path, timeout=60.0, poll=0.1):
             except OSError as exc:
                 if exc.errno not in (errno.EACCES, errno.EAGAIN):
                     raise
-                if time.monotonic() > deadline:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
                     raise LockTimeout(
                         "timed out after %.1fs waiting for %s" % (timeout, path))
-                time.sleep(poll)
+                time.sleep(min(poll, remaining))
         try:
             os.ftruncate(fd, 0)
             os.write(fd, ("%d %s\n" % (os.getpid(), _to_iso(utc_now()))).encode())

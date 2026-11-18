@@ -23,7 +23,9 @@ EXIT_CODES = {
     "AUTH_MISSING": 3,
     "AUTH_FAILED": 3,
     "AUTH_CAPTCHA": 3,
+    "ACCESS_DENIED": 3,
     "RATE_LIMITED": 4,
+    "SESSION_BUSY": 4,
     "SERVICE_ERROR": 4,
     "NOT_FOUND": 5,
     "SIMULATION_FAILED": 6,
@@ -39,8 +41,10 @@ ERROR_CODES = {
     "AUTH_MISSING": "No BRAIN credentials configured (environment or .env).",
     "AUTH_FAILED": "BRAIN rejected the configured credentials.",
     "AUTH_CAPTCHA": "BRAIN wants a captcha before issuing a session; wait, then retry.",
+    "ACCESS_DENIED": "The BRAIN account lacks permission for this endpoint.",
     "NOT_FOUND": "An alpha id or endpoint does not exist for this account.",
     "RATE_LIMITED": "BRAIN rate limited us and the backoff budget ran out.",
+    "SESSION_BUSY": "Another process is signing in to BRAIN; retry shortly.",
     "SERVICE_ERROR": "Network or HTTP failure while talking to BRAIN.",
     "SIMULATION_FAILED": "Every submitted simulation failed.",
     "SUBMIT_DISABLED": "Real submission is disabled by the submission policy.",
@@ -151,8 +155,8 @@ def session_reader(args):
                                       refresh=getattr(args, "relogin", False))
         try:
             return work(session)
-        except ml.AuthError:
-            if retried:
+        except ml.AuthError as exc:
+            if retried or exc.code != "AUTH_FAILED":
                 raise
             retried = True
             session = ml.load_session(use_cache=False, refresh=True)

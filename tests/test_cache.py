@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -195,6 +196,16 @@ class LockTests(TempCacheCase):
         release.set()
         worker.join(10)
         self.assertEqual(worker.exitcode, 0)
+
+    def test_last_poll_is_shortened_to_the_lock_deadline(self):
+        lock = self.path("locks", "brain-session.lock")
+        with cache_store.file_lock(lock):
+            with mock.patch.object(cache_store.time, "monotonic", side_effect=[0, 0.9375, 1]), \
+                    mock.patch.object(cache_store.time, "sleep") as wait:
+                with self.assertRaises(cache_store.LockTimeout):
+                    with cache_store.file_lock(lock, timeout=1, poll=0.1):
+                        self.fail("entered an already held lock")
+        wait.assert_called_once_with(0.0625)
 
     def test_waiter_acquires_after_owner_releases(self):
         lock = self.path("l.lock")
@@ -406,6 +417,32 @@ class SessionCacheTests(TempCacheCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(self.calls), 1, "single-flight login was not honoured")
 
+    def test_session_lock_timeout_never_logs_in_outside_lock(self):
+        meta = {}
+        with mock.patch.dict(os.environ, {"BRAIN_LOGIN_LOCK_TIMEOUT": "0"}):
+            with cache_store.file_lock(research_paths.lock_path("brain-session")):
+                with self.assertRaises(ml.SessionBusy):
+                    ml.load_session(meta=meta)
+        self.assertEqual(meta["reason"], "session-busy")
+        self.assertEqual(self.calls, [])
+        self.assertFalse(os.path.exists(self.cache_path))
+
+    def test_forced_refresh_reuses_a_concurrent_login(self):
+        ml.load_session()
+        meta = {}
+
+        @contextmanager
+        def lock_after_another_login(*args, **kwargs):
+            session, info = ml.authenticate()
+            ml.save_session(session, info, self.cache_path)
+            yield
+
+        with mock.patch.object(cache_store, "file_lock", lock_after_another_login):
+            refreshed = ml.load_session(use_cache=False, refresh=True, meta=meta)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(refreshed.cookies.get("t"), "token-value")
+        self.assertEqual(meta["reason"], "waited-for-other-login")
+
     def test_status_reports_expiry_and_owner(self):
         ml.load_session()
         status = ml.session_status(self.cache_path)
@@ -494,6 +531,18 @@ class MetadataCacheTests(TempCacheCase):
 
         with self.assertRaises(ml.ServiceError):
             ml.cached_metadata("operators", {}, broken)
+
+    def test_request_timeout_serves_stale_snapshot(self):
+        from requests.exceptions import ReadTimeout
+
+        path = ml.metadata_cache_path("operators", {})
+        cache_store.write_json_atomic(path, cache_store.build_entry("operators", ["cached"], ttl=-1))
+        session = mock.Mock()
+        session.request.side_effect = ReadTimeout("synthetic timeout")
+        result = ml.cached_metadata("operators", {}, lambda: ml.request_json(session, "GET", "/operators"))
+        self.assertEqual(result["data"], ["cached"])
+        self.assertTrue(result["cache"]["degraded"])
+        self.assertEqual(result["cache"]["error"], "SERVICE_ERROR")
 
     def test_corrupt_snapshot_is_replaced(self):
         path = ml.metadata_cache_path("operators", {})

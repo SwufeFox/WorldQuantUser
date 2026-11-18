@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
+import os
+import time
+
 import cache_store
 import machine_lib as ml
-import os
 import research_paths
 import simulation_capabilities
 
-from .runtime import with_session
-
-
-
-
+DIAGNOSTIC_SECONDS = 25.0
+PROBE_SECONDS = 5.0
 
 def _equity_scope_samples(options):
     """Choose one native-advertised universe/delay per equity region."""
@@ -59,12 +58,17 @@ def _equity_scope_samples(options):
     return scopes, evidence
 
 
-def _data_access(session):
+def _data_access(session, *, deadline=None):
     """Keep live sampled access, empty catalogs and unavailable evidence distinct."""
     result = {"state": "unknown", "regions": [], "probes": [],
               "coverage": "one advertised equity universe/delay per advertised region; not all combinations"}
+    now = time.monotonic()
+    if deadline is not None and now >= deadline:
+        result["settings"] = {"state": "unknown", "reason": "diagnostic_budget_expired"}
+        return result
     try:
-        snapshot = simulation_capabilities.fetch(session, refresh=True)
+        snapshot = simulation_capabilities.fetch(
+            session, refresh=True, deadline=None if deadline is None else min(deadline, now + PROBE_SECONDS))
     except ml.AuthError:
         raise
     except ml.BrainError as exc:
@@ -79,11 +83,17 @@ def _data_access(session):
     result["settings"] = evidence
     for scope in scopes:
         cache = {}
-        row = {"scope": scope, "state": "unknown"}
+        row = {"scope": scope, "state": "unknown", "metadata": cache}
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            row["reason"] = "diagnostic_budget_expired"
+            result["probes"].append(row)
+            continue
         try:
             records = ml.get_datasets(session, instrument_type=scope["instrumentType"],
                                       region=scope["region"], universe=scope["universe"],
-                                      delay=scope["delay"], limit=1, refresh=True, report=cache)
+                                      delay=scope["delay"], limit=1, refresh=True, report=cache,
+                                      deadline=None if deadline is None else min(deadline, now + PROBE_SECONDS))
             fresh = cache.get("hit") is False and not any(
                 cache.get(key) for key in ("stale", "degraded", "error"))
             valid = isinstance(records, list) and all(
@@ -100,7 +110,6 @@ def _data_access(session):
             raise
         except ml.BrainError as exc:
             row["error"] = {"code": exc.code, "message": str(exc)}
-        row["metadata"] = cache
         result["probes"].append(row)
     if evidence["state"] == "verified" and all(row["state"] != "unknown" for row in result["probes"]):
         result["state"] = "verified"
@@ -110,10 +119,11 @@ def _data_access(session):
 def cmd_auth_check(args, _sink):
     """Verify BRAIN credentials, report permissions, session cache state and accessible data regions."""
     meta = {}
+    deadline = time.monotonic() + DIAGNOSTIC_SECONDS
     session = ml.load_session(use_cache=not args.no_cache, refresh=args.relogin,
-                              meta=meta)
+                              meta=meta, deadline=deadline)
     info = ml.session_status()
-    access = _data_access(session)
+    access = _data_access(session, deadline=deadline)
     return {
         "authenticated": True,
         "user_id": info.get("user_id"),
@@ -172,35 +182,37 @@ def cmd_api_probe(args, _sink):
     import requests
 
     alpha_id = getattr(args, "alpha", None)
-
-    def work(session):
-        rows = []
-        for path, purpose in PROBE_PATHS:
-            target = path.replace("{alpha}", alpha_id) if "{alpha}" in path else path
-            if "{alpha}" in path and not alpha_id:
-                rows.append({"path": path, "purpose": purpose, "status": None,
-                             "note": "no --alpha given"})
-                continue
-            try:
-                response = session.request(
-                    "GET", ml.BRAIN_API_URL + target, timeout=30)
-                status = response.status_code
-            except requests.RequestException as exc:
-                rows.append({"path": target, "purpose": purpose, "status": None,
-                             "note": str(exc)[:80]})
-                continue
-            note = {
-                200: "available",
-                403: "level-gated (exists, your account may not read it)",
-                404: "absent",
-                405: "exists but rejects GET",
-            }.get(status, "")
-            rows.append({"path": target, "purpose": purpose, "status": status, "note": note})
-        return {"probed": len(rows), "alpha": alpha_id, "endpoints": rows,
-                "note": ("403 and 404 are different findings: one is a level gate, the "
-                         "other is an endpoint that does not exist.")}
-
-    return with_session(args, work)
+    deadline = time.monotonic() + DIAGNOSTIC_SECONDS
+    session = ml.load_session(use_cache=not getattr(args, "no_cache", False),
+                              refresh=getattr(args, "relogin", False), deadline=deadline)
+    rows = []
+    for path, purpose in PROBE_PATHS:
+        if "{alpha}" in path and not alpha_id:
+            rows.append({"path": path, "purpose": purpose, "status": None, "note": "no --alpha given"})
+            continue
+        target = path.replace("{alpha}", alpha_id) if alpha_id else path
+        row = {"path": target, "purpose": purpose, "status": None}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            rows.append({**row, "note": "diagnostic budget expired"})
+            continue
+        try:
+            response = session.request("GET", ml.BRAIN_API_URL + target,
+                                       timeout=min(PROBE_SECONDS, remaining), allow_redirects=False)
+            status = response.status_code
+        except requests.RequestException as exc:
+            rows.append({**row, "note": type(exc).__name__})
+            continue
+        note = {
+            200: "available",
+            403: "level-gated (exists, your account may not read it)",
+            404: "absent",
+            405: "exists but rejects GET",
+        }.get(status, "")
+        rows.append({**row, "status": status, "note": note})
+    return {"probed": len(rows), "alpha": alpha_id, "endpoints": rows,
+            "note": ("403 and 404 are different findings: one is a level gate, the "
+                     "other is an endpoint that does not exist.")}
 
 
 def cmd_cache_info(args, _sink):
@@ -243,8 +255,7 @@ def cmd_cache_info(args, _sink):
             "session": {
                 "single_flight": True,
                 "file_mode": "0600",
-                "lock_timeout_seconds": float(
-                    os.environ.get("BRAIN_LOGIN_LOCK_TIMEOUT", "60") or 60),
+                "lock_timeout_seconds": ml.login_lock_timeout(),
             },
         },
         "session": ml.session_status(),

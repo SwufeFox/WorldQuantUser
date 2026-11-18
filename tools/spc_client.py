@@ -18,7 +18,7 @@ The forum post's `model` + `modelVersion` pair does not exist here: the schema
 requires `modelFamily` and the concrete model id.
 
 Subcommands:
-  recon                  Print the schema, the submission list and endpoint reachability.
+  recon                  Print the schema, submission list and bounded endpoint checks.
   validate SPEC.json     Read the live schema and validate local submission specs.
   experiment SPEC.json --run RUN.json [--run MORE.json] [--reference UNIVERSE.json]
                          Compare captured model outputs without platform access.
@@ -31,6 +31,7 @@ import argparse
 from decimal import Decimal
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -40,16 +41,33 @@ from tools.spc_experiment import experiment, parse_predictions  # noqa: E402
 BASE = "https://api.worldquantbrain.com"
 SPC = f"{BASE}/competitions/spc/submissions"
 REQUIRED = ("name", "prompt", "sampleOutput", "modelFamily", "weight", "updateFrequency")
+DIAGNOSTIC_SECONDS = 25.0
+PROBE_SECONDS = 5.0
 
 
-def session():
-    return machine_lib.load_session()
+def session(*, deadline=None):
+    if deadline is None:
+        return machine_lib.load_session()
+    return machine_lib.load_session(deadline=deadline)
 
 
-def schema(s) -> dict:
-    r = s.options(SPC, timeout=60)
+def _probe_timeout(deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("SPC diagnostic budget expired")
+    return min(PROBE_SECONDS, remaining)
+
+
+def schema(s, *, deadline=None) -> dict:
+    timeout = PROBE_SECONDS if deadline is None else _probe_timeout(deadline)
+    r = s.options(SPC, timeout=timeout, allow_redirects=False)
     r.raise_for_status()
-    return ((r.json() or {}).get("actions") or {}).get("POST") or {}
+    body = r.json()
+    actions = body.get("actions") if isinstance(body, dict) else None
+    post = actions.get("POST") if isinstance(actions, dict) else None
+    if not 200 <= r.status_code < 300 or not isinstance(post, dict) or not post:
+        raise ValueError("SPC response did not advertise a POST schema")
+    return post
 
 
 def model_index(post: dict) -> set[str]:
@@ -65,8 +83,11 @@ def model_index(post: dict) -> set[str]:
 
 
 def cmd_recon() -> int:
-    s = session()
-    post = schema(s)
+    from requests.exceptions import RequestException
+
+    deadline = time.monotonic() + DIAGNOSTIC_SECONDS
+    s = session(deadline=deadline)
+    post = schema(s, deadline=deadline)
     print("== POST schema ==")
     for key, spec in post.items():
         if isinstance(spec, dict):
@@ -76,25 +97,33 @@ def cmd_recon() -> int:
                 for f in (post.get("modelFamily") or {}).get("choices") or []]
     print("\n== model families ==")
     for fam, items in families:
-        print(f"  {fam:10s} {items[:3]}")
+        print(f"  {fam:10s} {items}")
     freq = [c.get("value") for c in (post.get("updateFrequency") or {}).get("choices") or []]
     print("\n== updateFrequency ==", freq)
 
-    print("\n== endpoint reachability ==")
-    for url in (f"{BASE}/competitions", f"{BASE}/competitions/spc", f"{SPC}?limit=1",
-                f"{BASE}/competitions/spc/leaderboard", f"{BASE}/users/self/competitions"):
-        try:
-            r = s.get(url, timeout=45)
-            print(f"  {r.status_code}  {url.replace(BASE, '')}")
-        except Exception as exc:  # noqa: BLE001 - recon wants the failure text
-            print(f"  ERR  {url.replace(BASE, '')}  {str(exc)[:60]}")
-
-    r = s.get(f"{SPC}?limit=50", timeout=60)
-    body = r.json() if r.text else {}
+    r = s.get(f"{SPC}?limit=50", timeout=_probe_timeout(deadline), allow_redirects=False)
+    r.raise_for_status()
+    body = r.json()
+    results = body.get("results", [] if body.get("count") == 0 else None) if isinstance(body, dict) else None
+    if not 200 <= r.status_code < 300 or not isinstance(results, list) or not all(
+        isinstance(row, dict) for row in results
+    ):
+        raise ValueError("SPC submission list has an unexpected format")
     print(f"\n== submissions: {body.get('count', 0)} ==")
-    for sub in body.get("results") or []:
-        print(f"  {sub.get('id')} {sub.get('status'):>16s} w={sub.get('weight')} "
+    for sub in results:
+        print(f"  {sub.get('id')} {str(sub.get('status') or 'unknown'):>16s} w={sub.get('weight')} "
               f"{sub.get('updateFrequency')} model={sub.get('modelFamily')} {str(sub.get('name'))[:40]}")
+
+    print("\n== endpoint reachability ==")
+    print(f"  {r.status_code}  {SPC.removeprefix(BASE)}?limit=50")
+    for path in ("/competitions", "/competitions/spc", "/competitions/spc/leaderboard", "/users/self/competitions"):
+        try:
+            response = s.get(BASE + path, timeout=_probe_timeout(deadline), allow_redirects=False)
+            print(f"  {response.status_code}  {path}")
+        except TimeoutError:
+            print(f"  SKIPPED {path}  diagnostic budget expired")
+        except RequestException as exc:
+            print(f"  ERR  {path}  {type(exc).__name__}")
     return 0
 
 
@@ -138,11 +167,19 @@ def validate_spec(spec: dict, post: dict) -> list[str]:
     return problems
 
 
-def cmd_validate(path: str) -> int:
-    post = schema(session())
-    specs = json.loads(Path(path).read_text())
-    if isinstance(specs, dict):
+def _read_specs(path):
+    specs = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(specs, list):
         specs = [specs]
+    if not specs:
+        raise ValueError("spec file contains no submissions")
+    return specs
+
+
+def cmd_validate(path: str) -> int:
+    specs = _read_specs(path)
+    deadline = time.monotonic() + DIAGNOSTIC_SECONDS
+    post = schema(session(deadline=deadline), deadline=deadline)
     bad = 0
     for spec in specs:
         problems = validate_spec(spec, post)
@@ -163,21 +200,44 @@ def cmd_submit(path: str, yes: bool) -> int:
         print("refused: submission is a public competitive action and needs an explicit 提交 "
               "from the user. Re-run with --yes once that authorisation exists.")
         return 2
-    s = session()
-    post = schema(s)
-    specs = json.loads(Path(path).read_text())
-    if isinstance(specs, dict):
-        specs = [specs]
+    from requests.exceptions import RequestException
+
+    specs = _read_specs(path)
+    deadline = time.monotonic() + DIAGNOSTIC_SECONDS
+    s = session(deadline=deadline)
+    post = schema(s, deadline=deadline)
+    failed = False
     for spec in specs:
         problems = validate_spec(spec, post)
         if problems:
             name = spec.get("name") if isinstance(spec, dict) else None
             print(f"FAIL {name or '(unnamed)'}: {problems}")
+            failed = True
             continue
         payload = {k: spec[k] for k in REQUIRED}
-        r = s.post(SPC, json=payload, timeout=120)
-        print(f"{r.status_code} {spec.get('name')}: {r.text[:160]}")
-    return 0
+        name = spec["name"]
+        try:
+            response = s.post(SPC, json=payload, timeout=30, allow_redirects=False)
+        except RequestException as exc:
+            print(f"UNKNOWN {name} ({type(exc).__name__}); check recon before retrying")
+            return 1
+        status = response.status_code
+        if 400 <= status < 500 and status != 408:
+            print(f"FAIL {name}: HTTP {status}")
+            failed = True
+            continue
+        if 200 <= status < 300:
+            try:
+                body = response.json()
+            except ValueError:
+                body = None
+            identity = body.get("id") if isinstance(body, dict) else None
+            if type(identity) is int or isinstance(identity, str) and identity.strip():
+                print(f"{status} {name}: id={identity}")
+                continue
+        print(f"UNKNOWN {name} (HTTP {status}); check recon before retrying")
+        return 1
+    return int(failed)
 
 
 def main(argv=None) -> int:
@@ -196,18 +256,32 @@ def main(argv=None) -> int:
     submit.add_argument("spec", metavar="SPEC.json")
     submit.add_argument("--yes", action="store_true")
     args = parser.parse_args(argv)
-    if args.command == "recon":
-        return cmd_recon()
-    if args.command == "validate":
-        return cmd_validate(args.spec)
-    if args.command == "submit":
-        return cmd_submit(args.spec, args.yes)
     if args.command == "experiment":
         result = experiment(args.spec, args.run, reference_path=args.reference)
         print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
         return 0 if result["ok"] else 2
-    parser.print_help()
-    return 1
+    if args.command is None:
+        parser.print_help()
+        return 1
+    if args.command == "submit" and not args.yes:
+        return cmd_submit(args.spec, args.yes)
+
+    from requests.exceptions import RequestException
+
+    try:
+        if args.command == "recon":
+            return cmd_recon()
+        if args.command == "validate":
+            return cmd_validate(args.spec)
+        if args.command == "submit":
+            return cmd_submit(args.spec, args.yes)
+    except RequestException as exc:
+        status = exc.response.status_code if exc.response is not None else type(exc).__name__
+        print(f"FAIL SPC {args.command}: {status}", file=sys.stderr)
+        return 1
+    except (machine_lib.BrainError, OSError, ValueError) as exc:
+        print(f"FAIL SPC {args.command}: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

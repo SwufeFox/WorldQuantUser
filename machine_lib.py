@@ -123,9 +123,22 @@ def agent_submit_allowed():
 
 
 class ServiceError(BrainError):
-    """BRAIN answered with a non-2xx status we could not classify further."""
+    """A transport or unexpected HTTP failure while talking to BRAIN."""
 
     code = "SERVICE_ERROR"
+
+
+class SessionBusy(ServiceError):
+    """Another process is acquiring the shared account session."""
+
+    code = "SESSION_BUSY"
+    hint = "retry shortly to reuse the session created by the active login"
+
+
+class PermissionDenied(ServiceError):
+    """BRAIN denied access to an endpoint with HTTP 403."""
+
+    code = "ACCESS_DENIED"
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +260,7 @@ def login():
     return session
 
 
-def authenticate():
+def authenticate(*, deadline=None):
     """Return ``(session, info)`` for the configured BRAIN credentials.
 
     ``info`` is ``{"user_id", "permissions", "token_expiry"}`` -- deliberately
@@ -255,19 +268,29 @@ def authenticate():
     """
     username, password = get_credentials()
     from requests import Session
+    from requests.exceptions import RequestException
 
     session = Session()
     session.auth = (username, password)
-    response = session.post(BRAIN_API_URL + "/authentication", timeout=_request_timeout(None))
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ServiceError("authentication wait budget expired before login")
+    try:
+        response = session.post(BRAIN_API_URL + "/authentication", timeout=_request_timeout(deadline))
+    except RequestException as exc:
+        raise ServiceError("authentication request failed (%s)" % type(exc).__name__) from exc
     if response.status_code != 201:
-        body = response.text[:300]
-        if "captcha" in body.lower():
+        status = response.status_code
+        if "captcha" in response.text[:300].lower():
             raise CaptchaRequired(
-                "BRAIN is asking for a captcha before issuing a session (HTTP 400)."
+                "BRAIN is asking for a captcha before issuing a session (HTTP %s)." % status
             )
-        raise AuthError(
-            "authentication failed (HTTP %s): %s" % (response.status_code, body)
-        )
+        if status in (400, 401):
+            raise AuthError("authentication failed (HTTP %s)" % status)
+        if status == 403:
+            raise PermissionDenied("BRAIN denied access to authentication (HTTP 403)")
+        if status == 429:
+            raise RateLimited("BRAIN authentication is rate limited")
+        raise ServiceError("authentication request failed (HTTP %s)" % status)
     try:
         payload = response.json()
     except ValueError:
@@ -398,7 +421,18 @@ def invalidate_session(cache_path=None):
     return cache_store.remove(Path(cache_path or session_cache_path()))
 
 
-def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
+def login_lock_timeout():
+    """Seconds a caller waits for another process to finish authentication."""
+    try:
+        timeout = float(environ.get("BRAIN_LOGIN_LOCK_TIMEOUT", "5") or 5)
+    except ValueError as exc:
+        raise ServiceError("BRAIN_LOGIN_LOCK_TIMEOUT must be finite and non-negative") from exc
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ServiceError("BRAIN_LOGIN_LOCK_TIMEOUT must be finite and non-negative")
+    return timeout
+
+
+def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *, deadline=None):
     """Return an authenticated session, reusing a cached cookie when still valid.
 
     BRAIN issues sessions that last hours but challenges repeated logins with a
@@ -408,35 +442,41 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
 
     The login itself is single-flight: concurrent callers take a file lock, and
     the ones that lose the race re-check the cache and reuse the winner's
-    session instead of adding a second login. Pass ``meta`` (a dict) to receive
-    ``cached`` and ``reason`` for diagnostics.
+    session instead of adding a second login. A forced refresh may share a
+    session written by another caller after the refresh started. A lock timeout
+    with no reusable session raises ``SessionBusy``. Pass ``meta`` (a dict) to
+    receive ``cached`` and ``reason`` for diagnostics.
     """
     meta = meta if meta is not None else {}
     path = Path(cache_path or session_cache_path())
     reuse_cache = use_cache and not refresh
     credentials = get_credentials() if reuse_cache else None
+    previous_creation = None if reuse_cache else cache_store.read_entry(path).get("created_at")
 
     def _reuse(*, locked=False):
         entry = cache_store.read_entry(path)
+        if not reuse_cache and entry.get("created_at") == previous_creation:
+            return None
         if entry["present"] and entry["fresh"]:
             payload = entry["payload"]
             if (entry["kind"] != "brain-session" or not isinstance(payload, dict)
                     or not isinstance(payload.get("cookies"), dict) or not payload["cookies"]):
                 meta["cache_state"] = "invalid"
                 return None
-            if payload.get("username") != credentials[0].casefold():
+            account_credentials = credentials if credentials is not None else get_credentials()
+            if payload.get("username") != account_credentials[0].casefold():
                 meta["cache_state"] = "account-mismatch"
                 return None
             meta.update({"cached": True, "reason": "reused-cache",
                          "cache_state": "fresh",
                          "expires_in": entry.get("expires_in")})
-            return _session_from_entry(payload, credentials)
+            return _session_from_entry(payload, account_credentials)
         if entry["present"]:
             meta.setdefault("cache_state", "expired")
         elif entry.get("error") not in (None, "missing"):
             # Keep corrupt samples under the login lock for later diagnosis.
             meta["cache_state"] = "corrupt"
-            if locked:
+            if locked and reuse_cache:
                 quarantined = cache_store.quarantine(path)
                 if quarantined:
                     meta["quarantined_to"] = quarantined
@@ -447,7 +487,10 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
         return None
 
     def _login_and_save(reason):
-        session, info = authenticate()
+        if deadline is None:
+            session, info = authenticate()
+        else:
+            session, info = authenticate(deadline=deadline)
         try:
             save_session(session, info, path)
         except OSError:
@@ -460,27 +503,28 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None):
         if reused is not None:
             return reused
 
-    timeout = float(environ.get("BRAIN_LOGIN_LOCK_TIMEOUT", "5") or 5)
+    timeout = login_lock_timeout()
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise ServiceError("authentication wait budget expired before login")
+        timeout = min(timeout, remaining)
     try:
         with cache_store.file_lock(research_paths.lock_path("brain-session"),
                                    timeout=timeout):
-            if reuse_cache:
-                reused = _reuse(locked=True)  # another caller may have refreshed the cache
-                if reused is not None:
-                    meta["reason"] = "waited-for-other-login"
-                    return reused
+            reused = _reuse(locked=True)  # another caller may have refreshed the cache
+            if reused is not None:
+                meta["reason"] = "waited-for-other-login"
+                return reused
             return _login_and_save("logged-in")
     except cache_store.LockTimeout as exc:
-        # Do not pay for a login until the cache has been re-read: the holder may
-        # have finished writing it a moment ago, and a duplicate login is what
-        # triggers the captcha the lock exists to avoid.
-        if reuse_cache:
-            reused = _reuse(locked=False)
-            if reused is not None:
-                meta["reason"] = "cache-after-lock-timeout"
-                return reused
-        note("session cache: %s; logging in anyway" % exc)
-        return _login_and_save("lock-timeout-login")
+        # The holder may have published a reusable cookie just before timeout.
+        reused = _reuse()
+        if reused is not None:
+            meta["reason"] = "cache-after-lock-timeout"
+            return reused
+        meta.update(cached=False, reason="session-busy")
+        raise SessionBusy("another process is signing in to BRAIN") from exc
 
 
 
@@ -643,7 +687,7 @@ def _cached_account_catalog(session, kind, params, fetch, refresh, report):
 
 
 def get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
-                 universe="TOP3000", limit=None, refresh=None, report=None, theme=None):
+                 universe="TOP3000", limit=None, refresh=None, report=None, theme=None, *, deadline=None):
     """List datasets available for a region/universe/delay as ``list[dict]``.
 
     Quota-free and cached (see :func:`cached_metadata`). An empty result concerns
@@ -656,15 +700,17 @@ def get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
               "delay": delay, "universe": universe, "limit": limit}
     if theme is not None:
         params["theme"] = theme
+    request_limits = {} if deadline is None else {"deadline": deadline}
     return _cached_account_catalog(
         s, "datasets", params,
-        lambda session: _get_datasets(session, instrument_type, region, delay, universe, limit, theme),
+        lambda session: _get_datasets(session, instrument_type, region, delay, universe, limit, theme,
+                                      **request_limits),
         refresh, report,
     )
 
 
 def _get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
-                  universe="TOP3000", limit=None, theme=None):
+                  universe="TOP3000", limit=None, theme=None, *, deadline=None):
     """List datasets available for a region/universe/delay as ``list[dict]``.
 
     Quota-free. An empty result concerns only this exact combination.
@@ -674,7 +720,8 @@ def _get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
               "delay": delay, "universe": universe}
     if theme is not None:
         params["theme"] = "true" if theme else "false"
-    for batch in _catalog_pages(s, "/data-sets", params, keys=("data-sets",)):
+    request_limits = {} if deadline is None else {"deadline": deadline}
+    for batch in _catalog_pages(s, "/data-sets", params, keys=("data-sets",), **request_limits):
         results.extend(batch)
         if limit and len(results) >= limit:
             return results[:limit]
@@ -701,16 +748,17 @@ def _as_results(payload, *keys):
     return []
 
 
-def _catalog_pages(session, path, params=None, keys=(), page_size=None):
+def _catalog_pages(session, path, params=None, keys=(), page_size=None, *, deadline=None):
     """Yield complete collection pages; incomplete or repeated pages are errors."""
     offset = 0
     seen = set()
     total = None
+    request_limits = {} if deadline is None else {"deadline": deadline, "max_retries": 1}
     while True:
         query = dict(params or {})
         if page_size is not None or offset:
             query.update(limit=page_size or 50, offset=offset)
-        payload = request_json(session, "GET", path, params=query or None)
+        payload = request_json(session, "GET", path, params=query or None, **request_limits)
         collections = (*keys, "results", "operators", "categories", "data-sets", "datafields")
         if not isinstance(payload, list) and not (
             isinstance(payload, dict) and any(isinstance(payload.get(key), list) for key in collections)
@@ -1026,27 +1074,36 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4, *,
     """Decode a BRAIN API response or raise a typed HTTP failure.
 
     Responses with status 429 use backoff within the attempt and time budgets.
-    Other HTTP failures raise AuthError, NotFound or ServiceError.
+    Other failures raise AuthError, PermissionDenied, NotFound or ServiceError.
     Successful responses without decodable JSON yield an empty dict.
     """
+    from requests.exceptions import RequestException
+
     url = path if path.startswith("http") else BRAIN_API_URL + path
+    if deadline is None:
+        deadline = time.monotonic() + _request_timeout(None)
     last = None
     for attempt in range(1, max_retries + 1):
-        if deadline is not None and time.monotonic() >= deadline:
+        if time.monotonic() >= deadline:
             raise last or ServiceError("request wait budget expired for %s %s" % (method, url))
-        response = s.request(method, url, params=params, json=json_body,
-                             timeout=_request_timeout(deadline))
-        if response.status_code in (401, 403):
-            raise AuthError(
-                "BRAIN rejected the session (HTTP %s) for %s %s"
-                % (response.status_code, method, url)
-            )
+        try:
+            response = s.request(method, url, params=params, json=json_body,
+                                 timeout=_request_timeout(deadline))
+        except RequestException as exc:
+            raise ServiceError("BRAIN request failed (%s) for %s %s"
+                               % (type(exc).__name__, method, url)) from exc
+        if response.status_code == 401:
+            raise AuthError("BRAIN rejected the session (HTTP 401) for %s %s" % (method, url))
+        if response.status_code == 403:
+            raise PermissionDenied("BRAIN denied access (HTTP 403) for %s %s" % (method, url))
         if response.status_code == 404:
             raise NotFound("%s %s -> 404 (unknown id or endpoint)" % (method, url))
         if response.status_code == 429:
-            wait = _retry_after_seconds(response) or min(60.0, 5.0 * attempt)
+            wait = _retry_after_seconds(response)
+            if not math.isfinite(wait) or wait <= 0:
+                wait = min(60.0, 5.0 * attempt)
             last = RateLimited("%s %s is rate limited" % (method, url))
-            if attempt < max_retries and (deadline is None or wait < deadline - time.monotonic()):
+            if attempt < max_retries and wait < deadline - time.monotonic():
                 sleep(wait)
                 continue
             raise last
@@ -1644,6 +1701,13 @@ def simulate_alphas(
             data["index"] = index
             on_event(kind, data)
 
+    def checkpoint_submission(index, record, identity):
+        if identity is not None:
+            record.update(slot_reservation=identity, slot_reservation_state="submitting")
+        record.update(submission_attempted=True, status="UNKNOWN_SUBMISSION")
+        records[index] = record
+        emit("submitting", index, record)
+
     quota_exhausted = False
 
     def submission_event(kind, index, payload):
@@ -1878,7 +1942,11 @@ def simulate_alphas(
                 records[index] = record
                 emit("failed", index, record)
                 continue
-            identity, slots = simulation_slots.reserve(plan["account"], plan["effective"])
+            payload = _single_simulation_data(expression, decay, settings)
+            identity, slots = simulation_slots.prepare_submission(
+                plan["account"], plan["effective"],
+                lambda reservation: checkpoint_submission(index, record, reservation),
+            )
             if scheduling_report is not None:
                 scheduling_report["shared_slots"] = slots
             if identity is None and slots["available"] == 0:
@@ -1887,16 +1955,9 @@ def simulate_alphas(
                 records[index] = record
                 emit("deferred", index, record)
                 break
-            if identity is not None:
-                record["slot_reservation"] = identity
-                record["slot_reservation_state"] = "submitting"
-            record["submission_attempted"] = True
-            record["status"] = "UNKNOWN_SUBMISSION"
-            records[index] = record
-            emit("submitting", index, record)
             try:
                 location = submit_single_simulation(
-                    s, _single_simulation_data(expression, decay, settings),
+                    s, payload,
                     on_event=lambda kind, payload, i=index: submission_event(kind, i, payload),
                     deadline=deadline,
                 )

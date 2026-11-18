@@ -232,6 +232,51 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         post.assert_not_called()
         self.assertEqual(resumed[0]["status"], "UNKNOWN_SUBMISSION")
 
+    def test_checkpoint_interrupt_releases_slot_before_any_post(self):
+        saved = []
+
+        def checkpoint(kind, data):
+            if kind == "submitting":
+                saved.append(dict(data))
+                raise KeyboardInterrupt
+
+        with mock.patch.object(ml, "submit_single_simulation") as post:
+            with self.assertRaises(KeyboardInterrupt):
+                self.simulate(concurrency=1, on_event=checkpoint)
+        post.assert_not_called()
+        self.assertEqual(simulation_slots.snapshot(ACCOUNT, 1)["active"], 0)
+
+        with mock.patch.object(ml, "submit_single_simulation", return_value="https://api.worldquantbrain.com/simulations/offline") as post, \
+                mock.patch.object(ml, "poll_simulation", return_value={"status": "PENDING"}):
+            resumed = self.simulate(concurrency=1, initial_records=saved)
+        post.assert_called_once()
+        self.assertEqual(resumed[0]["status"], "PENDING")
+        self.assertNotEqual(resumed[0]["slot_reservation"], saved[0]["slot_reservation"])
+
+    def test_abandoned_preparation_is_reclaimed_without_discarding_unknown_posts(self):
+        identity, _ = simulation_slots.reserve(ACCOUNT, 2)
+        sent, _ = simulation_slots.reserve(ACCOUNT, 2)
+        path, lock = simulation_slots._paths(ACCOUNT["fingerprint"])
+        journal = simulation_slots._load(path, ACCOUNT["fingerprint"])
+        journal["reservations"][identity["id"]]["state"] = "preparing"
+        cache_store.write_json_atomic(path, journal)
+        saved = {"slot_reservation": identity, "status": "UNKNOWN_SUBMISSION", "submission_attempted": True}
+        with cache_store.file_lock(lock + ".prepare"):
+            self.assertFalse(simulation_slots.restore_record(saved, ACCOUNT))
+        self.assertEqual(saved["status"], "UNKNOWN_SUBMISSION")
+
+        with mock.patch.object(ml, "submit_single_simulation", return_value="https://api.worldquantbrain.com/simulations/offline") as post, \
+                mock.patch.object(ml, "poll_simulation", return_value={"status": "PENDING"}):
+            rows = self.simulate(concurrency=2)
+        post.assert_called_once()
+        self.assertEqual(rows[0]["status"], "PENDING")
+        self.assertTrue(simulation_slots.restore_record(saved, ACCOUNT))
+        self.assertEqual(saved["status"], "QUEUED")
+        self.assertFalse(saved["submission_attempted"])
+        journal = simulation_slots._load(path, ACCOUNT["fingerprint"])
+        self.assertNotIn(identity["id"], journal["reservations"])
+        self.assertIn(sent["id"], journal["reservations"])
+
     def test_recovery_reuses_progress_without_repost_and_preserves_role(self):
         identity, _ = simulation_slots.reserve(ACCOUNT, 1)
         saved = {"expression": "rank(cap)", "decay": 0, "status": "UNKNOWN_SUBMISSION",

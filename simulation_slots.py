@@ -1,8 +1,9 @@
 """Durable simulation reservations scoped to one account and research workspace.
 
-Locks protect journal updates only. Reservations have no expiry: an interrupted
-POST may have been accepted, so only definite refusal or observed completion
-releases its slot. Other workspaces and unidentifiable accounts are not covered.
+Locks protect local preparation and journal updates. Reservations that reached
+POST have no expiry: an interrupted POST may have been accepted. Abandoned
+preparation can be reclaimed before any POST. Other workspaces and
+unidentifiable accounts are not covered.
 """
 
 import hashlib
@@ -43,6 +44,7 @@ def _load(path, fingerprint):
         journal.get("account_fingerprint") != fingerprint
         or not isinstance(journal.get("reservations"), dict)
         or any(not isinstance(value, dict) for value in journal.get("reservations", {}).values())
+        or not isinstance(journal.get("not_submitted", {}), dict)
     ):
         raise cache_store.CacheError("simulation slot journal cannot be read safely: %s" % (error or path))
     return journal
@@ -84,16 +86,67 @@ def reserve(account, limit):
     path, lock = _paths(fingerprint)
     with cache_store.file_lock(lock):
         journal = _load(path, fingerprint)
-        active = len(journal["reservations"])
-        if active >= limit:
-            return None, _report(account, limit, active)
-        identity = {"id": uuid.uuid4().hex, "account_fingerprint": fingerprint,
-                    "workspace": _workspace()}
-        journal["reservations"][identity["id"]] = {
-            "state": "submitting", "created_at": time.time(),
-        }
-        cache_store.write_json_atomic(path, journal)
-        return identity, _report(account, limit, active + 1)
+        identity, state = _reserve(journal, account, limit, "submitting")
+        if identity:
+            cache_store.write_json_atomic(path, journal)
+        return identity, state
+
+
+def _reserve(journal, account, limit, phase):
+    active = len(journal["reservations"])
+    if active >= limit:
+        return None, _report(account, limit, active)
+    identity = {"id": uuid.uuid4().hex, "account_fingerprint": _fingerprint(account),
+                "workspace": _workspace()}
+    journal["reservations"][identity["id"]] = {"state": phase, "created_at": time.time()}
+    return identity, _report(account, limit, active + 1)
+
+
+def _record_unposted(journal, identity):
+    entry = journal["reservations"].pop(identity)
+    # Keep proof for a checkpoint that was saved before preparation stopped.
+    journal.setdefault("not_submitted", {})[identity] = entry.get("created_at")
+
+
+def prepare_submission(account, limit, checkpoint):
+    """Reserve, checkpoint, then authorize the caller to POST.
+
+    The preparation lock is never held during network I/O. If its owner dies,
+    a reservation still marked ``preparing`` could not yet have been sent.
+    """
+    fingerprint = _fingerprint(account)
+    if not fingerprint:
+        state = _report(account, limit)
+        checkpoint(None)
+        return None, state
+    path, lock = _paths(fingerprint)
+    with cache_store.file_lock(lock + ".prepare"):
+        with cache_store.file_lock(lock):
+            journal = _load(path, fingerprint)
+            abandoned = [identity for identity, entry in journal["reservations"].items()
+                         if entry.get("state") == "preparing"]
+            for identity in abandoned:
+                _record_unposted(journal, identity)
+            identity, state = _reserve(journal, account, limit, "preparing")
+            if identity or abandoned:
+                cache_store.write_json_atomic(path, journal)
+        if identity is None:
+            return identity, state
+
+        ready = False
+        try:
+            checkpoint(identity)
+            ready = True
+        finally:
+            with cache_store.file_lock(lock):
+                journal = _load(path, fingerprint)
+                entry = journal["reservations"][identity["id"]]
+                if ready:
+                    entry["state"] = "submitting"
+                else:
+                    _record_unposted(journal, identity["id"])
+                cache_store.write_json_atomic(path, journal)
+        return identity, state
 
 
 def _reservation_identity(record, account):
@@ -124,8 +177,16 @@ def _restore_progress(record, entry):
     return url
 
 
+def _restore_unposted(record):
+    if record.get("submission_attempted") is False:
+        return False
+    record.update(status="QUEUED", submission_attempted=False,
+                  slot_reservation_state="released", error=None)
+    return True
+
+
 def restore_record(record, account=None):
-    """Restore a missing progress URL from the same durable reservation.
+    """Restore a missing progress URL or a definitely unposted attempt.
 
     Return whether the in-memory record changed. Local inspection can read
     completed copies across workspaces. Pass the authenticated account before
@@ -138,10 +199,23 @@ def restore_record(record, account=None):
     if not identity or record.get("progress_url") or terminal:
         return False
     fingerprint = identity["account_fingerprint"]
-    path, _ = _paths(fingerprint)
+    path, lock = _paths(fingerprint)
     # Writers replace the complete journal atomically.
     journal = _load(path, fingerprint)
-    return bool(_restore_progress(record, journal["reservations"].get(identity["id"], {})))
+    attempt = identity["id"]
+    entry = journal["reservations"].get(attempt, {})
+    if attempt in journal.get("not_submitted", {}):
+        return _restore_unposted(record)
+    if entry.get("state") == "preparing":
+        try:
+            with cache_store.file_lock(lock + ".prepare", timeout=0, poll=0):
+                journal = _load(path, fingerprint)
+                entry = journal["reservations"].get(attempt, {})
+                if attempt in journal.get("not_submitted", {}) or entry.get("state") == "preparing":
+                    return _restore_unposted(record)
+        except cache_store.LockTimeout:
+            return False
+    return bool(_restore_progress(record, entry))
 
 
 def reconcile_record(record, account=None, *, outcome=None, progress_url=None, alpha_id=None):
@@ -155,6 +229,8 @@ def reconcile_record(record, account=None, *, outcome=None, progress_url=None, a
     if outcome not in {None, "accepted", "terminal", "refused"}:
         raise ValueError("unknown simulation reservation outcome %r" % outcome)
     identity = _reservation_identity(record, account)
+    if identity and outcome is None and not progress_url and not alpha_id:
+        restore_record(record, account)
     fingerprint = identity["account_fingerprint"] if identity else _fingerprint(account)
     effective_url = progress_url or record.get("progress_url")
     if outcome is None:
@@ -177,6 +253,11 @@ def reconcile_record(record, account=None, *, outcome=None, progress_url=None, a
                 journal["reservations"].pop(identity["id"], None)
             else:
                 entry = journal["reservations"].get(identity["id"], {})
+                if outcome is None and identity["id"] in journal.get("not_submitted", {}):
+                    _restore_unposted(record)
+                    return record
+                if entry.get("state") == "preparing":
+                    return record
                 effective_url = _restore_progress(record, entry) or effective_url
                 if entry.get("state") == "accepted":
                     outcome = "accepted"

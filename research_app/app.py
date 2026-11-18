@@ -79,7 +79,7 @@ def main(argv=None):
             code = exc.exit_code
         except ml.BrainError as exc:
             error_code = getattr(exc, "code", "SERVICE_ERROR")
-            if str(error_code).startswith("AUTH") and ml.invalidate_session():
+            if error_code == "AUTH_FAILED" and ml.invalidate_session():
                 note("session cache cleared after %s" % error_code)
             payload = {"ok": False, "command": options.command,
                        "error": {"code": error_code, "message": str(exc),

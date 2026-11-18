@@ -5,17 +5,12 @@ import io
 import json
 import sys
 import tempfile
-import types
 import unittest
 from pathlib import Path
 from unittest import mock
 
-# spc_client imports machine_lib at module scope; stub it so the pure validation
-# function can be tested without credentials or network.
-if "machine_lib" not in sys.modules:
-    stub = types.ModuleType("machine_lib")
-    stub.load_session = lambda *a, **k: None
-    sys.modules["machine_lib"] = stub
+from requests import Response
+from requests.exceptions import ReadTimeout
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from tools import spc_client  # noqa: E402
@@ -55,6 +50,87 @@ def spec(**overrides):
 
 
 class SpcSpecTests(unittest.TestCase):
+    def spec_file(self, data):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "spec.json"
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return str(path)
+
+    @staticmethod
+    def platform_response(status, body):
+        response = Response()
+        response.status_code = status
+        response._content = json.dumps(body).encode()
+        return response
+
+    def test_submit_requires_consent_before_session(self):
+        with mock.patch.object(spc_client, "session") as session, redirect_stdout(io.StringIO()):
+            self.assertEqual(spc_client.cmd_submit("unused.json", False), 2)
+        session.assert_not_called()
+
+    def test_invalid_and_http_refused_submissions_exit_nonzero(self):
+        for invalid in (True, False):
+            with self.subTest(invalid=invalid):
+                path = self.spec_file(spec(weight=5) if invalid else spec())
+                session = mock.Mock()
+                session.post.return_value = self.platform_response(400, {"modelFamily": "rejected"})
+                stdout = io.StringIO()
+                with mock.patch.object(spc_client, "session", return_value=session), \
+                        mock.patch.object(spc_client, "schema", return_value=SCHEMA), redirect_stdout(stdout):
+                    self.assertEqual(spc_client.cmd_submit(path, True), 1)
+                self.assertEqual(session.post.call_count, 0 if invalid else 1)
+                self.assertIn("FAIL demo", stdout.getvalue())
+
+    def test_unknown_post_outcome_stops_without_repeating_or_submitting_remaining_specs(self):
+        path = self.spec_file([spec(), spec(name="second")])
+        for outcome in (ReadTimeout(), self.platform_response(502, {}), self.platform_response(201, {}),
+                        self.platform_response(307, {})):
+            with self.subTest(outcome=outcome):
+                session = mock.Mock()
+                if isinstance(outcome, Exception):
+                    session.post.side_effect = outcome
+                else:
+                    session.post.return_value = outcome
+                stdout = io.StringIO()
+                with mock.patch.object(spc_client, "session", return_value=session), \
+                        mock.patch.object(spc_client, "schema", return_value=SCHEMA), redirect_stdout(stdout):
+                    self.assertEqual(spc_client.cmd_submit(path, True), 1)
+                session.post.assert_called_once_with(spc_client.SPC, json=spec(), timeout=30,
+                                                     allow_redirects=False)
+                self.assertIn("check recon before retrying", stdout.getvalue())
+
+    def test_submit_success_identifies_server_record(self):
+        path = self.spec_file(spec())
+        session = mock.Mock()
+        session.post.return_value = self.platform_response(201, {"id": "spc-1"})
+        stdout = io.StringIO()
+        with mock.patch.object(spc_client, "session", return_value=session), \
+                mock.patch.object(spc_client, "schema", return_value=SCHEMA), redirect_stdout(stdout):
+            self.assertEqual(spc_client.cmd_submit(path, True), 0)
+        self.assertIn("id=spc-1", stdout.getvalue())
+
+    def test_recon_prioritizes_submissions_and_stops_optional_probes_at_deadline(self):
+        clock = [100.0]
+        session = mock.Mock()
+        session.options.return_value = self.platform_response(200, {"actions": {"POST": SCHEMA}})
+
+        def submissions(*_args, **_kwargs):
+            clock[0] += spc_client.DIAGNOSTIC_SECONDS + 1
+            return self.platform_response(200, {"count": 1, "results": [{"id": "spc-1"}]})
+
+        session.get.side_effect = submissions
+        stdout = io.StringIO()
+        with mock.patch.object(spc_client.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(spc_client, "session", return_value=session), redirect_stdout(stdout):
+            self.assertEqual(spc_client.cmd_recon(), 0)
+        session.options.assert_called_once_with(spc_client.SPC, timeout=spc_client.PROBE_SECONDS,
+                                                allow_redirects=False)
+        session.get.assert_called_once_with(f"{spc_client.SPC}?limit=50", timeout=spc_client.PROBE_SECONDS,
+                                            allow_redirects=False)
+        self.assertIn("== submissions: 1 ==", stdout.getvalue())
+        self.assertIn("diagnostic budget expired", stdout.getvalue())
+
     def test_valid_spec_passes(self):
         self.assertEqual(spc_client.validate_spec(spec(), SCHEMA), [])
 

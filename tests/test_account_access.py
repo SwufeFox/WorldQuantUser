@@ -156,6 +156,34 @@ class AccountAccessTests(unittest.TestCase):
         self.assertEqual(result["data_scope_evidence"]["state"], "verified")
         self.assertIn("unprobed", result["note"])
 
+    def test_shared_deadline_preserves_earlier_region_and_marks_unprobed_unknown(self):
+        clock = [100.0]
+
+        def catalogs(session, **kwargs):
+            clock[0] = 106.0
+            return self.fresh(session, **kwargs)
+
+        session = object()
+        with mock.patch.object(account.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(ml, "request_json", return_value=options(("USA", "EUR"))) as request, \
+                mock.patch.object(ml, "get_datasets", side_effect=catalogs) as datasets:
+            result = account._data_access(session, deadline=105.0)
+        request.assert_called_once_with(session, "OPTIONS", "/simulations", deadline=105.0, max_retries=1)
+        self.assertEqual(datasets.call_count, 1)
+        self.assertEqual(datasets.call_args.kwargs["deadline"], 105.0)
+        self.assertEqual(result["regions"], ["USA"])
+        self.assertEqual(result["state"], "unknown")
+        self.assertEqual(result["probes"][1]["reason"], "diagnostic_budget_expired")
+
+    def test_dataset_catalog_uses_probe_deadline_and_does_not_retry(self):
+        session = object()
+        payload = {"results": [{"id": "sample"}], "count": 1}
+        with mock.patch.object(ml, "request_json", return_value=payload) as request:
+            self.assertEqual(ml.get_datasets(session, limit=1, deadline=105.0), payload["results"])
+        self.assertEqual(request.call_args.args, (session, "GET", "/data-sets"))
+        self.assertEqual(request.call_args.kwargs["deadline"], 105.0)
+        self.assertEqual(request.call_args.kwargs["max_retries"], 1)
+
     def test_malformed_settings_do_not_make_up_regions(self):
         for schema in ([], {"actions": []}, {"actions": {"POST": {"settings": "unknown"}}}):
             with self.subTest(schema=schema), \

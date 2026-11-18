@@ -16,7 +16,7 @@ class _Session:
     def __init__(self, mapping):
         self.mapping = mapping
 
-    def request(self, method, url, timeout=30):
+    def request(self, method, url, timeout=30, allow_redirects=True):
         for suffix, status in self.mapping.items():
             if url.endswith(suffix):
                 return _Response(status)
@@ -44,3 +44,21 @@ class ApiProbeTests(unittest.TestCase):
         gated = [row for row in data["endpoints"] if "correlations/prod" in row["path"]]
         self.assertEqual(gated[0]["status"], 403)
         self.assertIn("level-gated", gated[0]["note"])
+
+    def test_probe_retains_results_and_skips_endpoints_after_its_budget(self):
+        clock = [100.0]
+        session = mock.Mock()
+
+        def get(*_args, **_kwargs):
+            clock[0] += account.DIAGNOSTIC_SECONDS + 1
+            return _Response(200)
+
+        session.request.side_effect = get
+        with mock.patch.object(account.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(ml, "load_session", return_value=session) as load:
+            data = account.cmd_api_probe(mock.Mock(alpha="A1", no_cache=False, relogin=False), None)
+        self.assertEqual(load.call_args.kwargs["deadline"], 100.0 + account.DIAGNOSTIC_SECONDS)
+        session.request.assert_called_once_with("GET", ml.BRAIN_API_URL + "/users/self/alphas",
+                                                timeout=account.PROBE_SECONDS, allow_redirects=False)
+        self.assertEqual(data["endpoints"][0]["status"], 200)
+        self.assertTrue(all(row["note"] == "diagnostic budget expired" for row in data["endpoints"][1:]))

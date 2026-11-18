@@ -70,8 +70,9 @@ class SchemaContractTests(unittest.TestCase):
             self.assertIn(key, data)
         self.assertEqual(data["exit_codes"]["CONFIRM_REQUIRED"], 2)
         self.assertIn("CONFIRM_REQUIRED", data["error_codes"])
-
-
+        for key, code in (("ACCESS_DENIED", 3), ("SESSION_BUSY", 4)):
+            self.assertEqual(data["exit_codes"][key], code)
+            self.assertIn(key, data["error_codes"])
 
     def test_schema_can_describe_one_command(self):
         payload = parse(run_cli("schema", "simulate"))["data"]
@@ -86,6 +87,41 @@ class SchemaContractTests(unittest.TestCase):
         proc = run_cli("search", "market liquidity")
         self.assertEqual(proc.returncode, 2)
         self.assertEqual(parse(proc)["error"]["code"], "USAGE")
+
+
+class SessionErrorContractTests(unittest.TestCase):
+    def test_http_403_keeps_session_and_is_not_retried_as_auth_failure(self):
+        session = mock.Mock()
+        session.request.return_value.status_code = 403
+        args = cli_parser.build_parser().parse_args(["auth", "check"])
+        with mock.patch.object(ml, "load_session", return_value=session) as login:
+            with self.assertRaises(ml.PermissionDenied):
+                cli_runtime.with_session(args, lambda current: ml.request_json(current, "GET", "/data-sets"))
+        login.assert_called_once()
+        session.request.assert_called_once()
+
+    def test_transient_and_permission_errors_do_not_purge_session_cache(self):
+        for exc, code in ((ml.SessionBusy("synthetic"), 4),
+                          (ml.PermissionDenied("synthetic"), 3),
+                          (ml.CaptchaRequired("synthetic"), 3)):
+            with self.subTest(error=exc.code), mock.patch.object(cli_app, "_dispatch", side_effect=exc), \
+                    mock.patch.object(ml, "invalidate_session") as invalidate, \
+                    contextlib.redirect_stdout(io.StringIO()) as stdout, \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(cli_app.main(["auth", "check"]), code)
+                self.assertEqual(json.loads(stdout.getvalue())["error"]["code"], exc.code)
+                invalidate.assert_not_called()
+
+    def test_retry_after_over_default_request_budget_does_not_sleep(self):
+        session = mock.Mock()
+        session.request.return_value.status_code = 429
+        session.request.return_value.headers = {"Retry-After": "120"}
+        session.request.return_value.ok = False
+        with mock.patch.object(ml, "sleep") as sleep:
+            with self.assertRaises(ml.RateLimited):
+                ml.request_json(session, "GET", "/data-sets")
+        session.request.assert_called_once()
+        sleep.assert_not_called()
 
 
 class BriefContractTests(unittest.TestCase):

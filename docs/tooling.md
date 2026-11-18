@@ -124,6 +124,8 @@ python3 tools/aqp_strategy_maps.py --cycle 202611 --output-dir /path/to/another-
 合法股票池和 delay 查询目录，不再给所有地区套美股默认股票池。`data_scope_evidence`
 保留实际查询范围、目录时效及 available / empty / unknown；它只证明抽查的组合。
 错误、旧目录回退和未查询组合不能作为“该地区无数据”的证据。
+`auth check` 和 `api probe` 从读取会话开始使用同一个 25 秒探测预算。单次探测的 HTTP
+超时至多 5 秒。预算用完后保留已取得的证据，其余项目标记为未完成。
 
 BRAIN 会话缓存跟随当前配置的账户。只有用户名一致且仍有效的会话才会复用。
 旧缓存缺少用户名绑定时会跳过，下次正常登录后自动写入绑定当前账户的会话。
@@ -753,7 +755,8 @@ python3 research_cli.py resume checkpoint.json --batch-size 6 --max-wait-seconds
 diagnostic 保留用于归因，但不能进入候选冻结、候选架、晋级或新提交；恢复和刷新不抹掉角色。
 旧记录没有声明时保持 unspecified，不从 C1 之类的标签或备注猜测。
 
-每个 POST 之前保存提交意图，拿到任务身份后立即保存。若槽位账本比批次先保存了任务地址，
+每个 POST 之前保存提交意图，拿到任务身份后立即保存。准备阶段中断时，下次调度会回收
+可确认尚未发出 POST 的占位，保存的批次可恢复为排队。若槽位账本比批次先保存了任务地址，
 中断后 `resume`、`probe --resume` 和 `probe --recover` 会用同一预约补回地址，
 由对应账户继续查询。没有确切任务身份的发单尝试保持结果未知，需先核对身份。
 
@@ -851,7 +854,10 @@ python3 research_cli.py alpha check ALPHA_A ALPHA_B --workers 2 --max-wait 300
 `--save` 在命令完成后原子写入最终 JSON，不是实时检查点。默认串行检查两个 Alpha，
 仅异步等待预算就可能达到 2 × 180 秒，另有认证、登录锁及网络等待；外层 `timeout 240`
 直接终止进程时，可能还没有最终文件。退出码 124 只说明外层时间预算耗尽，不能证明平台过载。
-认证 POST 与通用目录请求使用现有的 60 秒连接/读取超时；这不是整个命令的墙钟上限。
+认证 POST 使用 60 秒连接和读取超时。通用 BRAIN 请求默认在 60 秒预算内重试，
+会根据剩余预算决定是否等待 Retry-After。认证、分页和异步等待仍会增加整条命令的耗时。
+登录锁等待到期时，如果其他进程尚未保存可复用会话，CLI 返回 `SESSION_BUSY`。
+通用请求的 HTTP 401 触发一次会话刷新，HTTP 403 返回 `ACCESS_DENIED`，沿用当前会话缓存。
 
 先用 `cache info` 读取本地会话状态，不打印缓存里的凭据。定位无输出时，Python 使用 `-u`，
 阶段信息与堆栈写 stderr；在一次诊断中区分导入、认证、请求及异步等待，不反复执行相同的长调用。
@@ -1073,6 +1079,7 @@ python tools/spc_client.py experiment SPEC.json --run RUN-A.json --reference UNI
 `updateFrequency`、`weight` 和 `sampleOutput`。`sampleOutput` 是装有真实模型输出数组的
 JSON 字符串。`RUN.json` 文件直接保存模型返回的数组。固定 prompt、模型和信息时点做重复运行，
 可在 spec 里记录 `as_of`，以便后续复核。
+`recon` 优先读取表单和提交列表，再用剩余的探测预算检查其他端点。跳过的端点会标出原因。
 
 `experiment` 在本地检查每条记录、ISIN 校验位、MIC 格式、重复标的和预测数值。
 回执包含输入文件与 prompt 的 SHA-256，以及每个有效运行相对样例的标的重叠率、多空变化、
@@ -1088,4 +1095,6 @@ JSON 字符串。`RUN.json` 文件直接保存模型返回的数组。固定 pro
 覆盖按置信度非零的输出行统计。回执保留命中和缺漏，这份统计用于实验比较，领奖资格由平台核算。
 [分段定义](https://support.worldquantbrain.com/hc/en-us/articles/44793597008919-What-is-the-segment-coverage-requirement)
 
-SPC 平台提交仍通过独立的 `submit SPEC.json --yes` 入口，需要明确授权。
+SPC 平台提交通过独立的 `submit SPEC.json --yes` 入口，需要明确授权。成功会输出平台条目 ID。
+本地校验失败、HTTP 拒绝或无法确认条目 ID 时退出非零。POST 结果不明会停止本批次，重试前先用
+`recon` 核对提交列表。
