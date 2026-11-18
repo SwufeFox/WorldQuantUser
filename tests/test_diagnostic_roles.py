@@ -135,12 +135,13 @@ class DiagnosticRoleTests(unittest.TestCase):
             kwargs["scheduling_report"].update(requested=7, effective=7, source="explicit_local_policy")
             return [{"status": "QUEUED", "submission_attempted": False}]
         args = argparse.Namespace(resume=str(path), concurrency=7, summary=True, max_wait_seconds=10)
-        with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn: fn(object())), \
+        with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn, **kw: fn(object())), \
                 mock.patch.object(experiments.simulation_capabilities, "fetch", return_value=snapshot) as fetch, \
                 mock.patch.object(experiments, "_preflight_lint", return_value=report), \
                 mock.patch.object(experiments.guarded_sim, "simulate", side_effect=simulate):
             result = experiments.cmd_probe(args, None)
-        fetch.assert_called_once_with(mock.ANY, refresh=True)
+        fetch.assert_called_once_with(mock.ANY, refresh=True, deadline=mock.ANY)
+        self.assertIsInstance(fetch.call_args.kwargs["deadline"], float)
         saved = json.loads(path.read_text())
         self.assertEqual(saved["request_fingerprint"], document["request_fingerprint"])
         self.assertEqual(saved["recording_policy"], document["recording_policy"])
@@ -187,7 +188,7 @@ class DiagnosticRoleTests(unittest.TestCase):
             "status": "PENDING"}]}))
         payload = {"status": "COMPLETE", "is": {"fitness": 0, "sharpe": 0},
                    "train": {"fitness": 0, "sharpe": 0}}
-        with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn: fn(object())), \
+        with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn, **kw: fn(object())), \
                 mock.patch.object(ml, "fetch_alpha_metrics", return_value=payload), \
                 mock.patch.object(ml, "extract_split", return_value={"train": payload["train"]}):
             result = experiments.cmd_probe(argparse.Namespace(recover=str(batch), summary=True), None)
@@ -208,7 +209,7 @@ class DiagnosticRoleTests(unittest.TestCase):
         experiments._probe_document_update(document, path)
         path.write_text(json.dumps(document))
         snapshot = {"state": "verified", "account": {"state": "unknown"}, "settings_schema": {}}
-        with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn: fn(object())), \
+        with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn, **kw: fn(object())), \
                 mock.patch.object(experiments.simulation_capabilities, "fetch", return_value=snapshot), \
                 mock.patch.object(experiments, "_preflight_lint", side_effect=AssertionError("launch-only")), \
                 mock.patch.object(experiments.guarded_sim, "simulate", side_effect=AssertionError("launch-only")), \

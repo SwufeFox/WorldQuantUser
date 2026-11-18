@@ -23,7 +23,7 @@ import simulation_capabilities
 import simulation_slots
 from tools import guarded_sim
 
-from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, protect_output, with_session
+from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, protect_output, session_reader, with_session
 from . import costs, incentives, selection, stats
 from .validation import _preflight_lint, attach_field_contracts, cached_field_scope, lint_python_source
 
@@ -728,16 +728,20 @@ def _requested_concurrency(args, saved=None):
     return requested
 
 
-def _invocation_capabilities(session, args):
+def _invocation_capabilities(session, args, *, deadline=None):
     snapshot = getattr(args, "capability_snapshot", None)
     current = simulation_capabilities.account_provenance(session)
     prior_account = (snapshot or {}).get("account") or {}
     changed = (current.get("fingerprint") and prior_account.get("fingerprint")
                and current["fingerprint"] != prior_account["fingerprint"])
     if snapshot is None or changed:
-        snapshot = simulation_capabilities.fetch(session, refresh=True)
+        snapshot = simulation_capabilities.fetch(session, refresh=True, deadline=deadline)
         args.capability_snapshot = snapshot
     return snapshot
+
+
+def _simulation_deadline(args):
+    return time.monotonic() + getattr(args, "max_wait_seconds", 300.0)
 
 
 def cmd_compare(args, _sink):
@@ -1117,45 +1121,45 @@ def _recovery_expression_key(expression, language):
     return _normalized_expression(expression)
 
 
+def _probe_recovery_index(session, limit, pages, deadline):
+    index = {}
+    for page in range(pages):
+        if time.monotonic() >= deadline:
+            raise ml.RateLimited("probe recovery wait budget expired during alpha lookup")
+        batch = ml.list_alphas(session, limit=limit, offset=page * limit,
+                               order="-dateCreated", status="UNSUBMITTED", deadline=deadline)
+        for alpha in batch:
+            code, _description, _ops = ml.regular_expression(alpha)
+            key = _recovery_expression_key(code, ml.alpha_language(alpha))
+            if key:
+                index.setdefault(key, []).append({"alpha_id": alpha.get("id"),
+                    "signature": _settings_signature(alpha.get("settings"))})
+        if len(batch) < limit:
+            break
+    return index
+
+
 def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.0,
-                        on_progress=None):
+                        on_progress=None, *, deadline=None):
     """Read known jobs first; use expression/settings lookup only for unidentified arms."""
     from requests.exceptions import RequestException
 
     limit = min(100, max(1, limit))
     missing = [row for row in rows if row.get("train_fitness") is None or row.get("metrics_pending")]
-    matched, still_missing, ambiguous = {}, [], []
+    matched, still_missing, ambiguous = {}, set(), []
     not_submitted = [row["label"] for row in missing if row.get("submission_attempted") is False]
-    deadline = time.monotonic() + max_wait_seconds
-    lookup = [row for row in missing if row.get("submission_attempted") is not False
-              and not row.get("alpha_id") and not row.get("progress_url")
-              and (row.get("settings") or row.get("settings_signature") not in (None, "", "{}"))]
-    index = {}
-    if lookup:
-        for page in range(pages):
-            if time.monotonic() >= deadline:
-                break
-            batch = ml.list_alphas(session, limit=limit, offset=page * limit,
-                                   order="-dateCreated", status="UNSUBMITTED")
-            for alpha in batch:
-                code, _description, _ops = ml.regular_expression(alpha)
-                key = _recovery_expression_key(code, ml.alpha_language(alpha))
-                if key:
-                    index.setdefault(key, []).append({"alpha_id": alpha.get("id"),
-                        "signature": _settings_signature(alpha.get("settings"))})
-            if len(batch) < limit:
-                break
-    for row in missing:
+    if deadline is None:
+        deadline = time.monotonic() + max_wait_seconds
+    index = lookup_error = None
+    for row in sorted(missing, key=lambda item: not (item.get("alpha_id") or item.get("progress_url"))):
         label = row["label"]
-        if row.get("submission_attempted") is False or time.monotonic() >= deadline:
-            still_missing.append(label)
+        if (row.get("submission_attempted") is False or time.monotonic() >= deadline
+                or (row.get("next_poll_at") or 0) > time.time()):
+            still_missing.add(label)
             continue
         try:
             alpha_id = row.get("alpha_id")
             if not alpha_id and row.get("progress_url"):
-                if (row.get("next_poll_at") or 0) > time.time():
-                    still_missing.append(label)
-                    continue
                 progress = ml.poll_simulation(session, row["progress_url"], deadline=deadline)
                 row["status"] = progress.get("status")
                 alpha_id = progress.get("alpha")
@@ -1164,18 +1168,32 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
                     if wait is not None:
                         row["next_poll_at"] = time.time() + max(0, float(wait))
                     row["error"] = progress.get("message")
-                    still_missing.append(label)
+                    still_missing.add(label)
                     if on_progress:
                         on_progress(row)
                     continue
                 row["alpha_id"] = alpha_id
+                row["metrics_pending"] = True
                 row.pop("progress_url", None)
                 row.pop("next_poll_at", None)
                 if on_progress:
                     on_progress(row)
             if not alpha_id:
                 if not row.get("settings") and row.get("settings_signature") in (None, "", "{}"):
-                    still_missing.append(label)
+                    still_missing.add(label)
+                    continue
+                if index is None and lookup_error is None:
+                    try:
+                        index = _probe_recovery_index(session, limit, pages, deadline)
+                    except ml.AuthError:
+                        raise
+                    except (ml.BrainError, RequestException) as exc:
+                        lookup_error = exc
+                if lookup_error is not None:
+                    row["error"] = str(lookup_error)
+                    still_missing.add(label)
+                    if on_progress:
+                        on_progress(row)
                     continue
                 wanted = (_settings_signature(row["settings"]) if "settings" in row
                           else row.get("settings_signature") or _settings_signature(None))
@@ -1186,22 +1204,30 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
                     if len(exact) > 1:
                         ambiguous.append({"label": label,
                                           "candidates": [item["alpha_id"] for item in exact]})
-                    still_missing.append(label)
+                    still_missing.add(label)
                     continue
                 alpha_id = exact[0]["alpha_id"]
                 row["alpha_id"] = alpha_id
+                row["metrics_pending"] = True
                 if on_progress:
                     on_progress(row)
             payload = ml.fetch_alpha_metrics(session, alpha_id, deadline=deadline)
+            if ml.defer_alpha_metrics(row, payload):
+                still_missing.add(label)
+                if on_progress:
+                    on_progress(row)
+                continue
             split = ml.extract_split(payload) or {}
             train = split.get("train") or {}
             if train.get("fitness") is None:
-                still_missing.append(label)
-            row.update({"status": payload.get("status"), "train_sharpe": train.get("sharpe"),
+                still_missing.add(label)
+            row.update({"status": payload.get("status") or row.get("status"), "train_sharpe": train.get("sharpe"),
                         "train_fitness": train.get("fitness"), "train_turnover": train.get("turnover"),
                         "train_returns": train.get("returns"), "error": None,
                         "settings_signature": _settings_signature(row.get("settings"))})
             row.pop("metrics_pending", None)
+            row.pop("next_poll_at", None)
+            row.pop("poll_after_seconds", None)
             raw = {"alpha_id": alpha_id, "status": row["status"],
                    "role": row.get("role"),
                    "expression": row.get("expression"), "settings": row.get("settings") or {},
@@ -1215,13 +1241,14 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
             raise
         except (ml.BrainError, RequestException) as exc:
             row["error"] = str(exc)
-            still_missing.append(label)
+            still_missing.add(label)
             if on_progress:
                 on_progress(row)
             continue
         if on_progress:
             on_progress(row, raw)
-    return {"recovered": len(matched), "still_missing": still_missing,
+    return {"recovered": len(matched), "still_missing": [row["label"] for row in missing
+                                                           if row["label"] in still_missing],
             "ambiguous": ambiguous, "matched": matched, "not_submitted": not_submitted}
 
 
@@ -1327,6 +1354,7 @@ def _cmd_probe_recover(args):
 
 
 def _recover_probe_batch(args, path):
+    deadline = _simulation_deadline(args)
     path, document = _load_probe_batch(path)
     show_test = bool(getattr(args, "show_test", False))
     if show_test and not getattr(args, "selection", None):
@@ -1351,29 +1379,32 @@ def _recover_probe_batch(args, path):
             record = records[positions[id(row)]]
             if raw is not None:
                 record.update(raw)
-            for key in ("alpha_id", "status", "progress_url", "next_poll_at", "error"):
+            for key in ("alpha_id", "status", "progress_url", "next_poll_at", "poll_after_seconds", "error"):
                 if key in row:
                     record[key] = row[key]
-                elif key in {"progress_url", "next_poll_at"}:
+                elif key in {"progress_url", "next_poll_at", "poll_after_seconds"}:
                     record.pop(key, None)
             if raw is not None:
                 record.pop("metrics_pending", None)
+            elif row.get("metrics_pending"):
+                record["metrics_pending"] = True
             simulation_slots.reconcile_record(record, account)
             _probe_document_update(document, path)
             cache_store.write_json_atomic(path, document, indent=1)
 
-        outcome = _recover_probe_rows(session, active_rows, on_progress=save_recovered,
-                                     max_wait_seconds=getattr(args, "max_wait_seconds", 300.0))
-        _probe_halves(session, records)
+        outcome = _recover_probe_rows(session, active_rows, on_progress=save_recovered, deadline=deadline)
+        _probe_halves(session, records, deadline=deadline)
         return outcome
 
+    now = time.time()
     needs_platform = any((row.get("train_fitness") is None or row.get("metrics_pending"))
-                         and row.get("submission_attempted") is not False for row in rows)
+                         and row.get("submission_attempted") is not False
+                         and (row.get("next_poll_at") or 0) <= now for row in rows)
     needs_halves = any(record.get("alpha_id") and _has_finished_result(record)
         and ((record.get("out_of_sample") or {}).get("test") or {}).get("startDate")
         and (not record.get("half_sharpes") or any(value is None for value in record["half_sharpes"]))
         for record in document["records"])
-    outcome = with_session(args, recover) if needs_platform or needs_halves else recover(None)
+    outcome = with_session(args, recover, deadline=deadline) if needs_platform or needs_halves else recover(None)
     _probe_reconcile(document)
     _probe_document_update(document, path)
     cache_store.write_json_atomic(path, document, indent=1)
@@ -1771,13 +1802,22 @@ def _cmd_probe(args, _sink):
         raise CliError("INVALID_INPUT", "exact finished requests repeat under --strict-gate",
                        details={"gate_blocking": gate_blocking})
     if check:
+        deadline = _simulation_deadline(args)
+        proof_cache = {}
+
         def check_groups(session):
-            base["capability_snapshot"] = _invocation_capabilities(session, args)
-            return [_preflight_lint(session, group["pairs"], group["settings"], args)
-                    for group in groups.values()]
-        reports = with_session(args, check_groups)
+            base["capability_snapshot"] = _invocation_capabilities(session, args, deadline=deadline)
+            reports = []
+            for group in groups.values():
+                if time.monotonic() >= deadline:
+                    break
+                reports.append(_preflight_lint(session, group["pairs"], group["settings"], args,
+                                               deadline=deadline, proof_cache=proof_cache))
+            return reports
+        reports = with_session(args, check_groups, deadline=deadline)
         return {**base, "check": True, "preflight": reports,
-                "preflight_complete": all(bool(report) and report.get("ok", False) for report in reports),
+                "preflight_complete": len(reports) == len(groups)
+                and all(bool(report) and report.get("ok", False) for report in reports),
                 "run_id": None, "started_at": None,
                 "next_actions": [{"action": "run", "spec": str(args.spec), "batch_path": str(target)}]}
     try:
@@ -1806,7 +1846,7 @@ def _probe_row(record, arm, gate, show_test):
            "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
            "ops": arm["ops"], "gate": gate}
     row["incentives"] = incentives.check_summary(record.get("checks"))
-    for key in ("progress_url", "metrics_pending", "next_poll_at", "submission_attempted"):
+    for key in ("progress_url", "metrics_pending", "next_poll_at", "poll_after_seconds", "submission_attempted"):
         if key in record:
             row[key] = record[key]
     if show_test:
@@ -1899,8 +1939,10 @@ def _probe_reconcile(document):
         note=document.get("note"), registry_path=policy["registry"], source="simulate", batch=document.get("name"))}
 
 
-def _probe_halves(session, records):
+def _probe_halves(session, records, *, deadline=None):
     for record in records:
+        if deadline is not None and time.monotonic() >= deadline:
+            break
         if not _has_finished_result(record) or not record.get("alpha_id"):
             continue
         boundary = ((record.get("out_of_sample") or {}).get("test") or {}).get("startDate")
@@ -1914,7 +1956,8 @@ def _probe_halves(session, records):
         evidence = {}
         try:
             pnl = ml.fetch_daily_pnl(session, record["alpha_id"],
-                cache_dir=Path(research_paths.ensure_dir()) / "pnl", max_age_hours=24, report=evidence)
+                cache_dir=Path(research_paths.ensure_dir()) / "pnl", max_age_hours=24, report=evidence,
+                deadline=deadline)
         except (ml.BrainError, RequestException, OSError) as exc:
             record["half_sharpes"] = [None, None]
             record["half_sharpes_error"] = str(exc)
@@ -1925,6 +1968,8 @@ def _probe_halves(session, records):
 
 
 def _execute_probe(args, document, target, groups):
+    deadline = _simulation_deadline(args)
+    proof_cache = {}
     records = document["records"]
     state_lock = threading.Lock()
 
@@ -1958,8 +2003,7 @@ def _execute_probe(args, document, target, groups):
         note("  %s" % kind)
 
     def work(session):
-        deadline = time.monotonic() + getattr(args, "max_wait_seconds", 300.0)
-        document["capability_snapshot"] = _invocation_capabilities(session, args)
+        document["capability_snapshot"] = _invocation_capabilities(session, args, deadline=deadline)
         document.setdefault("preflight", [])
         save()
         ordered = sorted(groups.values(), key=lambda group: any(
@@ -1970,18 +2014,18 @@ def _execute_probe(args, document, target, groups):
             if time.monotonic() >= deadline:
                 break
             if launching:
-                preflight = _preflight_lint(session, group["pairs"], group["settings"], args)
+                preflight = _preflight_lint(session, group["pairs"], group["settings"], args,
+                                            deadline=deadline, proof_cache=proof_cache)
                 document["preflight"].append(preflight)
                 save()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if time.monotonic() >= deadline:
                 break
             scheduling = {}
             document.setdefault("scheduling", []).append(scheduling)
             options = dict(labels=[arm["label"] for arm in group["arms"]],
                 concurrency=document["concurrency"], capability_snapshot=document["capability_snapshot"],
                 scheduling_report=scheduling, initial_records=[records[index] for index in indices],
-                max_wait_seconds=remaining,
+                deadline=deadline,
                 on_event=lambda kind, payload, positions=indices: progress(positions, kind, payload))
             if launching:
                 produced = guarded_sim.simulate([expression for expression, _ in group["pairs"]],
@@ -1996,12 +2040,12 @@ def _execute_probe(args, document, target, groups):
             if launching and any(record.get("progress_url") or record.get("metrics_pending")
                    or record.get("status") in {"PENDING", "QUEUED", "UNKNOWN_SUBMISSION"} for record in produced):
                 break
-        _probe_halves(session, records)
+        _probe_halves(session, records, deadline=deadline)
 
     document["concurrency"] = _requested_concurrency(args, document)
     save()
     if groups:
-        with_session(args, work)
+        with_session(args, work, deadline=deadline)
     _probe_reconcile(document)
     save()
     return _probe_response(document, target, summary=getattr(args, "summary", False))
@@ -2127,37 +2171,45 @@ def cmd_simulate(args, sink):
     # Real submission: lint against the operator catalog first. An unknown
     # operator would otherwise burn a submission slot and a polling wait before
     # BRAIN rejected it -- exactly how `regression_neut` cost a round trip.
+    deadline = _simulation_deadline(args)
+    run = session_reader(args, deadline=deadline)
+
     def preflight(session):
-        _invocation_capabilities(session, args)
-        return _preflight_lint(session, pairs, settings, args)
-    with_session(args, preflight)
+        snapshot = _invocation_capabilities(session, args, deadline=deadline)
+        _preflight_lint(session, pairs, settings, args, deadline=deadline)
+        return session, snapshot
+
+    validated_session, snapshot = run(preflight)
 
     checkpoint_path, checkpoint = _prepare_simulation_run(
         settings, pairs, concurrency, args.checkpoint,
         labels=labels, families=families, candidates=candidates, metadata=metadata, roles=roles,
     )
-    checkpoint["capability_snapshot"] = args.capability_snapshot
+    checkpoint["capability_snapshot"] = snapshot
     checkpoint["scheduling"] = {}
     checkpoint["recording_policy"] = {key: getattr(args, key, None)
         for key in ("record", "registry", "idea", "mechanism", "family", "note")}
     _write_simulation_checkpoint(checkpoint_path, checkpoint)
     on_event = _simulation_checkpoint_callback(checkpoint_path, checkpoint, sink)
-    records = with_session(
-        args,
-        lambda s: ml.simulate_alphas(
-            s,
+    def simulate(session):
+        if session is not validated_session:
+            _, checkpoint["capability_snapshot"] = preflight(session)
+            _write_simulation_checkpoint(checkpoint_path, checkpoint)
+        return ml.simulate_alphas(
+            session,
             pairs,
             settings=settings,
             concurrency=concurrency, capability_snapshot=checkpoint["capability_snapshot"],
             scheduling_report=checkpoint["scheduling"],
             on_event=on_event,
-            max_wait_seconds=args.max_wait_seconds,
+            deadline=deadline,
             initial_records=checkpoint["records"],
             labels=labels,
             families=families,
             candidates=candidates,
-        ),
-    )
+        )
+
+    records = run(simulate)
     return _finalize_simulation(
         records,
         settings,
@@ -2181,6 +2233,7 @@ def cmd_resume(args, sink):
 
 
 def _resume_simulation(args, sink, path):
+    deadline = _simulation_deadline(args)
     try:
         checkpoint = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -2235,12 +2288,12 @@ def _resume_simulation(args, sink, path):
     on_event = _simulation_checkpoint_callback(path, checkpoint, sink)
     checkpoint["scheduling"] = {}
     def resume(session):
-        checkpoint["capability_snapshot"] = _invocation_capabilities(session, args)
+        checkpoint["capability_snapshot"] = _invocation_capabilities(session, args, deadline=deadline)
         return ml.simulate_alphas(session, pairs, settings=settings, concurrency=concurrency,
             capability_snapshot=checkpoint["capability_snapshot"], scheduling_report=checkpoint["scheduling"],
-            on_event=on_event, max_wait_seconds=args.max_wait_seconds,
+            on_event=on_event, deadline=deadline,
             initial_records=checkpoint["records"], labels=labels, candidates=candidates)
-    records = with_session(args, resume)
+    records = with_session(args, resume, deadline=deadline)
     return _finalize_simulation(
         records,
         settings,

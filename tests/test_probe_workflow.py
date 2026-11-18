@@ -41,8 +41,8 @@ class ProbeWorkflowTests(unittest.TestCase):
                      {"label": "second", "expression": "rank(volume)", "settings": {"decay": 7}},
                      {"label": "third", "expression": "rank(cap)"}]}), encoding="utf-8")
         for target, value in [("_novelty_gate", lambda arms, **kw: [{} for _ in arms]),
-                              ("_preflight_lint", lambda *a: {"ok": True}),
-                              ("with_session", lambda args, fn: fn(object()))]:
+                              ("_preflight_lint", lambda *a, **kw: {"ok": True}),
+                              ("with_session", lambda args, fn, **kw: fn(object()))]:
             patch = mock.patch.object(app, target, value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -93,7 +93,8 @@ class ProbeWorkflowTests(unittest.TestCase):
         clock = mock.Mock(wraps=app.time)
         clock.monotonic.return_value = 0
 
-        def preflight(*_):
+        def preflight(*_, deadline, proof_cache):
+            self.assertEqual(deadline, 30)
             clock.monotonic.return_value = 31
             return {"ok": True}
 
@@ -170,7 +171,7 @@ class ProbeWorkflowTests(unittest.TestCase):
             return ml.simulate_alphas(session, expressions, settings=settings, **kwargs)
 
         with mock.patch.object(app.research_paths, "research_dir", return_value=str(self.root)), \
-                mock.patch.object(app, "with_session", side_effect=lambda args, work: work(session)), \
+                mock.patch.object(app, "with_session", side_effect=lambda args, work, **kw: work(session)), \
                 mock.patch.object(app.guarded_sim, "simulate", side_effect=simulate), \
                 mock.patch.object(session, "post", return_value=accepted) as post, \
                 mock.patch.object(ml, "poll_simulation", return_value={"status": "COMPLETE", "alpha": "A1"}), \
@@ -278,6 +279,21 @@ class ProbeWorkflowTests(unittest.TestCase):
     def test_halves_without_boundary_remain_unknown(self):
         pnl = {"2020-%03d" % day: (-1 if day % 2 else 2) for day in range(200)}
         self.assertEqual(app.half_split_sharpes(pnl), (None, None))
+
+    def test_probe_halves_stop_at_shared_deadline(self):
+        records = [finished("FIRST"), finished("SECOND")]
+        for record in records:
+            record["out_of_sample"]["test"] = {"startDate": "2021-01-01"}
+
+        clock = mock.Mock(wraps=app.time)
+        clock.monotonic.side_effect = [8, 10]
+        with mock.patch.object(app, "time", clock), \
+                mock.patch.object(ml, "fetch_daily_pnl", return_value={}) as fetch:
+            app._probe_halves(object(), records, deadline=10)
+        fetch.assert_called_once()
+        self.assertEqual(fetch.call_args.args[1], "FIRST")
+        self.assertEqual(fetch.call_args.kwargs["deadline"], 10)
+        self.assertNotIn("half_sharpes", records[1])
 
     def test_resume_keeps_accepted_job_identity(self):
         def accepted(expressions, settings, **kw):

@@ -156,6 +156,29 @@ class ScopedCacheTests(unittest.TestCase):
             self.assertIsNone(result["known_fields"])
         self.assertIn("sample_matrix", validation.cached_field_scope(SETTINGS)["known_fields"])
 
+    def test_preflight_reuses_verified_proofs_across_decay_groups_only_within_scope(self):
+        def operators(session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"name": "rank"}]
+
+        args = SimpleNamespace(allow_lint_errors=False)
+        cache = {}
+        with mock.patch.object(ml, "fetch_operators", side_effect=operators) as operator_fetch, \
+                mock.patch.object(ml, "request_json", return_value={"results": FIELDS, "count": len(FIELDS)}) as field_fetch:
+            first = validation._preflight_lint(self.session, [("rank(sample_matrix)", 0)], SETTINGS, args,
+                                               proof_cache=cache)
+            second = validation._preflight_lint(self.session, [("rank(sample_matrix)", 6)], SETTINGS, args,
+                                                proof_cache=cache)
+            validation._preflight_lint(self.session, [("rank(sample_matrix)", 6)],
+                                       {**SETTINGS, "universe": "TOP500"}, args, proof_cache=cache)
+            validation._preflight_lint(SimpleNamespace(auth=("other-account", "unused")),
+                                       [("rank(sample_matrix)", 6)], SETTINGS, args, proof_cache=cache)
+        self.assertEqual(operator_fetch.call_count, 2)
+        self.assertEqual(field_fetch.call_count, 3)
+        self.assertTrue(second["operator_catalog"]["reused_in_invocation"])
+        self.assertTrue(second["field_catalog"]["catalogs"][0]["reused_in_invocation"])
+        self.assertEqual(first["field_catalog"]["as_of"], second["field_catalog"]["as_of"])
+
     def test_rate_limited_search_stops_without_preflight_approval_or_full_scan(self):
         self.capture()
 

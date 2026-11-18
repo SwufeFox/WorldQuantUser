@@ -327,20 +327,53 @@ def cmd_ledger_sync(args, _sink):
                                "reason": "read-only preview"})
             return result
         rows, repaired, reverse_drift, changed_during_capture = [], set(), [], []
-        for alpha_id in targets[:record_limit]:
+        fetched = []
+
+        def persist_fetched():
+            if not fetched:
+                return
             try:
-                current = ml.fetch_alpha_metrics(session, alpha_id)
-                if alpha_id in platform and current.get("status") != platform[alpha_id].get("status"):
-                    changed_during_capture.append(alpha_id)
-                entry = _platform_entry(current, alpha_id, latest.get(alpha_id), source="sync")
-                stored, written = alpha_registry.record_entry(entry, registry)
-                rows.append({"alpha_id": alpha_id, "complete": True, "written": written,
-                             "status": stored.get("status")})
-                repaired.add(alpha_id)
-                if alpha_id in absent and str(stored.get("status") or "").upper() not in book_state.BOOK_STATUSES:
-                    reverse_drift.append(alpha_id)
+                with alpha_registry.append_batch(registry) as (stored_by_key, append):
+                    locked_latest = {row["alpha_id"]: row for row in stored_by_key.values()
+                                     if row.get("alpha_id")}
+                    for row, current in fetched:
+                        alpha_id = row["alpha_id"]
+                        previous = locked_latest.get(alpha_id) or {}
+                        try:
+                            prior_status = (latest.get(alpha_id) or {}).get("status")
+                            if previous.get("status") not in {prior_status, current.get("status")}:
+                                if alpha_id not in changed_during_capture:
+                                    changed_during_capture.append(alpha_id)
+                                raise ValueError("local status changed during capture; refresh before writing")
+                            entry = _platform_entry(current, alpha_id, previous, source="sync")
+                            if previous.get("verdict_manual") and previous.get("verdict"):
+                                entry["verdict"] = previous["verdict"]
+                            stored, written = append(entry)
+                        except Exception as exc:
+                            row.update(complete=False, error=str(exc))
+                            continue
+                        row.update(complete=True, written=written, status=stored.get("status"))
+                        repaired.add(alpha_id)
+                        if alpha_id in absent and str(stored.get("status") or "").upper() not in book_state.BOOK_STATUSES:
+                            reverse_drift.append(alpha_id)
             except Exception as exc:
-                rows.append({"alpha_id": alpha_id, "complete": False, "error": str(exc)})
+                for row, _current in fetched:
+                    if "complete" not in row:
+                        row.update(complete=False, error=str(exc))
+
+        try:
+            for alpha_id in targets[:record_limit]:
+                row = {"alpha_id": alpha_id}
+                rows.append(row)
+                try:
+                    current = ml.fetch_alpha_metrics(session, alpha_id)
+                    if alpha_id in platform and current.get("status") != platform[alpha_id].get("status"):
+                        changed_during_capture.append(alpha_id)
+                    fetched.append((row, current))
+                except Exception as exc:
+                    row.update(complete=False, error=str(exc))
+        finally:
+            persist_fetched()
         if changed_during_capture:
             snapshot.update(invalidated=True, invalidation_reason="status changed during account capture",
                             changed_during_capture=changed_during_capture)

@@ -143,31 +143,32 @@ def make_event_sink(stream, verbose):
     return sink
 
 
-def session_reader(args):
+def session_reader(args, *, deadline=None):
     """Open BRAIN on first use and share one re-login after an operation rejects the session."""
     session = None
     retried = False
+    limits = {} if deadline is None else {"deadline": deadline}
 
     def run(work):
         nonlocal session, retried
         if session is None:
             session = ml.load_session(use_cache=not getattr(args, "no_cache", False),
-                                      refresh=getattr(args, "relogin", False))
+                                      refresh=getattr(args, "relogin", False), **limits)
         try:
             return work(session)
         except ml.AuthError as exc:
             if retried or exc.code != "AUTH_FAILED":
                 raise
             retried = True
-            session = ml.load_session(use_cache=False, refresh=True)
+            session = ml.load_session(use_cache=False, refresh=True, **limits)
             return work(session)
 
     return run
 
 
-def with_session(args, work):
+def with_session(args, work, *, deadline=None):
     """Run ``work(session)``, re-authenticating once if the session died."""
-    return session_reader(args)(work)
+    return session_reader(args, deadline=deadline)(work)
 
 
 def collect_alphas(args, metadata=None):

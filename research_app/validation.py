@@ -173,15 +173,20 @@ def _python_batch(results, known_fields):
             "errors": errors, "warnings": warnings, "field_contracts": []}
 
 
-def _preflight_lint(session, pairs, settings, args, capability_snapshot=None):
+def _preflight_lint(session, pairs, settings, args, capability_snapshot=None, *,
+                    deadline=None, proof_cache=None):
     """Require fresh field proofs and check supplied or cached settings evidence."""
     settings = ml.resolve_settings(settings)
     pairs = [[pair[0], pair[1]] if isinstance(pair, (tuple, list))
              else [pair, settings["decay"]] for pair in pairs]
     python = ml.is_python_language(settings.get("language"))
+    budget = {} if deadline is None else {"deadline": deadline}
+    field_options = dict(budget)
+    if proof_cache is not None:
+        field_options["proof_cache"] = proof_cache
     snapshot = capability_snapshot if capability_snapshot is not None else getattr(args, "capability_snapshot", None)
     if snapshot is None:
-        snapshot = simulation_capabilities.fetch(session) if python else simulation_capabilities.cached()
+        snapshot = simulation_capabilities.fetch(session, **budget) if python else simulation_capabilities.cached()
     account = simulation_capabilities.account_provenance(session)
     if (not account.get("fingerprint") or not isinstance(snapshot.get("account"), dict)
             or snapshot["account"].get("fingerprint") != account.get("fingerprint")):
@@ -211,7 +216,7 @@ def _preflight_lint(session, pairs, settings, args, capability_snapshot=None):
                    for expression, _ in pairs]
         required = {field for result in results for field in (result["declared_fields"] or [])}
         if required:
-            fields = _field_scope(session, settings, required_fields=required)
+            fields = _field_scope(session, settings, required_fields=required, **field_options)
         elif all(result["declared_fields"] == [] for result in results):
             fields["evidence"]["state"] = "not_applicable"
         report = _python_batch(results, fields["known_fields"])
@@ -226,16 +231,25 @@ def _preflight_lint(session, pairs, settings, args, capability_snapshot=None):
         report["language"] = "PYTHON"
         report["language_capability"] = {"state": language_state, "source": snapshot.get("source")}
     else:
-        try:
-            records = ml.fetch_operators(session, refresh=True, report=operator_evidence)
-            if (records and operator_evidence.get("complete") is True
-                    and not operator_evidence.get("stale") and not operator_evidence.get("error")
-                    and not operator_evidence.get("degraded") and not operator_evidence.get("hit")):
-                operator_index = expression_lint.build_operator_index(records)
-            operator_evidence["state"] = "verified" if operator_index else "unknown"
-            operator_evidence["complete"] = bool(operator_index)
-        except Exception as exc:  # noqa: BLE001 - preserve failed metadata evidence
-            operator_evidence.update(state="unknown", complete=False, error=str(exc))
+        fingerprint = account.get("fingerprint")
+        cache_key = ("operators", fingerprint) if fingerprint and proof_cache is not None else None
+        cached = proof_cache.get(cache_key) if cache_key is not None else None
+        if cached is not None:
+            operator_index, evidence = cached
+            operator_evidence = {**evidence, "reused_in_invocation": True}
+        else:
+            try:
+                records = ml.fetch_operators(session, refresh=True, report=operator_evidence, **budget)
+                if (records and operator_evidence.get("complete") is True
+                        and not operator_evidence.get("stale") and not operator_evidence.get("error")
+                        and not operator_evidence.get("degraded") and not operator_evidence.get("hit")):
+                    operator_index = expression_lint.build_operator_index(records)
+                operator_evidence["state"] = "verified" if operator_index else "unknown"
+                operator_evidence["complete"] = bool(operator_index)
+                if cache_key is not None and operator_index:
+                    proof_cache[cache_key] = (operator_index, dict(operator_evidence))
+            except Exception as exc:  # noqa: BLE001 - preserve failed metadata evidence
+                operator_evidence.update(state="unknown", complete=False, error=str(exc))
         required = set()
         for expression, _ in pairs:
             try:
@@ -245,7 +259,7 @@ def _preflight_lint(session, pairs, settings, args, capability_snapshot=None):
                 continue
         if required:
             try:
-                fields = _field_scope(session, settings, required_fields=required)
+                fields = _field_scope(session, settings, required_fields=required, **field_options)
             except ml.AuthError:
                 raise
             except Exception as exc:  # noqa: BLE001 - retain failed capability evidence
@@ -313,12 +327,12 @@ def _operator_index_from_catalog(session):
     return expression_lint.build_operator_index(ml.fetch_operators(session))
 
 
-def _field_scope(session, settings, required_fields=None):
+def _field_scope(session, settings, required_fields=None, **proof_options):
     scope = capabilities.scope_settings(settings)
     evidence = {}
     try:
         if required_fields:
-            return capabilities.required_field_scope(session, settings, required_fields)
+            return capabilities.required_field_scope(session, settings, required_fields, **proof_options)
         records = capabilities.fetch_fields(
             session, region=scope["region"], universe=scope["universe"],
             delay=scope["delay"], instrument_type=scope["instrumentType"],

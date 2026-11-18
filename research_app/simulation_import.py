@@ -86,7 +86,7 @@ def read_existing_simulation(args, reference):
     if type(wait) not in (int, float) or not math.isfinite(wait) or wait <= 0:
         raise CliError("INVALID_INPUT", "simulation inspection wait must be positive and finite")
     deadline = time.monotonic() + wait
-    run = session_reader(args)
+    run = session_reader(args, deadline=deadline)
 
     def read(identifier):
         return run(lambda session: ml.read_simulation_snapshot(session, identifier, deadline=deadline))

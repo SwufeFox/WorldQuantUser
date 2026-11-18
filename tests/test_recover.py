@@ -109,7 +109,7 @@ class RecoverTests(unittest.TestCase):
             path = Path(tmp) / "batch.json"
             path.write_text(json.dumps(document), encoding="utf-8")
             args = argparse.Namespace(recover=str(path), show_test=False)
-            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn: fn(object())), \
+            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn, **kw: fn(object())), \
                     mock.patch.object(ml, "list_alphas", return_value=[_Alpha("A1", "rank(close)", SETTINGS_A)]), \
                     mock.patch.object(ml, "regular_expression", side_effect=lambda a: (a.expression, "", 1)), \
                     mock.patch.object(ml, "fetch_alpha_metrics", return_value=_payload(2.0)):
@@ -152,6 +152,59 @@ class RecoverTests(unittest.TestCase):
         self.assertEqual(fetch.call_args.args[1], "KNOWN")
         self.assertEqual(result["matched"], {"a1": "KNOWN"})
 
+    def test_deferred_metrics_remain_pending_in_the_checkpoint(self):
+        import argparse
+        import json
+        import tempfile
+        from pathlib import Path
+
+        row = {**self._rows(SETTINGS_A)[0], "alpha_id": "KNOWN", "status": "COMPLETE"}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "batch.json"
+            path.write_text(json.dumps({"name": "pending", "rows": [row]}), encoding="utf-8")
+            args = argparse.Namespace(recover=str(path), show_test=False)
+            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn, **kw: fn(object())), \
+                    mock.patch.object(ml, "fetch_alpha_metrics",
+                        return_value={"_deferred": True, "next_poll_after_seconds": 7}) as fetch, \
+                    mock.patch("time.time", return_value=1000):
+                pending = experiments._cmd_probe_recover(args)
+                experiments._cmd_probe_recover(args)
+            fetch.assert_called_once()
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(pending["still_missing"], ["a1"])
+            self.assertEqual(saved["records"][0]["status"], "PENDING")
+            self.assertTrue(saved["records"][0]["metrics_pending"])
+            self.assertEqual(saved["records"][0]["next_poll_at"], 1007)
+            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn, **kw: fn(object())), \
+                    mock.patch.object(ml, "fetch_alpha_metrics", return_value=_payload(2.0)), \
+                    mock.patch("time.time", return_value=1008):
+                complete = experiments._cmd_probe_recover(args)
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(complete["matched"], {"a1": "KNOWN"})
+        self.assertNotIn("metrics_pending", saved["records"][0])
+        self.assertNotIn("next_poll_at", saved["records"][0])
+
+    def test_lookup_uses_budget_without_preempting_known_jobs(self):
+        rows = self._rows(SETTINGS_A)
+        rows.append({**rows[0], "label": "known", "alpha_id": "KNOWN"})
+        calls = []
+        deadline = experiments.time.monotonic() + 30
+
+        def read_metrics(_session, alpha_id, *, deadline):
+            calls.append(("metrics", deadline, alpha_id))
+            return _payload(2.0)
+
+        def listing(_session, *, deadline, **kw):
+            calls.append(("lookup", deadline, kw["offset"]))
+            raise ml.RateLimited("test budget")
+
+        with mock.patch.object(ml, "list_alphas", side_effect=listing), \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=read_metrics):
+            result = experiments._recover_probe_rows(object(), rows, deadline=deadline)
+        self.assertEqual(calls, [("metrics", deadline, "KNOWN"), ("lookup", deadline, 0)])
+        self.assertEqual(result["still_missing"], ["a1"])
+        self.assertEqual(result["matched"], {"known": "KNOWN"})
+
     def test_never_submitted_arm_cannot_borrow_a_historical_result(self):
         rows = self._rows(SETTINGS_A)
         rows[0].update(status="QUEUED", submission_attempted=False)
@@ -175,7 +228,7 @@ class RecoverTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "batch.json"
             path.write_text(json.dumps({"name": "partial", "rows": rows}), encoding="utf-8")
-            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn: fn(object())), \
+            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn, **kw: fn(object())), \
                     mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[_payload(2.0), KeyboardInterrupt]):
                 with self.assertRaises(KeyboardInterrupt):
                     experiments._cmd_probe_recover(argparse.Namespace(recover=str(path)))

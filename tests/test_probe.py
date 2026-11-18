@@ -284,7 +284,8 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(data["simulated"], 2)
         self.assertEqual(len(self.fake.calls), 2)
         self.assertTrue(all(call["session"] is self.session for call in self.fake.calls))
-        self.load_session.assert_called_once_with(use_cache=False, refresh=True)
+        self.load_session.assert_called_once_with(use_cache=False, refresh=True, deadline=mock.ANY)
+        self.assertIsInstance(self.load_session.call_args.kwargs["deadline"], float)
 
     def test_a_spec_without_arms_is_refused_with_a_code(self):
         self._write({"name": "x", "arms": []})
@@ -398,7 +399,7 @@ class ProbeTests(unittest.TestCase):
         preview = self._run(dry_run=True)
         self.assertEqual(preview["groups"], 1)
         self._run()
-        self.load_session.assert_called_once_with(use_cache=True, refresh=False)
+        self.load_session.assert_called_once_with(use_cache=True, refresh=False, deadline=mock.ANY)
         self.assertEqual(len(self.fake.calls), 1)
         self.assertIs(self.fake.calls[0]["session"], self.session)
         self.assertEqual(self.fake.calls[0]["labels"], ["implicit", "explicit"])
@@ -465,7 +466,7 @@ class ProbeTests(unittest.TestCase):
                          [item["payload"]["settings"] for item in preview["results"]])
         self.assertEqual([row["settings"] for row in data["rows"]],
                          [item["settings"] for item in records])
-        self.load_session.assert_called_once_with(use_cache=True, refresh=False)
+        self.load_session.assert_called_once_with(use_cache=True, refresh=False, deadline=mock.ANY)
         self.assertTrue(all(call["session"] is self.session for call in self.fake.calls))
 
     def test_each_record_carries_the_settings_it_ran_under(self):

@@ -573,20 +573,24 @@ def metadata_cache_path(kind, params):
 
 
 def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None, *,
-                    use_cache=True, account=None):
+                    use_cache=True, account=None, derive_from=None):
     """Read catalog data and return it with cache evidence.
 
     A hit must satisfy both the stored expiry and the requested maximum age.
     Read the source on a miss, a forced refresh, or when caching is disabled.
     On BrainError, reuse an available snapshot from the same cache key and mark
-    it stale and degraded. Pass a report dict to receive the cache metadata.
+    it stale and degraded. A derived query may use a separate, fresh full
+    snapshot before attempting the network. Pass a report dict for cache evidence.
     """
     policy = _metadata_policy
     ttl = policy["max_age"] if max_age is None else float(max_age)
     do_refresh = policy["refresh"] if refresh is None else bool(refresh)
-    path = metadata_cache_path(kind, params) if use_cache else None
-    if path is not None and account is not None:
-        path = path.with_name(f"{account}-{path.name}")
+
+    def cache_path(query):
+        path = metadata_cache_path(kind, query)
+        return path.with_name(f"{account}-{path.name}") if account is not None else path
+
+    path = cache_path(params) if use_cache else None
     status = {
         "kind": kind,
         "path": None if path is None else str(path),
@@ -616,18 +620,27 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
 
     entry = cache_store.read_entry(path)
     usable = entry["present"] and entry["kind"] == kind
-    age = entry["age_seconds"]
 
-    def cached_result(error=None):
-        remaining = entry["expires_in"]
+    def cached_result(source, data, error=None):
+        remaining = source["expires_in"]
         status.update(hit=True, stale=error is not None, degraded=error is not None,
-                      age_seconds=round(age, 1), refreshed_at=entry["created_at"],
+                      age_seconds=round(source["age_seconds"], 1), refreshed_at=source["created_at"],
                       expires_in_seconds=None if remaining is None else round(remaining, 1),
                       error=error)
-        return done(entry["payload"])
+        return done(data)
 
-    if usable and not do_refresh and entry["fresh"] and age <= ttl:
-        return cached_result()
+    if usable and not do_refresh and entry["fresh"] and entry["age_seconds"] <= ttl:
+        return cached_result(entry, entry["payload"])
+    if not do_refresh and derive_from is not None:
+        source_params, derive = derive_from
+        source_path = cache_path(source_params)
+        source = cache_store.read_entry(source_path)
+        if (source["present"] and source["kind"] == kind and source["fresh"]
+                and source["age_seconds"] <= ttl):
+            derived = derive(source["payload"])
+            if derived is not None:
+                status.update(path=str(source_path), derived_from_complete=True)
+                return cached_result(source, derived)
     if entry.get("error") not in (None, "missing"):
         cache_store.quarantine(path)
 
@@ -636,7 +649,7 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
     except BrainError as exc:
         if usable:
             note("metadata cache: serving stale %s snapshot (%s)" % (kind, exc.code))
-            return cached_result(exc.code)
+            return cached_result(entry, entry["payload"], exc.code)
         raise
     entry = cache_store.build_entry(kind, data, ttl=ttl, source="brain-api")
     try:
@@ -671,7 +684,7 @@ def catalog_field_cache_paths():
             yield path, bool(separator)
 
 
-def _cached_account_catalog(session, kind, params, fetch, refresh, report):
+def _cached_account_catalog(session, kind, params, fetch, refresh, report, *, derive_from=None):
     if isinstance(session, CatalogAccess):
         username, run = session.username, session.run
     else:
@@ -683,7 +696,8 @@ def _cached_account_catalog(session, kind, params, fetch, refresh, report):
 
     account = _catalog_account(username)
     return cached_metadata(kind, params, lambda: run(fetch), refresh=refresh, report=report,
-                           use_cache=account is not None, account=account)["data"]
+                           use_cache=account is not None, account=account,
+                           derive_from=derive_from)["data"]
 
 
 def get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
@@ -795,14 +809,14 @@ def _catalog_pages(session, path, params=None, keys=(), page_size=None, *, deadl
             page_size = len(batch)
 
 
-def fetch_operators(s, search="", group="", refresh=None, report=None):
+def fetch_operators(s, search="", group="", refresh=None, report=None, *, deadline=None):
     """List FASTEXPR operators as ``list[dict]`` (``name``, ``category``, ...).
 
     Quota-free and cached. ``search`` matches name or description, ``group``
     selects an exact category such as ``Time Series``.
     """
     operators = cached_metadata(
-        "operators", {}, lambda: _fetch_operators(s), refresh=refresh, report=report)["data"]
+        "operators", {}, lambda: _fetch_operators(s, deadline=deadline), refresh=refresh, report=report)["data"]
     if group:
         operators = [o for o in operators if (o.get("category") or "") == group]
     if search:
@@ -814,13 +828,13 @@ def fetch_operators(s, search="", group="", refresh=None, report=None):
     return operators
 
 
-def _fetch_operators(s, search="", group=""):
+def _fetch_operators(s, search="", group="", *, deadline=None):
     """List FASTEXPR operators as ``list[dict]`` (``name``, ``category``, ...).
 
     Quota-free. ``search`` matches the name or description, ``group`` an exact
     category such as ``Time Series``.
     """
-    operators = [row for batch in _catalog_pages(s, "/operators") for row in batch]
+    operators = [row for batch in _catalog_pages(s, "/operators", deadline=deadline) for row in batch]
     if group:
         operators = [o for o in operators if (o.get("category") or "") == group]
     if search:
@@ -888,11 +902,18 @@ def get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
     params = {"instrumentType": instrument_type, "region": region, "delay": delay,
               "universe": universe, "dataset": dataset_id, "search": search,
               "type": field_type, "limit": limit}
+    derive_from = None
+    if search or field_type or limit:
+        def filter_complete(rows):
+            if isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
+                return _filter_datafields(rows, field_type, search, limit)
+
+        derive_from = ({**params, "search": "", "type": None, "limit": None}, filter_complete)
     return _cached_account_catalog(
         s, "datafields", params,
         lambda session: _get_datafields(session, instrument_type, region, delay, universe,
                                         dataset_id, search, field_type, limit),
-        refresh, report,
+        refresh, report, derive_from=derive_from,
     )
 
 
@@ -905,20 +926,25 @@ def _get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
     collected. ``field_type`` filters on the BRAIN type (MATRIX, VECTOR, GROUP).
     Quota-free.
     """
-    fields = []
     params = {"instrumentType": instrument_type, "region": region, "delay": delay,
               "universe": universe, "dataset.id": dataset_id}
-    for batch in _catalog_pages(s, "/data-fields", params, keys=("datafields",), page_size=50):
-        for item in batch:
-            if field_type and item.get("type") != field_type:
-                continue
-            if search and search.lower() not in (
-                (item.get("id") or "") + " " + (item.get("description") or "")
-            ).lower():
-                continue
-            fields.append(item)
-            if limit and len(fields) >= limit:
-                return fields
+    pages = _catalog_pages(s, "/data-fields", params, keys=("datafields",), page_size=50)
+    return _filter_datafields((item for page in pages for item in page), field_type, search, limit)
+
+
+def _filter_datafields(rows, field_type, search, limit):
+    fields = []
+    search = search.lower() if search else ""
+    for item in rows:
+        if field_type and item.get("type") != field_type:
+            continue
+        if search and search not in (
+            (item.get("id") or "") + " " + (item.get("description") or "")
+        ).lower():
+            continue
+        fields.append(item)
+        if limit and len(fields) >= limit:
+            break
     return fields
 
 
@@ -1321,6 +1347,19 @@ def fetch_alpha_metrics(s, alpha_id, on_event=None, deadline=None):
         )
 
 
+def defer_alpha_metrics(record, payload):
+    """Keep a simulation resumable when the metrics response asks us to wait."""
+    if not payload.get("_deferred"):
+        return False
+    wait = max(0.0, float(payload.get("next_poll_after_seconds") or 0))
+    record.update(status="PENDING", metrics_pending=True, poll_after_seconds=wait)
+    if wait:
+        record["next_poll_at"] = time.time() + wait
+    else:
+        record.pop("next_poll_at", None)
+    return True
+
+
 def normalize_setting_keys(overrides=None):
     """Canonicalize known key spellings within one input layer, without defaults.
 
@@ -1566,6 +1605,7 @@ def simulate_alphas(
     dry_run=False,
     on_event=None,
     max_wait_seconds=None,
+    deadline=None,
     initial_records=None,
     labels=None,
     families=None,
@@ -1581,7 +1621,7 @@ def simulate_alphas(
     ``GET /alphas/{id}`` for completed runs; ``checks`` maps platform check
     names to ``{"result", "limit", "value"}``. A failed expression is recorded
     with a populated ``error`` instead of aborting the run. When
-    ``max_wait_seconds`` is set, unfinished work is returned as ``PENDING`` (or
+    ``max_wait_seconds`` or an absolute monotonic ``deadline`` is set, unfinished work is returned as ``PENDING`` (or
     ``QUEUED`` if it has not yet been submitted) instead of keeping the caller
     blocked. Pass those records back as ``initial_records`` to resume without
     resubmitting accepted jobs.
@@ -1689,11 +1729,9 @@ def simulate_alphas(
 
     shared_state()
 
-    deadline = (
-        time.monotonic() + max_wait_seconds
-        if max_wait_seconds is not None
-        else None
-    )
+    if max_wait_seconds is not None:
+        relative_deadline = time.monotonic() + max_wait_seconds
+        deadline = relative_deadline if deadline is None else min(deadline, relative_deadline)
 
     def emit(kind, index, payload=None):
         if on_event:
@@ -1754,13 +1792,7 @@ def simulate_alphas(
         except Exception as exc:
             record["error"] = "metrics fetch failed: %s" % exc
         else:
-            if payload.get("_deferred"):
-                wait = max(0.0, float(payload.get("next_poll_after_seconds") or 0))
-                record["status"] = "PENDING"
-                record["metrics_pending"] = True
-                record["poll_after_seconds"] = wait
-                if wait:
-                    record["next_poll_at"] = time.time() + wait
+            if defer_alpha_metrics(record, payload):
                 emit("pending", index, record)
                 return
             record["metrics"] = payload.get("is")
@@ -2403,7 +2435,7 @@ def pnl_cache_status(cache_dir, alpha_id, series=None):
 
 
 def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
-                    page_limit=10000, attempts=3, report=None, max_wait_seconds=180.0):
+                    page_limit=10000, attempts=3, report=None, max_wait_seconds=180.0, *, deadline=None):
     """Read daily PnL; never return or cache a silently truncated recordset.
 
     Raw cache files remain date/value maps. A hash-bound metadata sidecar records
@@ -2446,7 +2478,8 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
                 "points": 0, "as_of": None, "error": None, "missing_values": 0}
     from requests.exceptions import RequestException
 
-    deadline = time.monotonic() + max_wait_seconds
+    relative_deadline = time.monotonic() + max_wait_seconds
+    deadline = relative_deadline if deadline is None else min(deadline, relative_deadline)
     out = {}
     offset = 0
     total = None
@@ -2672,7 +2705,7 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
 
 def list_alphas(s, limit=100, offset=0, order="-is.sharpe", status="UNSUBMITTED",
                 region=None, universe=None, min_sharpe=None, min_fitness=None,
-                alpha_type_not="SUPER", hidden=False, search=None):
+                alpha_type_not="SUPER", hidden=False, search=None, *, deadline=None):
     """List the account's own alphas (``GET /users/self/alphas``) as ``list[dict]``.
 
     Metadata only: this never re-simulates anything and consumes no quota.
@@ -2705,7 +2738,8 @@ def list_alphas(s, limit=100, offset=0, order="-is.sharpe", status="UNSUBMITTED"
         params["is.fitness>"] = min_fitness
     if search:
         params["search"] = search
-    payload = request_json(s, "GET", "/users/self/alphas", params=params)
+    limits = {} if deadline is None else {"deadline": deadline}
+    payload = request_json(s, "GET", "/users/self/alphas", params=params, **limits)
     return _as_results(payload, "alphas")
 
 

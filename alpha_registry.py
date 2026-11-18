@@ -32,6 +32,8 @@ import hashlib
 import json
 import re
 import os
+from contextlib import ExitStack, contextmanager
+from functools import partial
 
 import research_paths
 import cache_store
@@ -44,6 +46,7 @@ __all__ = [
     "expression_hash",
     "same_expression",
     "load_entries",
+    "append_batch",
     "record_entry",
     "render_markdown",
     "summarize",
@@ -425,9 +428,26 @@ def record_entry(entry, path=None, skip_unchanged=True, allow_metrics_loss=False
     record looked fine afterwards. Refusing is cheap; the caller who genuinely means
     it can say so.
     """
-    # Attach the cause here rather than at analysis time: `failing_checks` says which
-    # gate tripped, not why, and by the time a reader asks "how many of these were
-    # low amplitude" the answer is no longer recoverable from the label alone.
+    with append_batch(path) as (_, append):
+        return append(entry, skip_unchanged=skip_unchanged, allow_metrics_loss=allow_metrics_loss)
+
+
+@contextmanager
+def append_batch(path=None):
+    """Load the latest rows under the append lock for a batch of local writes.
+
+    Use the yielded index for any merge, and the bound append function for
+    writes. Successful rows are individually durable and update the index.
+    Collect platform data before entering the batch.
+    """
+    path = os.fspath(path or default_registry_path())
+    with cache_store.file_lock(path + ".lock", timeout=30):
+        existing = {item["key"]: item for item in load_entries(path)}
+        yield existing, partial(_append_locked, path, existing)
+
+
+def _append_locked(path, existing, entry, *, skip_unchanged=True, allow_metrics_loss=False):
+    # Attach the rejection cause while the observed check and metrics are present.
     if entry.get("verdict") == "rejected" and not entry.get("reason_code"):
         try:
             import rejection_reasons
@@ -438,35 +458,25 @@ def record_entry(entry, path=None, skip_unchanged=True, allow_metrics_loss=False
         except Exception:  # noqa: BLE001 - recording must never fail on this
             pass
 
-    path = path or default_registry_path()
-    # The dedupe check and the append have to happen under one lock: two
-    # concurrent CLI calls otherwise both see "not present" and both append.
-    # JSONL appends stay line-atomic because each record is written in a single
-    # unbuffered write, so a reader never sees half a line.
-    with cache_store.file_lock(path + ".lock", timeout=30):
-        existing = {item["key"]: item for item in load_entries(path)}
-        current = existing.get(entry.get("key"))
-        entry["role"] = evidence_role(current, entry)
-        if current is not None and not allow_metrics_loss:
-            had = bool(current.get("metrics"))
-            has = bool(entry.get("metrics"))
-            if had and not has:
-                raise ValueError(
-                    "refusing to record %r: the stored row has metrics and this one "
-                    "does not, and the newest row wins -- the metrics would disappear "
-                    "from every view. Fix the payload (BRAIN puts them under 'is'), or "
-                    "pass allow_metrics_loss=True if the loss is intended."
-                    % (entry.get("key"),))
-        if skip_unchanged:
-            if current is not None and _comparable(current) == _comparable(entry):
-                return current, False
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        with open(path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(entry, sort_keys=True, ensure_ascii=False))
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        return entry, True
+    key = entry.get("key")
+    current = existing.get(key)
+    entry["role"] = evidence_role(current, entry)
+    if current is not None and not allow_metrics_loss and current.get("metrics") and not entry.get("metrics"):
+        raise ValueError(
+            "refusing to record %r: the stored row has metrics and this one "
+            "does not, and the newest row wins -- the metrics would disappear "
+            "from every view. Fix the payload (BRAIN puts them under 'is'), or "
+            "pass allow_metrics_loss=True if the loss is intended."
+            % (key,))
+    if skip_unchanged and current is not None and _comparable(current) == _comparable(entry):
+        return current, False
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(entry, sort_keys=True, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    existing[key] = entry
+    return entry, True
 
 
 def auto_verdict(record):
@@ -554,82 +564,83 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
     durable record.
     """
     path = registry_path or default_registry_path()
-    stored = {entry.get("key"): entry for entry in load_entries(path)}
-    producer_batch = batch
     entries = []
     written = 0
     skipped = []
     deferred = []
-    for record in records:
-        key = record.get("alpha_id")
-        previous = stored.get(key) if key else None
-        status = record.get("status")
-        evidence_status = (status or "").upper()
-        if evidence_status not in FINISHED_STATUSES | {"UNSUBMITTED", "ACTIVE", "SUBMITTED"}:
-            deferred.append({"alpha_id": key, "label": record.get("mechanism"),
-                             "status": status, "reason": "execution_not_finished"})
-            continue
-        if not key or not _pick_metrics(record.get("metrics")):
-            deferred.append({"alpha_id": key, "label": record.get("mechanism"),
-                             "status": status, "reason": "completed_evidence_missing"})
-            continue
-        chosen_verdict = verdict or auto_verdict(record)
-        if previous and (previous.get("status") or "").upper() in {"ACTIVE", "SUBMITTED"}:
-            # A simulation cannot un-submit a book alpha. BRAIN hands back the
-            # existing id when an identical expression is re-run, so a re-run of a
-            # book member arrives here looking like an ordinary new record. Preserve
-            # its ACTIVE status and existing verdict rather than demoting it.
-            if (status or "").upper() != "ACTIVE":
-                status = previous.get("status")
-            if not verdict:
-                chosen_verdict = previous.get("verdict") or chosen_verdict
-        entry = build_entry(
-            {
-                "alpha_id": key,
-                "role": record.get("role"),
-                "expression": record.get("expression"),
-                "decay": record.get("decay"),
-                "settings": record.get("settings") or settings,
-                "language": entry_language(record),
-                "metrics": record.get("metrics"),
-                "checks": record.get("checks"),
-                "out_of_sample": record.get("out_of_sample"),
-                "status": status,
-                "error": record.get("error"),
-            },
-            idea=idea,
-            mechanism=record.get("mechanism") or mechanism,
-            family=record.get("family") or family,
-            verdict=chosen_verdict,
-            note=note,
-            source=source,
-            batch=producer_batch or record.get("batch"),
-        )
-        if previous:
-            entry = _inherit_judgement(entry, previous, pinned_verdict=verdict is not None)
-            entry["metrics"] = {**(previous.get("metrics") or {}), **entry["metrics"]}
-            old_split = previous.get("out_of_sample") or {}
-            new_split = entry.get("out_of_sample") or {}
-            if old_split:
-                entry["out_of_sample"] = {**old_split, **new_split}
-                for period in ("train", "test"):
-                    if old_split.get(period):
-                        entry["out_of_sample"][period] = {**old_split[period],
-                            **{key: value for key, value in (new_split.get(period) or {}).items()
-                               if value is not None}}
-        try:
-            _, did_write = record_entry(entry, path)
-        except ValueError as exc:
-            # `record_entry` refuses to let a metrics-less row erase a metrics-bearing
-            # one, which is right. Abandoning the rest of the batch is not: on
-            # 2026-11-13 a grid died after its third arm because that arm (a known
-            # expression under a new setting) came back without metrics. Keep the
-            # stored row, say which arm was skipped, and finish the run.
-            skipped.append({"alpha_id": key, "reason": str(exc)})
-            continue
-        written += 1 if did_write else 0
-        entries.append(entry)
-        stored[entry["key"]] = entry
+    with ExitStack() as stack:
+        stored = append = None
+        for record in records:
+            key = record.get("alpha_id")
+            status = record.get("status")
+            evidence_status = (status or "").upper()
+            if evidence_status not in FINISHED_STATUSES | {"UNSUBMITTED", "ACTIVE", "SUBMITTED"}:
+                deferred.append({"alpha_id": key, "label": record.get("mechanism"),
+                                 "status": status, "reason": "execution_not_finished"})
+                continue
+            if not key or not _pick_metrics(record.get("metrics")):
+                deferred.append({"alpha_id": key, "label": record.get("mechanism"),
+                                 "status": status, "reason": "completed_evidence_missing"})
+                continue
+            if append is None:
+                stored, append = stack.enter_context(append_batch(path))
+            previous = stored.get(key)
+            chosen_verdict = verdict or auto_verdict(record)
+            if previous and (previous.get("status") or "").upper() in {"ACTIVE", "SUBMITTED"}:
+                # A simulation cannot un-submit a book alpha. BRAIN hands back the
+                # existing id when an identical expression is re-run, so a re-run of a
+                # book member arrives here looking like an ordinary new record. Preserve
+                # its ACTIVE status and existing verdict rather than demoting it.
+                if (status or "").upper() != "ACTIVE":
+                    status = previous.get("status")
+                if not verdict:
+                    chosen_verdict = previous.get("verdict") or chosen_verdict
+            entry = build_entry(
+                {
+                    "alpha_id": key,
+                    "role": record.get("role"),
+                    "expression": record.get("expression"),
+                    "decay": record.get("decay"),
+                    "settings": record.get("settings") or settings,
+                    "language": entry_language(record),
+                    "metrics": record.get("metrics"),
+                    "checks": record.get("checks"),
+                    "out_of_sample": record.get("out_of_sample"),
+                    "status": status,
+                    "error": record.get("error"),
+                },
+                idea=idea,
+                mechanism=record.get("mechanism") or mechanism,
+                family=record.get("family") or family,
+                verdict=chosen_verdict,
+                note=note,
+                source=source,
+                batch=batch or record.get("batch"),
+            )
+            if previous:
+                entry = _inherit_judgement(entry, previous, pinned_verdict=verdict is not None)
+                entry["metrics"] = {**(previous.get("metrics") or {}), **entry["metrics"]}
+                old_split = previous.get("out_of_sample") or {}
+                new_split = entry.get("out_of_sample") or {}
+                if old_split:
+                    entry["out_of_sample"] = {**old_split, **new_split}
+                    for period in ("train", "test"):
+                        if old_split.get(period):
+                            entry["out_of_sample"][period] = {**old_split[period],
+                                **{key: value for key, value in (new_split.get(period) or {}).items()
+                                   if value is not None}}
+            try:
+                entry, did_write = append(entry)
+            except ValueError as exc:
+                # `record_entry` refuses to let a metrics-less row erase a metrics-bearing
+                # one, which is right. Abandoning the rest of the batch is not: on
+                # 2026-11-13 a grid died after its third arm because that arm (a known
+                # expression under a new setting) came back without metrics. Keep the
+                # stored row, say which arm was skipped, and finish the run.
+                skipped.append({"alpha_id": key, "reason": str(exc)})
+                continue
+            written += 1 if did_write else 0
+            entries.append(entry)
     return {
         "registry": path,
         "recorded": len(entries),

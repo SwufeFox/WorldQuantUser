@@ -109,22 +109,35 @@ def fetch_fields(session, region="USA", universe="TOP3000", delay=1,
     return records
 
 
-def required_field_scope(session, settings, required_fields):
+def required_field_scope(session, settings, required_fields, *, deadline=None, proof_cache=None):
     """Verify exact required IDs using bounded, live searches in the current scope."""
     from requests.exceptions import RequestException
 
     scope, account = scope_settings(settings), simulation_capabilities.account_provenance(session)
     required = set(required_fields or ())
-    catalogs, records = [], []
-    deadline = time.monotonic() + _REQUIRED_FIELDS_WAIT_SECONDS
+    catalogs, records, timestamps = [], [], []
+    field_deadline = time.monotonic() + _REQUIRED_FIELDS_WAIT_SECONDS
+    if deadline is not None:
+        field_deadline = min(field_deadline, deadline)
+    fingerprint = account.get("fingerprint")
+    cache_scope = ("field", fingerprint, tuple(scope.items())) if fingerprint and proof_cache is not None else None
     for field in sorted(required):
+        cache_key = (*cache_scope, field) if cache_scope is not None else None
+        previous = proof_cache.get(cache_key) if cache_key is not None else None
+        if previous is not None:
+            search, row, stamp = previous
+            catalogs.append({**search, "reused_in_invocation": True})
+            records.append(row)
+            timestamps.append(stamp)
+            continue
         now = time.monotonic()
-        if now >= deadline:
-            break
+        if now >= field_deadline:
+            continue
         search = {"kind": "datafield_search", "field": field, "state": "unknown"}
         catalogs.append(search)
         try:
-            result = ml.search_datafield(session, field, scope, deadline=min(deadline, now + _FIELD_SEARCH_WAIT_SECONDS))
+            result = ml.search_datafield(session, field, scope,
+                                         deadline=min(field_deadline, now + _FIELD_SEARCH_WAIT_SECONDS))
         except ml.AuthError:
             raise
         except ml.RateLimited as exc:
@@ -146,9 +159,13 @@ def required_field_scope(session, settings, required_fields):
             continue
         search["state"] = "verified"
         records.append(row)
+        stamp = cache_store.utc_now().isoformat()
+        timestamps.append(stamp)
+        if cache_key is not None:
+            proof_cache[cache_key] = (dict(search), row, stamp)
     available = {row["id"] for row in records}
     state = "verified" if required and required <= available else "unknown"
-    stamp = cache_store.utc_now().isoformat() if records else None
+    stamp = min(timestamps, default=None)
     evidence = {"state": state, "scope": scope, "account": account,
                 "source": "authenticated_field_search", "catalogs": catalogs,
                 "verification": "required_fields_only",

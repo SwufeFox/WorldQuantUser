@@ -1841,13 +1841,16 @@ class SimulationResumeTests(unittest.TestCase):
             source = {"alphas": ["rank(cap)", "rank(volume)", "rank(sales)"]}
             with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(source))), \
                     mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr), \
-                    mock.patch.object(cli_experiments, "with_session", side_effect=lambda args, work: work(session)), \
+                    mock.patch.object(ml, "load_session", return_value=session) as load_session, \
                     mock.patch.object(cli_experiments, "_preflight_lint", return_value={"ok": True}), \
                     mock.patch.object(cli_experiments.simulation_capabilities, "fetch", return_value=capability), \
                     mock.patch.object(cli_experiments.simulation_capabilities, "account_provenance", return_value=account):
                 code = cli_app.main(["simulate", "-", "--research-dir", directory,
                     "--checkpoint", str(checkpoint), "--registry", str(Path(directory) / "registry.jsonl"),
-                    "--batch-size", "1", "--quiet"])
+                    "--batch-size", "1", "--relogin", "--quiet"])
+            load_session.assert_called_once()
+            self.assertTrue(load_session.call_args.kwargs["refresh"])
+            self.assertIn("deadline", load_session.call_args.kwargs)
             document = json.loads(stdout.getvalue())
             self.assertEqual(code, 0, document)
             self.assertEqual(len(session.post_calls), 1)
@@ -1886,7 +1889,7 @@ class SimulationResumeTests(unittest.TestCase):
                     )],
                 )
                 with mock.patch.object(sys, "stdin", io.StringIO("\ufeff" + json.dumps(source))), \
-                        mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work: work(first_session)), \
+                        mock.patch.object(ml, "load_session", return_value=first_session), \
                         mock.patch.object(cli_experiments, "_preflight_lint", return_value={"ok": True}):
                     pending = cli_experiments.cmd_simulate(simulate_args, None)
                 self.assertEqual(pending["status"], "PENDING")
@@ -1903,7 +1906,7 @@ class SimulationResumeTests(unittest.TestCase):
                     self.Response(payload={"status": "COMPLETE", "alpha": "A123"}),
                 ])
                 with (
-                    mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work: work(resume_session)),
+                    mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work, **kw: work(resume_session)),
                     mock.patch.object(
                         ml, "fetch_alpha_metrics", return_value={
                             "is": {"sharpe": 1.2, "fitness": 1.0}, "train": {"fitness": 1.0}}
@@ -1943,7 +1946,7 @@ class SimulationResumeTests(unittest.TestCase):
                                    progress_url=progress_url)
             args = cli_parser.build_parser().parse_args(["resume", str(path)])
             session = self.Session([self.Response(payload={"status": "COMPLETE", "alpha": "A123"})])
-            with mock.patch.object(cli_experiments, "with_session", side_effect=lambda _, run: run(session)), \
+            with mock.patch.object(cli_experiments, "with_session", side_effect=lambda _, run, **kw: run(session)), \
                     mock.patch.object(cli_experiments, "_invocation_capabilities", return_value={}), \
                     mock.patch.object(cli_experiments.simulation_capabilities, "account_provenance",
                                       return_value=account), \

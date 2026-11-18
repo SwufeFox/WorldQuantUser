@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -101,6 +102,48 @@ class TopTruncationTests(unittest.TestCase):
 
 
 class JudgementInheritanceTests(unittest.TestCase):
+    def test_batch_merges_a_concurrent_activation_after_taking_the_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "registry.jsonl")
+            alpha_registry.record_entry(alpha_registry.build_entry(record()), path)
+            original_lock = alpha_registry.cache_store.file_lock
+            published = False
+
+            @contextmanager
+            def acquire(*args, **kwargs):
+                nonlocal published
+                if not published:
+                    published = True
+                    active = alpha_registry.build_entry(record(status="ACTIVE"), family="event")
+                    alpha_registry.record_entry(alpha_registry.relabel(active, verdict="watch"), path)
+                with original_lock(*args, **kwargs):
+                    yield
+
+            with mock.patch.object(alpha_registry.cache_store, "file_lock", acquire), \
+                    mock.patch.object(alpha_registry, "load_entries", wraps=alpha_registry.load_entries) as loads:
+                summary = alpha_registry.record_simulation([
+                    record(sharpe=2.5), record(alpha_id="A2"), record(alpha_id="A3"),
+                ], {}, registry_path=path)
+            self.assertEqual(loads.call_count, 2)  # one competing writer and one batch
+            self.assertEqual(summary["appended"], 3)
+            active = next(row for row in alpha_registry.load_entries(path) if row["alpha_id"] == "A1")
+            self.assertEqual(active["status"], "ACTIVE")
+            self.assertEqual(active["family"], "event")
+            self.assertEqual(active["verdict"], "watch")
+            self.assertEqual(active["metrics"]["sharpe"], 2.5)
+
+    def test_interrupted_batch_keeps_completed_appends(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "registry.jsonl")
+
+            def interrupted():
+                yield record(alpha_id="FIRST")
+                raise KeyboardInterrupt
+
+            with self.assertRaises(KeyboardInterrupt):
+                alpha_registry.record_simulation(interrupted(), {}, registry_path=path)
+            self.assertEqual([entry["key"] for entry in alpha_registry.load_entries(path)], ["FIRST"])
+
     def test_a_rerun_keeps_family_mechanism_and_lineage(self):
         tmp = tempfile.mkdtemp()
         path = os.path.join(tmp, "registry.jsonl")

@@ -498,6 +498,23 @@ class MetadataCacheTests(TempCacheCase):
         self.assertEqual(other["data"], ["b"])
         self.assertFalse(other["cache"]["hit"])
 
+    def test_field_filter_reuses_only_fresh_full_catalog_in_the_same_scope(self):
+        rows = [{"id": "prices", "type": "MATRIX"}, {"id": "news", "type": "VECTOR"}]
+        account = mock.Mock(auth=("catalog-owner", "unused"))
+        other = mock.Mock(auth=("other-catalog-owner", "unused"))
+        evidence = {}
+        with mock.patch.object(ml, "_catalog_pages", side_effect=lambda *a, **k: iter([rows])) as pages:
+            self.assertEqual(ml.get_datafields(account, dataset_id="sample"), rows)
+            self.assertEqual(ml.get_datafields(account, dataset_id="sample", field_type="VECTOR",
+                                               search="NEWS", limit=1, report=evidence), rows[1:])
+            pages.assert_called_once()
+            self.assertTrue(evidence["derived_from_complete"])
+            self.assertFalse(evidence["complete"])
+            ml.get_datafields(other, dataset_id="sample", field_type="VECTOR")
+            ml.get_datafields(account, dataset_id="sample", field_type="VECTOR", delay=0)
+            ml.get_datafields(account, dataset_id="sample", field_type="VECTOR", refresh=True)
+        self.assertEqual(pages.call_count, 4)
+
     def test_refresh_bypasses_a_fresh_entry(self):
         ml.cached_metadata("operators", {}, lambda: ["old"])
         fresh = ml.cached_metadata("operators", {}, lambda: ["new"], refresh=True)

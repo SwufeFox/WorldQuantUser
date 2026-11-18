@@ -823,8 +823,8 @@ def build_parser():
     _add_settings_args(sim)
     _add_concurrency_args(sim)
     sim.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
-                     help="Maximum wall time per invocation; longer Retry-After waits "
-                          "are saved as pending work (default: 300).")
+                     help="Shared wait budget for login, preflight and simulation. Longer Retry-After "
+                          "waits are saved for resume (default: 300).")
     sim.add_argument("--checkpoint", default=None,
                      help="Checkpoint path; pending work is saved automatically if omitted.")
     sim.add_argument("--dry-run", action="store_true",
@@ -863,7 +863,7 @@ def build_parser():
     resume.add_argument("checkpoint", help="Checkpoint JSON produced by simulate/resume.")
     _add_concurrency_args(resume)
     resume.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
-                        help="Maximum wall time for this resume invocation (default: 300).")
+                        help="Shared wait budget for login and resumed simulations (default: 300).")
     resume.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
                         help="Sort results by this metric, best first.")
     resume.add_argument("--top", type=int, default=None,
@@ -1029,7 +1029,8 @@ def build_parser():
     probe.add_argument("--summary", action="store_true",
                        help="Return a bounded train summary with a table, execution state and saved evidence paths.")
     probe.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
-                       help="Simulation wait budget across settings groups; accepted jobs remain recoverable.")
+                       help="Shared wait budget for login, preflight, simulation and recovery reads; "
+                            "accepted jobs remain recoverable (default: 300).")
     probe.add_argument("--show-test", action="store_true",
                        help="Validate --selection while recovering saved results; never run new simulations.")
     probe.add_argument("--force", action="store_true",

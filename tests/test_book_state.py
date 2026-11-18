@@ -170,6 +170,40 @@ class BookStateTests(unittest.TestCase):
         self.assertFalse(result["snapshot"]["complete"])
         self.assertTrue(result["snapshot"]["pages"][1]["duplicate_ids"])
 
+    def test_sync_batches_readbacks_and_reports_one_refusal_without_losing_other_rows(self):
+        self.record("MEMBER_A")
+        rows = [alpha("MEMBER_A"), alpha("MEMBER_B"), alpha("MEMBER_C")]
+        readbacks = {row["id"]: row for row in rows}
+        readbacks["MEMBER_A"] = {**rows[0], "is": {}}
+        with mock.patch.object(ml, "list_alphas", return_value=rows), \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=lambda _session, aid: readbacks[aid]), \
+                mock.patch.object(alpha_registry, "load_entries", wraps=alpha_registry.load_entries) as loads:
+            result = ledger.cmd_ledger_sync(self.args(), None)
+        self.assertEqual(loads.call_count, 2)  # initial listing comparison and locked write batch
+        by_id = {row["alpha_id"]: row for row in result["rows"]}
+        self.assertFalse(by_id["MEMBER_A"]["complete"])
+        self.assertIn("stored row has metrics", by_id["MEMBER_A"]["error"])
+        self.assertTrue(by_id["MEMBER_B"]["written"])
+        self.assertTrue(by_id["MEMBER_C"]["written"])
+        self.assertEqual(result["recorded"], 2)
+
+    def test_sync_retains_activation_written_while_the_readback_is_in_flight(self):
+        self.record("MEMBER_A", "COMPLETE")
+        captured = alpha("MEMBER_A", "COMPLETE")
+
+        def readback(_session, _alpha_id):
+            self.record("MEMBER_A", "ACTIVE")
+            return captured
+
+        with mock.patch.object(ml, "list_alphas", return_value=[captured]), \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=readback):
+            result = ledger.cmd_ledger_sync(self.args(platform_status="ALL"), None)
+        self.assertEqual(result["recorded"], 0)
+        self.assertIn("local status changed", result["rows"][0]["error"])
+        self.assertTrue(result["snapshot"]["invalidated"])
+        self.assertFalse(result["membership"]["complete"])
+        self.assertEqual(alpha_registry.load_entries(self.registry)[0]["status"], "ACTIVE")
+
     def test_submission_invalidates_platform_capture_without_erasing_history(self):
         snapshot = {"complete": True, "as_of": "2026-01-01", "scope": {"statuses": ["ACTIVE"]},
                     "member_ids": ["MEMBER_A"], "member_digest": book_state.member_digest(["MEMBER_A"])}

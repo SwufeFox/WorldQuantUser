@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import alpha_registry
+import cache_store
 import correlation
 import json
 import research_paths
@@ -327,7 +328,16 @@ def cmd_health(args, _sink):
                      "min_sharpe": getattr(args, "min_sharpe", 1.0)}}
 
 
-def _book_stability(book, min_move=0.3, limit=3):
+def _cached_book_series(book, pnl_dir):
+    series = {}
+    for alpha_id in book:
+        values, _ = cache_store.load_json(pnl_dir / (alpha_id + ".json"))
+        if values is not None:
+            series[alpha_id] = values
+    return series
+
+
+def _book_stability(book, min_move=0.3, limit=3, *, series=None):
     """How many book alphas earn their train Sharpe in only one half of train.
 
     A single train Sharpe can be the average of two opposite regimes, and the test
@@ -338,15 +348,15 @@ def _book_stability(book, min_move=0.3, limit=3):
     This catches *train-internal* regime dependence, not future decay. Stability
     within the training window does not guarantee positive returns in a later period.
     """
-    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+    if series is None:
+        series = _cached_book_series(book, Path(research_paths.ensure_dir()) / "pnl")
     gaps, flips, late = [], [], []
-    for alpha_id in book:
-        path = pnl_dir / ("%s.json" % alpha_id)
-        if not path.exists():
+    for alpha_id, values in series.items():
+        if not isinstance(values, dict):
             continue
         try:
-            pnl = {k: float(v) for k, v in json.loads(path.read_text()).items()}
-        except (OSError, ValueError):
+            pnl = {day: float(value) for day, value in values.items()}
+        except (TypeError, ValueError):
             continue
         # The halves must stay inside train: the test year is not selection evidence,
         # and splitting the whole series would quietly make it so.
@@ -370,51 +380,59 @@ def _book_stability(book, min_move=0.3, limit=3):
             "worst": flips[:limit] + late[:limit]}
 
 
-def _book_duplicates(book, gate=0.70, prefilter=0.75, limit=8):
+def _book_correlator(series):
+    ordered = {name: tuple(sorted(values)) for name, values in series.items()}
+    vectors = {name: [series[name][day] for day in days] for name, days in ordered.items()}
+
+    def correlate(left, right, min_overlap):
+        days = ordered[left]
+        if days == ordered[right]:
+            if len(days) < min_overlap:
+                return None, len(days)
+            return correlation.pearson(vectors[left], vectors[right]), len(days)
+        x, y, shared = correlation.align(series[left], series[right], min_overlap=min_overlap)
+        return correlation.pearson(x, y), len(shared)
+
+    return correlate
+
+
+def _book_duplicates(book, gate=0.70, prefilter=0.75, limit=8, *, series=None):
     """Book pairs above the correlation gate, measured inside their train windows.
 
     A stride prefilter keeps startup work bounded; surviving pairs are checked on
     daily train PnL. Test-period returns must not change the session-start signal.
     """
-    pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
-    series = {}
-    for alpha_id in book:
-        path = pnl_dir / ("%s.json" % alpha_id)
-        if not path.exists():
+    if series is None:
+        series = _cached_book_series(book, Path(research_paths.ensure_dir()) / "pnl")
+    train = {}
+    for alpha_id, pnl in series.items():
+        if not isinstance(pnl, dict):
             continue
-        try:
-            pnl = json.loads(path.read_text())
-            test = ((book[alpha_id].get("out_of_sample") or {}).get("test") or {})
-            train_end = test.get("startDate") or "2023-01-01"
-            series[alpha_id] = {day: value for day, value in pnl.items() if day < train_end}
-        except (OSError, ValueError):
-            continue
+        test = ((book[alpha_id].get("out_of_sample") or {}).get("test") or {})
+        train_end = test.get("startDate") or "2023-01-01"
+        train[alpha_id] = {day: value for day, value in pnl.items() if day < train_end}
     # Monthly averaging can distort daily pair correlations. Sample every fifth
     # day for the prefilter, then confirm each surviving pair on daily train PnL.
     # The prefilter is an approximation and does not guarantee an exhaustive scan.
     sampled = {name: {day: values[day] for day in sorted(values)[::5]}
-               for name, values in series.items()}
+               for name, values in train.items()}
+    sampled_correlation = _book_correlator(sampled)
+    daily_correlation = _book_correlator(train)
     names = sorted(sampled)
     suspects = []
     for index, left in enumerate(names):
         for right in names[index + 1:]:
-            x, y, dates = correlation.align(sampled[left], sampled[right], min_overlap=40)
-            if not x:
-                continue
-            value = correlation.pearson(x, y)
+            value, _ = sampled_correlation(left, right, min_overlap=40)
             if value is None or abs(value) < prefilter:
                 continue
             suspects.append((left, right, value))
     hits = []
     for left, right, strided_r in suspects:
-        x, y, dates = correlation.align(series[left], series[right], min_overlap=200)
-        if not x:
-            continue
-        value = correlation.pearson(x, y)
+        value, days = daily_correlation(left, right, min_overlap=200)
         if value is None or abs(value) < gate:
             continue
         hits.append({"a": left, "b": right, "r": round(value, 4),
-                     "strided_r": round(strided_r, 3), "days": len(dates)})
+                     "strided_r": round(strided_r, 3), "days": days})
     hits.sort(key=lambda row: abs(row["r"]), reverse=True)
     return {"gate": gate, "prefilter": prefilter, "frequency": "daily", "window": "train",
             "count": len(hits), "pairs": hits[:limit]}
@@ -550,7 +568,10 @@ def cmd_brief(args, _sink):
                     if not entry.get("family") or not entry.get("mechanism"))
     no_checks = sum(1 for entry in entries
                     if (entry.get("metrics") or {}) and not (entry.get("checks") or {}))
-    evidence = book_state.describe_book(latest, registry_path=registry_path)
+    pnl_dir = research_dir / "pnl"
+    series = _cached_book_series(book, pnl_dir)
+    evidence = book_state.describe_book(latest, series=series, registry_path=registry_path,
+                                       pnl_dir=pnl_dir)
     capture = evidence["platform"]
     book_evidence = {
         "source": "local_ledger", "member_digest": evidence["local"]["member_digest"],
@@ -577,9 +598,9 @@ def cmd_brief(args, _sink):
             "by_family": dict(sorted(families.items(), key=lambda item: -item[1])),
             "by_universe": dict(sorted(universes.items(), key=lambda item: -item[1])),
             # Same-bet pairs the submission gate could have missed (snapshot lag).
-            "self_duplicates": _book_duplicates(book),
+            "self_duplicates": _book_duplicates(book, series=series),
             # A train Sharpe can hide a single-regime edge; the halves stay in train.
-            "stability": _book_stability(book),
+            "stability": _book_stability(book, series=series),
         },
         "recent": {"runs": len(runs), "by_verdict": by_verdict, "best": best,
                    "metrics_scope": "train", "missing_train_metrics": len(runs) - len(scored),
