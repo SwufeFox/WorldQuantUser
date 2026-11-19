@@ -54,6 +54,27 @@ def load_done(path: Path) -> set[str]:
             expressions.add("".join(expr.split()))
     done_with_expr = done
     done_with_expr.update({"expr:" + e for e in expressions})
+    # Cross-batch dedupe: another ledger may already hold the same expression
+    # under a different label (ov2_surp_np_80 and ov3_surp_np_80 cost two sims).
+    for sibling in path.parent.glob("*.jsonl"):
+        if sibling == path:
+            continue
+        try:
+            text = sibling.read_text()
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if row.get("status") not in {"COMPLETE", "WARNING"}:
+                continue
+            expr = row.get("expr")
+            if expr:
+                done_with_expr.add("expr:" + "".join(expr.split()))
     return done_with_expr
 
 
