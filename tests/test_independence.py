@@ -2,12 +2,13 @@
 
 import json
 import os
+import random
 import tempfile
 import unittest
 from unittest import mock
 
 import research_paths
-from research_app import independence
+from research_app import independence, stats
 
 
 class MarginalTests(unittest.TestCase):
@@ -75,3 +76,30 @@ class IndependenceTests(unittest.TestCase):
             report = independence.independence_report(registry_path=registry)
         self.assertLess(abs(report["full_sample"]["mean"]), 0.25)
         self.assertGreater(report["full_sample"]["effective_bets"], 3.0)
+
+    def test_aligned_matrix_preserves_threshold_counts_and_short_regimes(self):
+        rng = random.Random(47)
+        for days in (260, 360):
+            with self.subTest(days=days), tempfile.TemporaryDirectory() as tmp:
+                directory = os.path.join(tmp, "pnl")
+                os.mkdir(directory)
+                dates = ["2020-%03d" % index for index in range(days)]
+                first = [rng.normalvariate(0, 1) for _ in dates]
+                second = [value + rng.normalvariate(0, 1) for value in first]
+                third = [-value for value in first]
+                rows = [first, second, third]
+                self.assertIsNotNone(stats.unit_correlation_rows(rows))
+                registry = os.path.join(tmp, "registry.jsonl")
+                with open(registry, "w", encoding="utf-8") as ledger:
+                    for index, values in enumerate(rows):
+                        member = "I%d" % index
+                        ledger.write(json.dumps({"alpha_id": member, "status": "ACTIVE"}) + "\n")
+                        with open(os.path.join(directory, member + ".json"), "w", encoding="utf-8") as handle:
+                            json.dump(dict(zip(dates, values)), handle)
+                threshold = stats.correlation(first, second)
+                report = independence.independence_report(registry, directory, threshold=threshold)
+                with mock.patch.object(stats, "unit_correlation_rows", return_value=None):
+                    legacy = independence.independence_report(registry, directory, threshold=threshold)
+                self.assertEqual(report, legacy)
+                self.assertEqual(report["full_sample"]["above_threshold"], 1)
+                self.assertEqual(report["stressed"]["pairs"], 0 if days == 260 else 3)

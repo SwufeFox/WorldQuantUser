@@ -50,14 +50,16 @@ def half_split_sharpes(pnl, test_start=None):
     if not pnl or not test_start:
         return None, None
     days = sorted(day for day in pnl if day < test_start)
-    if len(days) < 120:
+    return train_half_sharpes([pnl[day] for day in days])
+
+
+def train_half_sharpes(values):
+    """Measure two halves of an already sorted, train-only series."""
+    if len(values) < 120:
         return None, None
-    middle = len(days) // 2
-
-    def sharpe(subset):
-        return stats.sharpe([pnl[day] for day in subset], min_points=2)
-
-    return sharpe(days[:middle]), sharpe(days[middle:])
+    middle = len(values) // 2
+    return (stats.sharpe(values[:middle], min_points=2),
+            stats.sharpe(values[middle:], min_points=2))
 
 
 def _train_metrics(record):

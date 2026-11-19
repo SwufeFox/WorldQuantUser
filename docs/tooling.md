@@ -630,6 +630,21 @@ if_else(is_nan(s), s, m)
 | 这个数据族以前试过什么形状、最好多少分 | `python3 tools/unit_report.py --dataset model51`（数据集 id 自动映射到族） |
 | 台账的 verdict 和真实的书是否一致 | `python3 research_cli.py brief --drift` |
 
+### 反复查询训练期 PnL
+
+跨批次查看训练期两半 Sharpe 时，可以给 `ledger stability` 加 `--polars`。
+`--where` 和 `--status` 可继续用来筛选同一份分析缓存。
+
+```bash
+pip install "polars>=2.1,<3"
+python3 research_cli.py ledger stability --polars --list
+python3 research_cli.py ledger stability --polars --where 'family=quality'
+```
+
+命令从本地日度 PnL 建立 `cache/pnl-train.parquet`。只缓存各 Alpha 已记录的测试起始日之前的数据。
+缺少训练边界时，两半的 Sharpe 保持未知。日期排序和 Sharpe 口径与普通 `ledger stability` 一致。
+返回的 `pnl_snapshot.state` 表示复用或重建。PnL 文件或训练边界更新后，调用会重新生成缓存。
+
 ### 写表达式、跑模拟
 
 #### Python Alpha

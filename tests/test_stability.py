@@ -12,13 +12,16 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
+
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import research_paths
-from research_app import ledger as cli_ledger
+from research_app import app, ledger as cli_ledger
 
 
 def _dates(year, count):
@@ -76,6 +79,59 @@ class StabilityTests(unittest.TestCase):
         data = self._run({"LATE": late})
         self.assertEqual(data["flips"], 0)
         self.assertGreater(data["worst"][0]["gap"], 1.0)
+
+
+def test_polars_stability_reuses_and_invalidates_train_only_snapshot(tmp_path, monkeypatch, capsys):
+    pl = pytest.importorskip("polars")
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    registry = tmp_path / "alpha-registry.jsonl"
+    pnl_dir = tmp_path / "pnl"
+    pnl_dir.mkdir()
+    rows = [{"alpha_id": key, "status": status, "out_of_sample": {"test": {"startDate": cutoff}}}
+            for key, status, cutoff in [("Good", "ACTIVE", "2020-06-01T00:00:00Z"),
+                ("Short", "ACTIVE", None), ("Absent", "ACTIVE", "2020-06-01"),
+                ("Malformed", "UNSUBMITTED", "2020-06-01")]]
+
+    def write_registry():
+        registry.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+    write_registry()
+    good = pnl_dir / "Good.json"
+    good.write_text(json.dumps(_series(_dates(2020, 151)[::-1], 1.0, 2.0)
+                    | {"2020-06-01": 1e12, "2020-06-02": -1e12}), encoding="utf-8")
+    (pnl_dir / "Short.json").write_text('{"2020-01-01": 1}', encoding="utf-8")
+    (pnl_dir / "Malformed.json").write_text('["not a series"]', encoding="utf-8")
+
+    def invoke(*args):
+        assert app.main(["ledger", "stability", "--quiet", *args]) == 0
+        return json.loads(capsys.readouterr().out)["data"]
+
+    expected = invoke("--list")
+    assert expected["count"] == 2
+    assert next(row for row in expected["worst"] if row["alpha_id"] == "Short")["gap"] is None
+    first = invoke("--polars", "--list")
+    evidence = first.pop("pnl_snapshot")
+    assert evidence["state"] == "rebuilt"
+    assert first == expected
+    path = Path(evidence["path"])
+    assert pl.read_parquet(path)["day"].max() < "2020-06-01"
+
+    subset = invoke("--polars", "--status", "ACTIVE")
+    assert subset.pop("pnl_snapshot")["state"] == "hit"
+    assert subset == invoke("--status", "ACTIVE")
+    rows[0]["out_of_sample"]["test"]["startDate"] = "2020-05-10"
+    write_registry()
+    changed_cutoff = invoke("--polars")
+    assert changed_cutoff.pop("pnl_snapshot")["state"] == "rebuilt"
+    assert changed_cutoff == invoke()
+    assert pl.read_parquet(path)["day"].max() < "2020-05-10"
+
+    good.unlink()
+    changed_pnl = invoke("--polars")
+    assert changed_pnl.pop("pnl_snapshot")["state"] == "rebuilt"
+    assert changed_pnl == invoke()
+    path.write_text("damaged", encoding="utf-8")
+    assert invoke("--polars")["pnl_snapshot"]["state"] == "rebuilt"
 
 
 if __name__ == "__main__":

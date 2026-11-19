@@ -23,7 +23,7 @@ import os
 import alpha_registry
 import research_paths
 
-from . import book_state, legs
+from . import book_state, legs, stats
 
 
 def _series(alpha_ids, directory):
@@ -45,6 +45,15 @@ def _aligned(series):
 
 def _sharpe(values):
     return legs.sharpe_of(values)
+
+
+def _near_rounding_boundary(value, places, tolerance=stats.CORRELATION_ROUNDOFF):
+    if not math.isfinite(value):
+        return False
+    scale = 10 ** places
+    scaled = value * scale
+    return (abs(value) <= tolerance
+            or abs(abs(scaled - round(scaled)) - 0.5) <= tolerance * scale)
 
 
 def marginal_report(alpha_id, registry_path=None, pnl_dir=None):
@@ -112,29 +121,48 @@ def independence_report(registry_path=None, pnl_dir=None, threshold=0.7):
     book_daily = [sum(series[aid][d] for aid in book) for d in dates]
     ordered = sorted(range(len(dates)), key=lambda i: book_daily[i])
     cut = max(10, len(ordered) // 10)
-    stressed = {dates[i] for i in ordered[:cut]}
-    calm = {dates[i] for i in ordered[-cut:]}
+    stressed = sorted(ordered[:cut])
+    calm = sorted(ordered[-cut:])
+    all_rows = [[series[aid][day] for day in dates] for aid in book]
+    stress_rows = [[row[index] for index in stressed] for row in all_rows]
+    calm_rows = [[row[index] for index in calm] for row in all_rows]
 
-    def corr_on(days):
-        picked = [i for i, d in enumerate(dates) if d in days]
-        values = {aid: [series[aid][dates[i]] for i in picked] for aid in book}
+    def corr_on(values, *, scalar=False):
+        if len(values[0]) < stats.MIN_POINTS:
+            return [], False
+        units = stats.unit_correlation_rows(values) if not scalar else None
+        matrix = units @ units.T if units is not None else None
         pairs = []
         for i, first in enumerate(book):
-            for second in book[i + 1:]:
-                rho = legs.correlation(values[first], values[second])
+            for j in range(i + 1, len(book)):
+                if matrix is None:
+                    rho = legs.correlation(values[i], values[j])
+                else:
+                    rho = float(matrix[i, j])
+                    # The report rounds the quantiles and compares the raw
+                    # values to a threshold. Keep scalar arithmetic at either boundary.
+                    if (abs(rho - threshold) <= stats.CORRELATION_ROUNDOFF
+                            or _near_rounding_boundary(rho, 3)):
+                        rho = legs.correlation(values[i], values[j])
                 if rho is not None:
-                    pairs.append({"a": first, "b": second, "r": rho})
-        return pairs
+                    pairs.append({"a": first, "b": book[j], "r": rho})
+        return pairs, matrix is not None
 
-    full = corr_on(set(dates))
-    stress = corr_on(stressed)
-    calm = corr_on(calm)
+    full, full_vectorized = corr_on(all_rows)
+    stress, stress_vectorized = corr_on(stress_rows)
+    calm_pairs, calm_vectorized = corr_on(calm_rows)
 
-    def summary(pairs):
+    def summary(pairs, rows, vectorized):
         if not pairs:
             return {"pairs": 0}
         values = sorted(p["r"] for p in pairs)
         mean = sum(values) / len(values)
+        effective = len(book) / (1 + (len(book) - 1) * max(mean, 0))
+        effective_tolerance = stats.CORRELATION_ROUNDOFF * len(book) ** 2
+        if vectorized and (_near_rounding_boundary(mean, 3)
+                           or _near_rounding_boundary(effective, 2, effective_tolerance)):
+            exact, _ = corr_on(rows, scalar=True)
+            return summary(exact, rows, False)
         high = [p for p in pairs if p["r"] >= threshold]
         return {
             "pairs": len(pairs),
@@ -142,7 +170,7 @@ def independence_report(registry_path=None, pnl_dir=None, threshold=0.7):
             "median": round(values[len(values) // 2], 3),
             "p90": round(values[int(0.9 * (len(values) - 1))], 3),
             "above_threshold": len(high),
-            "effective_bets": round(len(book) / (1 + (len(book) - 1) * max(mean, 0)), 2),
+            "effective_bets": round(effective, 2),
         }
 
     full_map = {key: value for key, value in
@@ -151,9 +179,17 @@ def independence_report(registry_path=None, pnl_dir=None, threshold=0.7):
     shifted = [(a, b, value, stress_map[(a, b)])
                for (a, b), value in full_map.items() if (a, b) in stress_map]
     # The interesting number: how much higher does correlation get when the book bleeds?
-    jumps = sorted(({"a": a, "b": b, "full": round(fr, 3), "stressed": round(sr, 3),
-                     "jump": round(sr - fr, 3)} for a, b, fr, sr in shifted),
-                   key=lambda row: -row["jump"])
+    positions = {aid: index for index, aid in enumerate(book)}
+    jumps = []
+    for a, b, fr, sr in shifted:
+        if (full_vectorized or stress_vectorized) and _near_rounding_boundary(
+                sr - fr, 3, 2 * stats.CORRELATION_ROUNDOFF):
+            left, right = positions[a], positions[b]
+            fr = legs.correlation(all_rows[left], all_rows[right])
+            sr = legs.correlation(stress_rows[left], stress_rows[right])
+        jumps.append({"a": a, "b": b, "full": round(fr, 3), "stressed": round(sr, 3),
+                      "jump": round(sr - fr, 3)})
+    jumps.sort(key=lambda row: -row["jump"])
 
     return {
         "book_members": len(book),
@@ -161,10 +197,11 @@ def independence_report(registry_path=None, pnl_dir=None, threshold=0.7):
                                            pnl_dir=directory),
         "window": {"start": dates[0], "end": dates[-1], "days": len(dates)},
         "stress_days": len(stressed),
-        "calm_days": len(calm),
-        "full_sample": summary(full),
-        "stressed": summary(stress),
-        "calm": summary(calm),
+        # Historical reports export the number of calm pairs in this field.
+        "calm_days": len(calm_pairs),
+        "full_sample": summary(full, all_rows, full_vectorized),
+        "stressed": summary(stress, stress_rows, stress_vectorized),
+        "calm": summary(calm_pairs, calm_rows, calm_vectorized),
         "largest_correlation_jumps": jumps[:10],
         "note": ("effective_bets uses the average pairwise correlation over the full "
                  "sample; the stress block is the worst decile of book days, where the "

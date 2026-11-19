@@ -31,6 +31,11 @@ class StatsTests(unittest.TestCase):
     def test_a_flat_series_has_no_sharpe(self):
         self.assertIsNone(stats.sharpe([0.0] * 50))
 
+    def test_vectorized_correlations_defer_to_scalar_on_flat_or_short_data(self):
+        self.assertIsNone(stats.unit_correlation_rows([[0.1] * 49, list(range(49))]))
+        self.assertIsNone(stats.unit_correlation_rows([list(range(29))]))
+        self.assertIsNone(stats.unit_correlation_rows([[1e308, -1e308] * 30]))
+
     def test_pairs_and_legs_agree_on_one_row(self):
         values = [0.02, -0.01, 0.03, -0.02, 0.01] * 30
         matrix = __import__("numpy").array([values])

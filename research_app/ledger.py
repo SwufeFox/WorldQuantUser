@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import time
+from datetime import date
 from pathlib import Path
 
 import alpha_registry
@@ -14,8 +15,8 @@ import correlation
 import machine_lib as ml
 import research_paths
 
-from . import experiments, mechanisms, styles
-from .runtime import CliError, with_session
+from . import experiments, mechanisms, pnl_snapshot, styles
+from .runtime import CliError, protect_output, with_session
 
 
 _SYNC_WRITE_BATCH_SIZE = 10
@@ -844,6 +845,16 @@ def cmd_ledger_convergence(args, _sink):
     return data
 
 
+def _stability_cutoff(entry):
+    start = ((entry.get("out_of_sample") or {}).get("test") or {}).get("startDate")
+    if isinstance(start, str):
+        try:
+            return date.fromisoformat(start[:10]).isoformat()
+        except ValueError:
+            pass
+    return None
+
+
 def cmd_ledger_stability(args, _sink):
     """Which book alphas earn their train Sharpe in only one half of train.
 
@@ -852,8 +863,9 @@ def cmd_ledger_stability(args, _sink):
     period selection is allowed to see. A sign flip between halves warns that an
     edge may be regime-bound; stability within train does not rule out future decay.
     """
-    _path, entries = _ledger(args)
-    selected = [entry for entry in entries if _ask_passes(entry, _ask_filters(args.where))]
+    registry, entries = _ledger(args)
+    filters = _ask_filters(args.where)
+    selected = [entry for entry in entries if _ask_passes(entry, filters)]
     if getattr(args, "status", None):
         wanted = {part.strip().upper() for part in str(args.status).split(",") if part.strip()}
         selected = [entry for entry in selected
@@ -864,21 +876,32 @@ def cmd_ledger_stability(args, _sink):
         if key:
             latest[key] = entry          # ledger is append-only; last row wins
     pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
+    training, snapshot = None, None
+    if getattr(args, "polars", False):
+        path = Path(research_paths.cache_root()) / "pnl-train.parquet"
+        cache_paths = (path, path.with_suffix(".json"), path.with_suffix(".lock"))
+        protect_output(args, registry, *cache_paths)
+        if registry and Path(registry).expanduser().resolve() in {item.resolve() for item in cache_paths}:
+            raise CliError("INVALID_INPUT", "--registry conflicts with the training PnL snapshot")
+        cutoffs = {entry["alpha_id"]: _stability_cutoff(entry) for entry in entries
+                   if ml.valid_simulation_id(entry.get("alpha_id"))}
+        cutoffs.update({alpha_id: _stability_cutoff(entry) for alpha_id, entry in latest.items()
+                        if alpha_id in cutoffs})
+        training, state = pnl_snapshot.training_values(pnl_dir, path, cutoffs, latest)
+        snapshot = {"path": str(path), "state": state}
     rows = []
     for alpha_id, entry in latest.items():
-        path = pnl_dir / ("%s.json" % alpha_id)
-        if not path.exists():
+        if training is None or not ml.valid_simulation_id(alpha_id):
+            pnl = pnl_snapshot.read_series(pnl_dir / f"{alpha_id}.json")
+            values = None if pnl is None else experiments.half_split_sharpes(pnl, _stability_cutoff(entry))
+        else:
+            train = training.get(alpha_id)
+            values = None if train is None else experiments.train_half_sharpes(train)
+        if values is None:
             rows.append({"alpha_id": alpha_id, "status": entry.get("status"),
                          "family": entry.get("family"), "missing_pnl": True})
             continue
-        try:
-            pnl = {k: float(v) for k, v in json.loads(path.read_text()).items()}
-        except (OSError, ValueError):
-            rows.append({"alpha_id": alpha_id, "status": entry.get("status"),
-                         "family": entry.get("family"), "missing_pnl": True})
-            continue
-        test_start = (entry.get("out_of_sample", {}).get("test") or {}).get("startDate")
-        first, second = experiments.half_split_sharpes(pnl, test_start)
+        first, second = values
         flip = (first is not None and second is not None
                 and first * second < 0 and min(abs(first), abs(second)) >= args.min_move)
         rows.append({"alpha_id": alpha_id, "status": entry.get("status"),
@@ -890,11 +913,13 @@ def cmd_ledger_stability(args, _sink):
     measured = [row for row in rows if not row.get("missing_pnl")]
     flips = [row for row in measured if row.get("flip")]
     measured.sort(key=lambda row: -(row.get("gap") or 0))
+    gaps = sorted(row["gap"] for row in measured if row.get("gap") is not None)
     data = {"count": len(measured), "flips": len(flips),
             "min_move": args.min_move,
-            "median_gap": (sorted(row["gap"] for row in measured)[len(measured) // 2]
-                           if measured else None),
+            "median_gap": gaps[len(gaps) // 2] if gaps else None,
             "worst": measured[: args.limit]}
+    if snapshot is not None:
+        data["pnl_snapshot"] = snapshot
     if args.list:
         data["flip_list"] = flips
     return data

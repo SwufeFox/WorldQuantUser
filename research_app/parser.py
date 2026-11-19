@@ -1389,6 +1389,8 @@ def build_parser():
                         help="Both halves must exceed this |Sharpe| to count as a flip.")
     l_stab.add_argument("--limit", type=int, default=10)
     l_stab.add_argument("--list", action="store_true", help="Also list every flip.")
+    l_stab.add_argument("--polars", action="store_true",
+                        help="Use a rebuildable training PnL Parquet cache for bulk queries (optional Polars).")
     l_stab.bind_handler("ledger.cmd_ledger_stability")
 
     l_sty = ledger_sub.add_parser(

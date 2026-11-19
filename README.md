@@ -150,6 +150,15 @@ can run without it. Install `pandas` separately for `fields_to_df()` or notebook
 pip install "pandas>=2.0"
 ```
 
+For repeated cross-batch training PnL queries, install optional Polars and run
+`ledger stability --polars`. The command automatically refreshes its Parquet
+snapshot when the daily PnL files or recorded test boundaries change.
+
+```bash
+pip install "polars>=2.1,<3"
+python research_cli.py ledger stability --polars
+```
+
 ## Credentials
 
 Copy the template and fill it in:

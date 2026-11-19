@@ -26,7 +26,7 @@ import alpha_registry
 import machine_lib as ml
 import research_paths
 
-from . import benchmark, costs, legs, mechanisms, selection
+from . import benchmark, costs, legs, mechanisms, selection, stats
 from .book_state import describe_book, member_digest
 from .runtime import CliError
 
@@ -249,7 +249,27 @@ def _percentile(values, value):
     return round(100.0 * below / len(values), 0)
 
 
-def _score(alpha_id, entry, series, dates, criteria, candidate=None):
+def _member_correlations(values, series, dates, unit_book):
+    members = list(series.items())
+    unit_candidate = stats.unit_correlation_rows([values]) if unit_book is not None else None
+    if unit_candidate is not None:
+        approximate = abs((unit_book * unit_candidate[0]).sum(axis=1))
+        maximum = approximate.max()
+        contenders = [member for member, rho in zip(members, approximate)
+                      if maximum - rho <= stats.CORRELATION_ROUNDOFF]
+    else:
+        contenders = members
+    # Use the scalar values to select and report the winner, including ties.
+    measured = []
+    for member, member_values in contenders:
+        rho = legs.correlation(values, [member_values[day] for day in dates])
+        if rho is not None:
+            measured.append((rho, member))
+    count = len(members) if unit_candidate is not None else len(measured)
+    return count, max(measured, key=lambda item: abs(item[0]), default=None)
+
+
+def _score(alpha_id, entry, series, dates, criteria, candidate=None, *, book_daily=None, unit_book=None):
     """The four questions plus the internal bar, for one alpha."""
     directory = criteria["pnl_dir"]
     n = len(series)
@@ -300,21 +320,18 @@ def _score(alpha_id, entry, series, dates, criteria, candidate=None):
         common = [day for day in dates if day in candidate]
         row["overlap_days"] = len(common)
         if len(common) >= MIN_OVERLAP_DAYS:
-            book_slice = [sum(values[day] for values in series.values()) for day in common]
+            book_slice = ([book_daily[day] for day in common] if book_daily is not None else
+                          [sum(values[day] for values in series.values()) for day in common])
             values = [candidate[day] for day in common]
             rho = legs.correlation(values, book_slice)
             # Local cached-PnL correlations are heuristic evidence. Platform
             # check values and thresholds are displayed separately when available.
-            member_rhos = []
-            for member, member_values in series.items():
-                other = legs.correlation(values, [member_values[day] for day in common])
-                if other is not None:
-                    member_rhos.append((other, member))
-            row["book_correlations_measured"] = len(member_rhos)
+            complete_book = unit_book if len(common) == len(dates) else None
+            count, worst = _member_correlations(values, series, common, complete_book)
+            row["book_correlations_measured"] = count
             own = legs.sharpe_of(values)
             now = legs.sharpe_of(book_slice)
-            if member_rhos:
-                worst = max(member_rhos, key=lambda item: abs(item[0]))
+            if worst is not None:
                 # Magnitude reports strong relationships in either direction;
                 # it does not establish the platform's correlation verdict.
                 row["max_member_rho"] = round(abs(worst[0]), 3)
@@ -509,9 +526,13 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
     # The ordinary train view can report on its legacy/default cutoff. The
     # scoped gate requires a known boundary for every compared Alpha.
     scoring_days = [] if against_shelf and missing_boundaries else dates
-    book_sharpe = legs.sharpe_of([sum(values[day] for values in series.values()) for day in scoring_days])
+    book_daily = {day: sum(values[day] for values in series.values()) for day in scoring_days}
+    book_sharpe = legs.sharpe_of(book_daily.values())
     if scoring_days and book_sharpe is None and not show_test and not against_shelf:
         raise ValueError("the book's own Sharpe is not measurable on the cached days")
+    unit_book = (stats.unit_correlation_rows([[values[day] for day in scoring_days]
+                                             for values in series.values()])
+                 if len(targets) > 1 and len(scoring_days) >= MIN_OVERLAP_DAYS else None)
     if manifest:
         decision_criteria = dict(manifest["criteria"])
     else:
@@ -546,7 +567,8 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
                 rows.append(row)
             continue
         candidate = series[alpha_id] if alpha_id in series else legs.load_pnl(alpha_id, directory)
-        row = _score(alpha_id, entry, series, scoring_days, settings, candidate=candidate)
+        row = _score(alpha_id, entry, series, scoring_days, settings, candidate=candidate,
+                     book_daily=book_daily, unit_book=unit_book)
         row["evidence"] = _candidate_evidence(
             row, candidate, scoring_days, window, book_state, missing_boundaries, directory)
         if against_shelf:

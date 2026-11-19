@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import math
 import os
 import random
 import tempfile
@@ -10,7 +11,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from research_app import triage
+from research_app import stats, triage
 
 
 class TriageModeTests(unittest.TestCase):
@@ -167,6 +168,37 @@ class MemberCorrelationSignTests(unittest.TestCase):
         self.assertAlmostEqual(row["max_member_rho"], 1.0, places=2)
         self.assertLess(row["max_member_rho_signed"], 0.0)
         self.assertEqual(row["verdict"], "duplicate")
+
+    def test_matrix_rechecks_one_ulp_winner_with_scalar_reduction(self):
+        days = ["2020-%03d" % index for index in range(140)]
+        values = [float(index) for index in range(len(days))]
+        series = {member: dict(zip(days, values)) for member in ("first", "second")}
+        units = stats.unit_correlation_rows([values, values])
+        self.assertIsNotNone(units)
+        lower = 0.9
+        higher = math.nextafter(lower, math.inf)
+        with patch.object(triage.legs, "correlation", side_effect=[lower, higher]) as scalar:
+            count, winner = triage._member_correlations(values, series, days, units)
+        self.assertEqual(scalar.call_count, 2)
+        self.assertEqual((count, winner), (2, (higher, "second")))
+
+    def test_candidate_missing_dates_keeps_scalar_date_intersection(self):
+        days = ["2020-%03d" % index for index in range(145)]
+        rng = random.Random(9)
+        series = {member: {day: rng.normalvariate(0, 1) for day in days}
+                  for member in ("book1", "book2")}
+        subset = [day for index, day in enumerate(days) if index % 11 != 0]
+        candidate = {day: -series["book1"][day] + 0.05 for day in subset}
+        units = stats.unit_correlation_rows([list(values.values()) for values in series.values()])
+        book_daily = {day: sum(values[day] for values in series.values()) for day in days}
+        criteria = {"pnl_dir": ".", "show_test": False, "min_delta": 0.02, "retention_floor": 0.2}
+        entry = {"expression": "rank(close)"}
+        legacy = triage._score("cand", entry, series, days, criteria, candidate)
+        measured = triage._score("cand", entry, series, days, criteria, candidate,
+                                 book_daily=book_daily, unit_book=units)
+        self.assertEqual(measured, legacy)
+        self.assertEqual(measured["overlap_days"], len(subset))
+        self.assertEqual(measured["max_member_rho_signed"], -1.0)
 
 
 class ShelfTrainingEvidenceTests(unittest.TestCase):

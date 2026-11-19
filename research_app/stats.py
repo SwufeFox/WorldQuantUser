@@ -16,6 +16,8 @@ import math
 #: Below this many points a Sharpe is not reported, it is guessed.
 MIN_POINTS = 30
 FITNESS_TURNOVER_FLOOR = 0.125
+# Recheck decisive comparisons with the scalar kernel within this band.
+CORRELATION_ROUNDOFF = 1e-10
 
 
 def platform_fitness(sharpe, returns, turnover):
@@ -47,6 +49,39 @@ def correlation(a, b, min_points=MIN_POINTS):
     if var_a <= 0 or var_b <= 0:
         return None
     return cov / math.sqrt(var_a * var_b)
+
+
+def unit_correlation_rows(rows):
+    """Center and normalize aligned rows so dot products give Pearson r.
+
+    Return None when the scalar kernel is needed, including when NumPy is
+    absent or a row is constant or numerically sensitive.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    try:
+        values = np.asarray(rows)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if values.ndim != 2 or values.shape[1] < MIN_POINTS or values.dtype.kind not in "biuf":
+        return None
+    if values.dtype.kind in "iu" and (values.max() > 2**53 or values.min() < -(2**53)):
+        return None
+    values = values.astype(np.float64, copy=False)
+    if not np.isfinite(values).all():
+        return None
+    with np.errstate(over="ignore", under="ignore", invalid="ignore"):
+        low, high = values.min(axis=1), values.max(axis=1)
+        if not ((high - low) > 1e-5 * np.maximum(abs(low), abs(high))).all():
+            return None
+        centered = values - values.mean(axis=1, keepdims=True)
+        norms = np.sqrt(np.einsum("ij,ij->i", centered, centered))
+        # Preserve the scalar variance product's behavior at extreme scales.
+        if not ((norms > 1e-70) & (norms < 1e70)).all():
+            return None
+        return centered / norms[:, None]
 
 
 def effective_bets(pair_correlations, members):
