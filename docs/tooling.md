@@ -723,6 +723,7 @@ REGULAR 字段为准。
 恢复时优先沿用已记录的任务地址或 Alpha ID。任务身份缺失时才核对平台最近的候选列表，
 须有唯一匹配的源码和完整设置。Python 源码仍按保留缩进的规则匹配。台账中旧的部分
 `settings_fingerprint` 用于占位记录，不能拿来替代完整请求判重。
+任务进入终态且没有 Alpha ID 时，回执计入 `execution.terminal`，结束该任务的回读。
 
 ```bash
 python3 research_cli.py probe sample-batch.spec.json --batch-size 6 --summary --batch-path sample-batch.json --save sample-response.json

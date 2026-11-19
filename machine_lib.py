@@ -1145,6 +1145,33 @@ def _get_poll_response(s, url, deadline):
             raise last
 
 
+def _poll_json_when_ready(s, url, on_event, deadline, *, endpoint, status_errors):
+    """Return the JSON payload or the delay for the caller to checkpoint."""
+    while deadline is None or time.monotonic() < deadline:
+        response = _get_poll_response(s, url, deadline)
+        error = status_errors.get(response.status_code)
+        if error is not None:
+            raise error
+
+        delay = _retry_after_seconds(response, cap_error_wait=False)
+        if not math.isfinite(delay):
+            raise ReadInterrupted("%s returned an invalid Retry-After" % endpoint)
+        if response.status_code not in (429, 503) or not delay:
+            response.raise_for_status()
+        if not delay:
+            try:
+                return response.json(), None
+            except ValueError as exc:
+                raise SimulationError("%s endpoint returned non-JSON: %s"
+                                      % (endpoint, response.text[:300])) from exc
+        if deadline is not None and delay >= deadline - time.monotonic():
+            return None, delay
+        if on_event:
+            on_event("polling", {"retry_after": delay})
+        sleep(delay)
+    return None, 0
+
+
 def request_json(s, method, path, params=None, json_body=None, max_retries=4, *, deadline=None):
     """Decode a BRAIN API response or raise a typed HTTP failure.
 
@@ -1248,54 +1275,14 @@ def poll_simulation(s, progress_url, on_event=None, deadline=None):
     so callers can checkpoint it and continue in a later invocation.
     """
     progress_url = _validated_progress_url(progress_url)
-    while True:
-        if deadline is not None and deadline - time.monotonic() <= 0:
-            return {
-                "status": "PENDING",
-                "progress_url": progress_url,
-                "next_poll_after_seconds": 0,
-            }
-        progress = _get_poll_response(s, progress_url, deadline)
-        if progress.status_code in (401, 403):
-            raise AuthError(
-                "session rejected while polling (HTTP %s)" % progress.status_code
-            )
-        retry_after = _retry_after_seconds(progress, cap_error_wait=False)
-        if not math.isfinite(retry_after):
-            raise ReadInterrupted("simulation progress returned an invalid Retry-After")
-        if progress.status_code in (429, 503) and retry_after:
-            if deadline is not None:
-                remaining = max(0.0, deadline - time.monotonic())
-                if retry_after >= remaining:
-                    return {
-                        "status": "PENDING",
-                        "progress_url": progress_url,
-                        "next_poll_after_seconds": retry_after,
-                    }
-            if on_event:
-                on_event("polling", {"retry_after": retry_after})
-            sleep(retry_after)
-            continue
-        progress.raise_for_status()
-        if not retry_after:
-            break
-        if deadline is not None:
-            remaining = max(0.0, deadline - time.monotonic())
-            if retry_after >= remaining:
-                return {
-                    "status": "PENDING",
-                    "progress_url": progress_url,
-                    "next_poll_after_seconds": retry_after,
-                }
-        if on_event:
-            on_event("polling", {"retry_after": retry_after})
-        sleep(retry_after)
-    try:
-        return progress.json()
-    except ValueError:
-        raise SimulationError(
-            "progress endpoint returned non-JSON: %s" % progress.text[:300]
-        )
+    payload, delay = _poll_json_when_ready(
+        s, progress_url, on_event, deadline, endpoint="progress",
+        status_errors={status: AuthError("session rejected while polling (HTTP %s)" % status)
+                       for status in (401, 403)},
+    )
+    if delay is None:
+        return payload
+    return {"status": "PENDING", "progress_url": progress_url, "next_poll_after_seconds": delay}
 
 
 def submit_single_simulation(
@@ -1372,40 +1359,13 @@ def fetch_alpha_metrics(s, alpha_id, on_event=None, deadline=None):
     Raises ``NotFound`` for an unknown id. Returns a private ``_deferred``
     sentinel when a Retry-After would exceed ``deadline``.
     """
-    while True:
-        if deadline is not None and deadline - time.monotonic() <= 0:
-            return {"_deferred": True, "next_poll_after_seconds": 0}
-        response = _get_poll_response(s, BRAIN_API_URL + "/alphas/" + alpha_id, deadline)
-        if response.status_code == 404:
-            raise NotFound("alpha %s not found" % alpha_id)
-        retry_after = _retry_after_seconds(response, cap_error_wait=False)
-        if not math.isfinite(retry_after):
-            raise ReadInterrupted("alpha metrics returned an invalid Retry-After")
-        if response.status_code in (429, 503) and retry_after:
-            if deadline is not None:
-                remaining = max(0.0, deadline - time.monotonic())
-                if retry_after >= remaining:
-                    return {"_deferred": True, "next_poll_after_seconds": retry_after}
-            if on_event:
-                on_event("polling", {"retry_after": retry_after})
-            sleep(retry_after)
-            continue
-        response.raise_for_status()
-        if not retry_after:
-            break
-        if deadline is not None:
-            remaining = max(0.0, deadline - time.monotonic())
-            if retry_after >= remaining:
-                return {"_deferred": True, "next_poll_after_seconds": retry_after}
-        if on_event:
-            on_event("polling", {"retry_after": retry_after})
-        sleep(retry_after)
-    try:
-        return response.json()
-    except ValueError:
-        raise SimulationError(
-            "alpha endpoint returned non-JSON: %s" % response.text[:300]
-        )
+    payload, delay = _poll_json_when_ready(
+        s, BRAIN_API_URL + "/alphas/" + alpha_id, on_event, deadline, endpoint="alpha",
+        status_errors={404: NotFound("alpha %s not found" % alpha_id)},
+    )
+    if delay is None:
+        return payload
+    return {"_deferred": True, "next_poll_after_seconds": delay}
 
 
 def defer_alpha_metrics(record, payload):

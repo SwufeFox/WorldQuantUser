@@ -35,6 +35,27 @@ def quota_headers(remaining, reset="60"):
 
 
 class TransportRetryTests(unittest.TestCase):
+    def test_progress_and_metrics_share_readiness_without_losing_resume_details(self):
+        url = ml.BRAIN_API_URL + "/simulations/accepted"
+        for read, identifier, pending in (
+            (ml.poll_simulation, url, {"status": "PENDING", "progress_url": url}),
+            (ml.fetch_alpha_metrics, "A1", {"_deferred": True}),
+        ):
+            with self.subTest(read=read.__name__):
+                events = []
+                session = mock.Mock()
+                session.get.side_effect = [response(200, {"Retry-After": "1"}),
+                                           response(503, {"Retry-After": "2"}),
+                                           response(429, {"Retry-After": "120"})]
+                with mock.patch.object(ml, "sleep") as wait:
+                    result = read(session, identifier, deadline=time.monotonic() + 30,
+                                  on_event=lambda kind, data: events.append((kind, data)))
+                self.assertEqual(result, {**pending, "next_poll_after_seconds": 120.0})
+                self.assertEqual(wait.call_args_list, [mock.call(1.0), mock.call(2.0)])
+                self.assertEqual(events, [("polling", {"retry_after": 1.0}),
+                                          ("polling", {"retry_after": 2.0})])
+                self.assertEqual(session.get.call_count, 3)
+
     def test_get_retries_partial_transfer_and_gateway_failure(self):
         session = mock.Mock()
         session.request.side_effect = [requests.exceptions.ChunkedEncodingError(),

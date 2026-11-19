@@ -350,6 +350,57 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(first["alpha_id"], "SYNTHETIC_first")
         self.assertTrue(result["complete"])
 
+    def test_terminal_recovery_releases_the_slot_and_retires_the_poll_route(self):
+        self.spec.write_text(json.dumps({"name": "synthetic", "design": "explore",
+            "arms": [{"label": "first", "expression": "rank(close)"}]}), encoding="utf-8")
+        account = {"fingerprint": "synthetic-terminal-recovery"}
+        url = "https://api.worldquantbrain.com/simulations/synthetic"
+
+        def accepted(expressions, settings, **kwargs):
+            identity, _ = app.simulation_slots.reserve(account, 1)
+            record = {"index": 0, "status": "PENDING", "submission_attempted": True,
+                      "slot_reservation": identity, "progress_url": url}
+            app.simulation_slots.reconcile_record(record, account, outcome="accepted")
+            kwargs["on_event"]("submitted", record)
+            raise KeyboardInterrupt
+
+        with mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(self.root)}):
+            with mock.patch.object(app.guarded_sim, "simulate", side_effect=accepted):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.run_probe(no_record=True)
+            self.assertEqual(app.simulation_slots.snapshot(account, 1)["active"], 1)
+            with mock.patch.object(app.simulation_capabilities, "account_provenance", return_value=account), \
+                    mock.patch.object(ml, "poll_simulation", return_value={
+                        "status": "ERROR", "message": "synthetic failure"}) as poll, \
+                    mock.patch.object(ml, "list_alphas") as listing:
+                result = app.cmd_probe(arguments(recover=str(self.batch)), None)
+            poll.assert_called_once()
+            listing.assert_not_called()
+            self.assertEqual(result["rows"][0]["status"], "ERROR")
+            self.assertEqual(result["rows"][0]["error"], "synthetic failure")
+            self.assertEqual(result["execution"]["terminal"], 1)
+            self.assertEqual(result["execution"]["unknown_submission"], 0)
+            self.assertEqual(result["still_missing"], ["first"])
+            self.assertEqual(result["next_actions"], [])
+            self.assertEqual(app.simulation_slots.snapshot(account, 1)["active"], 0)
+            saved = json.loads(self.batch.read_text(encoding="utf-8"))
+            self.assertNotIn("progress_url", saved["records"][0])
+
+            # Earlier checkpoints could retain a stale route after terminal polling.
+            saved["records"][0].update(progress_url=url, next_poll_at=1000)
+            self.batch.write_text(json.dumps(saved), encoding="utf-8")
+            with mock.patch.object(app, "with_session", side_effect=AssertionError("terminal arm went online")), \
+                    mock.patch.object(ml, "submit_single_simulation") as post:
+                for mode in ("recover", "resume"):
+                    repeated = app.cmd_probe(arguments(**{mode: str(self.batch)}), None)
+                    self.assertEqual(repeated["next_actions"], [])
+                    self.assertNotIn("progress_url", repeated["rows"][0])
+            post.assert_not_called()
+
+    def test_unposted_failure_is_not_a_terminal_platform_task(self):
+        record = {"status": "FAILED", "submission_attempted": False}
+        self.assertEqual(app._submission_state(record), "not_submitted")
+
     def test_probe_restores_progress_saved_only_in_slot_journal(self):
         self.spec.write_text(json.dumps({"name": "synthetic", "design": "explore",
             "arms": [{"label": "first", "expression": "rank(close)"}]}), encoding="utf-8")

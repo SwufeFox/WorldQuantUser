@@ -132,6 +132,7 @@ def _write_simulation_checkpoint(path, checkpoint):
 
 
 _CHECKPOINT_EVENTS = {"submitting", "submitted", "pending", "completed", "failed", "deferred"}
+_CHECKPOINT_POLL_FIELDS = ("progress_url", "next_poll_at", "poll_after_seconds", "metrics_pending")
 
 
 def _merge_checkpoint_record(previous, payload):
@@ -139,8 +140,7 @@ def _merge_checkpoint_record(previous, payload):
     if payload.get("alpha_id") or payload.get("status") in simulation_slots.TERMINAL_STATUSES:
         # Once a poll yields an Alpha ID, subsequent metrics reads use that ID.
         # Missing transport markers in the new event supersede the old ones.
-        for key in ("progress_url", "next_poll_at", "poll_after_seconds", "metrics_pending",
-                    "simulation_status", "simulation_error"):
+        for key in (*_CHECKPOINT_POLL_FIELDS, "simulation_status", "simulation_error"):
             if key not in payload:
                 updated.pop(key, None)
     return updated
@@ -1168,6 +1168,23 @@ def _probe_recovery_index(session, limit, pages, deadline):
     return index
 
 
+def _terminal_probe_without_alpha(record):
+    attempted = record.get("submission_attempted")
+    if record.get("alpha_id") or attempted is False:
+        return False
+    status = str(record.get("status") or "").upper()
+    # Legacy rows can describe unlocated successful results. An explicit POST
+    # attempt distinguishes today's terminal no-ID result from that old layout.
+    return (status in simulation_slots.TERMINAL_FAILURE_STATUSES
+            or (attempted is True and status in simulation_slots.TERMINAL_STATUSES))
+
+
+def _probe_needs_recovery(row):
+    return (row.get("submission_attempted") is not False
+            and (row.get("train_fitness") is None or row.get("metrics_pending"))
+            and not _terminal_probe_without_alpha(row))
+
+
 def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.0,
                         on_progress=None, *, deadline=None):
     """Read known jobs first; use expression/settings lookup only for unidentified arms."""
@@ -1182,7 +1199,7 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
     index = lookup_error = None
     for row in sorted(missing, key=lambda item: not (item.get("alpha_id") or item.get("progress_url"))):
         label = row["label"]
-        if (row.get("submission_attempted") is False or time.monotonic() >= deadline
+        if (not _probe_needs_recovery(row) or time.monotonic() >= deadline
                 or (row.get("next_poll_at") or 0) > time.time()):
             still_missing.add(label)
             continue
@@ -1190,21 +1207,29 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
             alpha_id = row.get("alpha_id")
             if not alpha_id and row.get("progress_url"):
                 progress = ml.poll_simulation(session, row["progress_url"], deadline=deadline)
-                row["status"] = progress.get("status")
+                status = str(progress.get("status") or "").upper()
+                row["status"] = status or None
+                row["submission_attempted"] = True
                 alpha_id = progress.get("alpha")
                 if not alpha_id:
-                    wait = progress.get("next_poll_after_seconds")
-                    if wait is not None:
-                        row["next_poll_at"] = time.time() + max(0, float(wait))
                     row["error"] = progress.get("message")
+                    if _terminal_probe_without_alpha(row):
+                        for key in _CHECKPOINT_POLL_FIELDS:
+                            row.pop(key, None)
+                    else:
+                        wait = progress.get("next_poll_after_seconds")
+                        if wait is not None:
+                            row["next_poll_at"] = time.time() + max(0, float(wait))
                     still_missing.add(label)
                     if on_progress:
                         on_progress(row)
                     continue
                 row["alpha_id"] = alpha_id
+                row["simulation_status"] = row["status"]
                 row["metrics_pending"] = True
                 row.pop("progress_url", None)
                 row.pop("next_poll_at", None)
+                row.pop("poll_after_seconds", None)
                 if on_progress:
                     on_progress(row)
             if not alpha_id:
@@ -1258,6 +1283,7 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
             row.pop("metrics_pending", None)
             row.pop("next_poll_at", None)
             row.pop("poll_after_seconds", None)
+            row.pop("simulation_status", None)
             raw = {"alpha_id": alpha_id, "status": row["status"],
                    "role": row.get("role"),
                    "expression": row.get("expression"), "settings": row.get("settings") or {},
@@ -1352,7 +1378,7 @@ def _load_probe_batch(value):
         record = {**record, "expression": arm["expression"], "settings": arm["settings"],
                   "decay": arm["settings"].get("decay"), "mechanism": arm["label"]}
         record["role"] = role
-        for key in ("alpha_id", "status", "progress_url", "next_poll_at", "submission_attempted", "error"):
+        for key in ("alpha_id", "status", "submission_attempted", "error", "simulation_status", *_CHECKPOINT_POLL_FIELDS):
             if key not in record and key in row:
                 record[key] = row[key]
         if not record.get("out_of_sample"):
@@ -1360,6 +1386,9 @@ def _load_probe_batch(value):
                 for key in ("sharpe", "fitness", "turnover", "returns")}}
         if record.get("alpha_id") and not record.get("metrics"):
             record["metrics_pending"] = True
+        if _terminal_probe_without_alpha(record):
+            for key in _CHECKPOINT_POLL_FIELDS:
+                record.pop(key, None)
         records.append(record)
     document["records"] = records
     fingerprint = _request_fingerprint(arms)
@@ -1395,10 +1424,12 @@ def _recover_probe_batch(args, path):
     def recover(session):
         records = document["records"]
         account = None
-        if session is not None and any(record.get("slot_reservation") for record in records):
+        unresolved = [record for record in records if record.get("slot_reservation")
+                      and not _terminal_probe_without_alpha(record)]
+        if session is not None and unresolved:
             account = simulation_capabilities.account_provenance(session)
             restored = [_selection_call(simulation_slots.restore_record, record, account)
-                        for record in records]
+                        for record in unresolved]
             if any(restored):
                 _probe_document_update(document, path)
                 cache_store.write_json_atomic(path, document, indent=1)
@@ -1413,13 +1444,14 @@ def _recover_probe_batch(args, path):
             record = records[index]
             if raw is not None:
                 record = records[index] = _merge_checkpoint_record(record, raw)
-            for key in ("alpha_id", "status", "progress_url", "next_poll_at", "poll_after_seconds", "error"):
+            for key in ("alpha_id", "status", "submission_attempted", "error"):
                 if key in row:
                     record[key] = row[key]
-                elif key in {"progress_url", "next_poll_at", "poll_after_seconds"}:
+            for key in (*_CHECKPOINT_POLL_FIELDS, "simulation_status"):
+                if key in row:
+                    record[key] = row[key]
+                else:
                     record.pop(key, None)
-            if raw is None and row.get("metrics_pending"):
-                record["metrics_pending"] = True
             simulation_slots.reconcile_record(record, account)
             _probe_document_update(document, path)
             cache_store.write_json_atomic(path, document, indent=1)
@@ -1429,9 +1461,8 @@ def _recover_probe_batch(args, path):
         return outcome
 
     now = time.time()
-    needs_platform = any((row.get("train_fitness") is None or row.get("metrics_pending"))
-                         and row.get("submission_attempted") is not False
-                         and (row.get("next_poll_at") or 0) <= now for row in rows)
+    needs_platform = any(_probe_needs_recovery(row) and (row.get("next_poll_at") or 0) <= now
+                         for row in rows)
     needs_halves = any(record.get("alpha_id") and _has_finished_result(record)
         and ((record.get("out_of_sample") or {}).get("test") or {}).get("startDate")
         and (not record.get("half_sharpes") or any(value is None for value in record["half_sharpes"]))
@@ -1660,9 +1691,7 @@ def _probe_checkpoint_refs(target, arms, gate):
 
 def _recoverable_probe_reference(row):
     """Only link to recovery when the saved row identifies an accepted job."""
-    if (row["submission_state"] != "accepted" or row.get("submission_attempted") is False
-            or str(row.get("status") or "").upper() in simulation_slots.TERMINAL_FAILURE_STATUSES
-            or (not row.get("metrics_pending") and row.get("train_fitness") is not None)):
+    if row["submission_state"] != "accepted" or not _probe_needs_recovery(row):
         return False
     if row.get("alpha_id"):
         return True
@@ -1878,7 +1907,7 @@ def _probe_row(record, arm, gate, show_test):
            "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
            "ops": arm["ops"], "gate": gate}
     row["incentives"] = incentives.check_summary(record.get("checks"))
-    for key in ("progress_url", "metrics_pending", "next_poll_at", "poll_after_seconds", "submission_attempted"):
+    for key in (*_CHECKPOINT_POLL_FIELDS, "submission_attempted"):
         if key in record:
             row[key] = record[key]
     if show_test:
@@ -1892,6 +1921,8 @@ def _probe_row(record, arm, gate, show_test):
 
 
 def _submission_state(record):
+    if _terminal_probe_without_alpha(record):
+        return "terminal"
     if record.get("alpha_id") or record.get("progress_url"):
         return "accepted"
     return "not_submitted" if record.get("submission_attempted") is False else "unknown_submission"
@@ -1912,11 +1943,12 @@ def _probe_document_update(document, target):
     document["execution"] = {"total": len(rows), "finished": sum(_has_finished_result(r) for r in records),
         "train_evidence": len(rows) - len(incomplete),
         **{state: sum(row["submission_state"] == state for row in rows)
-           for state in ("accepted", "not_submitted", "unknown_submission")}}
+           for state in ("accepted", "not_submitted", "unknown_submission", "terminal")}}
     actions = []
-    if any(row["submission_state"] != "not_submitted" and row["label"] in incomplete for row in rows):
+    if any(_probe_needs_recovery(row) for row in rows):
         actions.append({"action": "recover", "batch_path": str(target), "platform_read_only": True})
-    if any(row["submission_state"] == "not_submitted" or row.get("progress_url") for row in rows):
+    if any(row["submission_state"] == "not_submitted"
+           or (row["submission_state"] == "accepted" and row.get("progress_url")) for row in rows):
         actions.append({"action": "resume", "batch_path": str(target), "requires_explicit_request": True})
     if document.get("recording_policy", {}).get("enabled") and not document.get("recording"):
         actions.append({"action": "recover", "batch_path": str(target), "reason": "reconcile_recording"})
@@ -2119,14 +2151,17 @@ def _cmd_probe_resume(args):
     def groups_for(saved):
         groups = {}
         for arm, record in zip(saved["arms"], saved["records"]):
+            if _terminal_probe_without_alpha(record) or _has_finished_result(record):
+                continue
             _selection_call(simulation_slots.restore_record, record)
-            if _submission_state(record) == "unknown_submission" or _has_finished_result(record):
+            state = _submission_state(record)
+            if state == "unknown_submission":
                 continue
             if not arm.get("settings") or not arm.get("expression"):
                 raise CliError("INVALID_INPUT", "legacy batch lacks exact requests; cannot resume")
-            if _submission_state(record) == "not_submitted" and ml.resolve_settings(arm["settings"]) != arm["settings"]:
+            if state == "not_submitted" and ml.resolve_settings(arm["settings"]) != arm["settings"]:
                 raise CliError("INVALID_INPUT", "legacy batch lacks complete resolved settings; cannot start a new POST")
-            group = groups.setdefault((_settings_signature(arm["settings"]), _submission_state(record)),
+            group = groups.setdefault((_settings_signature(arm["settings"]), state),
                                       {"settings": arm["settings"], "arms": [], "pairs": []})
             group["arms"].append(arm)
             group["pairs"].append((arm["expression"], arm["settings"].get("decay")))

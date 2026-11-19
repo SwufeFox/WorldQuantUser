@@ -184,6 +184,40 @@ class RecoverTests(unittest.TestCase):
         self.assertNotIn("metrics_pending", saved["records"][0])
         self.assertNotIn("next_poll_at", saved["records"][0])
 
+    def test_alpha_discovered_before_metrics_deferral_keeps_the_final_simulation_status(self):
+        import argparse
+        import json
+        import tempfile
+        from pathlib import Path
+
+        row = {**self._rows(SETTINGS_A)[0], "status": "PENDING", "submission_attempted": True,
+               "progress_url": "https://api.worldquantbrain.com/simulations/synthetic"}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batch.json"
+            path.write_text(json.dumps({"rows": [row]}), encoding="utf-8")
+            args = argparse.Namespace(recover=str(path))
+            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn, **kw: fn(object())), \
+                    mock.patch.object(ml, "poll_simulation", return_value={
+                        "status": "WARNING", "alpha": "SYNTHETIC"}) as poll, \
+                    mock.patch.object(ml, "fetch_alpha_metrics",
+                        return_value={"_deferred": True, "next_poll_after_seconds": 0}):
+                pending = experiments._cmd_probe_recover(args)
+            poll.assert_called_once()
+            self.assertEqual(pending["rows"][0]["status"], "PENDING")
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["records"][0]["simulation_status"], "WARNING")
+            self.assertNotIn("progress_url", saved["records"][0])
+
+            metrics = {"is": {"fitness": 1.0}, "train": {"fitness": 1.0}}
+            with mock.patch.object(experiments, "with_session", side_effect=lambda args, fn, **kw: fn(object())), \
+                    mock.patch.object(ml, "poll_simulation") as poll, \
+                    mock.patch.object(ml, "fetch_alpha_metrics", return_value=metrics) as fetch:
+                recovered = experiments._cmd_probe_recover(args)
+            poll.assert_not_called()
+            self.assertEqual(fetch.call_args.args[1], "SYNTHETIC")
+            self.assertEqual(recovered["rows"][0]["status"], "WARNING")
+            self.assertEqual(recovered["execution"]["finished"], 1)
+
     def test_lookup_uses_budget_without_preempting_known_jobs(self):
         rows = self._rows(SETTINGS_A)
         rows.append({**rows[0], "label": "known", "alpha_id": "KNOWN"})

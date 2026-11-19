@@ -80,7 +80,9 @@ def _probe_state(data):
     failures = 0
     for row in rows:
         status = str(row.get("status") or "").upper()
-        if row.get("progress_url") or row.get("metrics_pending"):
+        if row.get("submission_state") == "terminal":
+            failures += 1
+        elif row.get("progress_url") or row.get("metrics_pending"):
             pending.append("resume")
         elif status in _FAILED:
             failures += 1

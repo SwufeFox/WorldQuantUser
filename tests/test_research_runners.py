@@ -71,6 +71,13 @@ class ResearchRunnerTests(TestCase):
         self.assertEqual(result.state, "done")
         self.assertEqual(run.call_args.args[2:4], ("--resume", self.batch))
 
+    def test_terminal_platform_task_without_alpha_does_not_defer_the_queue(self):
+        for status in ("WARNING", "COMPLETE"):
+            with self.subTest(status=status):
+                row = arm(status, submission_state="terminal")
+                self.assertEqual(runner._probe_state({"rows": [row], "execution": {"finished": 0}}),
+                                 ("failed", None))
+
     def test_unknown_post_uses_read_only_recovery_even_if_other_arms_are_queued(self):
         rows = [arm("UNKNOWN_SUBMISSION", submission_state="unknown_submission"),
                 arm("QUEUED", submission_state="not_submitted")]
