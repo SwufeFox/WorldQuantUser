@@ -382,14 +382,19 @@ def _book_stability(book, min_move=0.3, limit=3, *, series=None):
 
 def _book_correlator(series):
     ordered = {name: tuple(sorted(values)) for name, values in series.items()}
-    vectors = {name: [series[name][day] for day in days] for name, days in ordered.items()}
+    centered = {}
+
+    def prepare(name):
+        if name not in centered:
+            centered[name] = correlation.center_for_pearson([series[name][day] for day in ordered[name]])
+        return centered[name]
 
     def correlate(left, right, min_overlap):
         days = ordered[left]
         if days == ordered[right]:
             if len(days) < min_overlap:
                 return None, len(days)
-            return correlation.pearson(vectors[left], vectors[right]), len(days)
+            return correlation.pearson_centered(prepare(left), prepare(right)), len(days)
         x, y, shared = correlation.align(series[left], series[right], min_overlap=min_overlap)
         return correlation.pearson(x, y), len(shared)
 

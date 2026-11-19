@@ -9,6 +9,7 @@ overlap would invalidate the conclusion while looking entirely plausible.
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -49,6 +50,24 @@ class PearsonTests(unittest.TestCase):
 
     def test_length_mismatch_is_undefined(self):
         self.assertIsNone(correlation.pearson([1, 2, 3], [1, 2]))
+
+
+def test_book_correlator_reuses_equal_date_series_and_aligns_different_dates():
+    from research_app.campaign import _book_correlator
+
+    a = series([2, -1, 3, 0, 7])
+    b = series([1, 4, 2, -1, 6])
+    c = series([4, 1, 6, 2, 3])
+    sparse = series([-3, 5, 1], start=2)
+    query = _book_correlator({"a": a, "b": b, "c": c, "sparse": sparse})
+    with mock.patch.object(correlation, "center_for_pearson", wraps=correlation.center_for_pearson) as prepare:
+        pairs = [query("a", "b", 3), query("a", "c", 3), query("b", "c", 3)]
+        assert prepare.call_count == 3
+    assert pairs == [(correlation.pearson(list(left.values()), list(right.values())), len(left))
+                     for left, right in [(a, b), (a, c), (b, c)]]
+    x, y, days = correlation.align(a, sparse, min_overlap=3)
+    assert query("a", "sparse", 3) == (correlation.pearson(x, y), len(days))
+    assert query("a", "sparse", 4) == (None, 0)
 
 
 class MatrixTests(unittest.TestCase):

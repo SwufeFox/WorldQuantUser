@@ -131,7 +131,7 @@ def _compact_metrics(record):
 
 
 def _write_simulation_checkpoint(path, checkpoint):
-    cache_store.write_json_atomic(path, checkpoint, indent=2)
+    cache_store.write_json_atomic(path, checkpoint)
 
 
 _CHECKPOINT_EVENTS = {"submitting", "submitted", "pending", "completed", "failed", "deferred"}
@@ -2184,7 +2184,7 @@ def _update_probe_record(document, index, payload, *, submitting=False):
 
 def _save_probe_checkpoint(document, target):
     _probe_document_update(document, target)
-    cache_store.write_json_atomic(target, document, indent=1)
+    cache_store.write_json_atomic(target, document)
 
 
 def _save_probe_progress(document, target, indices, kind, payload):

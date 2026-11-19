@@ -887,16 +887,16 @@ def cmd_ledger_stability(args, _sink):
                    if ml.valid_simulation_id(entry.get("alpha_id"))}
         cutoffs.update({alpha_id: _stability_cutoff(entry) for alpha_id, entry in latest.items()
                         if alpha_id in cutoffs})
-        training, state = pnl_snapshot.training_values(pnl_dir, path, cutoffs, latest)
+        training, state = pnl_snapshot.training_half_sharpes(pnl_dir, path, cutoffs, latest)
         snapshot = {"path": str(path), "state": state}
     rows = []
     for alpha_id, entry in latest.items():
-        if training is None or not ml.valid_simulation_id(alpha_id):
+        if (training is None or not ml.valid_simulation_id(alpha_id)
+                or (alpha_id in training and training[alpha_id] is None)):
             pnl = pnl_snapshot.read_series(pnl_dir / f"{alpha_id}.json")
             values = None if pnl is None else experiments.half_split_sharpes(pnl, _stability_cutoff(entry))
         else:
-            train = training.get(alpha_id)
-            values = None if train is None else experiments.train_half_sharpes(train)
+            values = training.get(alpha_id)
         if values is None:
             rows.append({"alpha_id": alpha_id, "status": entry.get("status"),
                          "family": entry.get("family"), "missing_pnl": True})

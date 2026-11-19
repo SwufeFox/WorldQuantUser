@@ -643,7 +643,8 @@ python3 research_cli.py ledger stability --polars --where 'family=quality'
 
 命令从本地日度 PnL 建立 `cache/pnl-train.parquet`。只缓存各 Alpha 已记录的测试起始日之前的数据。
 缺少训练边界时，两半的 Sharpe 保持未知。日期排序和 Sharpe 口径与普通 `ledger stability` 一致。
-返回的 `pnl_snapshot.state` 表示复用或重建。PnL 文件或训练边界更新后，调用会重新生成缓存。
+返回的 `pnl_snapshot.state` 表示复用或重建。命中时直接读取已算好的两半 Sharpe，
+筛选和翻转判定仍按本次参数执行。PnL 文件或训练边界更新后，调用会重新生成缓存。
 
 ### 写表达式、跑模拟
 

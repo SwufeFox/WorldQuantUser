@@ -22,10 +22,14 @@ strings (``YYYY-MM-DD``), which is how the API returns them and sorts correctly.
 
 from __future__ import annotations
 
+from operator import mul
+
 __all__ = [
     "align",
     "spectrum",
     "pearson",
+    "center_for_pearson",
+    "pearson_centered",
     "matrix",
     "max_against",
     "residualize",
@@ -55,14 +59,28 @@ def pearson(x, y):
     n = len(x)
     if n < 3 or n != len(y):
         return None
-    mean_x = sum(x) / n
-    mean_y = sum(y) / n
-    sxx = sum((v - mean_x) ** 2 for v in x)
-    syy = sum((v - mean_y) ** 2 for v in y)
-    if sxx <= 0 or syy <= 0:
+    return pearson_centered(center_for_pearson(x), center_for_pearson(y))
+
+
+def center_for_pearson(values):
+    """Center one aligned series and compute its norm once for reuse."""
+    if len(values) < 3:
         return None
-    sxy = sum((x[i] - mean_x) * (y[i] - mean_y) for i in range(n))
-    return sxy / (sxx ** 0.5 * syy ** 0.5)
+    mean = sum(values) / len(values)
+    centered = [value - mean for value in values]
+    norm_squared = sum(value ** 2 for value in centered)
+    return None if norm_squared <= 0 else (centered, norm_squared ** 0.5)
+
+
+def pearson_centered(left, right):
+    """Correlate two prepared series with the same observations in the same order."""
+    if left is None or right is None:
+        return None
+    x, x_norm = left
+    y, y_norm = right
+    if len(x) != len(y):
+        return None
+    return sum(map(mul, x, y)) / (x_norm * y_norm)
 
 
 def beta(target, control, min_overlap=200):

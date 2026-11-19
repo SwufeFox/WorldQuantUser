@@ -116,6 +116,15 @@ def test_polars_stability_reuses_and_invalidates_train_only_snapshot(tmp_path, m
     path = Path(evidence["path"])
     assert pl.read_parquet(path)["day"].max() < "2020-06-01"
 
+    with monkeypatch.context() as warm:
+        warm.setitem(sys.modules, "polars", None)
+        warm.setitem(sys.modules, "numpy", None)
+        with mock.patch.object(cli_ledger.experiments, "train_half_sharpes",
+                               side_effect=AssertionError("warm stability remeasured PnL")):
+            reuse = invoke("--polars", "--list")
+        assert reuse.pop("pnl_snapshot")["state"] == "hit"
+        assert reuse == expected
+
     subset = invoke("--polars", "--status", "ACTIVE")
     assert subset.pop("pnl_snapshot")["state"] == "hit"
     assert subset == invoke("--status", "ACTIVE")
@@ -132,6 +141,21 @@ def test_polars_stability_reuses_and_invalidates_train_only_snapshot(tmp_path, m
     assert changed_pnl == invoke()
     path.write_text("damaged", encoding="utf-8")
     assert invoke("--polars")["pnl_snapshot"]["state"] == "rebuilt"
+
+    manifest = path.with_suffix(".json")
+    damaged = json.loads(manifest.read_text(encoding="utf-8"))
+    damaged["half_sharpes"]["Short"] = [True, None]
+    manifest.write_text(json.dumps(damaged), encoding="utf-8")
+    assert invoke("--polars")["pnl_snapshot"]["state"] == "rebuilt"
+
+    rows.append({"alpha_id": "Extreme", "status": "UNSUBMITTED",
+                 "out_of_sample": {"test": {"startDate": "2021-01-01"}}})
+    write_registry()
+    (pnl_dir / "Extreme.json").write_text(
+        json.dumps(_series(_dates(2020, 150), 1e180, -1e180)), encoding="utf-8")
+    filtered = invoke("--polars", "--status", "ACTIVE")
+    assert filtered.pop("pnl_snapshot")["state"] == "rebuilt"
+    assert filtered == invoke("--status", "ACTIVE")
 
 
 if __name__ == "__main__":

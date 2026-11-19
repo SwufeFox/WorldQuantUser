@@ -26,7 +26,6 @@ The module is pure: it takes raw catalog dicts and never touches the network.
 from __future__ import annotations
 
 import re
-import fastexpr_ast as ast
 
 __all__ = [
     "audit_field",
@@ -433,6 +432,8 @@ def audit_expression(expression, raw_records):
     A type-correct operator does not establish fiscal alignment or economic units.
     These findings are research evidence, never instructions to rewrite a signal.
     """
+    import fastexpr_ast as ast
+
     try:
         program = ast.parse(expression)
     except Exception as exc:

@@ -19,7 +19,6 @@ import random
 import re
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from os import environ
 from pathlib import Path
 from time import sleep
@@ -1790,6 +1789,7 @@ def simulate_alphas(
             for index, (expression, decay) in enumerate(pairs)
         ]
 
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
     from requests.exceptions import HTTPError, RequestException
 
     if initial_records is None:

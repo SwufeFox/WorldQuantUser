@@ -182,6 +182,8 @@ handlers = {
 }
 assert handlers.isdisjoint(sys.modules), handlers.intersection(sys.modules)
 assert "requests" not in sys.modules
+assert "fastexpr_ast" not in sys.modules
+assert "concurrent.futures.thread" not in sys.modules
 """
         proc = subprocess.run([sys.executable, "-c", script], cwd=ROOT,
                               capture_output=True, encoding="utf-8")
