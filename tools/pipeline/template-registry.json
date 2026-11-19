@@ -222,6 +222,35 @@
         0.1
       ],
       "evidence": "Strongest family found 2026-11-19. On earningscall_sentiment (5 topics, coverage 0.86) it produced five zero-FAIL candidates, all robust year by year: profitability trend 1.70 (worst year +0.59, last3 2.12), leverage net 1.67 (+0.24, 2.12, fitness 1.08), profitability net 1.61 (+0.21, 1.95), cashflow net 1.53 (+0.32, 1.91), valuation net 1.35 (+0.07, 1.58). Turnover stays near 3% and sub-universe clears its bar by 1.2-1.35x, which matters because that bar scales with Sharpe. Two fields means the alpha is not ATOM-shaped. The five are one mechanism (same transcript, different topic), so count them once."
+    },
+    {
+      "id": "orthogonal_overlay",
+      "name": "Strong signal with an orthogonal weak overlay",
+      "formula": "{w} * ({main}) + {1-w} * (group_rank(ts_mean(ts_backfill({overlay_field},5),20) / ts_mean(ts_backfill({overlay_field},5),120), sector) - 0.5)",
+      "slots": {
+        "main": [
+          "any ranked leg"
+        ],
+        "overlay_field": [
+          "exempt_gbda_broker_concentration_index"
+        ],
+        "w": [
+          0.5,
+          0.7,
+          0.8
+        ]
+      },
+      "kinds": [
+        "VECTOR",
+        "MATRIX"
+      ],
+      "operators": 5,
+      "fields": 2,
+      "turnover_band": [
+        0.05,
+        0.3
+      ],
+      "evidence": "Best hit rate measured here: 11 arms, 9 clean (82%), clean Sharpes 1.70-2.69. The overlay is broker clearing concentration, near-orthogonal to everything tested (0.069-0.153 against other candidates). Key effect is not raw Sharpe but survival: the valuation percentile leg alone scored 2.48 with worst year +0.55, and the 70/30 overlay gave 2.69 with worst year +1.09, so the weak leg mostly buys robustness. Weight on the main leg follows relative standalone strength (70/30 or 80/20), not a searched value."
     }
   ],
   "shape_statistics": {

@@ -27,7 +27,14 @@ QUICK = "QUICK"
 
 
 def load_done(path: Path) -> set[str]:
+    """Labels already finished, plus a normalised-expression set.
+
+    Label-only dedupe missed a real duplicate: ov_valrank_70 and bb_valrank_70
+    were the same expression under different names and both consumed a
+    simulation. Track the expression too so repeats cannot slip through.
+    """
     done: set[str] = set()
+    expressions: set[str] = set()
     if not path.exists():
         return done
     for line in path.read_text().splitlines():
@@ -38,12 +45,16 @@ def load_done(path: Path) -> set[str]:
             row = json.loads(line)
         except json.JSONDecodeError:
             continue
-        # Only a finished simulation counts as done. POST failures and
-        # timeouts must be retried next run, or a login blip silently
-        # removes arms from the batch.
-        if row.get("label") and row.get("status") in {"COMPLETE", "WARNING"}:
+        if row.get("status") not in {"COMPLETE", "WARNING"}:
+            continue
+        if row.get("label"):
             done.add(row["label"])
-    return done
+        expr = row.get("expr")
+        if expr:
+            expressions.add("".join(expr.split()))
+    done_with_expr = done
+    done_with_expr.update({"expr:" + e for e in expressions})
+    return done_with_expr
 
 
 def simulate(session, arm: dict, poll_timeout: int = 420) -> dict:
@@ -128,7 +139,13 @@ def main() -> int:
     arms = json.loads(Path(args.arms).read_text())
     out = Path(args.out)
     done = load_done(out)
-    todo = [a for a in arms if a["label"] not in done]
+    def already(arm: dict) -> bool:
+        if arm["label"] in done:
+            return True
+        expr = arm.get("expr") or ""
+        return ("expr:" + "".join(expr.split())) in done
+
+    todo = [a for a in arms if not already(a)]
     if args.limit:
         todo = todo[: args.limit]
     print(f"arms={len(arms)} done={len(done)} todo={len(todo)} concurrency={args.concurrency}",
