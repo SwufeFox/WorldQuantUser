@@ -1488,6 +1488,21 @@ class SubmissionStateTests(unittest.TestCase):
         self.assertEqual(document["submission"], "CONFIRMED")
         self.assertIn("already ACTIVE", document["reason"])
 
+    def test_quick_result_cannot_start_submission_or_live_precheck(self):
+        session = mock.Mock()
+        payload = {"id": "A", "status": "UNSUBMITTED", "settings": {"simulationMode": "QUICK"}}
+        with mock.patch.object(machine_lib, "fetch_alpha_metrics", return_value=payload), \
+             mock.patch.object(machine_lib, "fetch_alpha_checks") as checks:
+            for confirm in (False, True):
+                with self.subTest(confirm=confirm):
+                    document = machine_lib.submit_alpha(session, "A", confirm=confirm)
+                    self.assertEqual(document["submission"], "NOT_SENT")
+                    self.assertFalse(document["submitted"])
+                    self.assertFalse(document["post_attempted"])
+                    self.assertIn("simulationMode=FULL", document["reason"])
+        checks.assert_not_called()
+        session.post.assert_not_called()
+
     def test_dry_run_reports_not_sent(self):
         session = self._Session(self._Response(500))
         with mock.patch.object(machine_lib, "fetch_alpha_metrics",

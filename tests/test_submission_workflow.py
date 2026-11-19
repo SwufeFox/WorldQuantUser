@@ -13,7 +13,7 @@ import requests
 import alpha_registry
 import cache_store
 import machine_lib as ml
-from research_app import alphas, buffer_cmd, selection
+from research_app import alphas, buffer_cmd, confirm, selection
 from research_app.runtime import CliError
 
 
@@ -75,6 +75,58 @@ class SubmissionWorkflowTests(unittest.TestCase):
             command(args, None)
         self.assertEqual(caught.exception.code, "CONFIRM_REQUIRED")
         post.assert_not_called()
+
+    def test_quick_mode_blocks_both_entrypoints_before_confirmation(self):
+        self.shelve()
+        quick = {**platform_alpha(), "settings": {"simulationMode": "QUICK"}}
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=quick), \
+                mock.patch.object(ml, "fetch_alpha_checks") as checks, \
+                mock.patch.object(ml, "submit_alpha") as post, \
+                mock.patch.object(confirm, "require_double_call") as confirm_intent:
+            for command in (alphas.cmd_alpha_submit, buffer_cmd.cmd_buffer_submit):
+                for yes in (False, True):
+                    with self.subTest(command=command.__name__, yes=yes):
+                        with self.assertRaises(CliError) as caught:
+                            command(self.args(yes=yes, force=True), None)
+                        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+                        self.assertIn("Full Mode", caught.exception.hint)
+        checks.assert_not_called()
+        post.assert_not_called()
+        confirm_intent.assert_not_called()
+        self.assertFalse(alphas._submission_path("CANDIDATE").exists())
+
+    def test_mode_omitted_from_platform_uses_exact_saved_quick_evidence(self):
+        alpha_registry.record_entry(alpha_registry.build_entry({
+            "alpha_id": "CANDIDATE", "expression": "rank(close)",
+            "settings": {"simulationMode": "QUICK"}}), path=self.registry)
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()), \
+                mock.patch.object(ml, "submit_alpha") as post:
+            with self.assertRaises(CliError) as caught:
+                alphas.cmd_alpha_submit(self.args(), None)
+        self.assertIn("Quick Mode", caught.exception.message)
+        post.assert_not_called()
+
+        full_mode = {**platform_alpha(), "settings": {"simulationMode": "FULL"}}
+        with mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[platform_alpha("OTHER"), full_mode]), \
+                mock.patch.object(ml, "submit_alpha") as post:
+            self.stage(alphas.cmd_alpha_submit, self.args(alpha_id="OTHER"), post)
+            self.stage(alphas.cmd_alpha_submit, self.args(), post)
+
+    def test_quick_mode_found_on_final_read_records_no_post(self):
+        session = mock.Mock()
+        legacy = platform_alpha()
+        quick = {**legacy, "settings": {"simulationMode": "QUICK"}}
+        with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
+                mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[legacy, legacy, quick, quick]):
+            self.stage(alphas.cmd_alpha_submit, self.args(), session.post)
+            result = alphas.cmd_alpha_submit(self.args(), None)
+        session.post.assert_not_called()
+        self.assertFalse(result["post_attempted"])
+        self.assertEqual(result["submission"], "NOT_SENT")
+        journal, error = cache_store.load_json(alphas._submission_path("CANDIDATE"))
+        self.assertIsNone(error)
+        self.assertEqual(journal["state"], "NOT_SENT")
 
     def test_both_entrypoints_reconcile_same_facts_without_record_flag(self):
         records = []
@@ -167,11 +219,12 @@ class SubmissionWorkflowTests(unittest.TestCase):
         session.get.assert_called_once()
 
     def test_accepted_and_uncertain_are_not_reposted(self):
+        quick = {**platform_alpha(), "settings": {"simulationMode": "QUICK"}}
         for state in ("INTENT", "ACCEPTED", "UNCERTAIN"):
             with self.subTest(state=state):
                 cache_store.write_json_atomic(alphas._submission_path("CANDIDATE"),
                                               {"alpha_id": "CANDIDATE", "state": state})
-                with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()), \
+                with mock.patch.object(ml, "fetch_alpha_metrics", return_value=quick), \
                         mock.patch.object(ml, "submit_alpha") as post:
                     result = alphas.cmd_alpha_submit(self.args(selection=None), None)
                 post.assert_not_called()
@@ -179,7 +232,8 @@ class SubmissionWorkflowTests(unittest.TestCase):
 
     def test_confirmed_local_failure_is_repaired_idempotently_without_post(self):
         self.shelve()
-        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha(status="ACTIVE")), \
+        active = {**platform_alpha(status="ACTIVE"), "settings": {"simulationMode": "QUICK"}}
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=active), \
                 mock.patch.object(ml, "submit_alpha") as post, \
                 mock.patch.object(ml, "fetch_daily_pnl", side_effect=complete_pnl):
             with mock.patch.object(alpha_registry, "append_batch", side_effect=OSError("disk unavailable")):

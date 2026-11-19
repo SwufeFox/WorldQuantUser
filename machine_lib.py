@@ -19,7 +19,7 @@ import random
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from os import environ
 from pathlib import Path
 from time import sleep
@@ -307,6 +307,7 @@ def authenticate(*, deadline=None):
         else payload.get("tokenExpiry"),
     }
     session._brain_account_id = info["user_id"]
+    session._brain_permissions = info["permissions"]
     return session, info
 
 
@@ -391,6 +392,7 @@ def _session_from_entry(payload, credentials):
     session.auth = credentials
     session.cookies.update(payload["cookies"])
     session._brain_account_id = payload.get("user_id")
+    session._brain_permissions = payload.get("permissions")
     return session
 
 
@@ -1233,7 +1235,7 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4, *,
 
 
 def read_simulation_snapshot(s, simulation_id, *, deadline):
-    """Read one simulation payload and return its suggested retry time."""
+    """Read a snapshot, preserving terminal failure evidence in HTTP 400 replies."""
     from requests.exceptions import RequestException
 
     if not valid_simulation_id(simulation_id):
@@ -1252,7 +1254,7 @@ def read_simulation_snapshot(s, simulation_id, *, deadline):
         raise NotFound("simulation not found")
     if status == 429:
         raise RateLimited("simulation inspection rate limited")
-    if status != 200:
+    if status not in (200, 400):
         raise ServiceError(f"simulation inspection returned HTTP {status}")
     seconds = _retry_after_seconds(response, cap_error_wait=False)
     retry_after = seconds if math.isfinite(seconds) and seconds > 0 else None
@@ -1260,6 +1262,16 @@ def read_simulation_snapshot(s, simulation_id, *, deadline):
         payload = response.json()
     except ValueError:
         payload = None
+    if status == 400:
+        from simulation_slots import TERMINAL_FAILURE_STATUSES
+
+        task = payload if isinstance(payload, dict) else {}
+        echoed_id, children = task.get("id"), task.get("children")
+        failed = str(task.get("status")).upper() in TERMINAL_FAILURE_STATUSES
+        identified = echoed_id == simulation_id or (
+            echoed_id is None and isinstance(children, list) and bool(children))
+        if not (failed and identified):
+            raise ServiceError("simulation inspection returned HTTP 400")
     if not isinstance(payload, dict):
         if retry_after is None:
             raise ServiceError("simulation inspection returned an invalid response")
@@ -1293,6 +1305,39 @@ def submit_single_simulation(
     Daily-quota headers are retained separately from transient HTTP throttling.
     Confirmed exhaustion defers new work; accepted jobs remain recoverable.
     """
+    return _submit_simulation_request(s, simulation_data, max_retries, on_event, deadline)
+
+
+def submit_multi_simulation(s, simulations, max_retries=5, on_event=None, deadline=None):
+    """POST an array of REGULAR simulation requests and return the parent URL."""
+    if not isinstance(simulations, list) or not 2 <= len(simulations) <= 10:
+        raise ValueError("native multi-simulation needs 2–10 requests")
+    if any(not isinstance(request, dict) or request.get("type") != "REGULAR"
+           or not isinstance(request.get("settings"), dict) for request in simulations):
+        raise ValueError("native multi-simulation accepts REGULAR request objects")
+    first = simulations[0]["settings"]
+    common = ("instrumentType", "region", "delay", "language")
+    if any(any(request["settings"].get(key) != first.get(key) for key in common)
+           for request in simulations):
+        raise ValueError("native multi-simulation needs common instrumentType, region, delay and language")
+    if _has_multi_simulation_permission(s) is False:
+        raise PermissionDenied("native multi-simulation requires MULTI_SIMULATION permission")
+    parent_url = _submit_simulation_request(s, simulations, max_retries, on_event, deadline)
+    try:
+        simulation_reference_id(parent_url)
+    except ValueError as exc:
+        raise SimulationError("native multi-simulation returned an invalid parent Location") from exc
+    return parent_url
+
+
+def _has_multi_simulation_permission(session):
+    permissions = getattr(session, "_brain_permissions", None)
+    if isinstance(permissions, (list, tuple, set, frozenset)):
+        return "MULTI_SIMULATION" in permissions
+    return None
+
+
+def _submit_simulation_request(s, simulation_data, max_retries, on_event, deadline):
     import simulation_capabilities
     import simulation_slots
 
@@ -1305,9 +1350,11 @@ def submit_single_simulation(
             if on_event:
                 on_event("quota", quota)
             raise RateLimited("daily simulation quota exhausted; resume after the reported reset")
+        native = isinstance(simulation_data, list)
+        redirect_limits = {"allow_redirects": False} if native else {}
         response = s.post(
             BRAIN_API_URL + "/simulations", json=simulation_data,
-            timeout=_request_timeout(deadline),
+            timeout=_request_timeout(deadline), **redirect_limits,
         )
         observation = (simulation_slots.observe_quota(account, response.headers)
                        if response.status_code not in (401, 403) else None)
@@ -1320,11 +1367,9 @@ def submit_single_simulation(
                 60.0, 5.0 * attempt
             )
             if on_event:
-                on_event(
-                    "rate_limited",
-                    {"attempt": attempt, "wait_seconds": wait, "expression":
-                    simulation_data.get("regular")},
-                )
+                request = ({"child_count": len(simulation_data)} if isinstance(simulation_data, list)
+                           else {"expression": simulation_data.get("regular")})
+                on_event("rate_limited", {"attempt": attempt, "wait_seconds": wait, **request})
             if attempt < max_retries:
                 if deadline is not None:
                     remaining = max(0.0, deadline - time.monotonic())
@@ -1341,6 +1386,8 @@ def submit_single_simulation(
             raise AuthError(
                 "submission rejected (HTTP %s)" % response.status_code
             )
+        if native and 300 <= response.status_code < 400:
+            raise SimulationError("native multi-simulation returned an unexpected redirect")
         response.raise_for_status()
         location = response.headers.get("Location")
         if not location:
@@ -1366,6 +1413,13 @@ def fetch_alpha_metrics(s, alpha_id, on_event=None, deadline=None):
     if delay is None:
         return payload
     return {"_deferred": True, "next_poll_after_seconds": delay}
+
+
+def is_quick_simulation(alpha):
+    """Identify a Quick simulation from its recorded settings."""
+    settings = alpha.get("settings")
+    mode = settings.get("simulationMode") if isinstance(settings, dict) else None
+    return isinstance(mode, str) and mode.strip().upper() == "QUICK"
 
 
 def defer_alpha_metrics(record, payload):
@@ -1634,6 +1688,9 @@ def simulate_alphas(
     concurrency=None,
     capability_snapshot=None,
     scheduling_report=None,
+    fetch_metrics=True,
+    multi_size=None,
+    recover_only=False,
 ):
     """Simulate a list of alphas and return one record per expression.
 
@@ -1652,8 +1709,11 @@ def simulate_alphas(
     ``submitted`` / ``polling`` / ``quota`` / ``rate_limited`` / ``completed`` events.
     Feeding it the result of ``resolve_settings`` is the caller's job.
     ``concurrency`` is a positive local budget, clamped only by verified account
-    capacity. A full shared workspace journal leaves work queued until the
-    current wave can release a slot.
+    capacity. A terminal progress response releases its slot independently
+    of the Alpha metrics read. With ``fetch_metrics=False``, keep Alpha IDs in
+    the checkpoint for a later metrics-only read of those records.
+    ``multi_size`` sends native batches of compatible arms with a maximum size
+    between two and ten. ``recover_only`` reads existing work without creating it.
     Reservations survive interruptions and are
     reconciled by ``simulation_slots.reconcile_record``; other workspaces and
     unidentified accounts cannot share these reservations.
@@ -1675,10 +1735,23 @@ def simulate_alphas(
     import simulation_capabilities
     import simulation_slots
 
+    native_enabled = multi_size is not None
+    if native_enabled or (initial_records and any(row.get("multi_request_id") for row in initial_records)):
+        import simulation_multi
+    if native_enabled and (type(multi_size) is not int or not 2 <= multi_size <= simulation_multi.MAX_CHILDREN):
+        raise ValueError("native multi-simulation size must be an integer between 2 and 10")
+
+    def payload_for(index):
+        expression, decay = pairs[index]
+        return _single_simulation_data(expression, decay, settings)
+
     if capability_snapshot is None and not dry_run:
         capability_snapshot = simulation_capabilities.cached()
     plan = concurrency_plan(None if dry_run else s, concurrency,
                             (capability_snapshot or {}) if dry_run else capability_snapshot)
+    if native_enabled:
+        plan["multi_parent_limit"] = simulation_multi.CONSULTANT_PARENT_LIMIT
+        plan["effective"] = min(plan["effective"], plan["multi_parent_limit"])
     batch_size = max(1, plan["effective"])
     if scheduling_report is not None:
         scheduling_report.update(plan)
@@ -1692,6 +1765,13 @@ def simulate_alphas(
         raise ValueError("max_wait_seconds must be a finite, non-negative number")
 
     if dry_run:
+        if native_enabled and scheduling_report is not None:
+            requests = simulation_multi.request_groups(range(len(pairs)), payload_for, multi_size)
+            scheduling_report["multi_requests"] = [
+                {"indices": list(group), "payload": [payload_for(index) for index in group]
+                 if len(group) > 1 else payload_for(group[0])}
+                for group in requests
+            ]
         return [
             {
                 "expression": expression,
@@ -1705,7 +1785,7 @@ def simulate_alphas(
                 "metrics": None,
                 "checks": None,
                 "error": None,
-                "payload": _single_simulation_data(expression, decay, settings),
+                "payload": payload_for(index),
             }
             for index, (expression, decay) in enumerate(pairs)
         ]
@@ -1739,16 +1819,11 @@ def simulate_alphas(
                 record["role"] = roles[index]
 
 
-    for record in records:
-        simulation_slots.reconcile_record(record, plan["account"])
-
     def shared_state():
         state = simulation_slots.snapshot(plan["account"], plan["effective"])
         if scheduling_report is not None:
             scheduling_report["shared_slots"] = state
         return state
-
-    shared_state()
 
     if max_wait_seconds is not None:
         relative_deadline = time.monotonic() + max_wait_seconds
@@ -1778,6 +1853,16 @@ def simulate_alphas(
                 scheduling_report["quota"] = payload
         emit(kind, index, payload)
 
+    has_saved_native = any(record.get("multi_request_id") for record in records)
+    native = (simulation_multi.MultiRuns(s, records, payload_for, plan["account"],
+              plan["effective"], deadline if deadline is not None else float("inf"), emit,
+              submission_event) if native_enabled or has_saved_native else None)
+    saved_groups = list(native.restore()) if has_saved_native else []
+    for record in records:
+        if not record.get("multi_request_id"):
+            simulation_slots.reconcile_record(record, plan["account"])
+    shared_state()
+
     def fetch_metrics_record(index):
         record = records[index]
         next_poll_at = record.pop("next_poll_at", None)
@@ -1804,6 +1889,12 @@ def simulate_alphas(
                 on_event=metrics_event,
                 deadline=deadline,
             )
+            if record.get("multi_request_id"):
+                if not isinstance(payload, dict) or payload.get("id") not in (None, record["alpha_id"]):
+                    raise ServiceError("multi-simulation Alpha metrics identity mismatch")
+                metrics = payload.get("is")
+                if not payload.get("_deferred") and (not isinstance(metrics, dict) or not metrics):
+                    raise ReadInterrupted("multi-simulation Alpha metrics are not available yet")
         except (AuthError, ReadInterrupted) as exc:
             record["status"] = "PENDING"
             record["metrics_pending"] = True
@@ -1812,6 +1903,10 @@ def simulate_alphas(
             return
         except Exception as exc:
             record["error"] = "metrics fetch failed: %s" % exc
+            if record.get("multi_request_id"):
+                record.update(status="PENDING", metrics_pending=True)
+                emit("pending", index, record)
+                return
         else:
             if defer_alpha_metrics(record, payload):
                 emit("pending", index, record)
@@ -1875,7 +1970,6 @@ def simulate_alphas(
                 emit("pending", index, record)
                 return
             simulation_slots.reconcile_record(record, plan["account"], outcome="terminal")
-            shared_state()
             record["error"] = None
             if progress.get("status") in simulation_slots.TERMINAL_FAILURE_STATUSES or progress.get("message"):
                 record["error"] = progress.get("message") or "simulation ended with %s" % record["status"]
@@ -1890,7 +1984,6 @@ def simulate_alphas(
             record.pop("progress_url", None)
             if record.get("metrics_pending"):
                 emit("pending", index, record)
-                fetch_metrics_record(index)
             else:
                 record.pop("next_poll_at", None)
                 record.pop("poll_after_seconds", None)
@@ -1906,56 +1999,6 @@ def simulate_alphas(
             record["progress_url"] = progress_url
             emit("failed", index, record)
 
-    def poll_many(indices):
-        """Poll several simulations at once.
-
-        Serial polling makes the slowest arm set the pace for every arm behind it, and an
-        arm whose progress endpoint keeps answering with an empty body blocks the batch
-        outright - which is exactly what happened to a batch of three whose other two had
-        already finished on the platform.
-
-        Each poll writes only its own record, so the workers do not share state; the event
-        sink writes whole lines, which is what it is for.
-        """
-        indices = [index for index in indices if records[index].get("progress_url")
-                   or records[index].get("metrics_pending")]
-        if not indices:
-            return
-        if len(indices) == 1:
-            index = indices[0]
-            if records[index].get("progress_url"):
-                poll_record(index)
-            elif records[index].get("metrics_pending"):
-                fetch_metrics_record(index)
-            return
-        workers = min(len(indices), max(2, batch_size))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = []
-            for index in indices:
-                if records[index].get("progress_url"):
-                    futures.append(pool.submit(poll_record, index))
-                elif records[index].get("metrics_pending"):
-                    futures.append(pool.submit(fetch_metrics_record, index))
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as exc:  # noqa: BLE001 - one arm failing is not the batch
-                    note("poll worker raised %s: %s" % (type(exc).__name__, exc))
-
-    # Resume accepted jobs first. An unresolved job still occupies one of the
-    # platform's limited active slots, so do not submit the next batch yet.
-    poll_many(range(len(records)))
-    shared_state()
-    if any(
-        record.get("progress_url") or record.get("metrics_pending")
-        or record.get("status") == "UNKNOWN_SUBMISSION"
-        for record in records
-    ):
-        return records
-
-    if not plan["effective"]:
-        return records
-
     snapshot_account = (capability_snapshot or {}).get("account") or {}
     settings_snapshot = capability_snapshot if (
         plan["account"].get("fingerprint")
@@ -1963,143 +2006,213 @@ def simulate_alphas(
     ) else {}
     settings_checks = {}
 
-    start = 0
-    while start < len(pairs):
-        end = min(len(pairs), start + batch_size)
-        submitted = []
-        submission_blocked = False
-        contended_index = None
-        for index in range(start, end):
-            expression, decay = pairs[index]
-            record = {
-                **records[index],
-            }
-            if record.get("status") not in {"QUEUED", None}:
-                continue
+    def settings_allowed(index):
+        decay = pairs[index][1]
+        if decay not in settings_checks:
+            settings_checks[decay] = regular_settings_evidence(
+                {**settings, "decay": decay}, settings_snapshot)
+        capability_check = settings_checks[decay]
+        if not capability_check["unsupported"]:
+            return True
+        record = records[index]
+        record.update(status="FAILED", submission_attempted=False,
+                      error="settings are unsupported by current account metadata",
+                      settings_capabilities=capability_check)
+        emit("failed", index, record)
+        return False
+
+    def submit_record(index):
+        record = dict(records[index])
+        payload = payload_for(index)
+        identity, slots = simulation_slots.prepare_submission(
+            plan["account"], plan["effective"],
+            lambda reservation: checkpoint_submission(index, record, reservation),
+        )
+        if scheduling_report is not None:
+            scheduling_report["shared_slots"] = slots
+        if identity is None and slots["available"] == 0:
+            record["error"] = "shared simulation slots are occupied; reconcile or resume existing attempts"
+            records[index] = record
+            emit("deferred", index, record)
+            return "contended"
+        try:
+            location = submit_single_simulation(
+                s, payload,
+                on_event=lambda kind, payload, i=index: submission_event(kind, i, payload),
+                deadline=deadline,
+            )
+        except RateLimited as exc:
+            simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
+            record["status"] = "QUEUED"
+            record["submission_attempted"] = False
+            record["error"] = "%s: %s" % (exc.code, exc)
+            records[index] = record
+            emit("deferred", index, record)
+            return "blocked"
+        except AuthError as exc:
+            simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
+            shared_state()
+            record.update(status="QUEUED", submission_attempted=False, error=str(exc))
+            records[index] = record
+            emit("deferred", index, record)
+            raise
+        except SimulationError as exc:
+            record.update(status="UNKNOWN_SUBMISSION", error=str(exc))
+            records[index] = record
+            emit("pending", index, record)
+            return "blocked"
+        except BrainError as exc:
+            record["status"] = "UNKNOWN_SUBMISSION"
+            record["error"] = "%s: %s" % (exc.code, exc)
+            records[index] = record
+            emit("pending", index, record)
+            return "blocked"
+        except HTTPError as exc:
+            status_code = getattr(exc.response, "status_code", None)
+            refused = status_code is not None and 400 <= status_code < 500 and status_code != 408
+            record["status"] = "FAILED" if refused else "UNKNOWN_SUBMISSION"
+            record["error"] = "submit failed: %s" % exc
+            if refused:
+                detail = getattr(exc.response, "text", "")
+                if is_python_language(settings.get("language")) and isinstance(detail, str) and detail.strip():
+                    record["error"] += " (" + detail.strip()[:500] + ")"
+                simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
+                record["status"] = "FAILED"
+                if not is_python_language(settings.get("language")):
+                    note_operator_rejection(record.get("expression"), record["error"])
+            records[index] = record
+            emit("failed" if refused else "pending", index, record)
+            return "skipped" if refused else "blocked"
+        except RequestException as exc:
+            record.update(status="UNKNOWN_SUBMISSION", error="submit transport failed: %s" % type(exc).__name__)
+            records[index] = record
+            emit("pending", index, record)
+            return "blocked"
+        record["status"] = "PENDING"
+        record["progress_url"] = location
+        record["error"] = None
+        simulation_slots.reconcile_record(record, plan["account"], outcome="accepted")
+        records[index] = record
+        emit("submitted", index, record)
+        return "accepted"
+
+    def read_result(future):
+        try:
+            future.result()
+        except Exception as exc:  # One read failure should not discard the other jobs.
+            note("simulation read worker raised %s: %s" % (type(exc).__name__, exc))
+
+    def dispatch(group):
+        for index in group:
+            record = records[index]
             if record.get("submission_attempted"):
                 record["status"] = "UNKNOWN_SUBMISSION"
                 record["error"] = "submission outcome needs reconciliation before another POST"
-                records[index] = record
                 emit("pending", index, record)
-                return records
-            if deadline is not None and deadline - time.monotonic() <= 0:
-                break
-            if quota_exhausted:
-                submission_blocked = True
+                return "blocked", ()
+        if quota_exhausted:
+            for index in group:
+                record = records[index]
                 record["error"] = "daily simulation quota exhausted; resume after the reported reset"
-                records[index] = record
                 emit("deferred", index, record)
-                break
-            if decay not in settings_checks:
-                settings_checks[decay] = regular_settings_evidence(
-                    {**settings, "decay": decay}, settings_snapshot)
-            capability_check = settings_checks[decay]
-            if capability_check["unsupported"]:
-                record.update(status="FAILED", submission_attempted=False,
-                              error="settings are unsupported by current account metadata",
-                              settings_capabilities=capability_check)
-                records[index] = record
-                emit("failed", index, record)
+            return "blocked", ()
+        allowed = tuple(index for index in group if records[index].get("status") != "FAILED"
+                        and settings_allowed(index))
+        if not allowed:
+            return "skipped", ()
+        if len(allowed) == 1:
+            return submit_record(allowed[0]), allowed
+        return native.submit(allowed), allowed
+
+    queued = [index for index, record in enumerate(records)
+              if record.get("status") in {"QUEUED", None}
+              and not (record.get("progress_url") or record.get("metrics_pending") or record.get("multi_request_id"))]
+    groups = (simulation_multi.request_groups(queued, payload_for, multi_size) if native_enabled
+              else ((index,) for index in queued))
+    next_group = next(groups, None)
+    stop_submitting = recover_only or any(record.get("status") == "UNKNOWN_SUBMISSION" for record in records)
+    unresolved_polls = 0
+    read_workers = max(2, batch_size)
+
+    with (ThreadPoolExecutor(max_workers=read_workers) as progress_pool,
+          ThreadPoolExecutor(max_workers=read_workers) as metrics_pool):
+        progress_reads = {}
+        metrics_reads = []
+
+        def read_progress(group):
+            future = (progress_pool.submit(poll_record, group[0]) if len(group) == 1
+                      else progress_pool.submit(native.poll_parent, group))
+            progress_reads[future] = group
+
+        def read_metrics(index):
+            if fetch_metrics and records[index].get("metrics_pending"):
+                metrics_reads.append(metrics_pool.submit(fetch_metrics_record, index))
+
+        def read_children_and_metrics(group):
+            native.collect_children(group)
+            for index in group:
+                if fetch_metrics and records[index].get("metrics_pending"):
+                    fetch_metrics_record(index)
+
+        def read_native_results(group):
+            if native.needs_children(group):
+                metrics_reads.append(metrics_pool.submit(read_children_and_metrics, group))
+            else:
+                for index in group:
+                    read_metrics(index)
+
+        for group in saved_groups:
+            if native.needs_parent_read(group):
+                read_progress(group)
+            else:
+                read_native_results(group)
+        for index, record in enumerate(records):
+            if record.get("multi_request_id"):
                 continue
-            payload = _single_simulation_data(expression, decay, settings)
-            identity, slots = simulation_slots.prepare_submission(
-                plan["account"], plan["effective"],
-                lambda reservation: checkpoint_submission(index, record, reservation),
-            )
-            if scheduling_report is not None:
-                scheduling_report["shared_slots"] = slots
-            if identity is None and slots["available"] == 0:
-                contended_index = index
-                record["error"] = "shared simulation slots are occupied; reconcile or resume existing attempts"
-                records[index] = record
-                emit("deferred", index, record)
-                break
-            try:
-                location = submit_single_simulation(
-                    s, payload,
-                    on_event=lambda kind, payload, i=index: submission_event(kind, i, payload),
-                    deadline=deadline,
-                )
-            except RateLimited as exc:
-                submission_blocked = True
-                simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
-                record["status"] = "QUEUED"
-                record["submission_attempted"] = False
-                record["error"] = "%s: %s" % (exc.code, exc)
-                records[index] = record
-                emit("deferred", index, record)
-                break
-            except AuthError as exc:
-                simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
-                shared_state()
-                record.update(status="QUEUED", submission_attempted=False, error=str(exc))
-                records[index] = record
-                emit("deferred", index, record)
-                raise
-            except SimulationError as exc:
-                record.update(status="UNKNOWN_SUBMISSION", error=str(exc))
-                records[index] = record
-                emit("pending", index, record)
-                break
-            except BrainError as exc:
-                record["status"] = "UNKNOWN_SUBMISSION"
-                record["error"] = "%s: %s" % (exc.code, exc)
-                records[index] = record
-                emit("pending", index, record)
-                break
-            except HTTPError as exc:
-                status_code = getattr(exc.response, "status_code", None)
-                refused = status_code is not None and 400 <= status_code < 500 and status_code != 408
-                record["status"] = "FAILED" if refused else "UNKNOWN_SUBMISSION"
-                record["error"] = "submit failed: %s" % exc
-                if refused:
-                    detail = getattr(exc.response, "text", "")
-                    if is_python_language(settings.get("language")) and isinstance(detail, str) and detail.strip():
-                        record["error"] += " (" + detail.strip()[:500] + ")"
-                    simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
-                    record["status"] = "FAILED"
-                    if not is_python_language(settings.get("language")):
-                        note_operator_rejection(record.get("expression"), record["error"])
-                records[index] = record
-                emit("failed" if refused else "pending", index, record)
-                if not refused:
+            if record.get("progress_url"):
+                read_progress((index,))
+            else:
+                read_metrics(index)
+
+        # Recover accepted jobs from the checkpoint before dispatching new ones.
+        # Their metrics are independent as soon as progress establishes an Alpha ID.
+        recovering_progress = bool(progress_reads)
+        while True:
+            while (next_group is not None and not stop_submitting and not recovering_progress
+                   and len(progress_reads) + unresolved_polls < plan["effective"]
+                   and (deadline is None or time.monotonic() < deadline)):
+                outcome, accepted = dispatch(next_group)
+                if outcome == "accepted":
+                    read_progress(accepted)
+                elif outcome in {"contended", "blocked"}:
+                    stop_submitting = outcome == "blocked"
                     break
-                continue
-            except RequestException as exc:
-                record.update(status="UNKNOWN_SUBMISSION", error="submit transport failed: %s" % type(exc).__name__)
-                records[index] = record
-                emit("pending", index, record)
-                break
-            record["status"] = "PENDING"
-            record["progress_url"] = location
-            record["error"] = None
-            simulation_slots.reconcile_record(record, plan["account"], outcome="accepted")
-            records[index] = record
-            emit("submitted", index, record)
-            submitted.append(index)
+                next_group = next(groups, None)
 
-        poll_many(submitted)
-        slots = shared_state()
-        if submission_blocked:
-            return records
-        if any(record.get("status") == "UNKNOWN_SUBMISSION" for record in records):
-            break
-        if any(
-            records[index].get("progress_url")
-            or records[index].get("metrics_pending")
-            for index in submitted
-        ):
-            # Avoid exceeding the platform's concurrent simulation limit.
-            break
-        if contended_index is not None:
-            # A full journal can include this wave's own reservations. After
-            # polling these to completion, retry only the unsent part of the wave.
-            if not submitted or slots["available"] == 0:
+            if not progress_reads:
                 break
-            start = contended_index
-        else:
-            start = end
+            ready, _ = wait(progress_reads, return_when=FIRST_COMPLETED)
+            for future in ready:
+                group = progress_reads.pop(future)
+                read_result(future)
+                pending = (records[group[0]].get("progress_url") if len(group) == 1
+                           else native.pending_on_platform(group))
+                if pending:
+                    # The attempt still occupies a slot even though this read has yielded.
+                    unresolved_polls += 1
+                elif len(group) > 1:
+                    read_native_results(group)
+                else:
+                    read_metrics(group[0])
 
+            if recovering_progress and not progress_reads:
+                recovering_progress = False
+                stop_submitting = stop_submitting or unresolved_polls > 0
+
+        for future in metrics_reads:
+            read_result(future)
+
+    shared_state()
     return records
 
 
@@ -2687,6 +2800,13 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
             "date_submitted": current.get("dateSubmitted"),
             "reason": "already %s" % status,
         })
+        return document
+    if is_quick_simulation(current):
+        document.update(
+            submission="NOT_SENT",
+            post_attempted=False,
+            reason="Quick simulation results are for screening; rerun with simulationMode=FULL",
+        )
         return document
     if not confirm:
         # the platform has no separate test-submission call: the test *is* the

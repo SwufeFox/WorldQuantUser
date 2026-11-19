@@ -135,6 +135,100 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertTrue(all(record["slot_reservation_state"] == "released" for record in records))
         self.assertEqual(simulation_slots.snapshot(ACCOUNT, 7)["active"], 0)
 
+    def test_refills_a_slot_while_sibling_progress_and_metrics_wait(self):
+        expressions = ["rank(cap)", "rank(close)", "rank(volume)"]
+        metrics_waiting = threading.Event()
+        replacement_posted = threading.Event()
+        posts = []
+
+        def submit(session, body, **kwargs):
+            posts.append(body["regular"])
+            if len(posts) == 3:
+                self.assertTrue(metrics_waiting.wait(5))
+                replacement_posted.set()
+            return "https://api.worldquantbrain.com/simulations/%d" % len(posts)
+
+        def poll(session, url, **kwargs):
+            job = url.rsplit("/", 1)[-1]
+            if job == "2":
+                self.assertTrue(replacement_posted.wait(5))
+            return {"status": "COMPLETE", "alpha": "alpha-" + job}
+
+        def fetch(session, alpha_id, **kwargs):
+            if alpha_id == "alpha-1":
+                metrics_waiting.set()
+                self.assertTrue(replacement_posted.wait(5))
+                return {"_deferred": True, "next_poll_after_seconds": 120}
+            return {"is": {"fitness": 1}}
+
+        with mock.patch.object(ml, "submit_single_simulation", side_effect=submit), \
+                mock.patch.object(ml, "poll_simulation", side_effect=poll), \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=fetch):
+            records = self.simulate(expressions, concurrency=2, settings={"simulationMode": "QUICK"})
+
+        self.assertEqual(posts, expressions)
+        self.assertEqual([record["status"] for record in records], ["PENDING", "COMPLETE", "COMPLETE"])
+        self.assertEqual(records[0]["simulation_status"], "COMPLETE")
+        self.assertTrue(records[0]["metrics_pending"])
+        self.assertTrue(all(record["slot_reservation_state"] == "released" for record in records))
+
+    def test_resume_dispatches_queued_work_while_a_saved_alpha_waits_for_metrics(self):
+        expressions = ["rank(cap)", "rank(close)"]
+        completed = {"expression": expressions[0], "decay": 6, "status": "PENDING",
+                     "simulation_status": "COMPLETE", "submission_attempted": True,
+                     "alpha_id": "alpha-saved", "metrics_pending": True}
+        queued = {"expression": expressions[1], "decay": 6, "status": "QUEUED"}
+        replacement_posted = threading.Event()
+
+        def submit(session, body, **kwargs):
+            self.assertEqual(body["regular"], expressions[1])
+            replacement_posted.set()
+            return "https://api.worldquantbrain.com/simulations/replacement"
+
+        def fetch(session, alpha_id, **kwargs):
+            if alpha_id == "alpha-saved":
+                if not replacement_posted.wait(5):
+                    return {"_deferred": True, "next_poll_after_seconds": 120}
+            return {"is": {"fitness": 1}}
+
+        with mock.patch.object(ml, "submit_single_simulation", side_effect=submit) as post, \
+                mock.patch.object(ml, "poll_simulation", return_value={
+                    "status": "COMPLETE", "alpha": "alpha-new"}) as poll, \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=fetch):
+            records = self.simulate(expressions, initial_records=[completed, queued], concurrency=1)
+
+        post.assert_called_once()
+        poll.assert_called_once()
+        self.assertTrue(poll.call_args.args[1].endswith("/replacement"))
+        self.assertEqual([record["alpha_id"] for record in records], ["alpha-saved", "alpha-new"])
+        self.assertEqual([record["status"] for record in records], ["COMPLETE", "COMPLETE"])
+
+    def test_dispatch_only_keeps_alpha_id_for_later_metrics_only_recovery(self):
+        events = []
+        with mock.patch.object(ml, "submit_single_simulation", return_value=
+                               "https://api.worldquantbrain.com/simulations/existing") as post, \
+                mock.patch.object(ml, "poll_simulation", return_value={
+                    "status": "COMPLETE", "alpha": "alpha-saved"}) as poll, \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {"fitness": 1}}) as fetch:
+            records = self.simulate(fetch_metrics=False,
+                                    on_event=lambda kind, row: events.append((kind, row)))
+            fetch.assert_not_called()
+            self.assertEqual(records[0]["alpha_id"], "alpha-saved")
+            self.assertEqual(records[0]["simulation_status"], "COMPLETE")
+            self.assertTrue(records[0]["metrics_pending"])
+            self.assertNotIn("progress_url", records[0])
+            self.assertEqual(events[-1][0], "pending")
+            self.assertEqual(events[-1][1]["alpha_id"], records[0]["alpha_id"])
+            self.assertEqual(simulation_slots.snapshot(ACCOUNT, 3)["active"], 0)
+
+            records = self.simulate(initial_records=records)
+
+        post.assert_called_once()
+        poll.assert_called_once()
+        fetch.assert_called_once()
+        self.assertEqual(records[0]["status"], "COMPLETE")
+        self.assertEqual(records[0]["metrics"], {"fitness": 1})
+
     def test_verified_zero_capacity_does_not_post(self):
         with mock.patch.object(ml, "submit_single_simulation") as submit:
             records = self.simulate(concurrency=8, capability_snapshot=evidence(0))

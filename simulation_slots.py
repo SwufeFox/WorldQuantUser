@@ -162,6 +162,11 @@ def _reservation_identity(record, account):
     return identity
 
 
+def validate_reservation_owner(record, account):
+    """Verify a saved reservation belongs to the current account and workspace."""
+    _reservation_identity(record, account)
+
+
 def _has_terminal_result(record):
     status = record.get("simulation_status", record.get("status"))
     return bool(record.get("alpha_id") or status in TERMINAL_STATUSES)

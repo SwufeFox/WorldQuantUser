@@ -20,6 +20,7 @@ sys.path.insert(0, ROOT)
 
 import machine_lib as ml
 from research_app import buffer_cmd, selection
+from research_app.runtime import CliError
 
 
 def _payload(name="cand", checks=None, self_corr=0.45):
@@ -84,6 +85,17 @@ class BufferTests(unittest.TestCase):
                 mock.patch.object(ml, "fetch_alpha_checks", return_value=failing):
             with self.assertRaises(Exception):
                 buffer_cmd.cmd_buffer_add(self._args(), mock.MagicMock())
+        self.assertFalse(os.path.exists(self.shelf))
+
+    def test_quick_mode_is_refused_before_checks_or_shelving(self):
+        payload = {**_payload(), "settings": {"simulationMode": "QUICK"}}
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=payload), \
+                mock.patch.object(ml, "fetch_alpha_checks") as checks:
+            with self.assertRaises(CliError) as caught:
+                buffer_cmd.cmd_buffer_add(self._args(), None)
+        self.assertEqual(caught.exception.code, "INVALID_INPUT")
+        self.assertIn("Full Mode", caught.exception.hint)
+        checks.assert_not_called()
         self.assertFalse(os.path.exists(self.shelf))
 
     def test_pending_is_not_a_failure(self):

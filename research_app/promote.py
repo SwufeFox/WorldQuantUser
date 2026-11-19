@@ -13,7 +13,7 @@ import research_paths
 
 from . import alphas, buffer_cmd, selection, triage
 from .experiments import _selection_call
-from .runtime import CliError, note, protect_output
+from .runtime import CliError, note, protect_output, with_session
 
 def _finite(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
@@ -71,6 +71,8 @@ def cmd_promote(args, sink):
                 retention_floor = selection.DEFAULT_PROMOTION_RETENTION
         if not _finite(retention_floor):
             raise CliError("INVALID_INPUT", "retention floor must be finite")
+        payload = with_session(args, lambda session: ml.fetch_alpha_metrics(session, alpha_id))
+        alphas._reject_quick_simulation(args, payload)
         if not saved_choice:
             freeze_args = parser.parse_args(["triage", "--ids", alpha_id, "--freeze", str(freeze)])
             freeze_args.retention_floor = retention_floor

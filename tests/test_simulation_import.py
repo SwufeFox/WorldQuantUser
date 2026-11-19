@@ -74,6 +74,33 @@ def test_retry_after_is_reported_without_waiting_or_reading_children(capsys):
     assert session.get.call_count == 1
 
 
+def test_failed_parent_with_http_400_preserves_successful_child(capsys):
+    status, output, session = run_import(capsys, "Parent", [
+        response({"id": "Parent", "status": "ERROR", "children": ["Good", "Bad"]}, status=400),
+        response({"id": "Good", "parent": "Parent", "status": "COMPLETE", "alpha": "Alpha1"}),
+        response({"id": "Bad", "parent": "Parent", "status": "FAIL"}, status=400),
+    ])
+    report = output["data"]
+    assert status == 0
+    assert report["state"] == "failed"
+    assert report["alpha_ids"] == ["Alpha1"]
+    assert report["summary"] == {"total": 2, "complete": 1, "failed": 1, "pending": 0, "unknown": 0}
+    assert session.get.call_count == 3
+
+
+@pytest.mark.parametrize("payload", [
+    {"detail": "bad request"},
+    {"status": "ERROR"},
+    {"id": "Parent", "status": "SIMULATING", "children": ["Good"]},
+    {"id": "Other", "status": "ERROR", "children": ["Good"]},
+])
+def test_http_400_requires_failed_parent_evidence(capsys, payload):
+    status, output, session = run_import(capsys, "Parent", [response(payload, status=400)])
+    assert status == 4
+    assert output["error"]["code"] == "SERVICE_ERROR"
+    assert session.get.call_count == 1
+
+
 def test_child_failures_preserve_provenance_and_stop_after_rate_limit(capsys):
     status, output, session = run_import(capsys, "Parent", [
         response({"status": "COMPLETE", "children": [

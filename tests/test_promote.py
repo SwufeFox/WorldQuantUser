@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 import machine_lib as ml
-from research_app import alphas, app, buffer_cmd, selection, triage
+from research_app import alphas, app, buffer_cmd, promote, selection, triage
 from research_app.runtime import CliError
 
 
@@ -23,7 +23,10 @@ def flow(monkeypatch, tmp_path):
                                     "LOW_SHARPE": {"result": "PASS"}},
         "self_correlation": {"result": "PASS", "value": 0.3}})
     state = {"row": row, "checked": {"complete": True, "results": [result]},
+             "alpha": {"settings": {"simulationMode": "FULL"}},
              "calls": [], "args": {}, "failures": {}}
+    monkeypatch.setattr(promote, "with_session", lambda args, work: work(object()))
+    monkeypatch.setattr(ml, "fetch_alpha_metrics", lambda session, alpha_id: state["alpha"])
 
     def called(name, args):
         state["calls"].append(name)
@@ -89,6 +92,21 @@ def test_all_pass_buffers_with_forwarded_options(flow, capsys, tmp_path):
     assert flow["args"]["buffer"].buffer == str(shelf)
     assert data["freeze_path"] == str(freeze) and freeze.exists()
     assert json.loads(saved.read_text()) == output
+
+
+@pytest.mark.parametrize("saved_choice", [False, True])
+def test_quick_mode_stops_before_freeze_or_validation(flow, capsys, tmp_path, saved_choice):
+    flow["alpha"]["settings"]["simulationMode"] = "QUICK"
+    choice, shelf = tmp_path / "choice.json", tmp_path / "shelf.jsonl"
+    if saved_choice:
+        selection.freeze(choice, source="triage", rows=[{"alpha_id": "A1"}])
+    code, output = invoke(capsys, "--selection" if saved_choice else "--freeze", choice,
+                          "--buffer", shelf)
+    assert code == 2 and output["error"]["code"] == "INVALID_INPUT"
+    assert "Quick Mode" in output["error"]["message"]
+    assert output["data"]["steps"]["validate"]["status"] == "pending"
+    assert flow["calls"] == []
+    assert choice.exists() is saved_choice and not shelf.exists()
 
 
 @pytest.mark.parametrize("sharpe", [0, -0.01])

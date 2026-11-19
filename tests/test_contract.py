@@ -78,6 +78,17 @@ class SchemaContractTests(unittest.TestCase):
         payload = parse(run_cli("schema", "simulate"))["data"]
         self.assertEqual(payload["command"]["command"], "simulate")
 
+    def test_native_multi_is_opt_in_with_a_bounded_request_size(self):
+        for command in ("simulate", "probe"):
+            options = parse(run_cli("schema", command))["data"]["command"]["options"]
+            size = next(option for option in options if "--multi-size" in option["flags"])
+            self.assertEqual([int(choice) for choice in size["choices"]], list(range(2, 11)))
+        for command in (("simulate", "--multi-size", "1"), ("probe", "--multi-size", "11"),
+                        ("resume", "checkpoint.json", "--multi-size", "4")):
+            result = run_cli(*command)
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(parse(result)["error"]["code"], "USAGE")
+
     def test_ledger_sync_advertises_a_finite_network_wait_budget(self):
         options = parse(run_cli("schema", "ledger", "sync"))["data"]["command"]["options"]
         budget = next(option for option in options if "--max-wait-seconds" in option["flags"])
@@ -246,7 +257,7 @@ class PromoteContractTests(unittest.TestCase):
         self.assertTrue(options["alpha_id"]["required"])
 
     def test_failure_keeps_one_saved_envelope_with_completed_evidence(self):
-        from research_app import alphas, triage
+        from research_app import alphas, promote, triage
 
         with tempfile.TemporaryDirectory() as directory:
             frozen = Path(directory) / "choice.json"
@@ -256,6 +267,7 @@ class PromoteContractTests(unittest.TestCase):
             with mock.patch.object(triage, "cmd_triage", side_effect=[
                     evidence, cli_runtime.CliError("INVALID_INPUT", "validation failed")]), \
                     mock.patch.object(alphas, "cmd_alpha_check") as check, \
+                    mock.patch.object(promote, "with_session", return_value={}), \
                     mock.patch.object(ml, "load_session", side_effect=AssertionError("offline")), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 code = cli_app.main(["promote", "A1", "--research-dir", directory,
@@ -901,6 +913,20 @@ class ErrorEnvelopeTests(unittest.TestCase):
 
 
 class DryRunTests(unittest.TestCase):
+    def test_simulate_native_multi_preview_keeps_per_arm_payloads(self):
+        proc = run_cli("simulate", "--expr", "rank(close)", "--expr", "rank(volume)",
+                       "--expr", "rank(open)", "--multi-size", "2", "--batch-size", "7",
+                       "--setting", "simulationMode=QUICK", "--setting", "visualization=false", "--dry-run")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        result = parse(proc)["data"]
+        payloads = [record["payload"] for record in result["results"]]
+        self.assertEqual(result["multi_size"], 2)
+        self.assertEqual(result["concurrency"], 7)
+        self.assertEqual(result["scheduling"]["multi_requests"], [
+            {"indices": [0, 1], "payload": payloads[:2]}, {"indices": [2], "payload": payloads[2]}])
+        self.assertTrue(all(payload["settings"]["simulationMode"] == "QUICK"
+                            and payload["settings"]["visualization"] is False for payload in payloads))
+
     def test_dry_run_needs_no_credentials_and_no_network(self):
         proc = run_cli("simulate", "--expr", "rank(cap)", "--dry-run")
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -1936,6 +1962,49 @@ class SimulationResumeTests(unittest.TestCase):
                 self.assertAlmostEqual(contribution["contribution"], 1.0)
             finally:
                 os.chdir(original_directory)
+
+    def test_native_multi_resume_reuses_saved_size_mode_and_parent_records(self):
+        parser = cli_parser.build_parser()
+        url = "https://api.worldquantbrain.com/simulations/parent"
+
+        def accept(_session, _pairs, **kwargs):
+            self.assertEqual(kwargs["multi_size"], 2)
+            records = [{**row, "multi_request_id": "request-1", "multi_member": index,
+                        "multi_size": 2, "status": "PENDING", "submission_attempted": True,
+                        "multi_parent_url": url} for index, row in enumerate(kwargs["initial_records"])]
+            kwargs["on_event"]("multi_submitted", {"records": [
+                {"index": index, **record} for index, record in enumerate(records)]})
+            saved = json.loads(path.read_text())
+            self.assertEqual([row["multi_parent_url"] for row in saved["records"]], [url, url])
+            return records
+
+        def complete(_session, _pairs, **kwargs):
+            self.assertEqual(kwargs["multi_size"], 2)
+            self.assertEqual(kwargs["settings"]["simulationMode"], "QUICK")
+            self.assertEqual([row["multi_parent_url"] for row in kwargs["initial_records"]], [url, url])
+            return [{**row, "alpha_id": "A%d" % index, "status": "COMPLETE",
+                    "multi_parent_terminal": True, "metrics": {"sharpe": 1.2}}
+                    for index, row in enumerate(kwargs["initial_records"])]
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "multi-checkpoint.json"
+            simulate = parser.parse_args(["simulate", "--expr", "rank(close)", "--expr", "rank(volume)",
+                "--multi-size", "2", "--setting", "simulationMode=QUICK", "--setting", "visualization=false",
+                "--no-record", "--checkpoint", str(path)])
+            with mock.patch.object(ml, "load_session", return_value=object()), \
+                    mock.patch.object(cli_experiments, "_invocation_capabilities", return_value={}), \
+                    mock.patch.object(cli_experiments, "_preflight_lint", return_value={}), \
+                    mock.patch.object(ml, "simulate_alphas", side_effect=accept):
+                first = cli_experiments.cmd_simulate(simulate, None)
+            self.assertEqual(first["status"], "PENDING")
+            self.assertEqual(first["multi_size"], 2)
+            resume = parser.parse_args(["resume", str(path)])
+            with mock.patch.object(cli_experiments, "with_session", side_effect=lambda _args, work, **kw: work(object())), \
+                    mock.patch.object(cli_experiments, "_invocation_capabilities", return_value={}), \
+                    mock.patch.object(ml, "simulate_alphas", side_effect=complete):
+                result = cli_experiments.cmd_resume(resume, None)
+            self.assertEqual(result["status"], "COMPLETE")
+            self.assertEqual([record["alpha_id"] for record in result["results"]], ["A0", "A1"])
 
     def test_cli_resume_restores_progress_saved_only_in_slot_journal(self):
         account = {"fingerprint": "synthetic-checkpoint-recovery"}

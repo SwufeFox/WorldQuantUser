@@ -499,8 +499,25 @@ journal saved the accepted job URL just before an interruption, `resume`,
 
 Daily simulation quota is separate from concurrency and transient HTTP throttling.
 Successful repeats and every successful multi-simulation child count; Alpha creation-date
-filters cannot reconstruct that count. The current runner sends individual REGULAR requests;
-`--batch-size` is not a multi-simulation array size or evidence of `MULTI_SIMULATION` permission.
+filters cannot reconstruct that count.
+
+Use `--multi-size N` on `simulate` or `probe` to opt in to native Multi Simulation.
+Each parent holds 2–10 simulation objects that BRAIN runs in sequence. `--batch-size`
+controls concurrent task slots, and the consultant documentation specifies up to eight
+concurrent Multi parents. Native Multi requires `MULTI_SIMULATION` permission. Each
+parent contains a compatible group, and a singleton tail uses the ordinary simulation path.
+
+```bash
+python research_cli.py simulate sample-batch.json --multi-size 4 --batch-size 2 --dry-run
+python research_cli.py simulate sample-batch.json --multi-size 4 --batch-size 2 --checkpoint multi-run.json
+python research_cli.py resume multi-run.json
+```
+
+The checkpoint retains the parent request and the child configuration for each result.
+Resume reads accepted parents before dispatching any queued work. A failed parent can
+still yield successful children, which are reconciled individually. `probe --from-simulation ID`
+inspects an existing parent and its children.
+[Consultant simulation features](https://platform.worldquantbrain.com/learn/documentation/consultant-information/multi-alpha-simulation)
 
 `scheduling.quota` retains `X-Ratelimit-Limit`, `X-Ratelimit-Remaining` and
 `X-Ratelimit-Reset` from simulation responses. `observed_at` and `reset_at` are Unix seconds;

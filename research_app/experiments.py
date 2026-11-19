@@ -21,6 +21,7 @@ import machine_lib as ml
 import research_config as config_io
 import research_paths
 import simulation_capabilities
+import simulation_multi
 import simulation_slots
 from tools import guarded_sim
 
@@ -133,10 +134,16 @@ def _write_simulation_checkpoint(path, checkpoint):
 
 _CHECKPOINT_EVENTS = {"submitting", "submitted", "pending", "completed", "failed", "deferred"}
 _CHECKPOINT_POLL_FIELDS = ("progress_url", "next_poll_at", "poll_after_seconds", "metrics_pending")
+_MULTI_CHECKPOINT_EVENTS = {"multi_submitting", "multi_submitted", "multi_pending"}
+_MULTI_CHECKPOINT_FIELDS = ("multi_request_id", "multi_member", "multi_size", "multi_parent_url",
+                            "multi_child_id", "multi_parent_terminal", "multi_parent_status")
 
 
 def _merge_checkpoint_record(previous, payload):
     updated = {**previous, **{key: value for key, value in payload.items() if key != "index"}}
+    if "multi_request_id" in payload and payload["multi_request_id"] is None:
+        for key in simulation_multi.STATE_KEYS:
+            updated.pop(key, None)
     if payload.get("alpha_id") or payload.get("status") in simulation_slots.TERMINAL_STATUSES:
         # Once a poll yields an Alpha ID, subsequent metrics reads use that ID.
         # Missing transport markers in the new event supersede the old ones.
@@ -146,24 +153,43 @@ def _merge_checkpoint_record(previous, payload):
     return updated
 
 
+def _checkpoint_event_updates(kind, payload, size):
+    if kind in _MULTI_CHECKPOINT_EVENTS:
+        rows = payload["records"]
+        indices = [row.get("index") for row in rows]
+        if (not indices or any(type(index) is not int or not 0 <= index < size for index in indices)
+                or len(set(indices)) != len(indices)):
+            raise ValueError("invalid native Multi checkpoint event indices")
+        return zip(indices, rows)
+    index = payload.get("index")
+    if kind in _CHECKPOINT_EVENTS and type(index) is int and 0 <= index < size:
+        return ((index, payload),)
+    return ()
+
+
 def _simulation_checkpoint_callback(path, checkpoint, sink):
     lock = threading.Lock()
 
     def on_event(kind, payload):
         with lock:
-            if kind in _CHECKPOINT_EVENTS:
-                index = payload.get("index")
-                if isinstance(index, int) and 0 <= index < len(checkpoint["records"]):
-                    previous = checkpoint["records"][index]
-                    updated = _merge_checkpoint_record(previous, payload)
-                    updated["role"] = alpha_registry.evidence_role(previous, payload)
-                    if updated != previous:
-                        checkpoint["records"][index] = updated
-                        try:
-                            _write_simulation_checkpoint(path, checkpoint)
-                        except BaseException:
-                            checkpoint["records"][index] = previous
-                            raise
+            records = checkpoint["records"]
+            updates = {}
+            for index, row in _checkpoint_event_updates(kind, payload, len(records)):
+                previous = records[index]
+                updated = _merge_checkpoint_record(previous, row)
+                updated["role"] = alpha_registry.evidence_role(previous, row)
+                if updated != previous:
+                    updates[index] = updated
+            if updates:
+                previous = {index: records[index] for index in updates}
+                for index, updated in updates.items():
+                    records[index] = updated
+                try:
+                    _write_simulation_checkpoint(path, checkpoint)
+                except BaseException:
+                    for index, record in previous.items():
+                        records[index] = record
+                    raise
             if sink:
                 sink(kind, payload)
 
@@ -255,6 +281,7 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
     has_unfinished = any(
         record.get("progress_url")
         or record.get("metrics_pending")
+        or _native_parent_pending(record)
         or record.get("status") in {"PENDING", "QUEUED", "UNKNOWN_SUBMISSION"}
         for record in records
     )
@@ -292,7 +319,7 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
         Path(checkpoint_path).unlink(missing_ok=True)
         checkpoint_path = None
     result = _simulation_result(display, settings, summary, checkpoint_path)
-    result.update({key: checkpoint[key] for key in ("concurrency", "scheduling", "capability_snapshot")
+    result.update({key: checkpoint[key] for key in ("concurrency", "scheduling", "capability_snapshot", "multi_size")
                    if key in checkpoint})
     result["unknown_submission"] = unknown
     result["results_total"] = len(records)
@@ -729,7 +756,7 @@ def _compact_preflight(report):
 
 def _summarize_probe_response(response):
     response["summary"] = _probe_summary(response)
-    for key in ("rows", "results", "incomplete", "comparisons", "arm_order", "preflight"):
+    for key in ("rows", "results", "incomplete", "comparisons", "arm_order", "preflight", "multi_requests"):
         items = response.get(key)
         if isinstance(items, list):
             response[key + "_total"] = len(items)
@@ -755,6 +782,33 @@ def _requested_concurrency(args, saved=None):
     if requested is not None and (isinstance(requested, bool) or not isinstance(requested, int) or requested < 1):
         raise CliError("INVALID_INPUT", "--batch-size must be a positive integer")
     return requested
+
+
+def _multi_options(args, saved=None):
+    size = getattr(args, "multi_size", None) if saved is None else saved.get("multi_size")
+    if size is None:
+        return {}
+    if type(size) is not int or not 2 <= size <= simulation_multi.MAX_CHILDREN:
+        raise CliError("INVALID_INPUT", f"--multi-size must be an integer from 2 to {simulation_multi.MAX_CHILDREN}")
+    return {"multi_size": size}
+
+
+def _validate_saved_native_owner(session, document):
+    if not document.get("multi_size"):
+        return
+    # Finished parents and singleton tails still bind a batch to its account
+    # when the scheduler only receives the remaining queued rows.
+    attempted = [record for record in document["records"] if (
+        record.get("submission_attempted") is True or record.get("alpha_id")
+        or record.get("progress_url") or record.get("multi_request_id"))]
+    if not attempted:
+        return
+    account = simulation_capabilities.account_provenance(session)
+    saved = ((document.get("capability_snapshot") or {}).get("account") or {}).get("fingerprint")
+    if saved and saved != account.get("fingerprint"):
+        raise CliError("INVALID_INPUT", "native Multi checkpoint belongs to another or unidentified account")
+    for record in attempted:
+        _selection_call(simulation_slots.validate_reservation_owner, record, account)
 
 
 def _invocation_capabilities(session, args, *, deadline=None):
@@ -1180,9 +1234,15 @@ def _terminal_probe_without_alpha(record):
 
 
 def _probe_needs_recovery(row):
+    if _native_parent_pending(row):
+        return True
     return (row.get("submission_attempted") is not False
             and (row.get("train_fitness") is None or row.get("metrics_pending"))
             and not _terminal_probe_without_alpha(row))
+
+
+def _native_parent_pending(record):
+    return bool(record.get("multi_parent_url") and not record.get("multi_parent_terminal"))
 
 
 def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.0,
@@ -1378,7 +1438,8 @@ def _load_probe_batch(value):
         record = {**record, "expression": arm["expression"], "settings": arm["settings"],
                   "decay": arm["settings"].get("decay"), "mechanism": arm["label"]}
         record["role"] = role
-        for key in ("alpha_id", "status", "submission_attempted", "error", "simulation_status", *_CHECKPOINT_POLL_FIELDS):
+        for key in ("alpha_id", "status", "submission_attempted", "error", "simulation_status",
+                    *_CHECKPOINT_POLL_FIELDS, *_MULTI_CHECKPOINT_FIELDS):
             if key not in record and key in row:
                 record[key] = row[key]
         if not record.get("out_of_sample"):
@@ -1391,6 +1452,8 @@ def _load_probe_batch(value):
                 record.pop(key, None)
         records.append(record)
     document["records"] = records
+    if any(record.get("multi_request_id") for record in records) and not _multi_options(None, document):
+        raise CliError("INVALID_INPUT", "native Multi batch lacks its saved request size")
     fingerprint = _request_fingerprint(arms)
     if document.get("request_fingerprint") and document["request_fingerprint"] != fingerprint:
         raise CliError("INVALID_INPUT", "saved probe request fingerprint does not match its arms")
@@ -1412,6 +1475,19 @@ def _cmd_probe_recover(args):
         raise CliError("SERVICE_ERROR", "this probe batch is already being updated", str(path)) from exc
 
 
+def _native_probe_groups(document):
+    """Keep every member of any unresolved native parent together on recovery."""
+    requests = {record["multi_request_id"] for row, record in zip(document["rows"], document["records"])
+                if record.get("multi_request_id") and (_native_parent_pending(record)
+                    or (not _has_finished_result(record) and _probe_needs_recovery(row)))}
+    groups = {}
+    for index, record in enumerate(document["records"]):
+        if record.get("multi_request_id") in requests:
+            settings = document["arms"][index]["settings"]
+            groups.setdefault(_settings_signature(settings), []).append(index)
+    return groups.values()
+
+
 def _recover_probe_batch(args, path):
     deadline = _simulation_deadline(args)
     path, document = _load_probe_batch(path)
@@ -1420,12 +1496,16 @@ def _recover_probe_batch(args, path):
         raise CliError("USAGE", "--show-test requires --selection")
     manifest = _selection_call(selection.load, args.selection) if show_test else None
     rows = document["rows"]
+    multi = _multi_options(args, document)
+    native_indices = list(_native_probe_groups(document))
 
     def recover(session):
         records = document["records"]
         account = None
+        if session is not None:
+            _validate_saved_native_owner(session, document)
         unresolved = [record for record in records if record.get("slot_reservation")
-                      and not _terminal_probe_without_alpha(record)]
+                      and not record.get("multi_request_id") and not _terminal_probe_without_alpha(record)]
         if session is not None and unresolved:
             account = simulation_capabilities.account_provenance(session)
             restored = [_selection_call(simulation_slots.restore_record, record, account)
@@ -1433,6 +1513,27 @@ def _recover_probe_batch(args, path):
             if any(restored):
                 _probe_document_update(document, path)
                 cache_store.write_json_atomic(path, document, indent=1)
+        native_before = {row["label"] for row in document["rows"]
+                         if row.get("multi_request_id") and row.get("train_fitness") is None}
+        if session is not None:
+            progress_lock = threading.Lock()
+            for indices in native_indices:
+                if time.monotonic() >= deadline:
+                    break
+                arms = [document["arms"][index] for index in indices]
+                settings = arms[0]["settings"]
+
+                def progress(kind, payload):
+                    with progress_lock:
+                        _save_probe_progress(document, path, indices, kind, payload)
+
+                produced = ml.simulate_alphas(session, [(arm["expression"], arm["settings"]["decay"])
+                    for arm in arms], settings=settings, labels=[arm["label"] for arm in arms],
+                    initial_records=[records[index] for index in indices], deadline=deadline,
+                    concurrency=document.get("concurrency"), on_event=progress, recover_only=True, **multi)
+                for index, record in zip(indices, produced):
+                    _update_probe_record(document, index, record)
+                _save_probe_checkpoint(document, path)
         active_rows = document["rows"]
         for row, record in zip(active_rows, records):
             if "simulation_status" in record:
@@ -1456,7 +1557,19 @@ def _recover_probe_batch(args, path):
             _probe_document_update(document, path)
             cache_store.write_json_atomic(path, document, indent=1)
 
-        outcome = _recover_probe_rows(session, active_rows, on_progress=save_recovered, deadline=deadline)
+        outcome = _recover_probe_rows(session, [row for row in active_rows
+            if not row.get("multi_request_id") and row["label"] not in native_before],
+            on_progress=save_recovered, deadline=deadline)
+        for row in active_rows:
+            label = row["label"]
+            if label in native_before:
+                if row.get("train_fitness") is None:
+                    outcome["still_missing"].append(label)
+                    if row.get("submission_attempted") is False:
+                        outcome["not_submitted"].append(label)
+                elif row.get("alpha_id"):
+                    outcome["matched"][label] = row["alpha_id"]
+                    outcome["recovered"] += 1
         _probe_halves(session, records, deadline=deadline)
         return outcome
 
@@ -1696,7 +1809,7 @@ def _recoverable_probe_reference(row):
     if row.get("alpha_id"):
         return True
     try:
-        ml._validated_progress_url(row.get("progress_url"))
+        ml._validated_progress_url(row.get("multi_parent_url") or row.get("progress_url"))
     except ml.SimulationError:
         return False
     return True
@@ -1793,6 +1906,21 @@ def _offline_simulation_lint(pairs, settings, scoped=None):
     return report
 
 
+def _preview_probe_group(args, group, concurrency, multi):
+    scheduling = {}
+    arms = group["arms"]
+    records = ml.simulate_alphas(None, group["pairs"], settings=group["settings"],
+        labels=[arm["label"] for arm in arms], dry_run=True, concurrency=concurrency,
+        capability_snapshot=getattr(args, "capability_snapshot", None), scheduling_report=scheduling,
+        **multi)
+    requests = []
+    for request in scheduling.pop("multi_requests", []):
+        included = [arms[index] for index in request["indices"]]
+        requests.append({**request, "indices": [arm["arm_index"] for arm in included],
+                         "labels": [arm["label"] for arm in included]})
+    return records, scheduling, requests
+
+
 def _cmd_probe(args, _sink):
     """Prepare exact requests before checking, executing or continuing a batch."""
     recover = getattr(args, "recover", None)
@@ -1808,6 +1936,7 @@ def _cmd_probe(args, _sink):
         return _cmd_probe_recover(args)
     if resume:
         return _cmd_probe_resume(args)
+    multi = _multi_options(args)
     spec, name, groups, arms, design, gate = _prepare_probe(args)
     target = Path(getattr(args, "batch_path", None) or research_paths.batch_path(name)).expanduser().resolve()
     source_paths = [Path(arm["source_file"]) for arm in arms if "source_file" in arm]
@@ -1819,7 +1948,7 @@ def _cmd_probe(args, _sink):
             "groups": len(groups), "design": design, "arm_order": [arm["label"] for arm in arms],
             "request_fingerprint": _request_fingerprint(arms),
             "concurrency": _requested_concurrency(args),
-            "settings": [group["settings"] for group in groups.values()]}
+            "settings": [group["settings"] for group in groups.values()], **multi}
     gate_blocking = [{"code": "exact_repeat", "label": arm["label"],
                       "evidence_keys": verdict["exact_repeat_keys"]}
                      for arm, verdict in zip(arms, gate)
@@ -1828,15 +1957,14 @@ def _cmd_probe(args, _sink):
         recovery_actions = _probe_checkpoint_refs(target, arms, gate)
         results = [None] * len(arms)
         reports = []
+        requests = []
         for group in groups.values():
             scoped = cached_field_scope(group["settings"])
             report = _offline_simulation_lint(group["pairs"], group["settings"], scoped)
             reports.append({**report, "scope": scoped.get("evidence")})
-            scheduling = {}
-            preview = ml.simulate_alphas(None, group["pairs"], settings=group["settings"],
-                labels=[arm["label"] for arm in group["arms"]], dry_run=True,
-                concurrency=base["concurrency"], scheduling_report=scheduling,
-                capability_snapshot=getattr(args, "capability_snapshot", None))
+            preview, scheduling, group_requests = _preview_probe_group(
+                args, group, base["concurrency"], multi)
+            requests.extend(group_requests)
             reports[-1]["scheduling"] = scheduling
             for record, arm in zip(preview, group["arms"]):
                 index = arm["arm_index"]
@@ -1850,6 +1978,7 @@ def _cmd_probe(args, _sink):
                     results[index]["source_file"] = arm["source_file"]
         blocking = [item for report in reports for item in report.get("errors", [])]
         return {**base, "dry_run": True, "results": results, "blocking": blocking,
+                **({"multi_requests": requests} if multi else {}),
                 "gate_blocking": gate_blocking, "would_block": bool(blocking or gate_blocking),
                 "preflight_complete": False, "run_id": None, "started_at": None,
                 "comparisons": _probe_comparisons(results, design),
@@ -1858,7 +1987,7 @@ def _cmd_probe(args, _sink):
                          "operator_catalog_checked": False, "field_catalog_checked": False,
                          "hint": "Live catalogs were not checked; run probe --check for exact authenticated preflight.",
                          "groups": reports},
-                "next_actions": recovery_actions or [{"action": "check", "spec": str(args.spec)}]}
+                "next_actions": recovery_actions or [{"action": "check", "spec": str(args.spec), **multi}]}
     if gate_blocking:
         raise CliError("INVALID_INPUT", "exact finished requests repeat under --strict-gate",
                        details={"gate_blocking": gate_blocking})
@@ -1880,7 +2009,7 @@ def _cmd_probe(args, _sink):
                 "preflight_complete": len(reports) == len(groups)
                 and all(bool(report) and report.get("ok", False) for report in reports),
                 "run_id": None, "started_at": None,
-                "next_actions": [{"action": "run", "spec": str(args.spec), "batch_path": str(target)}]}
+                "next_actions": [{"action": "run", "spec": str(args.spec), "batch_path": str(target), **multi}]}
     try:
         with cache_store.file_lock(str(target) + ".lock", timeout=0):
             if target.exists() and not getattr(args, "force", False):
@@ -1907,7 +2036,7 @@ def _probe_row(record, arm, gate, show_test):
            "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
            "ops": arm["ops"], "gate": gate}
     row["incentives"] = incentives.check_summary(record.get("checks"))
-    for key in (*_CHECKPOINT_POLL_FIELDS, "submission_attempted"):
+    for key in (*_CHECKPOINT_POLL_FIELDS, *_MULTI_CHECKPOINT_FIELDS, "submission_attempted"):
         if key in record:
             row[key] = record[key]
     if show_test:
@@ -1923,7 +2052,7 @@ def _probe_row(record, arm, gate, show_test):
 def _submission_state(record):
     if _terminal_probe_without_alpha(record):
         return "terminal"
-    if record.get("alpha_id") or record.get("progress_url"):
+    if record.get("alpha_id") or record.get("progress_url") or record.get("multi_parent_url"):
         return "accepted"
     return "not_submitted" if record.get("submission_attempted") is False else "unknown_submission"
 
@@ -1948,7 +2077,9 @@ def _probe_document_update(document, target):
     if any(_probe_needs_recovery(row) for row in rows):
         actions.append({"action": "recover", "batch_path": str(target), "platform_read_only": True})
     if any(row["submission_state"] == "not_submitted"
-           or (row["submission_state"] == "accepted" and row.get("progress_url")) for row in rows):
+           or (row["submission_state"] == "accepted"
+               and (row.get("progress_url") or _native_parent_pending(row)))
+           for row in rows):
         actions.append({"action": "resume", "batch_path": str(target), "requires_explicit_request": True})
     if document.get("recording_policy", {}).get("enabled") and not document.get("recording"):
         actions.append({"action": "recover", "batch_path": str(target), "reason": "reconcile_recording"})
@@ -1961,7 +2092,7 @@ def _probe_response(document, path, show_test=False, manifest=None, summary=Fals
     keys = ("name", "idea", "mechanism", "note", "run_id", "started_at", "request_fingerprint",
             "arm_order", "design", "complete", "incomplete", "all_empty", "comparisons",
             "execution", "recording", "recording_policy", "next_actions", "preflight",
-            "concurrency", "scheduling", "capability_snapshot")
+            "concurrency", "scheduling", "capability_snapshot", "multi_size")
     rows = [_probe_visible_row(row, show_test) for row in document["rows"]]
     if manifest is not None:
         sources = {row.get("source_file") for row in manifest["rows"] if row.get("source_file")}
@@ -2031,52 +2162,100 @@ def _probe_halves(session, records, *, deadline=None):
             record.pop("half_sharpes_error", None)
 
 
+def _update_probe_record(document, index, payload, *, submitting=False):
+    records = document["records"]
+    merged = _merge_checkpoint_record(records[index], payload)
+    arm = document["arms"][index]
+    merged.update({"settings": dict(arm["settings"]), "expression": arm["expression"],
+                   "mechanism": arm["label"], "decay": arm["settings"]["decay"]})
+    merged["role"] = alpha_registry.evidence_role(arm, records[index], payload)
+    if submitting:
+        merged.update({"submission_attempted": True, "status": "UNKNOWN_SUBMISSION"})
+    if merged.get("alpha_id") or merged.get("progress_url") or merged.get("multi_parent_url"):
+        merged["submission_attempted"] = True
+    if _has_finished_result(merged):
+        for key in ("progress_url", "next_poll_at", "metrics_pending"):
+            if key not in payload:
+                merged.pop(key, None)
+    records[index] = merged
+
+
+def _save_probe_checkpoint(document, target):
+    _probe_document_update(document, target)
+    cache_store.write_json_atomic(target, document, indent=1)
+
+
+def _save_probe_progress(document, target, indices, kind, payload):
+    updates = [(indices[index], row) for index, row in _checkpoint_event_updates(kind, payload, len(indices))]
+    if not updates:
+        return
+    records = document["records"]
+    previous = {index: records[index] for index, _row in updates}
+    try:
+        for index, row in updates:
+            _update_probe_record(document, index, row, submitting=kind in {"submitting", "multi_submitting"})
+        _save_probe_checkpoint(document, target)
+    except BaseException:
+        for index, record in previous.items():
+            records[index] = record
+        _probe_document_update(document, target)
+        raise
+
+
 def _execute_probe(args, document, target, groups):
     deadline = _simulation_deadline(args)
     proof_cache = {}
     records = document["records"]
     state_lock = threading.Lock()
+    multi = _multi_options(args, document)
 
     def save():
-        _probe_document_update(document, target)
-        cache_store.write_json_atomic(target, document, indent=1)
-
-    def update(index, payload, kind=None):
-        merged = _merge_checkpoint_record(records[index], payload)
-        arm = document["arms"][index]
-        merged.update({"settings": dict(arm["settings"]), "expression": arm["expression"],
-                       "mechanism": arm["label"], "decay": arm["settings"]["decay"]})
-        merged["role"] = alpha_registry.evidence_role(arm, records[index], payload)
-        if kind == "submitting":
-            merged.update({"submission_attempted": True, "status": "UNKNOWN_SUBMISSION"})
-        if merged.get("alpha_id") or merged.get("progress_url"):
-            merged["submission_attempted"] = True
-        if _has_finished_result(merged):
-            for key in ("progress_url", "next_poll_at", "metrics_pending"):
-                if key not in payload:
-                    merged.pop(key, None)
-        records[index] = merged
+        _save_probe_checkpoint(document, target)
 
     def progress(indices, kind, payload):
-        index = payload.get("index")
-        if kind in _CHECKPOINT_EVENTS \
-                and isinstance(index, int) and 0 <= index < len(indices):
-            with state_lock:
-                update(indices[index], payload, kind)
-                save()
+        with state_lock:
+            _save_probe_progress(document, target, indices, kind, payload)
         note("  %s" % kind)
 
+    def run_group(session, group, *, launching=False, preflight=None, fetch_metrics=True):
+        indices = [arm["arm_index"] for arm in group["arms"]]
+        scheduling = {}
+        document.setdefault("scheduling", []).append(scheduling)
+        options = dict(labels=[arm["label"] for arm in group["arms"]],
+            concurrency=document["concurrency"], capability_snapshot=document["capability_snapshot"],
+            scheduling_report=scheduling, initial_records=[records[index] for index in indices],
+            deadline=deadline, fetch_metrics=fetch_metrics,
+            on_event=lambda kind, payload: progress(indices, kind, payload), **multi)
+        if launching:
+            produced = guarded_sim.simulate([expression for expression, _ in group["pairs"]],
+                group["settings"], session=session, preflight=preflight,
+                force=getattr(args, "allow_lint_errors", False), **options)
+        else:
+            if multi:
+                options["recover_only"] = True
+            produced = ml.simulate_alphas(session, group["pairs"], settings=group["settings"], **options)
+        with state_lock:
+            for index, record in zip(indices, produced):
+                _update_probe_record(document, index, record)
+            save()
+        return produced
+
     def work(session):
+        _validate_saved_native_owner(session, document)
         document["capability_snapshot"] = _invocation_capabilities(session, args, deadline=deadline)
         document.setdefault("preflight", [])
         save()
-        ordered = sorted(groups.values(), key=lambda group: any(
-            _submission_state(records[arm["arm_index"]]) == "not_submitted" for arm in group["arms"]))
-        for group in ordered:
-            indices = [arm["arm_index"] for arm in group["arms"]]
-            launching = any(_submission_state(records[index]) == "not_submitted" for index in indices)
+        def launches(group):
+            return any(_submission_state(records[arm["arm_index"]]) == "not_submitted"
+                       for arm in group["arms"])
+
+        ordered = sorted(((launches(group), group) for group in groups.values()), key=lambda item: item[0])
+        last_launch = len(ordered) - 1 if ordered[-1][0] else -1
+        deferred_metrics = []
+        for position, (launching, group) in enumerate(ordered):
             if time.monotonic() >= deadline:
                 break
+            preflight = None
             if launching:
                 preflight = _preflight_lint(session, group["pairs"], group["settings"], args,
                                             deadline=deadline, proof_cache=proof_cache)
@@ -2084,26 +2263,28 @@ def _execute_probe(args, document, target, groups):
                 save()
             if time.monotonic() >= deadline:
                 break
-            scheduling = {}
-            document.setdefault("scheduling", []).append(scheduling)
-            options = dict(labels=[arm["label"] for arm in group["arms"]],
-                concurrency=document["concurrency"], capability_snapshot=document["capability_snapshot"],
-                scheduling_report=scheduling, initial_records=[records[index] for index in indices],
-                deadline=deadline,
-                on_event=lambda kind, payload, positions=indices: progress(positions, kind, payload))
-            if launching:
-                produced = guarded_sim.simulate([expression for expression, _ in group["pairs"]],
-                    group["settings"], session=session, preflight=preflight,
-                    force=getattr(args, "allow_lint_errors", False), **options)
-            else:
-                produced = ml.simulate_alphas(session, group["pairs"], settings=group["settings"], **options)
-            with state_lock:
-                for index, record in zip(indices, produced):
-                    update(index, record)
-                save()
-            if launching and any(record.get("progress_url") or record.get("metrics_pending")
-                   or record.get("status") in {"PENDING", "QUEUED", "UNKNOWN_SUBMISSION"} for record in produced):
+            fetch_metrics = position >= last_launch
+            produced = run_group(session, group, launching=launching, preflight=preflight,
+                                 fetch_metrics=fetch_metrics)
+            if not fetch_metrics:
+                waiting = [(arm, pair) for arm, pair, record in zip(group["arms"], group["pairs"], produced)
+                           if record.get("alpha_id") and record.get("metrics_pending")
+                           and not record.get("progress_url")]
+                if waiting:
+                    arms, pairs = zip(*waiting)
+                    deferred_metrics.append(group if multi else
+                        {"settings": group["settings"], "arms": arms, "pairs": pairs})
+            if launching and any(
+                record.get("progress_url") or record.get("status") in {"QUEUED", "UNKNOWN_SUBMISSION"}
+                or (record.get("status") == "PENDING"
+                    and not (record.get("alpha_id") and record.get("metrics_pending")))
+                for record in produced
+            ):
                 break
+        for group in deferred_metrics:
+            if time.monotonic() >= deadline:
+                break
+            run_group(session, group)
         _probe_halves(session, records, deadline=deadline)
 
     document["concurrency"] = _requested_concurrency(args, document)
@@ -2119,6 +2300,7 @@ def _run_probe(args, spec, name, groups, design, gate, target):
     arms = sorted([arm for group in groups.values() for arm in group["arms"]], key=lambda arm: arm["arm_index"])
     document = {"format": "probe-batch", "version": 2, "spec": str(args.spec), "name": name,
         **{key: spec[key] for key in ("idea", "mechanism", "note") if key in spec},
+        **_multi_options(args),
         "run_id": str(uuid.uuid4()), "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "request_fingerprint": _request_fingerprint(arms), "arm_order": [arm["label"] for arm in arms],
         "arms": arms, "design": design, "gate": gate, "cost_bps": getattr(args, "cost_bps", None),
@@ -2133,7 +2315,7 @@ def _run_probe(args, spec, name, groups, design, gate, target):
 
 def _reject_saved_overrides(args, mode="resume/recover"):
     changing = ("setting", "region", "universe", "instrument_type", "neutralization",
-                "decay", "delay", "truncation", "pasteurization", "nan_handling", "test_period")
+                "decay", "delay", "truncation", "pasteurization", "nan_handling", "test_period", "multi_size")
     if any(getattr(args, key, None) is not None for key in changing):
         raise CliError("USAGE", f"{mode} uses saved settings; explicit overrides are not allowed")
 
@@ -2150,13 +2332,19 @@ def _cmd_probe_resume(args):
 
     def groups_for(saved):
         groups = {}
+        native_members = {index for indices in _native_probe_groups(saved) for index in indices}
         for arm, record in zip(saved["arms"], saved["records"]):
-            if _terminal_probe_without_alpha(record) or _has_finished_result(record):
-                continue
-            _selection_call(simulation_slots.restore_record, record)
-            state = _submission_state(record)
-            if state == "unknown_submission":
-                continue
+            if record.get("multi_request_id"):
+                if arm["arm_index"] not in native_members:
+                    continue
+                state = "native_parent"
+            else:
+                if _terminal_probe_without_alpha(record) or _has_finished_result(record):
+                    continue
+                _selection_call(simulation_slots.restore_record, record)
+                state = _submission_state(record)
+                if state == "unknown_submission":
+                    continue
             if not arm.get("settings") or not arm.get("expression"):
                 raise CliError("INVALID_INPUT", "legacy batch lacks exact requests; cannot resume")
             if state == "not_submitted" and ml.resolve_settings(arm["settings"]) != arm["settings"]:
@@ -2170,8 +2358,17 @@ def _cmd_probe_resume(args):
     if getattr(args, "dry_run", False):
         document["concurrency"] = _requested_concurrency(args, document)
         groups = groups_for(document)
+        multi = _multi_options(args, document)
+        requests = []
+        if multi:
+            for (_signature, state), group in groups.items():
+                if state == "not_submitted":
+                    _records, _scheduling, group_requests = _preview_probe_group(
+                        args, group, document["concurrency"], multi)
+                    requests.extend(group_requests)
         _probe_document_update(document, path)
         return {**_probe_response(document, path, summary=getattr(args, "summary", False)), "dry_run": True, "resume": True,
+                **({"multi_requests": requests} if multi else {}),
                 "continuing": [arm["label"] for group in groups.values() for arm in group["arms"]],
                 "blocked_unknown": [arm["label"] for arm, record in zip(document["arms"], document["records"])
                                     if _submission_state(record) == "unknown_submission"]}
@@ -2186,6 +2383,7 @@ def _cmd_probe_resume(args):
 def cmd_simulate(args, sink):
     """Simulate a batch of expressions, or dry-run exact payloads offline."""
     concurrency = _requested_concurrency(args)
+    multi = _multi_options(args)
     metadata = {}
     file_settings, alphas = collect_alphas(args, metadata=metadata)
     settings = merge_settings(file_settings, args)
@@ -2209,6 +2407,7 @@ def cmd_simulate(args, sink):
             families=families, candidates=candidates,
             concurrency=concurrency, capability_snapshot=getattr(args, "capability_snapshot", None),
             scheduling_report=scheduling,
+            **multi,
         )
         for record, role in zip(records, roles):
             record["role"] = role
@@ -2221,6 +2420,7 @@ def cmd_simulate(args, sink):
             "dry_run": True,
             "settings": settings,
             "concurrency": concurrency, "scheduling": scheduling,
+            **multi,
             "summary": {"total": len(records), "payloads": len(records)},
             "lint": {
                 "operator_catalog_checked": False,
@@ -2252,6 +2452,7 @@ def cmd_simulate(args, sink):
 
         validated_session, snapshot = run(preflight)
         checkpoint = _simulation_checkpoint_document(settings, pairs, concurrency, labels, families, candidates, roles)
+        checkpoint.update(multi)
         if metadata:
             checkpoint["metadata"] = metadata
         checkpoint["capability_snapshot"] = snapshot
@@ -2281,6 +2482,7 @@ def cmd_simulate(args, sink):
                 labels=labels,
                 families=families,
                 candidates=candidates,
+                **multi,
             )
 
         records = run(simulate)
@@ -2328,6 +2530,9 @@ def _resume_simulation(args, sink, path):
         for record in records
     ]
     settings = checkpoint.get("settings") or ml.default_settings()
+    multi = _multi_options(args, checkpoint)
+    if not multi and any(record.get("multi_request_id") for record in records):
+        raise CliError("INVALID_INPUT", "native Multi checkpoint lacks its saved request size")
     concurrency = _requested_concurrency(args, checkpoint)
     checkpoint["concurrency"] = concurrency
     policy = checkpoint.get("recording_policy")
@@ -2341,10 +2546,13 @@ def _resume_simulation(args, sink, path):
                 raise CliError("USAGE", "resume uses the saved recording policy; %s cannot change" % key)
             setattr(args, key, value)
     for record in records:
-        _selection_call(simulation_slots.restore_record, record)
+        if not record.get("multi_request_id"):
+            _selection_call(simulation_slots.restore_record, record)
     if not any(
         record.get("progress_url")
         or record.get("metrics_pending")
+        or _native_parent_pending(record)
+        or (record.get("multi_request_id") and record.get("status") in {"PENDING", "UNKNOWN_SUBMISSION"})
         or record.get("status") == "QUEUED"
         for record in records
         if isinstance(record, dict)
@@ -2355,11 +2563,12 @@ def _resume_simulation(args, sink, path):
     on_event = _simulation_checkpoint_callback(path, checkpoint, sink)
     checkpoint["scheduling"] = {}
     def resume(session):
+        _validate_saved_native_owner(session, checkpoint)
         checkpoint["capability_snapshot"] = _invocation_capabilities(session, args, deadline=deadline)
         return ml.simulate_alphas(session, pairs, settings=settings, concurrency=concurrency,
             capability_snapshot=checkpoint["capability_snapshot"], scheduling_report=checkpoint["scheduling"],
             on_event=on_event, deadline=deadline,
-            initial_records=checkpoint["records"], labels=labels, candidates=candidates)
+            initial_records=checkpoint["records"], labels=labels, candidates=candidates, **multi)
     records = with_session(args, resume, deadline=deadline)
     return _finalize_simulation(
         records,

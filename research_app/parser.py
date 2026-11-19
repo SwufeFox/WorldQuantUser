@@ -15,6 +15,7 @@ import field_contract
 import machine_lib as ml
 import research_config as config_io
 import research_paths
+import simulation_multi
 
 from .selection import DEFAULT_PROMOTION_RETENTION
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
@@ -203,6 +204,12 @@ def _add_concurrency_args(parser):
     parser.add_argument("--batch-size", dest="concurrency", type=_positive_count, default=None,
                         help="Requested simulation concurrency. Published account limits take precedence; "
                              "unpublished capacity uses a reported local policy, not a claimed platform allowance.")
+
+
+def _add_multi_size_arg(parser):
+    parser.add_argument("--multi-size", type=int, choices=range(2, simulation_multi.MAX_CHILDREN + 1),
+                        help="Opt in to native BRAIN Multi with up to this many Alphas per request. "
+                             "Requires MULTI_SIMULATION; the size is kept for resume.")
 
 
 def _add_settings_args(parser):
@@ -822,6 +829,7 @@ def build_parser():
                           "Later file settings override earlier files.")
     _add_settings_args(sim)
     _add_concurrency_args(sim)
+    _add_multi_size_arg(sim)
     sim.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
                      help="Shared wait budget for login, preflight and simulation. Longer Retry-After "
                           "waits are saved for resume (default: 300).")
@@ -1017,6 +1025,7 @@ def build_parser():
     _add_settings_args(probe)
     _add_session_args(probe)
     _add_concurrency_args(probe)
+    _add_multi_size_arg(probe)
     probe.add_argument("--name", default=None,
                        help="Batch name for the output file (default: the spec's name).")
     probe_mode = probe.add_mutually_exclusive_group()

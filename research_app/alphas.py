@@ -336,6 +336,20 @@ def _candidate_role(args, evidence=None):
         raise CliError("INVALID_INPUT", str(exc)) from exc
 
 
+def _reject_quick_simulation(args, payload):
+    quick = ml.is_quick_simulation(payload)
+    settings = payload.get("settings")
+    if not quick and (not isinstance(settings, dict) or settings.get("simulationMode") is None):
+        # Some older Alpha responses omit the mode. Only use saved evidence
+        # for this exact ID, since identical expressions can be run in either mode.
+        entries = alpha_registry.load_entries(getattr(args, "registry", None))
+        quick = any(ml.is_quick_simulation(entry) for entry in entries
+                    if entry.get("alpha_id") == args.alpha_id)
+    if quick:
+        raise CliError("INVALID_INPUT", "%s was simulated in Quick Mode" % args.alpha_id,
+                       "rerun the expression in Full Mode and use the resulting Alpha ID")
+
+
 def _selection_id(args, required=False):
     path = getattr(args, "selection", None)
     if not path:
@@ -477,6 +491,9 @@ def submit_workflow(session, args, shelf_entry=None):
         if prior.get("state") == "CONFIRMED" and not _confirmed(current):
             result["confirmation_evidence"] = "durable_journal"
             current = {**current, "dateSubmitted": (prior.get("platform") or {}).get("dateSubmitted")}
+        pending_attempt = prior.get("state") in {"INTENT", "ACCEPTED", "UNCERTAIN", "UNKNOWN"}
+        if not confirmed and not pending_attempt:
+            _reject_quick_simulation(args, current)
         selection_id = prior.get("selection_id")
         if not confirmed:
             selection_id = _selection_id(args, required=False) or selection_id
@@ -486,7 +503,7 @@ def submit_workflow(session, args, shelf_entry=None):
             if confirmed:
                 result.update(submitted=True, submission="CONFIRMED",
                               date_submitted=current.get("dateSubmitted"))
-            elif prior.get("state") in {"INTENT", "ACCEPTED", "UNCERTAIN", "UNKNOWN"}:
+            elif pending_attempt:
                 result.update(submitted=False, submission=prior["state"],
                               reason="previous attempt requires platform read-back; no repeated POST")
             else:
@@ -494,7 +511,7 @@ def submit_workflow(session, args, shelf_entry=None):
                                                max_wait_seconds=max_wait))
             result.update(dry_run=True, reconciled=False)
             return result
-        if not confirmed and prior.get("state") in {"INTENT", "ACCEPTED", "UNCERTAIN", "UNKNOWN"}:
+        if not confirmed and pending_attempt:
             result.update(submitted=False, submission=prior["state"],
                           reason="previous attempt is unresolved; no repeated POST",
                           repair_actions=["read platform status again with this command"])

@@ -770,8 +770,9 @@ checkpoint。收到取消或记账写入失败时，错误回执给出已保留�
 修复写入问题后，可用 `resume PATH` 向原台账补记已完成的结果。
 
 `--max-wait-seconds` 默认 300 秒。登录、预检、模拟、恢复查询和 PnL 补读共用一次等待预算。
-预算耗尽或前组未完成时，后续工作保持排队。`--recover` 接受批次或保存的回执，只读取现有任务并幂等补账。
-指标尚未生成时保留等待状态和建议重试时间，稍后可继续读取。
+预算耗尽时，未发出的工作保持排队。任务进入终态后立即释放槽位，空位可在同一组接下一条任务。
+前组若只剩指标待取，`probe` 会先启动后续设置组，再在剩余预算内补读。指标尚未生成时，
+回执保留 Alpha ID、等待状态和建议重试时间。`--recover` 接受批次或保存的回执，只读现有任务并幂等补账。
 连接中断和暂时的网关错误允许在预算内重试读取。重试后仍无法读取时，已接受模拟保留原有任务
 或 Alpha ID，供 `resume` 使用。网关错误或超时造成的未知提交要先回读平台状态。
 `--resume` 继续已排队或已接受的任务，支持离线预览。同批次的运行和恢复持有互斥锁。
@@ -784,13 +785,15 @@ checkpoint。收到取消或记账写入失败时，错误回执给出已保留�
 只有确认完成或拒绝才释放。不同研究目录及工具外启动的任务不共享这份占位。
 恢复可调整并发而不改变研究请求指纹；权限收缩时先取回已接受任务，再核验新启动的请求。
 
+批量初筛可以用 `--setting simulationMode=QUICK --setting visualization=false`。
+有训练期和留存期拆分要求时可同时显式设置 `--test-period P1Y`。候选晋级、入架和新提交
+需要用 `--setting simulationMode=FULL` 复跑，通过原有门槛后使用 Full 结果的 Alpha ID。
+
 `simulate/resume` 使用 `scheduling.quota` 展示配额观察；完整 probe 批次保留
 `scheduling[].quota`，`probe --summary` 的 `summary.quota` 仅保留最近一次观察，不复制调度历史。
 
 每日配额、并发占位与请求限流是不同信息。成功的重复模拟及 multi 的每个成功子模拟都会
 计数；Alpha 列表只保留首次创建日，不能靠“今天新增多少 Alpha”重建剩余额度。
-本工具目前发送单个 REGULAR 请求；API 文档中的 2–10 个对象 multi 数组另需
-`MULTI_SIMULATION` 权限，不能把该数组长度当成 `--batch-size` 的含义或账户日限额。
 
 模拟响应头的 `X-Ratelimit-Limit/Remaining/Reset` 作为配额观察保留；Reset 是秒数间隔。
 `limit/remaining` 缺失或非法保持 null，`observed_at/reset_at` 使用 Unix 秒，
@@ -820,6 +823,38 @@ FASTEXPR 从 AST 提取用到的字段与类型，Python 则使用 `@alpha` 的�
 无精确命中、多个精确命中或搜索出错时，未核验字段保留为 `unknown`。
 回执以 `required_fields_only` 记录这次核验，离线所用的完整快照由独立的目录检查维护。
 
+
+### 原生 Multi 回测
+
+在 `simulate` 或 `probe` 上显式设置 `--multi-size`，每个父任务打包指定数量的 Alpha。
+`--dry-run` 展开实际会发送的数组和单条请求。`simulate` 的预览在 `scheduling.multi_requests`，
+`probe` 的预览在 `multi_requests`。完整批次或 checkpoint 保存打包设置，恢复时直接使用。
+
+```bash
+python3 research_cli.py simulate sample-batch.json --multi-size 4 --batch-size 2 --dry-run
+python3 research_cli.py simulate sample-batch.json --multi-size 4 --batch-size 2 --checkpoint multi-run.json
+python3 research_cli.py resume multi-run.json
+python3 research_cli.py probe sample-batch.spec.json --multi-size 4 --batch-size 2 --dry-run
+python3 research_cli.py probe sample-batch.spec.json --multi-size 4 --batch-size 2 --batch-path multi-probe.json
+python3 research_cli.py probe --recover multi-probe.json
+```
+
+BRAIN 要求 `MULTI_SIMULATION` 权限。同一父任务内的 Alpha 类型、标的类型、Region、
+Delay 和 Language 必须一致。工具沿用 `probe` 的设置分组，末尾单独一条时发普通模拟。
+父任务之间并发，组内子回测顺序运行。
+[顾问 Multi 说明](https://platform.worldquantbrain.com/learn/documentation/consultant-information/multi-alpha-simulation)
+
+| 参数和计数 | 原生 Multi 含义 |
+| --- | --- |
+| `--multi-size` | 每个父任务打包 2–10 条 |
+| `--batch-size` | 同时占用的任务槽位，顾问文档的 Multi 父任务上限为 8 |
+| 每日配额 | 每条成功子回测单独计 1 次 |
+
+工具在发单前保存父任务和子配置，接受后记录父任务地址。恢复时从地址读取子任务，分别
+记录成功、失败及待确认的结果。父任务报错并返回子列表时，已确认成功的子结果仍可入账。
+任务身份不明时保留待核对状态。`probe --recover` 只读已保存的父任务，`probe --resume`
+还可继续排队的回测。`probe --from-simulation ID` 可只读检查平台上已有的父任务。
+[BRAIN 父子任务 API](https://platform.worldquantbrain.com/learn/documentation/brain-api/brain-api#simulations)
 
 ### 合并已有结果与读取实时检查
 

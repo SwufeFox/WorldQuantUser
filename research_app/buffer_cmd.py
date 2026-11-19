@@ -197,7 +197,7 @@ def _checks_summary(checks):
 
 def cmd_buffer_add(args, _sink, *, checked=None):
     """Run the checks on a finished alpha and put it on the shelf without submitting."""
-    from .alphas import _candidate_role, _selection_id
+    from .alphas import _candidate_role, _reject_quick_simulation, _selection_id
     role = _candidate_role(args)
     selection_id = _selection_id(args)
     def work(session):
@@ -205,6 +205,7 @@ def cmd_buffer_add(args, _sink, *, checked=None):
         if str(payload.get("status") or "").upper() in {"ACTIVE", "SUBMITTED"}:
             raise CliError("INVALID_INPUT", "submitted alphas cannot enter the shelf",
                            "use alpha submit --yes to repair their local records")
+        _reject_quick_simulation(args, payload)
         # The body's snapshot usually has SELF_CORRELATION PENDING; the check endpoint
         # computes it. Shelving on the snapshot would record a NULL where the whole
         # point of the shelf is that number.

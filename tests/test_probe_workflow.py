@@ -81,6 +81,74 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertFalse(first["preflight_complete"])
         self.assertFalse(self.batch.exists())
 
+    def test_native_multi_preview_groups_compatible_settings_in_arm_order(self):
+        with mock.patch.object(app, "cached_field_scope", return_value={"evidence": {"state": "unknown"}}), \
+                mock.patch.object(app, "_turnover_band", return_value={}), \
+                mock.patch.object(app, "with_session", side_effect=AssertionError("offline")):
+            result = self.run_probe(dry_run=True, multi_size=2)
+        self.assertEqual(result["arm_order"], ["first", "second", "third"])
+        self.assertEqual(result["multi_size"], 2)
+        self.assertEqual([(request["indices"], request["labels"]) for request in result["multi_requests"]],
+                         [([0, 2], ["first", "third"]), ([1], ["second"])])
+        payloads = [row["payload"] for row in result["results"]]
+        self.assertEqual([request["payload"] for request in result["multi_requests"]],
+                         [[payloads[0], payloads[2]], payloads[1]])
+
+    def test_native_parent_checkpoint_recovers_entire_group_without_launching(self):
+        parent_url = "https://api.worldquantbrain.com/simulations/synthetic-parent"
+
+        def interrupted(expressions, settings, **kwargs):
+            self.assertEqual(kwargs["multi_size"], 2)
+            rows = [{"index": index, "multi_request_id": "synthetic-request", "multi_member": index,
+                     "multi_size": 2, "submission_attempted": True, "status": "UNKNOWN_SUBMISSION"}
+                    for index in range(2)]
+            kwargs["on_event"]("multi_submitting", {"records": rows})
+            saved = json.loads(self.batch.read_text())["records"]
+            self.assertEqual([row.get("multi_request_id") for row in saved],
+                             ["synthetic-request", None, "synthetic-request"])
+            rows = [{**row, "status": "PENDING", "multi_parent_url": parent_url} for row in rows]
+            kwargs["on_event"]("multi_submitted", {"records": rows})
+            raise KeyboardInterrupt
+
+        with mock.patch.object(app.guarded_sim, "simulate", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_probe(multi_size=2, no_record=True)
+        with self.assertRaises(CliError):
+            app.cmd_probe(arguments(resume=str(self.batch), dry_run=True, multi_size=3), None)
+        preview = app.cmd_probe(arguments(resume=str(self.batch), dry_run=True), None)
+        self.assertEqual([(request["indices"], request["labels"]) for request in preview["multi_requests"]],
+                         [([1], ["second"])])
+
+        def read_parent(session, expressions, **kwargs):
+            self.assertIs(kwargs["recover_only"], True)
+            self.assertEqual(kwargs["multi_size"], 2)
+            self.assertEqual(kwargs["labels"], ["first", "third"])
+            records = kwargs["initial_records"]
+            self.assertTrue(all(row["multi_parent_url"] == parent_url for row in records))
+            return [{**row, **finished(label), "multi_parent_terminal": True}
+                    for row, label in zip(records, ("SYNTHETIC_FIRST", "SYNTHETIC_THIRD"))]
+
+        with mock.patch.object(ml, "simulate_alphas", side_effect=read_parent) as recover, \
+                mock.patch.object(ml, "poll_simulation", side_effect=AssertionError("parent is not a single job")), \
+                mock.patch.object(ml, "list_alphas", side_effect=AssertionError("no heuristic recovery")):
+            result = app.cmd_probe(arguments(recover=str(self.batch)), None)
+        recover.assert_called_once()
+        self.assertEqual(result["multi_size"], 2)
+        self.assertEqual(result["matched"], {"first": "SYNTHETIC_FIRST", "third": "SYNTHETIC_THIRD"})
+        self.assertEqual(result["not_submitted"], ["second"])
+
+        stored = json.loads(self.batch.read_text())
+        stored["capability_snapshot"]["account"]["fingerprint"] = "original-account"
+        self.batch.write_text(json.dumps(stored))
+        with mock.patch.object(app.simulation_capabilities, "account_provenance",
+                               return_value={"fingerprint": "other-account"}), \
+                mock.patch.object(app, "_invocation_capabilities") as capabilities, \
+                mock.patch.object(app.guarded_sim, "simulate") as launch:
+            with self.assertRaisesRegex(CliError, "belongs to another"):
+                app.cmd_probe(arguments(resume=str(self.batch)), None)
+        capabilities.assert_not_called()
+        launch.assert_not_called()
+
     def test_check_reports_incomplete_without_simulating(self):
         with mock.patch.object(app, "_preflight_lint", return_value={"ok": False,
                 "coverage": {"fields": "unknown"}}), mock.patch.object(app.guarded_sim, "simulate") as simulate:
@@ -240,6 +308,58 @@ class ProbeWorkflowTests(unittest.TestCase):
         saved = json.loads(self.batch.read_text(encoding="utf-8"))["records"][0]
         self.assertNotIn("metrics_pending", saved)
         self.assertNotIn("simulation_status", saved)
+
+    def test_probe_launches_later_settings_groups_before_waiting_for_earlier_metrics(self):
+        for resume in (False, True):
+            with self.subTest(resume=resume):
+                self.batch.unlink(missing_ok=True)
+                if resume:
+                    def interrupted(_expressions, _settings, **kwargs):
+                        kwargs["on_event"]("pending", {"index": 0, "status": "PENDING",
+                            "alpha_id": "close", "metrics_pending": True, "simulation_status": "COMPLETE"})
+                        raise KeyboardInterrupt
+
+                    with mock.patch.object(app.guarded_sim, "simulate", side_effect=interrupted), \
+                         self.assertRaises(KeyboardInterrupt):
+                        self.run_probe(no_record=True)
+
+                posted = []
+                posted_when_read = {}
+
+                def submit(_session, payload, **_kwargs):
+                    field = payload["regular"].removeprefix("rank(").removesuffix(")")
+                    posted.append(field)
+                    return "/simulations/" + field
+
+                def poll(_session, location, **_kwargs):
+                    return {"status": "COMPLETE", "alpha": location.rsplit("/", 1)[-1]}
+
+                def fetch(_session, alpha_id, **_kwargs):
+                    posted_when_read[alpha_id] = tuple(posted)
+                    if alpha_id == "close":
+                        return {"_deferred": True, "next_poll_after_seconds": 120}
+                    return {"is": {"fitness": 1.3}, "train": {"fitness": 1.1}}
+
+                def simulate(expressions, settings, session, preflight, force, **kwargs):
+                    return ml.simulate_alphas(session, expressions, settings=settings, **kwargs)
+
+                with mock.patch.object(app.guarded_sim, "simulate", side_effect=simulate), \
+                     mock.patch.object(ml, "submit_single_simulation", side_effect=submit), \
+                     mock.patch.object(ml, "poll_simulation", side_effect=poll), \
+                     mock.patch.object(ml, "fetch_alpha_metrics", side_effect=fetch) as metrics:
+                    if resume:
+                        result = app.cmd_probe(arguments(resume=str(self.batch), batch_size=1), None)
+                    else:
+                        result = self.run_probe(no_record=True, batch_size=1)
+
+                self.assertEqual(posted, ["volume", "cap"] if resume else ["close", "cap", "volume"])
+                self.assertIn("volume", posted_when_read["close"])
+                self.assertEqual(result["execution"]["accepted"], 3)
+                self.assertEqual(metrics.call_count, 3)
+                saved = json.loads(self.batch.read_text(encoding="utf-8"))["records"]
+                self.assertTrue(saved[0]["metrics_pending"])
+                self.assertEqual(saved[0]["poll_after_seconds"], 120)
+                self.assertEqual(saved[1]["status"], "COMPLETE")
 
     def test_resume_rejects_request_changes(self):
         with mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator):
