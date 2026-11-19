@@ -266,5 +266,41 @@
       }
     },
     "reading": "ratio_trend has the most total output only because it was tried most often; per-arm the net-sentiment difference shape is three times more likely to clear the bars. The orthogonal form (short vs long term neutralised) has produced nothing clean in four tries."
+  },
+  "combination_logic": {
+    "measured": "2026-11-19, cross-dataset design matrix",
+    "rule": "pick the logic from the relationship between channels; the same pair inverted by the wrong logic",
+    "cases": [
+      {
+        "pair": "conference-call profitability tone x analyst revision horizon",
+        "leg_sharpe": {
+          "tone": 1.7,
+          "revision": 1.2
+        },
+        "leg_correlation": 0.304,
+        "blend": {
+          "sharpe": 1.81,
+          "turnover": 0.071,
+          "verdict": "all Regular checks pass"
+        },
+        "diverge": {
+          "sharpe": -0.86,
+          "verdict": "sign flip"
+        },
+        "reading": "complementary channels: agreement is the signal, disagreement carries the opposite sign"
+      }
+    ],
+    "failures": {
+      "mechanical_multiplication": [
+        "pages_mul 0.24",
+        "hire_mul -0.08",
+        "ev_react_x_sens -0.06"
+      ],
+      "why": "multiplying two ranks from the same dataset compresses the distribution; the operands were never independent"
+    },
+    "practice": [
+      "rank each leg inside the same group so they share a scale before combining",
+      "check the two legs' mutual correlation first: near zero means blend, high means one leg is redundant"
+    ]
   }
 }

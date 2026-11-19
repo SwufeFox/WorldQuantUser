@@ -54,9 +54,18 @@ def simulate(session, arm: dict, poll_timeout: int = 420) -> dict:
 
     resp = None
     for attempt in range(4):
-        resp = session.post(
-            "https://api.worldquantbrain.com/simulations", json=payload, timeout=90
-        )
+        try:
+            resp = session.post(
+                "https://api.worldquantbrain.com/simulations", json=payload, timeout=90
+            )
+        except Exception as exc:
+            # Dropped connections were being recorded as RUNNER_ERROR without a
+            # retry, quietly losing arms from an otherwise healthy batch.
+            time.sleep(5 + attempt * 10)
+            if attempt == 3:
+                return {"label": arm["label"], "status": "NETWORK_FAIL",
+                        "detail": str(exc)[:180], "expr": arm["expr"]}
+            continue
         if resp.status_code == 201:
             break
         if resp.status_code == 429:
