@@ -84,6 +84,28 @@ def test_native_matches_child_echo_without_assuming_order_and_preserves_failure(
     assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0
 
 
+def test_native_matches_child_echo_that_omits_request_only_settings(simulator):
+    """BRAIN echoes executed settings: testPeriod and simulationMode do not come back."""
+    replies = {"NativeParent": {"id": "NativeParent", "status": "COMPLETE",
+                                "children": ["Child1", "Child2"]}}
+    for number in (1, 2):
+        body = child(number)
+        body["settings"].pop("testPeriod", None)
+        body["settings"].pop("simulationMode", None)
+        replies["Child%d" % number] = body
+
+    with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+            mock.patch.object(ml, "read_simulation_snapshot",
+                              side_effect=lambda s, identity, **kw: (replies[identity], None)), \
+            mock.patch.object(ml, "fetch_alpha_metrics",
+                              return_value={"is": {"fitness": 1}, "train": {"fitness": 1}}):
+        records = simulator()
+
+    assert [row["alpha_id"] for row in records] == ["Alpha1", "Alpha2"]
+    assert [row["multi_child_id"] for row in records] == ["Child1", "Child2"]
+    assert not [row for row in records if row.get("error")]
+
+
 def test_native_ambiguous_echo_does_not_attribute_an_alpha(simulator):
     replies = {
         "NativeParent": {"id": "NativeParent", "status": "COMPLETE", "children": ["Child1", "Child2"]},

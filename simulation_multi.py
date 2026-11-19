@@ -259,15 +259,27 @@ class MultiRuns:
         self._save_reservation(indices, parent)
         self._emit("multi_pending", indices)
 
+    # The child snapshot reports the executed settings, not the submitted
+    # request: testPeriod and simulationMode never come back. Their absence is
+    # unknown rather than different, so match on the identifying keys and on
+    # every key the snapshot does report. Requiring the full request made every
+    # real child fail to map ("did not expose a matching child", 2026-11-19).
+    IDENTIFYING_SETTINGS = ("instrumentType", "region", "universe", "delay",
+                            "neutralization", "truncation", "language")
+
     def _matches(self, index, payload):
         requested = self.payload_for(index)
         if payload.get("type") not in (None, requested["type"]):
             return False
         expression, _, _ = ml.regular_expression(payload)
         observed = payload.get("settings")
-        return (expression == requested["regular"] and isinstance(observed, dict)
-                and all(key in observed and observed[key] == value
-                        for key, value in requested["settings"].items()))
+        if expression != requested["regular"] or not isinstance(observed, dict):
+            return False
+        if any(key not in observed for key in self.IDENTIFYING_SETTINGS):
+            return False
+        return all(observed[key] == value
+                   for key, value in requested["settings"].items()
+                   if key in observed)
 
     def collect_children(self, indices):
         """Match echoed child requests, allowing a partial parent result."""
