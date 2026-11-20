@@ -21,7 +21,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import research_paths
-from research_app import app, ledger as cli_ledger
+from research_app import app, ledger as cli_ledger, pnl_snapshot
 
 
 def _dates(year, count):
@@ -156,6 +156,63 @@ def test_polars_stability_reuses_and_invalidates_train_only_snapshot(tmp_path, m
     filtered = invoke("--polars", "--status", "ACTIVE")
     assert filtered.pop("pnl_snapshot")["state"] == "rebuilt"
     assert filtered == invoke("--status", "ACTIVE")
+
+
+def test_polars_snapshot_refresh_reads_only_changed_series(tmp_path):
+    pl = pytest.importorskip("polars")
+    pnl_dir = tmp_path / "pnl"
+    pnl_dir.mkdir()
+    path = tmp_path / "cache" / "pnl-train.parquet"
+    days = _dates(2020, 145)
+    names = ("Unchanged", "Beta", "Alpha", "RemovedId", "DeletedFile")
+    series = {name: _series(days[::-1], index + 1.0, index + 2.0)
+              for index, name in enumerate(names)}
+    cutoffs = dict.fromkeys(series, days[140])
+
+    def write_source(alpha_id):
+        (pnl_dir / f"{alpha_id}.json").write_text(json.dumps(series[alpha_id]), encoding="utf-8")
+
+    for alpha_id in series:
+        write_source(alpha_id)
+    _, state = pnl_snapshot.training_half_sharpes(pnl_dir, path, cutoffs, cutoffs)
+    assert state == "rebuilt"
+
+    series["Alpha"][days[0]] = -12.0
+    write_source("Alpha")
+    cutoffs["Beta"] = days[122]
+    series["Middle"] = _series(days[::-1], 1.5, 3.0)
+    cutoffs["Middle"] = days[135]
+    write_source("Middle")
+    del cutoffs["RemovedId"]
+    (pnl_dir / "DeletedFile.json").unlink()
+
+    present = ("Alpha", "Beta", "Middle", "Unchanged")
+    expected_rows = sorted((alpha_id, day, pnl) for alpha_id in present
+                           for day, pnl in series[alpha_id].items() if day < cutoffs[alpha_id])
+    with mock.patch.object(pnl_snapshot, "read_series", wraps=pnl_snapshot.read_series) as read_series:
+        result, state = pnl_snapshot.training_half_sharpes(pnl_dir, path, cutoffs, cutoffs)
+        assert state == "rebuilt"
+        assert sorted(call.args[0].name for call in read_series.call_args_list) == [
+            "Alpha.json", "Beta.json", "Middle.json"]
+        assert pl.read_parquet(path).rows() == expected_rows
+        assert result.keys() == set(present)
+        for alpha_id, pair in result.items():
+            expected = cli_ledger.experiments.half_split_sharpes(series[alpha_id], cutoffs[alpha_id])
+            assert tuple(pair) == pytest.approx(expected)
+
+        read_series.reset_mock()
+        warm, state = pnl_snapshot.training_half_sharpes(pnl_dir, path, cutoffs, cutoffs)
+        assert state == "hit"
+        assert {alpha_id: tuple(pair) for alpha_id, pair in warm.items()} == {
+            alpha_id: tuple(pair) for alpha_id, pair in result.items()}
+        read_series.assert_not_called()
+
+        (pnl_dir / "Middle.json").write_text("[]", encoding="utf-8")
+        result, state = pnl_snapshot.training_half_sharpes(pnl_dir, path, cutoffs, cutoffs)
+        assert state == "rebuilt"
+        read_series.assert_called_once_with(pnl_dir / "Middle.json")
+        assert result.keys() == {"Alpha", "Beta", "Unchanged"}
+        assert pl.read_parquet(path).rows() == [row for row in expected_rows if row[0] != "Middle"]
 
 
 if __name__ == "__main__":
