@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date
 from pathlib import Path
 
 import alpha_registry
@@ -12,6 +13,22 @@ import machine_lib as ml
 import research_paths
 
 BOOK_STATUSES = frozenset({"ACTIVE", "SUBMITTED"})
+
+
+def test_boundaries(latest, ids):
+    """Read recorded, exclusive training cutoffs and identify missing boundaries."""
+    starts, missing = {}, []
+    for alpha_id in sorted(set(ids)):
+        split = (latest.get(alpha_id) or {}).get("out_of_sample") or {}
+        start = (split.get("test") or {}).get("startDate")
+        if not start:
+            missing.append(alpha_id)
+            continue
+        try:
+            starts[alpha_id] = date.fromisoformat(str(start)[:10]).isoformat()
+        except ValueError:
+            raise ValueError("invalid recorded test boundary for %s" % alpha_id) from None
+    return starts, missing
 
 
 def member_digest(ids):

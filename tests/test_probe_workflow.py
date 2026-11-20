@@ -94,6 +94,36 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual([request["payload"] for request in result["multi_requests"]],
                          [[payloads[0], payloads[2]], payloads[1]])
 
+    def test_failed_native_progress_write_keeps_published_records_and_rows(self):
+        settings = ml.resolve_settings()
+        arms = [{"label": label, "expression": "rank(close)", "settings": settings, "ops": []}
+                for label in ("first", "second", "third")]
+        records = [{"status": "QUEUED", "settings": settings, "submission_attempted": False} for _ in arms]
+        document = {"arms": arms, "records": records}
+        app._save_probe_checkpoint(document, self.batch)
+        original = self.batch.read_bytes()
+        published_rows = document["rows"]
+        payload = {"records": [{"index": index, "multi_request_id": "synthetic-request"}
+                               for index in range(2)]}
+
+        def fail_write(path, draft, **kwargs):
+            self.assertEqual(path, self.batch)
+            self.assertEqual([row["submission_state"] for row in draft["rows"]],
+                             ["unknown_submission", "not_submitted", "unknown_submission"])
+            self.assertEqual([row["status"] for row in records], ["QUEUED"] * len(arms))
+            raise OSError("synthetic disk full")
+
+        with mock.patch.object(app.cache_store, "write_json_atomic", side_effect=fail_write):
+            with self.assertRaisesRegex(OSError, "synthetic disk full"):
+                app._save_probe_progress(document, self.batch, [0, 2], "multi_submitting", payload)
+        self.assertIs(document["rows"], published_rows)
+        self.assertEqual(self.batch.read_bytes(), original)
+
+        app._save_probe_progress(document, self.batch, [0, 2], "multi_submitting", payload)
+        self.assertIs(document["records"], records)
+        self.assertEqual([row["status"] for row in records], ["UNKNOWN_SUBMISSION", "QUEUED", "UNKNOWN_SUBMISSION"])
+        self.assertEqual(json.loads(self.batch.read_text()), document)
+
     def test_native_parent_checkpoint_recovers_entire_group_without_launching(self):
         parent_url = "https://api.worldquantbrain.com/simulations/synthetic-parent"
 

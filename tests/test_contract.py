@@ -924,6 +924,15 @@ class ErrorEnvelopeTests(unittest.TestCase):
 
 
 class DryRunTests(unittest.TestCase):
+    def test_misaligned_simulation_metadata_does_not_shift_other_labels(self):
+        alphas = [{"expression": "rank(cap)", "candidate_id": "one", "family": "value"},
+                  {"expression": "rank(close)", "candidate_id": "two", "family": "price"}]
+        for supplied, expected in (({"families": ["value"]}, [(None, "one"), (None, "two")]),
+                                   ({"candidates": ["one"]}, [("value", None), ("price", None)])):
+            with self.subTest(supplied=supplied):
+                rows = ml.simulate_alphas(None, alphas, dry_run=True, **supplied)
+                self.assertEqual([(row["family"], row["candidate_id"]) for row in rows], expected)
+
     def test_simulate_native_multi_preview_keeps_per_arm_payloads(self):
         proc = run_cli("simulate", "--expr", "rank(close)", "--expr", "rank(volume)",
                        "--expr", "rank(open)", "--multi-size", "2", "--batch-size", "7",
@@ -1665,6 +1674,19 @@ class SimulationResumeTests(unittest.TestCase):
             if os.name == "posix":
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(list(path.parent.glob(".checkpoint.json.*.tmp")), [])
+
+    def test_resume_refuses_a_checkpoint_without_saved_settings_before_auth(self):
+        document = {"format": "worldquantuser.simulation-checkpoint", "version": 1,
+                    "records": [{"expression": "rank(cap)", "status": "QUEUED"}]}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            args = cli_parser.build_parser().parse_args(["resume", str(path)])
+            with mock.patch.object(cli_experiments, "with_session") as auth:
+                with self.assertRaisesRegex(cli_runtime.CliError, "missing saved settings"):
+                    cli_experiments.cmd_resume(args, None)
+            auth.assert_not_called()
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), document)
 
     def test_progress_url_rejects_untrusted_hosts_before_authenticated_get(self):
         unsafe_urls = [

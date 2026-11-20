@@ -8,8 +8,11 @@ positive one.
 """
 
 import argparse
+from datetime import date, timedelta
 import json
 import os
+from pathlib import Path
+from random import Random
 import sys
 import tempfile
 import unittest
@@ -37,11 +40,66 @@ def _series(kind, days=600):
 
 
 class HealthTests(unittest.TestCase):
-    def test_annual_sharpe_matches_the_definition(self):
-        values = [1.0, -0.2] * 100
-        value = cli_campaign._annual_sharpe(values)
-        self.assertGreater(value, 0)
-        self.assertIsNone(cli_campaign._annual_sharpe([1.0, 1.0]))
+    def _health(self, rows, **options):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            pnl_dir = root / "pnl"
+            pnl_dir.mkdir()
+            registry = root / "registry.jsonl"
+            entries = []
+            for name, status, series, test_start in rows:
+                entry = {"alpha_id": name, "status": status}
+                if test_start is not None:
+                    entry["out_of_sample"] = {"test": {"startDate": test_start}}
+                entries.append(entry)
+                (pnl_dir / f"{name}.json").write_text(json.dumps(series), encoding="utf-8")
+            registry.write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
+            args = argparse.Namespace(registry=str(registry), limit=8, min_overlap=120, pool=True,
+                                      gate=0.7, min_marginal=-100, min_sharpe=-100, **options)
+            with mock.patch.object(research_paths, "ensure_dir", return_value=directory):
+                return cli_campaign.cmd_health(args, None)
+
+    def test_health_uses_recorded_test_starts_for_book_and_candidate(self):
+        days = [(date(2020, 1, 1) + timedelta(days=index)).isoformat() for index in range(600)]
+        values = {day: float(index % 3) for index, day in enumerate(days)}
+        candidate = {day: 2 * value if day < days[360] else -10000.0 for day, value in values.items()}
+        data = self._health([
+            ("book", "ACTIVE", values, days[500]),
+            ("candidate", "UNSUBMITTED", candidate, days[360]),
+        ], window="train", train_end="2023-01-01")
+        self.assertEqual(data["train_end"], days[500])
+        self.assertEqual(data["days"], 500)
+        row = data["pool"][0]
+        self.assertEqual((row["train_end"], row["overlap_days"]), (days[360], 360))
+        self.assertAlmostEqual(row["max_single"], 1.0)
+
+    def test_rest_keeps_small_members_beside_a_large_one(self):
+        days = [(date(2020, 1, 1) + timedelta(days=index)).isoformat() for index in range(120)]
+        large = {day: 1e16 * (index % 3 + 1) for index, day in enumerate(days)}
+        small = {day: float((-1) ** index) for index, day in enumerate(days)}
+        data = self._health([
+            ("large", "ACTIVE", large, None), ("small", "ACTIVE", small, None),
+        ])
+        self.assertEqual(data["count"], 2)
+        self.assertTrue(all(row["delta"] is not None for row in data["strongest"]))
+
+    def test_pool_gate_uses_the_same_daily_correlation_as_the_report(self):
+        rng = Random(184)
+        book, candidate = {}, {}
+        for index in range(600):
+            day = (date(2020, 1, 1) + timedelta(days=index)).isoformat()
+            value = rng.uniform(-4, 4) if index % 2 else rng.uniform(-1, 1)
+            book[day] = value
+            candidate[day] = 2 + (value if index % 2 else rng.uniform(-1, 1))
+        with mock.patch.object(cli_campaign.pnl_snapshot, "read_series",
+                               wraps=cli_campaign.pnl_snapshot.read_series) as read:
+            data = self._health([
+                ("book", "ACTIVE", book, None), ("candidate", "UNSUBMITTED", candidate, None),
+            ])
+        self.assertEqual([call.args[0].stem for call in read.call_args_list], ["book", "candidate"])
+        self.assertGreater(data["pool"][0]["max_single"], 0.9)
+        self.assertFalse(data["pool"][0]["passes"])
+        self.assertEqual(data["pool_passing"], 0)
 
     def test_a_duplicate_of_the_book_has_a_negative_marginal(self):
         tmp = tempfile.mkdtemp()

@@ -50,21 +50,22 @@ def align(left, right, min_overlap=200):
     return ([left[d] for d in shared], [right[d] for d in shared], shared)
 
 
-def pearson(x, y):
+def pearson(x, y, *, min_points=3):
     """Pearson correlation, or ``None`` when it is not defined.
 
     A constant series has no correlation with anything; returning ``None`` rather
     than 0.0 keeps that distinct from "measured as uncorrelated".
     """
     n = len(x)
-    if n < 3 or n != len(y):
+    if n < min_points or n != len(y):
         return None
-    return pearson_centered(center_for_pearson(x), center_for_pearson(y))
+    return pearson_centered(center_for_pearson(x, min_points=min_points),
+                            center_for_pearson(y, min_points=min_points))
 
 
-def center_for_pearson(values):
+def center_for_pearson(values, *, min_points=3):
     """Center one aligned series and compute its norm once for reuse."""
-    if len(values) < 3:
+    if len(values) < max(1, min_points):
         return None
     mean = sum(values) / len(values)
     centered = [value - mean for value in values]

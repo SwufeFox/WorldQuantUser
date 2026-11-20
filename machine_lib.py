@@ -454,6 +454,18 @@ def login_lock_timeout():
     return timeout
 
 
+def isolated_session(source):
+    """Copy authenticated state into a session with independent cookies and adapters."""
+    from copy import deepcopy
+    import requests
+
+    session = requests.Session()
+    for name in ("auth", "headers", "cookies", "params", "proxies", "hooks", "verify", "cert",
+                 "trust_env", "max_redirects", "stream"):
+        setattr(session, name, deepcopy(getattr(source, name)))
+    return session
+
+
 def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *,
                  deadline=None, rejected_generation=None):
     """Return an authenticated session, reusing a cached cookie when still valid.
@@ -1884,10 +1896,12 @@ def simulate_alphas(
         labels = [None] * len(pairs)
     if families is None:
         families = alpha_families(alphas, len(pairs))
-    if candidates is None:
-        candidates = alpha_candidate_ids(alphas, len(pairs))
     elif len(families) != len(pairs):
         families = [None] * len(pairs)
+    if candidates is None:
+        candidates = alpha_candidate_ids(alphas, len(pairs))
+    elif len(candidates) != len(pairs):
+        candidates = [None] * len(pairs)
 
     import simulation_capabilities
     import simulation_slots

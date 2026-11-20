@@ -248,8 +248,8 @@ class MemberCorrelationSignTests(unittest.TestCase):
         self.assertIsNotNone(units)
         lower = 0.9
         higher = math.nextafter(lower, math.inf)
-        with patch.object(triage.legs, "correlation", side_effect=[lower, higher]) as scalar:
-            count, winner = triage._member_correlations(values, series, days, units)
+        with patch.object(stats, "correlation", side_effect=[lower, higher]) as scalar:
+            count, winner = stats.member_correlations(values, series, days, units)
         self.assertEqual(scalar.call_count, 2)
         self.assertEqual((count, winner), (2, (higher, "second")))
 

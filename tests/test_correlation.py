@@ -51,6 +51,14 @@ class PearsonTests(unittest.TestCase):
     def test_length_mismatch_is_undefined(self):
         self.assertIsNone(correlation.pearson([1, 2, 3], [1, 2]))
 
+    def test_research_correlation_handles_extreme_finite_scales(self):
+        from research_app import stats
+
+        for scale in (1e-100, 1e100):
+            with self.subTest(scale=scale):
+                values = [scale, 2 * scale, 3 * scale]
+                self.assertAlmostEqual(stats.correlation(values, values, min_points=3), 1.0)
+
 
 def test_book_correlator_reuses_equal_date_series_and_aligns_different_dates():
     from research_app.campaign import _book_correlator

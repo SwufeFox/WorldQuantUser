@@ -19,6 +19,7 @@ import simulation_multi
 
 from .selection import DEFAULT_PROMOTION_RETENTION
 from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
+from .stats import MIN_PORTFOLIO_OVERLAP
 
 
 def _dispatch_handler(target, args, sink):
@@ -1484,19 +1485,19 @@ def build_parser():
                         help="Train window by default: selecting on the full window "
                              "means selecting on the test year.")
     health.add_argument("--train-end", default="2023-01-01", dest="train_end",
-                        help="Exclusive end of the train window (test starts here).")
+                        help="Upper bound on the exclusive train cutoff, further capped by recorded test starts.")
     health.add_argument("--pool", action="store_true",
                         help="Also score every non-book alpha with cached PnL against "
                              "this book, ranked by marginal contribution.")
     health.add_argument("--min-marginal", type=float, default=0.3, dest="min_marginal",
                         help="Marginal contribution a pool alpha must reach to pass.")
     health.add_argument("--gate", type=float, default=0.70,
-                        help="Max correlation to any single book member (platform gate).")
+                        help="Maximum absolute daily PnL correlation to one member in this local screen.")
     health.add_argument("--min-sharpe", type=float, default=1.0, dest="min_sharpe",
                         help="A negative-Sharpe alpha can post a big marginal; require a "
                              "real Sharpe for a pool alpha to pass.")
     health.add_argument("--limit", type=int, default=8)
-    health.add_argument("--min-overlap", type=int, default=500, dest="min_overlap")
+    health.add_argument("--min-overlap", type=int, default=MIN_PORTFOLIO_OVERLAP, dest="min_overlap")
     health.add_argument("--registry", default=None)
     health.bind_handler("campaign.cmd_health")
 

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
 import json
 import hashlib
 import math
@@ -243,15 +242,6 @@ def _check_result(alpha_id, payload=None, error=None):
             "incentives": incentives.check_summary(checks, basis="live_check_endpoint")}
 
 
-def _isolated_check_session(source):
-    """Copy authenticated state without sharing mutable cookies or connection pools."""
-    session = requests.Session()
-    for name in ("auth", "headers", "cookies", "params", "proxies", "hooks",
-                 "verify", "cert", "trust_env", "max_redirects", "stream"):
-        setattr(session, name, deepcopy(getattr(source, name)))
-    return session
-
-
 def cmd_alpha_check(args, _sink):
     """Compute live checks for ordered unique IDs, preserving every partial outcome."""
     if args.max_wait is not None and (not math.isfinite(args.max_wait) or args.max_wait < 0):
@@ -275,7 +265,7 @@ def cmd_alpha_check(args, _sink):
                 if args.workers == 1:
                     payload = ml.fetch_alpha_checks(session, alpha_id, max_wait_seconds=args.max_wait)
                 else:
-                    with _isolated_check_session(session) as isolated:
+                    with ml.isolated_session(session) as isolated:
                         payload = ml.fetch_alpha_checks(isolated, alpha_id, max_wait_seconds=args.max_wait)
                 return _check_result(alpha_id, payload), None
             except (ml.BrainError, requests.RequestException) as exc:

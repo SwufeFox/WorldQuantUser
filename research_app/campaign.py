@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+from functools import lru_cache
 from pathlib import Path
 import alpha_registry
 import cache_store
@@ -9,7 +11,7 @@ import correlation
 import json
 import research_paths
 
-from . import book_state, experiments
+from . import book_state, experiments, pnl_snapshot, stats
 from .runtime import CliError
 
 
@@ -135,14 +137,48 @@ def _book_drift(book, platform):
             "in_sync": platform_ids == ledger_active}
 
 
-def _annual_sharpe(values):
-    if not values:
-        return None
-    mean = sum(values) / len(values)
-    var = sum((v - mean) ** 2 for v in values) / len(values)
-    if var <= 0:
-        return None
-    return mean / (var ** 0.5) * (252 ** 0.5)
+def _health_pool(args, latest, pnl_dir, series, book_daily, train_end):
+    @lru_cache(maxsize=4)
+    def reference(days):
+        values = [book_daily[day] for day in days]
+        units = stats.unit_correlation_rows([[member[day] for day in days] for member in series.values()])
+        return values, stats.sharpe(values, min_points=1), units
+
+    rows = []
+    for alpha_id, entry in latest.items():
+        if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES:
+            continue
+        candidate = pnl_snapshot.read_series(pnl_dir / f"{alpha_id}.json")
+        if not candidate:
+            continue
+        cutoff = train_end
+        if cutoff is not None:
+            try:
+                bounds, _ = book_state.test_boundaries(latest, [alpha_id])
+            except ValueError:
+                continue
+            cutoff = min(cutoff, bounds.get(alpha_id, cutoff))
+        days = tuple(day for day in book_daily if day in candidate and (cutoff is None or day < cutoff))
+        if len(days) < args.min_overlap:
+            continue
+        values = [candidate[day] for day in days]
+        book_values, book_sharpe, units = reference(days)
+        sharpe = stats.sharpe(values, min_points=1)
+        rho = correlation.pearson(values, book_values)
+        if sharpe is None or rho is None or book_sharpe is None:
+            continue
+        marginal = sharpe - rho * book_sharpe
+        measured, worst = stats.member_correlations(values, series, days, units, min_points=3)
+        rows.append({
+            "alpha_id": alpha_id, "family": entry.get("family"), "status": entry.get("status"),
+            "sharpe": sharpe, "rho_book": round(rho, 3), "marginal": marginal,
+            "overlap_days": len(days), "train_end": cutoff,
+            "max_single": worst[0] if worst is not None else None,
+            "max_single_vs": worst[1] if worst is not None else None,
+            "passes": (worst is not None and measured == len(series) and abs(worst[0]) < args.gate
+                       and marginal >= args.min_marginal and sharpe >= args.min_sharpe),
+        })
+    return sorted(rows, key=lambda row: -row["marginal"])
 
 
 def cmd_health(args, _sink):
@@ -157,160 +193,58 @@ def cmd_health(args, _sink):
     Read-only and offline: it never simulates, and it never submits.
     """
     entries = alpha_registry.load_entries(args.registry or alpha_registry.default_registry_path())
-    latest = {}
-    for entry in entries:
-        alpha_id = entry.get("alpha_id")
-        if alpha_id:
-            latest[alpha_id] = entry
+    latest = {entry["alpha_id"]: entry for entry in entries if entry.get("alpha_id")}
     book = {alpha_id: entry for alpha_id, entry in latest.items()
             if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES}
     pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
-    series = {}
-    for alpha_id in book:
-        path = pnl_dir / ("%s.json" % alpha_id)
-        if not path.exists():
-            continue
-        try:
-            series[alpha_id] = {k: float(v) for k, v in json.loads(path.read_text()).items()}
-        except (OSError, ValueError):
-            continue
-    ids = sorted(series)
-    if not ids:
+    series = {alpha_id: values for alpha_id in sorted(book)
+              if (values := pnl_snapshot.read_series(pnl_dir / f"{alpha_id}.json"))}
+    if not series:
         raise CliError("INVALID_INPUT", "no cached PnL for the book",
                        "run `ledger sync` or `alpha get` to warm the cache")
-    dates = sorted(set.intersection(*(set(series[a]) for a in ids)))
-    # Default to the train window. The cached series runs to 2023; ranking candidates on
-    # the full window would be ranking on the test year, which is the one thing this
-    # workspace refuses to select on.
-    if getattr(args, "window", "train") == "train" and getattr(args, "train_end", None):
-        dates = [day for day in dates if day < args.train_end]
-        if not dates:
-            raise CliError("INVALID_INPUT", "no days before --train-end %s" % args.train_end)
+    dates = sorted(set.intersection(*(set(values) for values in series.values())))
+    window = getattr(args, "window", "train")
+    train_end = None
+    if window == "train":
+        requested_end = getattr(args, "train_end", None) or "2023-01-01"
+        try:
+            if date.fromisoformat(requested_end).isoformat() != requested_end:
+                raise ValueError("--train-end must be YYYY-MM-DD")
+            bounds, _ = book_state.test_boundaries(latest, series)
+        except ValueError as exc:
+            raise CliError("INVALID_INPUT", str(exc)) from exc
+        train_end = min(requested_end, min(bounds.values(), default=requested_end))
+        dates = [day for day in dates if day < train_end]
     if len(dates) < args.min_overlap:
         raise CliError("INVALID_INPUT", "only %d common days" % len(dates),
                        "lower --min-overlap or refresh the PnL cache")
-    aligned = {a: [series[a][d] for d in dates] for a in ids}
-    sharpes = {a: _annual_sharpe(aligned[a]) for a in ids}
-    book_series = [sum(aligned[a][i] for a in ids) / len(ids) for i in range(len(dates))]
-    book_sharpe = _annual_sharpe(book_series)
+
+    aligned = {alpha_id: [values[day] for day in dates] for alpha_id, values in series.items()}
+    count = len(aligned)
+    total = [sum(values) for values in zip(*aligned.values())]
+    book_daily = {day: value / count for day, value in zip(dates, total)}
+    book_sharpe = stats.sharpe(book_daily.values(), min_points=1)
     rows = []
-    for alpha_id in ids:
-        # Marginal is a statement about the *other* members, so a single-alpha book has
-        # no marginal to report (and dividing by len-1 would crash).
-        rest = ([sum(aligned[b][i] for b in ids if b != alpha_id) / (len(ids) - 1)
-                 for i in range(len(dates))] if len(ids) > 1 else [])
-        rho = correlation.pearson(aligned[alpha_id], rest) if rest else None
-        sharpe = sharpes[alpha_id]
-        marginal = None
-        if sharpe is not None and rho is not None and book_sharpe is not None:
-            marginal = sharpe - rho * book_sharpe
-        # Two different numbers, deliberately side by side. `slope` is the first-order
-        # term S_i - rho*S_book; `delta` is what the book's own Sharpe does when this
-        # member is removed. They differ by roughly the member's weight, so calling
-        # both "marginal" can misrepresent the slope as a realised book-level change.
-        delta = None
-        if len(ids) > 1 and rest and book_sharpe is not None:
-            rest_sharpe = _annual_sharpe(rest)
-            if rest_sharpe is not None:
-                delta = book_sharpe - rest_sharpe
+    for alpha_id, values in aligned.items():
+        peers = [row for member, row in aligned.items() if member != alpha_id]
+        rest = [sum(day) / len(peers) for day in zip(*peers)]
+        sharpe = stats.sharpe(values, min_points=1)
+        rho = correlation.pearson(values, rest)
+        rest_sharpe = stats.sharpe(rest, min_points=1)
+        marginal = (round(sharpe - rho * book_sharpe, 2)
+                    if sharpe is not None and rho is not None and book_sharpe is not None else None)
+        delta = round(book_sharpe - rest_sharpe, 4) if rest_sharpe is not None and book_sharpe is not None else None
         rows.append({"alpha_id": alpha_id,
                      "family": (book.get(alpha_id) or {}).get("family"),
                      "sharpe": None if sharpe is None else round(sharpe, 2),
                      "rho_rest": None if rho is None else round(rho, 3),
-                     "slope": None if marginal is None else round(marginal, 2),
-                     "delta": None if delta is None else round(delta, 4),
-                     "marginal": None if marginal is None else round(marginal, 2)})
-    # Optional second pass: score the *pool* (alphas the ledger knows, PnL cached, not in
-    # the book) against this same book. Ranking a finished candidate by its Fitness hid
-    # the alphas that are weak alone but genuinely add; ranking by marginal is the
-    # criterion the book is actually optimised on.
-    pool = []
-    if getattr(args, "pool", False):
-        book_ids = set(ids)
-        for alpha_id, entry in latest.items():
-            if alpha_id in book_ids:
-                continue
-            if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES:
-                continue
-            path = pnl_dir / ("%s.json" % alpha_id)
-            if not path.exists():
-                continue
-            try:
-                series_map = {k: float(v) for k, v in json.loads(path.read_text()).items()}
-            except (OSError, ValueError):
-                continue
-            common = sorted(set(series_map) & set(dates))
-            if len(common) < args.min_overlap:
-                continue
-            values = [series_map[d] for d in common]
-            sharpe = _annual_sharpe(values)
-            index = {d: i for i, d in enumerate(dates)}
-            book_aligned = [book_series[index[d]] for d in common]
-            rho = correlation.pearson(values, book_aligned)
-            if sharpe is None or rho is None or book_sharpe is None:
-                continue
-            pool.append({"alpha_id": alpha_id,
-                         "family": entry.get("family"),
-                         "status": entry.get("status"),
-                         "sharpe": round(sharpe, 2),
-                         "rho_book": round(rho, 3),
-                         "marginal": round(sharpe - rho * book_sharpe, 2)})
-        pool.sort(key=lambda row: -(row["marginal"] or 0))
-        # Marginal is measured against the *portfolio*, but the platform's gate is the
-        # max against any single member. A duplicate of one member may still look
-        # diversified against the average. Report both for the rows we show, otherwise
-        # the marginal alone could wave duplicates through.
-        # Screen every pool row, not just the visible ones: the point of the pool pass is
-        # to answer "what is left after the two quantitative legs of the gate", and that
-        # answer is a count. The strided series keeps the correlation pass bounded.
-        stride = max(1, len(dates) // 250)
-        strided_dates = dates[::stride]
-        book_strided = {a: [series[a][d] for d in strided_dates] for a in ids}
-        for row in pool:
-            path = pnl_dir / ("%s.json" % row["alpha_id"])
-            try:
-                series_map = {k: float(v) for k, v in json.loads(path.read_text()).items()}
-            except (OSError, ValueError):
-                continue
-            values = [series_map.get(d) for d in strided_dates]
-            if any(v is None for v in values):
-                row["max_single"] = None
-            else:
-                worst, partner = 0.0, None
-                for other in ids:
-                    r = correlation.pearson(values, book_strided[other])
-                    if r is not None and abs(r) > abs(worst):
-                        worst, partner = r, other
-                row["max_single"] = round(worst, 3)
-                row["max_single_vs"] = partner
-            # A negative-Sharpe alpha with negative correlation scores a big "marginal"
-            # and would be nonsense to submit, so the screen also requires a real Sharpe.
-            row["passes"] = bool(row.get("max_single") is not None
-                                 and abs(row["max_single"]) < args.gate
-                                 and row["marginal"] >= args.min_marginal
-                                 and (row.get("sharpe") or 0) >= args.min_sharpe)
+                     "slope": marginal, "delta": delta, "marginal": marginal})
 
-        for row in pool[: max(args.limit, 1) * 2]:
-            path = pnl_dir / ("%s.json" % row["alpha_id"])
-            try:
-                series_map = {k: float(v) for k, v in json.loads(path.read_text()).items()}
-            except (OSError, ValueError):
-                continue
-            values = [series_map.get(d) for d in dates]
-            if any(v is None for v in values):
-                row["max_single"] = None
-                continue
-            worst, partner = 0.0, None
-            for other in ids:
-                r = correlation.pearson(values, aligned[other])
-                if r is not None and abs(r) > abs(worst):
-                    worst, partner = r, other
-            row["max_single"] = round(worst, 3)
-            row["max_single_vs"] = partner
+    pool = _health_pool(args, latest, pnl_dir, series, book_daily, train_end) if getattr(args, "pool", False) else None
 
     rows.sort(key=lambda row: (row["marginal"] if row["marginal"] is not None else 0))
     measured = [row for row in rows if row["marginal"] is not None]
-    return {"window": getattr(args, "window", "train"), "train_end": getattr(args, "train_end", None),
+    return {"window": window, "train_end": train_end,
             "days": len(dates), "count": len(measured),
             "book": book_state.describe_book(latest, series=series, registry_path=args.registry,
                                                pnl_dir=pnl_dir),
@@ -319,10 +253,9 @@ def cmd_health(args, _sink):
             "weakest": measured[: args.limit],
             "strongest": sorted(measured, key=lambda row: -(row["marginal"] or 0))[: args.limit],
             "negative_count": sum(1 for row in measured if row["marginal"] < 0),
-            "pool": pool[: args.limit] if getattr(args, "pool", False) else None,
-            "pool_size": len(pool) if getattr(args, "pool", False) else None,
-            "pool_passing": (sum(1 for row in pool if row.get("passes"))
-                             if getattr(args, "pool", False) else None),
+            "pool": pool[: args.limit] if pool is not None else None,
+            "pool_size": len(pool) if pool is not None else None,
+            "pool_passing": sum(row["passes"] for row in pool) if pool is not None else None,
             "gate": {"min_marginal": getattr(args, "min_marginal", 0.3),
                      "max_single": getattr(args, "gate", 0.70),
                      "min_sharpe": getattr(args, "min_sharpe", 1.0)}}

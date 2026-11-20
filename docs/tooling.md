@@ -598,7 +598,10 @@ python3 research_cli.py mine --dataset fundamental2 --limit 5
 python3 research_cli.py mine --dataset news18 --expr 'vec_sum(reviewed_event_field)' --emit draft.json
 ```
 
-`mine` 是离线复核，不会登录。`catalog` 展示默认模拟范围、缓存新鲜度及范围不匹配的排除数量。每个字段的 `source` 保留选中快照、年龄、范围和账户状态。`mine` 和 `catalog unused` 跳过属于其他账户的快照。未绑定账户的历史字段目录只作为 `account_unknown` 的研究线索，在线目录查询会建立新的账户缓存。
+`mine` 和 `catalog unused` 都从本地缓存读取字段，并用 AST 识别台账里的字段引用。
+`mine` 使用默认模拟范围，`catalog` 展示缓存新鲜度和范围不匹配的排除数量，每个字段的 `source` 保留选中快照及账户信息。
+`catalog unused` 遍历所有缓存范围，每个字段 ID 只计一次。优先选择匹配当前账户的快照，再按新鲜度和保存时间选择。
+两条命令都会跳过其他账户的快照，未绑定账户的旧目录只作为账户归属未知的研究线索。
 
 每个数据集的 `top` 是数值 MATRIX 待审线索；`needs_definition` 单列分类编码、日期、缺说明、VECTOR/EVENT 聚合，以及与已用字段同描述的项目。`related_history` 给出对应台账记录；同描述只提示需要复核，不证明 alias 等价。`unused` 只指最新台账可解析表达式没引用过该 id，不含旧报告/未入账实验，更不是新机制数量。字段提取走 AST，不把注释、字符串、局部变量当数据。
 
@@ -743,6 +746,10 @@ REGULAR 请求统一省略 `selectionHandling` 和 `selectionLimit`，Python 还
 | 我想跑一批，但怕名字写错 | `tools/guarded_sim.py`（库，不是 CLI） |
 | 这个池子够不够厚 | `python3 research_cli.py health --pool` |
 | 这个字段到底什么量纲 | `python3 tools/probe_units.py` |
+
+`health` 用共同交易日评估账本。默认训练窗截止于 `--train-end` 和可测成员已记录测试起点中的最早日期，
+池内每条候选还受自身测试起点约束。最低重叠天数与 `triage` 相同，可用 `--min-overlap` 提高。
+`--pool` 对有缓存的成员计算日频相关性，报告与通过计数使用同一次测量，返回每条候选的截止日期和重叠天数。
 
 日常实验维护一份 spec：先 `--dry-run` 离线预览，再用 `--check` 在线核验，最后正式运行。
 `idea` / `mechanism` / `note` 会随输出和批次文件保存；`--strict-gate` 只拒绝表达式与完整设置

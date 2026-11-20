@@ -27,11 +27,11 @@ import machine_lib as ml
 import research_paths
 
 from . import benchmark, costs, legs, mechanisms, selection, stats
-from .book_state import describe_book, member_digest
+from .book_state import describe_book, member_digest, test_boundaries
 from .runtime import CliError
 
 
-MIN_OVERLAP_DAYS = 120
+MIN_OVERLAP_DAYS = stats.MIN_PORTFOLIO_OVERLAP
 
 
 def _book_series(latest, directory):
@@ -99,21 +99,6 @@ def _round(value, places=3):
 def _observed_window(dates):
     return {"observed_start": dates[0] if dates else None,
             "observed_end": dates[-1] if dates else None, "days": len(dates)}
-
-
-def _test_boundaries(latest, ids):
-    starts, missing = {}, []
-    for alpha_id in sorted(set(ids)):
-        split = (latest.get(alpha_id) or {}).get("out_of_sample") or {}
-        start = (split.get("test") or {}).get("startDate")
-        if not start:
-            missing.append(alpha_id)
-            continue
-        try:
-            starts[alpha_id] = date.fromisoformat(str(start)[:10]).isoformat()
-        except ValueError:
-            raise ValueError("invalid recorded test boundary for %s" % alpha_id) from None
-    return starts, missing
 
 
 def _shelf_scope(path, targets):
@@ -249,26 +234,6 @@ def _percentile(values, value):
     return round(100.0 * below / len(values), 0)
 
 
-def _member_correlations(values, series, dates, unit_book):
-    members = list(series.items())
-    unit_candidate = stats.unit_correlation_rows([values]) if unit_book is not None else None
-    if unit_candidate is not None:
-        approximate = abs((unit_book * unit_candidate[0]).sum(axis=1))
-        maximum = approximate.max()
-        contenders = [member for member, rho in zip(members, approximate)
-                      if maximum - rho <= stats.CORRELATION_ROUNDOFF]
-    else:
-        contenders = members
-    # Use the scalar values to select and report the winner, including ties.
-    measured = []
-    for member, member_values in contenders:
-        rho = legs.correlation(values, [member_values[day] for day in dates])
-        if rho is not None:
-            measured.append((rho, member))
-    count = len(members) if unit_candidate is not None else len(measured)
-    return count, max(measured, key=lambda item: abs(item[0]), default=None)
-
-
 def _score(alpha_id, entry, series, dates, criteria, candidate=None, *, book_daily=None, unit_book=None):
     """The four questions plus the internal bar, for one alpha."""
     directory = criteria["pnl_dir"]
@@ -327,7 +292,7 @@ def _score(alpha_id, entry, series, dates, criteria, candidate=None, *, book_dai
             # Local cached-PnL correlations are heuristic evidence. Platform
             # check values and thresholds are displayed separately when available.
             complete_book = unit_book if len(common) == len(dates) else None
-            count, worst = _member_correlations(values, series, common, complete_book)
+            count, worst = stats.member_correlations(values, series, common, complete_book)
             row["book_correlations_measured"] = count
             own = legs.sharpe_of(values)
             now = legs.sharpe_of(book_slice)
@@ -511,7 +476,7 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
         relevant = set(book["member_ids"]) | set(targets) if against_shelf else set(series) | set(targets)
         if against_shelf:
             relevant.update(shelf["member_ids"])
-        bounds, missing_boundaries = _test_boundaries(latest, relevant)
+        bounds, missing_boundaries = test_boundaries(latest, relevant)
         boundaries = bounds.values()
         cutoff = min(boundaries) if boundaries else "2023-01-01"
         source = "recorded_test_start" if boundaries else "default_train_end"

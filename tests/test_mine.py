@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import research_paths
-from research_app import mine
+from research_app import catalog as catalog_cli, mine
 from research_app.runtime import CliError
 
 
@@ -227,8 +227,20 @@ class MineTests(unittest.TestCase):
         expression = ('local_shadow = assets; '
                       'group_rank(local_shadow, bucket(rank(assets), range="ghost_in_string")) '
                       '/* ghost_in_comment */')
-        _, registry = self._workspace([], [expression])
+        placeholders = {"local_shadow", "ghost_in_string", "ghost_in_comment"}
+        fields = [self._field(name, f"Reported amount for {name}", dataset="fundamental2")
+                  for name in sorted(placeholders | {"assets"})]
+        foreign = {**self._field("foreign_value", "Reported amount", dataset="eur_data"),
+                   "region": "EUR"}
+        tmp, registry = self._workspace([*fields, foreign], [expression])
         self.assertEqual(mine.used_identifiers(registry), {"assets"})
+        with mock.patch.object(research_paths, "metadata_root", return_value=tmp):
+            reviewed = mine.cmd_mine(self._args(registry), None)
+            census = catalog_cli.cmd_catalog_unused(SimpleNamespace(registry=registry, top=20), None)
+        self.assertEqual({field["id"] for field in reviewed["datasets"][0]["top"]}, placeholders)
+        self.assertEqual(census["used_fields"], 1)
+        census_fields = {field["id"] for row in census["datasets"] for field in row["top_unused"]}
+        self.assertEqual(census_fields, placeholders | {"foreign_value"})
 
     def test_same_description_history_is_reviewed_without_claiming_an_alias(self):
         fields = [
@@ -349,6 +361,26 @@ class CatalogEvidenceTests(unittest.TestCase):
         self.assertEqual(evidence["freshness"], {"stale": 1, "unknown": 1})
         self.assertEqual(evidence["source"], "local_metadata_cache")
         self.assertFalse(evidence["live_verified"])
+
+    def test_census_prefers_matched_account_then_newest_across_scopes(self):
+        matched = mine.ml._catalog_account("current-user")
+        foreign = mine.ml._catalog_account("other-user")
+        self._write(f"{matched}-a.json", [self._row(region="EUR", coverage=0.8)],
+                    created="2026-11-15T11:00:00Z", expires="2026-11-15T16:00:00Z")
+        self._write(f"{matched}-z.json", [self._row(coverage=0.4)],
+                    created="2026-11-15T10:00:00Z", expires="2026-11-15T16:00:00Z")
+        self._write(f"{foreign}-z.json", [self._row(id="foreign_account_only", coverage=1.0)],
+                    created="2026-11-15T11:59:00Z", expires="2026-11-15T16:00:00Z")
+        self._write("legacy.json", [self._row(coverage=0.99)],
+                    created="2026-11-15T11:59:00Z", expires="2026-11-15T16:00:00Z")
+        registry = os.path.join(self.root, "empty.jsonl")
+        with mock.patch.object(mine.ml, "configured_username", return_value="current-user"), \
+                mock.patch.object(research_paths, "metadata_root", return_value=self.root), \
+                mock.patch.object(mine.cache_store, "utc_now", return_value=self.now):
+            census = catalog_cli.cmd_catalog_unused(SimpleNamespace(registry=registry, top=20), None)
+        self.assertEqual(census["catalog_fields"], 1)
+        self.assertEqual(census["catalog_evidence"]["account_matched"], 1)
+        self.assertEqual(census["datasets"][0]["top_unused"][0]["coverage"], 0.8)
 
 
 class ShapeTests(unittest.TestCase):

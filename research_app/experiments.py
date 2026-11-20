@@ -169,6 +169,21 @@ def _checkpoint_event_updates(kind, payload, size):
     return ()
 
 
+def _commit_checkpoint_records(document, updates, save):
+    """Write all replacements before publishing any of them to the live batch."""
+    if not updates:
+        return
+    records = document["records"]
+    pending = records.copy()
+    for index, record in updates.items():
+        pending[index] = record
+    checkpoint = {**document, "records": pending}
+    save(checkpoint)
+    # Active callers keep a reference to the records list while scheduling work.
+    records[:] = pending
+    document.update({**checkpoint, "records": records})
+
+
 def _simulation_checkpoint_callback(path, checkpoint, sink):
     lock = threading.Lock()
 
@@ -182,16 +197,7 @@ def _simulation_checkpoint_callback(path, checkpoint, sink):
                 updated["role"] = alpha_registry.evidence_role(previous, row)
                 if updated != previous:
                     updates[index] = updated
-            if updates:
-                previous = {index: records[index] for index in updates}
-                for index, updated in updates.items():
-                    records[index] = updated
-                try:
-                    _write_simulation_checkpoint(path, checkpoint)
-                except BaseException:
-                    for index, record in previous.items():
-                        records[index] = record
-                    raise
+            _commit_checkpoint_records(checkpoint, updates, lambda pending: _write_simulation_checkpoint(path, pending))
             if sink:
                 sink(kind, payload)
 
@@ -1513,8 +1519,7 @@ def _recover_probe_batch(args, path):
             restored = [_selection_call(simulation_slots.restore_record, record, account)
                         for record in unresolved]
             if any(restored):
-                _probe_document_update(document, path)
-                cache_store.write_json_atomic(path, document, indent=1)
+                _save_probe_checkpoint(document, path, indent=1)
         native_before = {row["label"] for row in document["rows"]
                          if row.get("multi_request_id") and row.get("train_fitness") is None}
         if session is not None:
@@ -1533,9 +1538,7 @@ def _recover_probe_batch(args, path):
                     for arm in arms], settings=settings, labels=[arm["label"] for arm in arms],
                     initial_records=[records[index] for index in indices], deadline=deadline,
                     concurrency=document.get("concurrency"), on_event=progress, recover_only=True, **multi)
-                for index, record in zip(indices, produced):
-                    _update_probe_record(document, index, record)
-                _save_probe_checkpoint(document, path)
+                _save_probe_records(document, path, zip(indices, produced))
         active_rows = document["rows"]
         for row, record in zip(active_rows, records):
             if "simulation_status" in record:
@@ -1556,8 +1559,7 @@ def _recover_probe_batch(args, path):
                 else:
                     record.pop(key, None)
             simulation_slots.reconcile_record(record, account)
-            _probe_document_update(document, path)
-            cache_store.write_json_atomic(path, document, indent=1)
+            _save_probe_checkpoint(document, path, indent=1)
 
         outcome = _recover_probe_rows(session, [row for row in active_rows
             if not row.get("multi_request_id") and row["label"] not in native_before],
@@ -1584,8 +1586,7 @@ def _recover_probe_batch(args, path):
         for record in document["records"])
     outcome = with_session(args, recover, deadline=deadline) if needs_platform or needs_halves else recover(None)
     _probe_reconcile(document)
-    _probe_document_update(document, path)
-    cache_store.write_json_atomic(path, document, indent=1)
+    _save_probe_checkpoint(document, path, indent=1)
     result = _probe_response(document, path, show_test, manifest, summary=getattr(args, "summary", False))
     if show_test:
         research_paths.log_view("probe-recover", "test", [row.get("alpha_id") for row in result["rows"]],
@@ -2164,13 +2165,11 @@ def _probe_halves(session, records, *, deadline=None):
             record.pop("half_sharpes_error", None)
 
 
-def _update_probe_record(document, index, payload, *, submitting=False):
-    records = document["records"]
-    merged = _merge_checkpoint_record(records[index], payload)
-    arm = document["arms"][index]
+def _probe_checkpoint_record(previous, arm, payload, *, submitting):
+    merged = _merge_checkpoint_record(previous, payload)
     merged.update({"settings": dict(arm["settings"]), "expression": arm["expression"],
                    "mechanism": arm["label"], "decay": arm["settings"]["decay"]})
-    merged["role"] = alpha_registry.evidence_role(arm, records[index], payload)
+    merged["role"] = alpha_registry.evidence_role(arm, previous, payload)
     if submitting:
         merged.update({"submission_attempted": True, "status": "UNKNOWN_SUBMISSION"})
     if merged.get("alpha_id") or merged.get("progress_url") or merged.get("multi_parent_url"):
@@ -2179,29 +2178,26 @@ def _update_probe_record(document, index, payload, *, submitting=False):
         for key in ("progress_url", "next_poll_at", "metrics_pending"):
             if key not in payload:
                 merged.pop(key, None)
-    records[index] = merged
+    return merged
 
 
-def _save_probe_checkpoint(document, target):
+def _save_probe_checkpoint(document, target, *, indent=None):
     _probe_document_update(document, target)
-    cache_store.write_json_atomic(target, document)
+    cache_store.write_json_atomic(target, document, indent=indent)
+
+
+def _save_probe_records(document, target, updates, *, submitting=False):
+    records, arms = document["records"], document["arms"]
+    replacements = {
+        index: _probe_checkpoint_record(records[index], arms[index], payload, submitting=submitting)
+        for index, payload in updates
+    }
+    _commit_checkpoint_records(document, replacements, lambda pending: _save_probe_checkpoint(pending, target))
 
 
 def _save_probe_progress(document, target, indices, kind, payload):
-    updates = [(indices[index], row) for index, row in _checkpoint_event_updates(kind, payload, len(indices))]
-    if not updates:
-        return
-    records = document["records"]
-    previous = {index: records[index] for index, _row in updates}
-    try:
-        for index, row in updates:
-            _update_probe_record(document, index, row, submitting=kind in {"submitting", "multi_submitting"})
-        _save_probe_checkpoint(document, target)
-    except BaseException:
-        for index, record in previous.items():
-            records[index] = record
-        _probe_document_update(document, target)
-        raise
+    updates = ((indices[index], row) for index, row in _checkpoint_event_updates(kind, payload, len(indices)))
+    _save_probe_records(document, target, updates, submitting=kind in {"submitting", "multi_submitting"})
 
 
 def _execute_probe(args, document, target, groups):
@@ -2237,9 +2233,7 @@ def _execute_probe(args, document, target, groups):
                 options["recover_only"] = True
             produced = ml.simulate_alphas(session, group["pairs"], settings=group["settings"], **options)
         with state_lock:
-            for index, record in zip(indices, produced):
-                _update_probe_record(document, index, record)
-            save()
+            _save_probe_records(document, target, zip(indices, produced))
         return produced
 
     def work(session):
@@ -2514,6 +2508,10 @@ def _resume_simulation(args, sink, path):
     ):
         raise CliError("INVALID_INPUT", "unsupported or malformed simulation checkpoint")
 
+    settings = checkpoint.get("settings")
+    if not isinstance(settings, dict) or not settings:
+        raise CliError("INVALID_INPUT", "simulation checkpoint is missing saved settings")
+
     records = checkpoint["records"]
     try:
         pairs = [(record["expression"], record.get("decay")) for record in records]
@@ -2531,7 +2529,6 @@ def _resume_simulation(args, sink, path):
         record.get("candidate_id") if isinstance(record, dict) else None
         for record in records
     ]
-    settings = checkpoint.get("settings") or ml.default_settings()
     multi = _multi_options(args, checkpoint)
     if not multi and any(record.get("multi_request_id") for record in records):
         raise CliError("INVALID_INPUT", "native Multi checkpoint lacks its saved request size")

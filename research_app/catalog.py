@@ -420,52 +420,18 @@ def cmd_catalog_verify(args, _sink):
 
 
 def cmd_catalog_unused(args, _sink):
-    """Which catalog fields this book has never touched, by dataset.
+    """Count cached fields across scopes that the latest ledger has not referenced."""
+    from . import mine
 
-    "We only use 13% of the catalog" is true and useless on its own - the interesting
-    part is *which* families are untouched and what they let you ask. This counts the
-    difference between the cached catalog and every identifier that appears in the
-    ledger, per dataset, so the next mining round starts from a measurement instead of
-    from a hunch.
-
-    Operator names are excluded by the same rule the block classifier uses: a field is an
-    identifier that is not followed by `(`.
-    """
-    import json
-    import re
-
-    import alpha_registry
-
-    fields = {}
-    bound_fields = set()
-    for path, account_bound in ml.catalog_field_cache_paths():
-        try:
-            with open(path, encoding="utf-8") as handle:
-                payload = json.load(handle).get("payload") or []
-        except (OSError, ValueError):
-            continue
-        for row in payload:
-            field_id = row.get("id")
-            if field_id and (account_bound or field_id not in bound_fields):
-                fields[field_id] = row
-                if account_bound:
-                    bound_fields.add(field_id)
+    fields = mine.load_catalog(all_scopes=True)
     if not fields:
         raise ValueError("no cached catalog fields; run `catalog fields` first")
-
-    token = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
-    used = set()
-    for entry in alpha_registry.load_entries(getattr(args, "registry", None)):
-        text = entry.get("expression") or ""
-        for match in token.finditer(text):
-            if text[match.end():].lstrip().startswith("("):
-                continue
-            used.add(match.group(0))
-    used_fields = used & set(fields)
+    used_fields = mine.used_identifiers(getattr(args, "registry", None)) & fields.keys()
+    bound_count = sum(row["source"]["account_state"] == "matched" for row in fields.values())
 
     by_dataset = {}
     for field_id, row in fields.items():
-        dataset = (row.get("dataset") or {}).get("id") or "?"
+        dataset = row["dataset"]
         bucket = by_dataset.setdefault(dataset, {"dataset": dataset, "fields": 0,
                                                  "used": 0, "unused": []})
         bucket["fields"] += 1
@@ -473,8 +439,8 @@ def cmd_catalog_unused(args, _sink):
             bucket["used"] += 1
         else:
             bucket["unused"].append({"id": field_id,
-                                     "coverage": row.get("coverage"),
-                                     "description": (row.get("description") or "")[:70]})
+                                     "coverage": row["coverage"],
+                                     "description": row["description"][:70]})
 
     rows = []
     for dataset, bucket in by_dataset.items():
@@ -489,8 +455,8 @@ def cmd_catalog_unused(args, _sink):
     rows.sort(key=lambda r: -r["unused"])
     return {"catalog_fields": len(fields), "used_fields": len(used_fields),
             "unused_fields": len(fields) - len(used_fields),
-            "catalog_evidence": {"account_matched": len(bound_fields),
-                                 "account_unknown": len(fields) - len(bound_fields),
+            "catalog_evidence": {"account_matched": bound_count,
+                                 "account_unknown": len(fields) - bound_count,
                                  "live_verified": False},
             "datasets": rows}
 

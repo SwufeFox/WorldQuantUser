@@ -13,8 +13,11 @@ on. Changing the convention would move historical reports; unifying the code doe
 
 import math
 
+from correlation import pearson
+
 #: Below this many points a Sharpe is not reported, it is guessed.
 MIN_POINTS = 30
+MIN_PORTFOLIO_OVERLAP = 120
 FITNESS_TURNOVER_FLOOR = 0.125
 # Recheck decisive comparisons with the scalar kernel within this band.
 CORRELATION_ROUNDOFF = 1e-10
@@ -39,16 +42,7 @@ def sharpe(values, min_points=MIN_POINTS):
 
 def correlation(a, b, min_points=MIN_POINTS):
     """Pearson correlation of two equal-length series, aligned by position."""
-    if len(a) != len(b) or len(a) < min_points:
-        return None
-    mean_a = sum(a) / len(a)
-    mean_b = sum(b) / len(b)
-    cov = sum((x - mean_a) * (y - mean_b) for x, y in zip(a, b))
-    var_a = sum((x - mean_a) ** 2 for x in a)
-    var_b = sum((y - mean_b) ** 2 for y in b)
-    if var_a <= 0 or var_b <= 0:
-        return None
-    return cov / math.sqrt(var_a * var_b)
+    return pearson(a, b, min_points=min_points)
 
 
 def unit_correlation_rows(rows):
@@ -78,10 +72,33 @@ def unit_correlation_rows(rows):
             return None
         centered = values - values.mean(axis=1, keepdims=True)
         norms = np.sqrt(np.einsum("ij,ij->i", centered, centered))
-        # Preserve the scalar variance product's behavior at extreme scales.
+        # Keep extreme scales on the scalar path.
         if not ((norms > 1e-70) & (norms < 1e70)).all():
             return None
         return centered / norms[:, None]
+
+
+def member_correlations(values, series, dates, unit_book=None, min_points=MIN_POINTS):
+    """Return the measured count and strongest signed correlation to a member."""
+    if len(dates) < min_points:
+        return 0, None
+    members = list(series.items())
+    unit_candidate = unit_correlation_rows([values]) if unit_book is not None else None
+    if unit_candidate is not None:
+        approximate = abs((unit_book * unit_candidate[0]).sum(axis=1))
+        maximum = approximate.max()
+        members_to_check = [member for member, rho in zip(members, approximate)
+                            if maximum - rho <= CORRELATION_ROUNDOFF]
+    else:
+        members_to_check = members
+    # Recompute close contenders with the scalar kernel, including ties.
+    measured = []
+    for member, member_values in members_to_check:
+        rho = correlation(values, [member_values[day] for day in dates], min_points=min_points)
+        if rho is not None:
+            measured.append((rho, member))
+    count = len(members) if unit_candidate is not None else len(measured)
+    return count, max(measured, key=lambda item: abs(item[0]), default=None)
 
 
 def effective_bets(pair_correlations, members):

@@ -6,7 +6,6 @@ turnover is a train-only historical heuristic, not a field's update cadence.
 """
 
 import collections
-import json
 import math
 import os
 import re
@@ -62,22 +61,19 @@ def _moment(value):
         return None
 
 
-def load_catalog(report=None):
-    """``{field_id: {dataset, type, coverage, description}}`` from the disk cache."""
+def load_catalog(report=None, *, all_scopes=False):
+    """Select one cached record per field, within the default scope or across scopes."""
     fields = {}
-    scope = _scope()
+    scope = None if all_scopes else _scope()
     ignored = 0
     now = cache_store.utc_now()
     for path, account_bound in ml.catalog_field_cache_paths():
-        try:
-            with open(path, encoding="utf-8") as handle:
-                document = json.load(handle)
-            payload = document.get("payload") or []
-        except (OSError, ValueError, AttributeError):
-            continue
+        document, _ = cache_store.load_json(path)
+        payload = document.get("payload") if isinstance(document, dict) else None
         if not isinstance(payload, list):
             continue
-        envelope = document.get("_cache") or {}
+        envelope = document.get("_cache")
+        envelope = envelope if isinstance(envelope, dict) else {}
         created = _moment(envelope.get("created_at"))
         expiry = _moment(envelope.get("expires_at"))
         freshness = ("fresh" if expiry > now else "stale") if expiry else "unknown"
@@ -85,10 +81,10 @@ def load_catalog(report=None):
             if not isinstance(row, dict):
                 continue
             field_id = row.get("id")
-            if not field_id:
+            if not isinstance(field_id, str) or not field_id:
                 continue
-            declared = {key: row.get(key) for key in scope if row.get(key) is not None}
-            if any(value != scope[key] for key, value in declared.items()):
+            declared = {key: row[key] for key in scope or {} if row.get(key) is not None}
+            if scope is not None and any(value != scope[key] for key, value in declared.items()):
                 ignored += 1
                 continue
             scope_known = all(key in declared for key in ("region", "universe", "delay"))
@@ -97,18 +93,22 @@ def load_catalog(report=None):
                       "freshness": freshness, "created_at": envelope.get("created_at"),
                       "expires_at": envelope.get("expires_at"),
                       "age_seconds": max(0, (now - created).total_seconds()) if created else None}
-            # Prefer explicitly scoped, fresh, newest metadata; never depend on glob order.
+            # Marked scope takes precedence for scoped research. A census across
+            # scopes instead starts with account ownership, then freshness and age.
             priority = (scope_known, account_bound, freshness == "fresh",
                         created.timestamp() if created else 0, path)
             previous = fields.get(field_id)
             if previous and priority <= previous["_priority"]:
                 continue
-            dataset = row.get("dataset") or "?"
+            dataset = row.get("dataset")
+            if isinstance(dataset, dict):
+                dataset = dataset.get("id")
+            field_type, coverage, description = row.get("type"), row.get("coverage"), row.get("description")
             fields[field_id] = {
-                "dataset": dataset.get("id", "?") if isinstance(dataset, dict) else dataset,
-                "type": (row.get("type") or "").upper() or None,
-                "coverage": row.get("coverage"),
-                "description": (row.get("description") or "").strip(),
+                "dataset": dataset if isinstance(dataset, str) and dataset else "?",
+                "type": field_type.upper() if isinstance(field_type, str) and field_type else None,
+                "coverage": coverage if type(coverage) in (int, float) and 0 <= coverage <= 1 else None,
+                "description": description.strip() if isinstance(description, str) else "",
                 "source": source,
                 "_priority": priority,
             }
@@ -127,15 +127,19 @@ def _fields(expression):
     return set(fastexpr_ast.field_names(fastexpr_ast.parse_program(expression)))
 
 
+def _parsed_ledger_fields(entries):
+    for entry in entries:
+        try:
+            identifiers = _fields(entry.get("expression") or "")
+        except fastexpr_ast.ParseError:
+            identifiers = None
+        yield entry, identifiers
+
+
 def used_identifiers(registry_path=None):
     """Fields in parseable latest ledger expressions, excluding comments and locals."""
-    used = set()
-    for entry in alpha_registry.load_entries(registry_path):
-        try:
-            used.update(_fields(entry.get("expression") or ""))
-        except fastexpr_ast.ParseError:
-            continue
-    return used
+    return {field for _, identifiers in _parsed_ledger_fields(alpha_registry.load_entries(registry_path))
+            for field in identifiers or ()}
 
 
 def dataset_turnover(entries=None, catalog=None):
@@ -148,12 +152,14 @@ def dataset_turnover(entries=None, catalog=None):
     catalog = load_catalog() if catalog is None else catalog
     if entries is None:
         entries = alpha_registry.load_entries()
+    return _dataset_turnover(_parsed_ledger_fields(entries), catalog)
+
+
+def _dataset_turnover(parsed, catalog):
     buckets = collections.defaultdict(list)
     missing = collections.Counter()
-    for entry in entries:
-        try:
-            identifiers = _fields(entry.get("expression") or "")
-        except fastexpr_ast.ParseError:
+    for entry, identifiers in parsed:
+        if not identifiers:
             continue
         turnover = ((entry.get("out_of_sample") or {}).get("train") or {}).get("turnover")
         datasets = {catalog[name]["dataset"] for name in identifiers if name in catalog}
@@ -227,13 +233,12 @@ def cmd_mine(args, _sink):
     if not catalog:
         raise CliError("INVALID_INPUT", "no cached field catalog; run `catalog fields` first")
     entries = alpha_registry.load_entries(getattr(args, "registry", None))
+    parsed = list(_parsed_ledger_fields(entries))
     used = set()
     parse_failures = []
     usage = collections.defaultdict(list)
-    for entry in entries:
-        try:
-            identifiers = _fields(entry.get("expression") or "")
-        except fastexpr_ast.ParseError:
+    for entry, identifiers in parsed:
+        if identifiers is None:
             parse_failures.append(entry.get("key") or entry.get("alpha_id"))
             continue
         used.update(identifiers)
@@ -242,7 +247,7 @@ def cmd_mine(args, _sink):
                                       "key": entry.get("key") or entry.get("alpha_id"),
                                       "verdict": entry.get("verdict"),
                                       "mechanism": entry.get("mechanism")})
-    turnover = dataset_turnover(entries, catalog)
+    turnover = _dataset_turnover(parsed, catalog)
 
     try:
         band = tuple(float(part) for part in args.turnover_band.split(","))
