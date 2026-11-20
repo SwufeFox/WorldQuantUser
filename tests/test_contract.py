@@ -156,7 +156,8 @@ class BriefContractTests(unittest.TestCase):
 class ReferenceContractTests(unittest.TestCase):
     def test_schema_exposes_documentation_and_forum_read_options(self):
         cache_flags = {"--offline", "--meta-max-age", "--refresh-meta", "--no-cache", "--relogin"}
-        for path, expected in ((["docs", "get"], {"slug", "--relogin"}),
+        for path, expected in ((["docs", "get"], {"slug", "--query", "--text"}),
+                               (["docs", "list"], {"--query", "--summary"}),
                                (["forum", "search"], {"query", "--limit", "--page"}),
                                (["forum", "comments"], {"post_id", "--limit", "--cursor"})):
             with self.subTest(path=path):

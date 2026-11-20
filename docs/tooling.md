@@ -58,8 +58,9 @@ Python 检查源码的字段声明。同次 `probe` 可复用已经在线核验�
 ## 读平台文档和论坛
 
 ```bash
-python research_cli.py docs list --query python
-python research_cli.py docs get how-translate-fast-expression-alpha-python-alpha
+python research_cli.py docs get --query "power pool" --text
+python research_cli.py docs list --query submission --summary
+python research_cli.py docs get consultant-submission-tests --text
 python research_cli.py docs articles 41681062887191 --limit 5
 python research_cli.py docs article 41681217386903
 python research_cli.py forum topics --limit 5
@@ -70,8 +71,11 @@ python research_cli.py forum get 41113878259479 --offline
 python research_cli.py docs get how-translate-fast-expression-alpha-python-alpha --refresh-meta
 ```
 
-`docs list` 筛选 BRAIN 文档目录中的标题、分类和 ID。`docs get` 返回原始 `content`
-块、来源与更新时间。`docs articles` 按分类列英语 Help Center 文章，`docs article` 读取 `body`。
+知道主题时用 `docs get --query KEYWORD --text` 直接读。标题或 ID 的完整匹配优先，
+匹配到多个页面时从 `error.details.pages` 选 ID。`docs list --summary` 返回扁平的标题、ID 和链接列表。
+`--text` 将正文放在 `data.text`，并在 `data.unsupported_blocks` 标明无法转换的内容块类型。
+省略 `--text` 时，`docs get` 返回原始 `content` 块。两种视图都保留来源与更新时间。
+`docs articles` 按分类列英语 Help Center 文章，`docs article` 读取 `body`。
 `forum get` 的 `details` 和 `forum comments` 的 `body` 保留原始 HTML。
 
 论坛搜索和 Help Center 分类用 `--page` 翻页。论坛主题和评论用 `--cursor` 接收

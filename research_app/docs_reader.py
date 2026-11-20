@@ -8,8 +8,9 @@ import requests
 
 import machine_lib as ml
 
+from .docs_text import render_blocks
 from .reference_cache import read_cached
-from .runtime import CliError, with_session
+from .runtime import CliError, session_reader
 
 
 _CATALOG = "/tutorials"
@@ -49,46 +50,79 @@ def _fetch_catalog(session):
     return {"categories": categories}
 
 
-def _cached_catalog(args, session=None):
+def _cached_catalog(args, read=None):
+    read = read if read is not None else session_reader(args)
+
     def fetch():
         try:
-            if session is not None:
-                return _fetch_catalog(session)
-            return with_session(args, _fetch_catalog)
+            return read(_fetch_catalog)
         except requests.RequestException as exc:
             raise CliError("SERVICE_ERROR", "BRAIN tutorial catalog request failed") from exc
 
     return read_cached(args, "brain-tutorial-catalog", {}, fetch)
 
 
-def cmd_docs_list(args, _sink):
-    """List the catalog, optionally filtering its titles and identifiers."""
-    query = getattr(args, "query", None)
+def _query(query):
     if query is not None:
         query = query.strip()
         if not query:
             raise CliError("INVALID_INPUT", "documentation query must not be empty")
-    needle = query.casefold() if query else None
+    return query
 
-    cached = _cached_catalog(args)
+
+def _filter_catalog(sections, query):
+    needle = query.casefold() if query else None
     categories = []
-    for section in cached["categories"]:
+    for section in sections:
         section_matches = needle is None or _matches(
             needle, section["id"], section.get("title"), section.get("category"))
         pages = [page for page in section["pages"]
                  if section_matches or _matches(needle, page["id"], page.get("title"))]
         if section_matches or pages:
             categories.append({**section, "pages": pages})
-    return {"query": query, "category_count": len(categories),
-            "page_count": sum(len(c["pages"]) for c in categories), "categories": categories,
-            "cache": cached["cache"]}
+    return categories
+
+
+def _page_summaries(categories):
+    return [{"id": page["id"], "title": page.get("title"), "url": page["url"]}
+            for section in categories for page in section["pages"]]
+
+
+def cmd_docs_list(args, _sink):
+    """List the catalog, optionally filtering its titles and identifiers."""
+    query = _query(getattr(args, "query", None))
+    cached = _cached_catalog(args)
+    categories = _filter_catalog(cached["categories"], query)
+    result = {"query": query, "category_count": len(categories),
+              "page_count": sum(len(c["pages"]) for c in categories), "cache": cached["cache"]}
+    if getattr(args, "summary", False):
+        return {**result, "pages": _page_summaries(categories)}
+    return {**result, "categories": categories}
+
+
+def _lookup_page(args, query, read):
+    categories = _filter_catalog(_cached_catalog(args, read)["categories"], query)
+    pages = _page_summaries(categories)
+    needle = query.casefold()
+    exact = [page for page in pages
+             if any(isinstance(value, str) and value.casefold() == needle
+                    for value in (page["id"], page["title"]))]
+    matches = exact or pages
+    if not matches:
+        raise CliError("NOT_FOUND", "no BRAIN documentation page matches this query",
+                       "try a shorter keyword or use `docs list --summary`")
+    if len(matches) > 1:
+        raise CliError("INVALID_INPUT", "the documentation query matches multiple pages",
+                       "choose a page ID, then use `docs get PAGE_ID --text`",
+                       details={"pages": matches})
+    return matches[0]
 
 
 def _document_url(args, session, slug):
     # The article endpoint supplies a grouping label (e.g. Getting Started).
     # The web URL also needs the catalog section ID (e.g. discover-brain).
     try:
-        categories = _cached_catalog(args, session)["categories"]
+        categories = _cached_catalog(args, lambda work: work(session))["categories"]
     except (CliError, ml.BrainError):
         # A failed metadata lookup should still leave the successfully read
         # article and its authoritative API URL available.
@@ -98,8 +132,11 @@ def _document_url(args, session, slug):
 
 
 def cmd_docs_get(args, _sink):
-    """Read a known documentation slug without converting its content blocks."""
-    slug = args.slug
+    """Read a page by ID or catalog keyword, optionally rendering its body."""
+    query = _query(getattr(args, "query", None))
+    read = session_reader(args)
+    page = _lookup_page(args, query, read) if query is not None else None
+    slug = page["id"] if page is not None else args.slug
     if not _valid_slug(slug):
         raise CliError("INVALID_INPUT", "provide a BRAIN documentation slug",
                        "use `docs list` to find the page ID")
@@ -110,13 +147,21 @@ def cmd_docs_get(args, _sink):
         if (not isinstance(document, dict) or document.get("id") != slug
                 or not isinstance(document.get("content"), list)):
             raise CliError("SERVICE_ERROR", "BRAIN returned an invalid tutorial document")
-        return {**document, "url": _document_url(args, session, slug),
+        url = page["url"] if page is not None else _document_url(args, session, slug)
+        return {**document, "url": url,
                 "api_url": ml.BRAIN_API_URL + endpoint}
 
     def fetch():
         try:
-            return with_session(args, work)
+            return read(work)
         except requests.RequestException as exc:
             raise CliError("SERVICE_ERROR", "BRAIN tutorial document request failed") from exc
 
-    return read_cached(args, "brain-tutorial-page", {"slug": slug}, fetch)
+    document = read_cached(args, "brain-tutorial-page", {"slug": slug}, fetch)
+    if page is not None and document.get("url") != page["url"]:
+        document = {**document, "url": page["url"]}
+    if not getattr(args, "text", False):
+        return document
+    text, unsupported = render_blocks(document["content"])
+    return {**{key: value for key, value in document.items() if key != "content"},
+            "text": text, "unsupported_blocks": unsupported}

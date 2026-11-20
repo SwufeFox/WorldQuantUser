@@ -12,7 +12,7 @@ import requests
 import cache_store
 import machine_lib as ml
 import research_paths
-from research_app import docs_reader, reference, support_reader
+from research_app import app, docs_reader, reference, support_reader
 from research_app.runtime import CliError, OutputConflict
 
 SUPPORT = "https://support.worldquantbrain.com"
@@ -191,6 +191,72 @@ def test_platform_docs_share_catalog_across_queries_and_canonical_urls():
     assert warm["cache"]["hit"] is True
     assert load.call_count == 2    # catalog and article, neither hit
     assert [call.args[2] for call in request.call_args_list] == ["/tutorials", "/tutorial-pages/workflow"]
+
+
+def test_doc_query_renders_cached_provider_blocks_and_keeps_raw_view(capsys):
+    slug = "getting-started-power-pool-alphas"
+    blocks = [
+        {"type": "TEXT", "value": "<style>.policy {color:red}</style><p>Review &amp; prepare.</p>"
+                                   "<ul><li>Check eligibility</li><li>Read the rules</li></ul>"},
+        {"type": "HEADING", "value": {"level": "2", "content": "Submission"}},
+        {"type": "TABLE", "value": {"data": [["Field", "Value"], ["Mode", "FULL"]],
+                                     "firstRowIsTableHeader": True, "firstColIsHeader": False}},
+        {"type": "TEXT", "value": "<pre>if x &lt; 3:\n    simulate(x)</pre>"},
+        {"type": "NEW_BLOCK", "value": {"opaque": True}},
+    ]
+    detail = {"id": slug, "title": "Power Pool Alphas", "content": blocks,
+              "lastModified": "2026-11-17T12:00:00Z"}
+    directory = {"count": 1, "next": None, "results": [{"id": "consultant-information", "pages": [
+        {"id": slug, "title": detail["title"]},
+        {"id": "power-pool-related", "title": "Power Pool Alphas FAQ"},
+    ]}]}
+    session = object()
+    with mock.patch.object(ml, "load_session", return_value=session) as load, \
+            mock.patch.object(ml, "request_json", side_effect=[directory, detail]) as request:
+        assert app.main(["docs", "get", "--query", "power pool alphas", "--text", "--relogin"]) == 0
+        rendered = json.loads(capsys.readouterr().out)["data"]
+        assert app.main(["docs", "get", slug, "--offline"]) == 0
+        raw = json.loads(capsys.readouterr().out)["data"]
+        assert app.main(["docs", "get", slug, "--text", "--offline"]) == 0
+        warm = json.loads(capsys.readouterr().out)["data"]
+    assert [call.args[:3] for call in request.call_args_list] == [
+        (session, "GET", "/tutorials"), (session, "GET", f"/tutorial-pages/{slug}"),
+    ]
+    load.assert_called_once_with(use_cache=True, refresh=True)
+    assert "content" not in rendered and raw["content"] == blocks
+    assert rendered["unsupported_blocks"] == ["NEW_BLOCK"]
+    assert rendered["url"].endswith(f"/consultant-information/{slug}")
+    assert rendered["lastModified"] == detail["lastModified"]
+    assert "color:red" not in rendered["text"]
+    for phrase in ("Review & prepare.", "Check eligibility", "Read the rules", "Submission", "Mode | FULL",
+                   "if x < 3:\n    simulate(x)"):
+        assert phrase in rendered["text"]
+    assert raw["cache"]["hit"] and warm["cache"]["hit"]
+    assert warm["text"] == rendered["text"]
+
+
+def test_doc_search_lists_choices_without_fetching_an_ambiguous_page(capsys):
+    entries = [{"id": "power-pool-a", "title": "Power Pool A", "duration": "PT2M"},
+               {"id": "power-pool-b", "title": "Power Pool B"},
+               {"id": "unrelated", "title": "Unrelated page"}]
+    directory = {"count": 1, "next": None, "results": [{"id": "section", "pages": entries}]}
+    with mock.patch.object(ml, "load_session", return_value=object()) as load, \
+            mock.patch.object(ml, "request_json", return_value=directory) as request:
+        assert app.main(["docs", "list", "--query", "power pool", "--summary"]) == 0
+        summary = json.loads(capsys.readouterr().out)["data"]
+        assert app.main(["docs", "get", "--query", "power pool", "--text", "--offline"]) == 2
+        ambiguous = json.loads(capsys.readouterr().out)["error"]
+        assert app.main(["docs", "get", "--query", "no such topic", "--offline"]) != 0
+        missing = json.loads(capsys.readouterr().out)["error"]
+    load.assert_called_once()
+    request.assert_called_once()
+    assert "categories" not in summary
+    assert summary["page_count"] == 2
+    assert [page["id"] for page in summary["pages"]] == ["power-pool-a", "power-pool-b"]
+    assert all(set(page) == {"id", "title", "url"} for page in summary["pages"])
+    assert ambiguous["code"] == "INVALID_INPUT"
+    assert ambiguous["details"]["pages"] == summary["pages"]
+    assert missing["code"] == "NOT_FOUND"
 
 
 def test_doc_save_cannot_overwrite_the_shared_catalog(monkeypatch, tmp_path):

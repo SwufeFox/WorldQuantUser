@@ -256,8 +256,12 @@ def _add_reference_commands(sub):
     docs_sub = docs.add_subparsers(dest="subcommand", metavar="<action>", parser_class=JsonArgumentParser)
     docs_list = add(docs_sub, "list", "docs_reader.cmd_docs_list", "List BRAIN documentation by category.")
     docs_list.add_argument("--query", help="Filter category titles, page titles and IDs.")
-    docs_get = add(docs_sub, "get", "docs_reader.cmd_docs_get", "Read a BRAIN documentation page's original content blocks.")
-    docs_get.add_argument("slug", help="Page ID from docs list.")
+    docs_list.add_argument("--summary", action="store_true", help="Return a flat list of page IDs, titles and links.")
+    docs_get = add(docs_sub, "get", "docs_reader.cmd_docs_get", "Read a BRAIN documentation page by ID or keyword.")
+    page = docs_get.add_mutually_exclusive_group(required=True)
+    page.add_argument("slug", nargs="?", metavar="PAGE_ID", help="Page ID from docs list.")
+    page.add_argument("--query", help="Read the unique page matching this title or keyword.")
+    docs_get.add_argument("--text", action="store_true", help="Return readable text instead of original content blocks.")
     articles = add(docs_sub, "articles", "reference.cmd_docs_articles", "List English Help Center articles in a category.")
     articles.add_argument("category_id", help="Numeric ID from the Help Center category link.")
     paginate(articles)
@@ -1576,9 +1580,10 @@ _COMMAND_EXAMPLES = {
     "auth": ["auth check"],
     "auth check": ["auth check"],
     "auth logout": ["auth logout"],
-    "docs": ["docs list --query python", "docs articles 41681062887191 --limit 5"],
-    "docs list": ["docs list --query python"],
-    "docs get": ["docs get how-translate-fast-expression-alpha-python-alpha",
+    "docs": ['docs get --query "power pool" --text', "docs list --query python --summary"],
+    "docs list": ["docs list --query python --summary"],
+    "docs get": ['docs get --query "power pool" --text',
+                 "docs get how-translate-fast-expression-alpha-python-alpha",
                  "docs get how-translate-fast-expression-alpha-python-alpha --offline"],
     "docs articles": ["docs articles 41681062887191 --limit 5"],
     "docs article": ["docs article 41681217386903"],
