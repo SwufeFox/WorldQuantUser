@@ -103,12 +103,15 @@ class CatalogCacheTests(unittest.TestCase):
         self.datasets = [{"id": "first"}, {"id": "second"}]
 
     def invoke(self, *args):
-        stdout = io.StringIO()
-        with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", io.StringIO()):
+        return self.invoke_with_progress(*args)[0]
+
+    def invoke_with_progress(self, *args):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
             code = app.main(["catalog", *args, "--compact"])
         document = json.loads(stdout.getvalue())
         self.assertEqual(code, 0, document)
-        return document["data"]
+        return document["data"], stderr.getvalue()
 
     def test_warm_datasets_fields_and_find_use_disk_before_login(self):
         with mock.patch.object(ml, "_get_datasets", return_value=self.datasets), \
@@ -135,6 +138,140 @@ class CatalogCacheTests(unittest.TestCase):
         load.assert_called_once_with(use_cache=True, refresh=True)
         self.assertIs(datasets.call_args.args[0], self.session)
         self.assertEqual([call.args[0] for call in fields.call_args_list], [self.session] * len(self.datasets))
+
+    def test_find_scans_past_first_page_and_ranks_filtered_fields_globally(self):
+        first_page = [
+            {**_field("first_qualified", 0.99), "alphaCount": 0, "pyramidMultiplier": 2},
+            {**_field("low_coverage", 0.7), "alphaCount": 0, "pyramidMultiplier": 9},
+            {**_field("vector", 0.99, kind="VECTOR"), "alphaCount": 0, "pyramidMultiplier": 9},
+            {**_field("unknown_count", 0.99), "pyramidMultiplier": 9},
+            {**_field("boolean_count", 0.99), "alphaCount": False, "pyramidMultiplier": 9},
+            {**_field("string_count", 0.99), "alphaCount": "0", "pyramidMultiplier": 9},
+            {**_field("negative_count", 0.99), "alphaCount": -1, "pyramidMultiplier": 9},
+        ]
+        first_page += [{**_field(f"used_{index}", 0.99), "alphaCount": 20}
+                       for index in range(51 - len(first_page))]
+        fields = {
+            "analyst69": first_page + [{**_field("found_on_second_page", 0.8),
+                                        "alphaCount": 0, "userCount": 0, "pyramidMultiplier": 3}],
+            "analyst15": [{**_field("other_dataset", 0.82), "alphaCount": 0,
+                           "userCount": 3, "pyramidMultiplier": 4},
+                          {**_field("missing_multiplier", 0.99), "alphaCount": 0}],
+        }
+
+        def request_json(session, method, path, params=None, **_kwargs):
+            self.assertIs(session, self.session)
+            self.assertEqual(method, "GET")
+            self.assertEqual({key: params[key] for key in ("region", "universe", "delay", "instrumentType")},
+                             {"region": "EUR", "universe": "TOP2500", "delay": 1, "instrumentType": "EQUITY"})
+            if path == "/data-sets":
+                return {"count": len(fields), "results": [{"id": dataset} for dataset in fields]}
+            self.assertEqual(path, "/data-fields")
+            self.assertEqual(params["limit"], 50)
+            self.assertEqual(params["type"], "MATRIX")
+            rows = [row for row in fields[params["dataset.id"]] if row["type"] == params["type"]]
+            offset = params["offset"]
+            return {"count": len(rows), "results": rows[offset:offset + params["limit"]]}
+
+        arguments = ("find", "--dataset", "analyst69,analyst15", "--region", "EUR", "--universe", "TOP2500",
+                     "--type", "MATRIX", "--max-alpha-count", "0", "--min-coverage", "0.8",
+                     "--sort", "pyramid-multiplier")
+        with mock.patch.object(ml, "load_session", return_value=self.session) as load, \
+                mock.patch.object(ml, "request_json", side_effect=request_json) as request:
+            result, progress = self.invoke_with_progress(*arguments, "--limit", "2", "--stream")
+        load.assert_called_once()
+        offsets = [(call.kwargs["params"]["dataset.id"], call.kwargs["params"]["offset"])
+                   for call in request.call_args_list if call.args[2] == "/data-fields"]
+        self.assertCountEqual(offsets, [("analyst69", 0), ("analyst69", 50), ("analyst15", 0)])
+        self.assertTrue(result["discovery"]["complete"])
+        self.assertEqual(result["count"], 4)
+        self.assertEqual([row["id"] for row in result["fields"]], ["other_dataset", "found_on_second_page"])
+        self.assertEqual([(row["alpha_count"], row["user_count"], row["pyramid_multiplier"])
+                          for row in result["fields"]], [(0, 3, 4), (0, 0, 3)])
+        catalogs = {row["dataset"]: row for row in result["discovery"]["catalogs"]}
+        self.assertEqual({key: row["matches"] for key, row in catalogs.items()}, {"analyst69": 2, "analyst15": 2})
+        events = [json.loads(line) for line in progress.splitlines() if line.startswith("{")]
+        self.assertEqual({event["dataset"] for event in events if event.get("dataset")}, set(fields))
+
+        with mock.patch.object(ml, "load_session", side_effect=AssertionError("warm cache should not log in")), \
+                mock.patch.object(ml, "request_json", side_effect=AssertionError("warm cache should not query")):
+            warm = self.invoke(*arguments, "--limit", "4")
+        self.assertTrue(warm["cache"]["hit"])
+        self.assertTrue(warm["discovery"]["complete"])
+        self.assertEqual(warm["fields"][:2], result["fields"])
+        self.assertEqual([row["id"] for row in warm["fields"][2:]], ["first_qualified", "missing_multiplier"])
+        self.assertIsNone(warm["fields"][-1]["pyramid_multiplier"])
+
+    def test_find_distinguishes_no_match_from_limited_and_unlisted_datasets(self):
+        selection = ["available", "bad_page", "no_match", "not_listed", "rate_limited", "after_rate_limit"]
+        datasets = [dataset for dataset in selection if dataset != "not_listed"]
+
+        def request_json(_session, _method, path, params=None, **_kwargs):
+            if path == "/data-sets":
+                return {"count": len(datasets), "results": [{"id": dataset} for dataset in datasets]}
+            self.assertEqual(path, "/data-fields")
+            dataset = params["dataset.id"]
+            self.assertNotIn(dataset, {"not_listed", "after_rate_limit"})
+            if dataset == "bad_page":
+                return {"count": 1, "results": []}
+            if dataset == "rate_limited":
+                raise ml.RateLimited("server limited this read")
+            row = {**_field(dataset, 0.92), "alphaCount": 7 if dataset == "no_match" else 0}
+            return {"count": 1, "results": [row]}
+
+        with mock.patch.object(ml, "load_session", return_value=self.session), \
+                mock.patch.object(ml, "request_json", side_effect=request_json):
+            data = self.invoke("find", "--dataset", ",".join(selection), "--max-alpha-count", "0")
+        self.assertEqual([row["id"] for row in data["fields"]], ["available"])
+        self.assertFalse(data["discovery"]["complete"])
+        evidence = {row["dataset"]: row for row in data["discovery"]["catalogs"]}
+        self.assertEqual(evidence["available"]["matches"], 1)
+        self.assertEqual(evidence["available"]["fields_scanned"], 1)
+        self.assertIsNone(evidence["bad_page"]["matches"])
+        self.assertEqual(evidence["bad_page"]["error_code"], "SERVICE_ERROR")
+        self.assertEqual(evidence["no_match"]["matches"], 0)
+        self.assertEqual(evidence["no_match"]["fields_scanned"], 1)
+        self.assertIsNone(evidence["rate_limited"]["matches"])
+        self.assertEqual(evidence["rate_limited"]["error_code"], "RATE_LIMITED")
+        self.assertIsNone(evidence["not_listed"]["matches"])
+        self.assertEqual(evidence["not_listed"]["state"], "unknown")
+        self.assertEqual(evidence["after_rate_limit"]["state"], "not_scanned")
+        self.assertIsNone(evidence["after_rate_limit"]["matches"])
+
+    def test_malformed_field_id_does_not_discard_other_datasets(self):
+        fields = {
+            "before": [_field("first_signal", 0.9)],
+            "malformed": [_field("also_signal", 0.9), _field(42, 0.9)],
+            "after": [_field("last_signal", 0.9)],
+        }
+
+        def request_json(_session, _method, path, params=None, **_kwargs):
+            if path == "/data-sets":
+                rows = [{"id": dataset} for dataset in fields]
+            else:
+                self.assertEqual(path, "/data-fields")
+                rows = fields[params["dataset.id"]]
+            return {"count": len(rows), "results": rows}
+
+        with mock.patch.object(ml, "load_session", return_value=self.session), \
+                mock.patch.object(ml, "request_json", side_effect=request_json) as request:
+            result = self.invoke("find", "--min-coverage", "0.8")
+            request.reset_mock()
+            fields["malformed"] = [_field("repaired_signal", 0.9)]
+            retried = self.invoke("find", "--min-coverage", "0.8")
+
+        self.assertFalse(result["discovery"]["complete"])
+        self.assertEqual([row["id"] for row in result["fields"]], ["first_signal", "last_signal"])
+        catalogs = {row["dataset"]: row for row in result["discovery"]["catalogs"]}
+        self.assertEqual(catalogs["malformed"]["error_code"], "SERVICE_ERROR")
+        self.assertIsNone(catalogs["malformed"]["matches"])
+        self.assertEqual(catalogs["before"]["matches"], 1)
+        self.assertEqual(catalogs["after"]["matches"], 1)
+        request.assert_called_once()
+        self.assertEqual(request.call_args.kwargs["params"]["dataset.id"], "malformed")
+        self.assertTrue(retried["discovery"]["complete"])
+        self.assertEqual([row["id"] for row in retried["fields"]],
+                         ["first_signal", "last_signal", "repaired_signal"])
 
     def test_stricter_max_age_refetches_and_labels_fallback(self):
         expired_by_policy = cache_store.utc_now() - timedelta(minutes=2)

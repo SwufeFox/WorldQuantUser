@@ -769,6 +769,8 @@ def _get_datasets(s, instrument_type="EQUITY", region="USA", delay=1,
         params["theme"] = "true" if theme else "false"
     request_limits = {} if deadline is None else {"deadline": deadline}
     for batch in _catalog_pages(s, "/data-sets", params, keys=("data-sets",), **request_limits):
+        if any(not isinstance(row.get("id"), str) or not row["id"] for row in batch):
+            raise ServiceError("catalog returned an invalid dataset ID")
         results.extend(batch)
         if limit and len(results) >= limit:
             return results[:limit]
@@ -939,7 +941,10 @@ def get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
     if search or field_type or limit:
         def filter_complete(rows):
             if isinstance(rows, list) and all(isinstance(row, dict) for row in rows):
-                return _filter_datafields(rows, field_type, search, limit)
+                try:
+                    return _filter_datafields(rows, field_type, search, limit)
+                except ServiceError:
+                    return None
 
         derive_from = ({**params, "search": "", "type": None, "limit": None}, filter_complete)
     return _cached_account_catalog(
@@ -961,6 +966,9 @@ def _get_datafields(s, instrument_type="EQUITY", region="USA", delay=1,
     """
     params = {"instrumentType": instrument_type, "region": region, "delay": delay,
               "universe": universe, "dataset.id": dataset_id}
+    # BRAIN's MATRIX filter has been verified against complete scoped catalogs.
+    if field_type == "MATRIX":
+        params["type"] = field_type
     pages = _catalog_pages(s, "/data-fields", params, keys=("datafields",), page_size=50)
     return _filter_datafields((item for page in pages for item in page), field_type, search, limit)
 
@@ -969,10 +977,13 @@ def _filter_datafields(rows, field_type, search, limit):
     fields = []
     search = search.lower() if search else ""
     for item in rows:
+        field_id = item.get("id")
+        if not isinstance(field_id, str) or not field_id:
+            raise ServiceError("catalog returned an invalid field ID")
         if field_type and item.get("type") != field_type:
             continue
         if search and search not in (
-            (item.get("id") or "") + " " + (item.get("description") or "")
+            field_id + " " + (item.get("description") or "")
         ).lower():
             continue
         fields.append(item)

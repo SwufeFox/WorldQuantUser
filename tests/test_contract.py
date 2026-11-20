@@ -78,6 +78,14 @@ class SchemaContractTests(unittest.TestCase):
         payload = parse(run_cli("schema", "simulate"))["data"]
         self.assertEqual(payload["command"]["command"], "simulate")
 
+    def test_catalog_find_advertises_queryless_field_filters(self):
+        options = parse(run_cli("schema", "catalog", "find"))["data"]["command"]["options"]
+        by_flag = {flag: option for option in options for flag in option["flags"]}
+        self.assertFalse(by_flag["query"]["required"])
+        self.assertEqual(by_flag["--max-alpha-count"]["type"], "integer")
+        self.assertIn("pyramid-multiplier", by_flag["--sort"]["choices"])
+        self.assertIn("--stream", by_flag)
+
     def test_native_multi_is_opt_in_with_a_bounded_request_size(self):
         for command in ("simulate", "probe"):
             options = parse(run_cli("schema", command))["data"]["command"]["options"]

@@ -645,11 +645,18 @@ def build_parser():
 
     cat_find = cat.add_parser(
         "find", help="Search every dataset's fields at once (offline once cached).")
-    cat_find.add_argument("query", help="Search terms; multi-word queries are ANDed.")
+    cat_find.add_argument("query", nargs="?", help="Search terms; multi-word queries are ANDed. "
+                          "May be omitted when filtering by usage, coverage or field type.")
     cat_find.add_argument("--dataset", default=None,
                           help="Comma-separated dataset ids to restrict to.")
     cat_find.add_argument("--min-coverage", type=float, default=None, dest="min_coverage",
                           help="Drop fields whose coverage is below this.")
+    cat_find.add_argument("--max-alpha-count", type=int,
+                          help="Keep fields with a reported alphaCount at or below this value.")
+    cat_find.add_argument("--type", dest="field_type", type=str.upper, help="Keep a native BRAIN field type.")
+    cat_find.add_argument("--sort", choices=["relevance", "pyramid-multiplier"], default="relevance",
+                          help="Order by exact ID and coverage, or by descending reported Pyramid multiplier.")
+    cat_find.add_argument("--stream", action="store_true", help="Emit catalog scan progress on stderr.")
     cat_find.add_argument("--fuzzy", action="store_true")
     cat_find.add_argument("--any-term", action="store_true", dest="any_term")
     cat_find.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
@@ -1601,6 +1608,9 @@ _COMMAND_EXAMPLES = {
                          "catalog datasets --theme true --summary"],
     "catalog fields": ["catalog fields --dataset fundamental6 --search liability --expressions --limit 10",
                        "catalog fields --dataset fundamental6 --summary"],
+    "catalog find": ["catalog find debt --min-coverage 0.8",
+                     "catalog find --region EUR --universe TOP2500 --dataset analyst69,analyst15 "
+                     "--type MATRIX --max-alpha-count 0 --min-coverage 0.8 --sort pyramid-multiplier --stream"],
     "catalog concepts": ["catalog concepts --dataset fundamental6 --limit 10"],
     "catalog verify": ["catalog verify --fields close volume --strict"],
     "catalog categories": ["catalog categories"],

@@ -576,6 +576,23 @@ Windows 使用系统字节锁，POSIX 使用 flock；进程退出后系统释放
 输出中为 `date_coverage`，缺失时为 `null`。先对照截面覆盖和日期覆盖，再决定是否
 需要查具体日期的数据。排序和 `--min-coverage` 仍使用 `coverage`。
 
+可以省略关键词，按报告的字段使用量、覆盖或类型筛选多个数据集。
+
+```bash
+python3 research_cli.py catalog find --region EUR --universe TOP2500 --delay 1 \
+  --dataset analyst69,analyst15,model109 --type MATRIX --max-alpha-count 0 \
+  --min-coverage 0.8 --sort pyramid-multiplier --limit 20 --stream
+```
+
+`--max-alpha-count 0` 只接收平台目录明确报告 `alphaCount=0` 的字段。符合其他筛选条件但计数未知的字段计入
+`alpha_count_unknown`。`--sort pyramid-multiplier` 对全部匹配排序，缺失倍率排在最后，`--limit` 只限制输出。
+字段目录完整分页后按账户、数据集和范围缓存，换本地筛选条件时可重用。`--type MATRIX` 优先复用匹配缓存，
+冷读时直接向平台请求 MATRIX 分页。使用目录倍率来找线索时，仍需核对字段定义。
+
+`--stream` 将扫描进度写到 stderr。`discovery.complete` 表示请求范围的目录是否完整读取或命中新鲜缓存。
+每个数据集报告扫描行数、匹配数和错误。`matches: null` 表示未取得可筛选的记录，`matches: 0` 表示在读到的记录中没有匹配。
+遇到最终 `RATE_LIMITED` 时保留已有结果，后续数据集标为 `not_scanned`。
+
 ```bash
 python3 research_cli.py mine --dataset fundamental2 --limit 5
 python3 research_cli.py mine --dataset news18 --expr 'vec_sum(reviewed_event_field)' --emit draft.json

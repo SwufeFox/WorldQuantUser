@@ -10,7 +10,8 @@ SUMMARY_LIMIT = 20
 MEMBER_LIMIT = 5
 
 
-def _multiplier(value):
+def reported_multiplier(value):
+    """Return a finite platform-reported number, including explicit zero."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
     try:
@@ -29,7 +30,7 @@ def _entity(value):
         result["name"] = result["name"][:160]
         result["name_truncated"] = True
     if "multiplier" in value:
-        result["multiplier"] = _multiplier(value["multiplier"])
+        result["multiplier"] = reported_multiplier(value["multiplier"])
     omitted = sum(key not in {"id", "name", "multiplier"} for key in value)
     if omitted:
         result["fields_omitted"] = omitted
@@ -53,7 +54,7 @@ def catalog_item(record, scope):
             result[key] = record[key][:240]
     if "dataset" in record:
         result["dataset"] = _entity(record["dataset"])
-    multiplier = _multiplier(record.get("pyramidMultiplier"))
+    multiplier = reported_multiplier(record.get("pyramidMultiplier"))
     result["pyramid"] = {
         "region": record.get("region", scope.get("region")),
         "delay": record.get("delay", scope.get("delay")),
@@ -84,7 +85,7 @@ def check_summary(checks, basis="alpha_snapshot"):
         if not isinstance(check, dict):
             continue
         result = {key: check[key] for key in ("result", "effective", "date") if key in check}
-        result["multiplier"] = _multiplier(check.get("multiplier"))
+        result["multiplier"] = reported_multiplier(check.get("multiplier"))
         for key in ("pyramids", "themes", "competitions"):
             if key in check:
                 result[key] = _members(check[key])

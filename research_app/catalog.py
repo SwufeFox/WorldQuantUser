@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import Counter
+
 import field_contract
 import field_index
 import field_search
@@ -27,8 +29,8 @@ def cmd_catalog_operators(args, _sink):
         # Fetch the whole list and rank locally for the same reason fields are
         # ranked locally: the endpoint matches one token, so a two-word intent
         # could not be expressed at all.
-        operators = ml.fetch_operators(session, search="", group=args.group,
-                                       report=cache_report)
+        catalog = ml.fetch_operators(session, search="", group=args.group, report=cache_report)
+        operators = catalog
         scanned = len(operators)
         search_note = None
         if args.search:
@@ -36,9 +38,7 @@ def cmd_catalog_operators(args, _sink):
             operators = field_search.search_records(
                 operators, args.search, limit=args.limit, fuzzy=args.fuzzy,
                 match_all=not args.any_term, rank_by_coverage=False)
-            absent = field_search.absent_terms(
-                operators or ml.fetch_operators(session, search="", group=args.group),
-                args.search, fuzzy=args.fuzzy) if not operators else []
+            absent = field_search.absent_terms(catalog, args.search, fuzzy=args.fuzzy) if not operators else []
             search_note = {
                 "query": args.search, "required_terms": required,
                 "excluded_terms": excluded, "absent_terms": absent,
@@ -135,14 +135,12 @@ def cmd_catalog_fields(args, _sink):
     elif args.limit:
         fields = fields[: args.limit]
 
+    type_counts = Counter(field["type"] for field in fields if isinstance(field.get("type"), str))
     data = {
         "dataset": args.dataset, "region": args.region, "universe": args.universe,
         "delay": args.delay, "count": len(fields), "scanned": len(everything),
         "instrument_type": args.instrument_type,
-        "type_counts": {
-            kind: len([f for f in fields if f.get("type") == kind])
-            for kind in sorted({f.get("type") for f in fields if isinstance(f.get("type"), str)})
-        },
+        "type_counts": dict(sorted(type_counts.items())),
         "fields": fields, "cache": cache_report,
     }
     if search_note:
@@ -156,84 +154,158 @@ def cmd_catalog_fields(args, _sink):
     return incentives.catalog_summary(data, "fields") if getattr(args, "summary", False) else data
 
 
-def cmd_catalog_find(args, _sink):
-    """Search every dataset's fields at once, ranked, with the dataset in each row.
+def _catalog_complete(report):
+    return report.get("complete") is True and not any(
+        report.get(key) for key in ("stale", "degraded", "error"))
 
-    `catalog fields` needs `--dataset`, so "is there a short-term debt field anywhere?"
-    meant paging fourteen datasets by hand - which is what happened four times on
-    2026-11-08 while looking for `debt_st`, `debt_lt`, `*_oi` and growth forecasts.
-    Every field record is already cached per dataset, so the only thing missing was a
-    loop and a ranking rule.
 
-    Ranking: an exact id match first, then coverage (how much of the universe actually
-    has the field), then the local search score. Coverage is the tie-break that matters
-    in practice - a field that exists for 12% of the universe cannot carry an alpha.
-    """
+def _find_field_matches(fields, dataset, args, max_alpha_count):
+    category = dataset.get("category")
+    if isinstance(category, dict):
+        category = category.get("name")
+    if args.query:
+        fields = field_search.search_records(fields, args.query, fuzzy=args.fuzzy,
+                                             match_all=not args.any_term)
+
+    matches = []
+    unknown_alpha_count = 0
+    for field in fields:
+        coverage = field.get("coverage")
+        if type(coverage) not in (int, float) or not 0 <= coverage <= 1:
+            coverage = None
+        if args.min_coverage is not None and (coverage is None or coverage < args.min_coverage):
+            continue
+        alpha_count = field.get("alphaCount")
+        if type(alpha_count) is not int or alpha_count < 0:
+            alpha_count = None
+        if max_alpha_count is not None:
+            if alpha_count is None:
+                unknown_alpha_count += 1
+                continue
+            if alpha_count > max_alpha_count:
+                continue
+        description = field.get("description")
+        matches.append({
+            "id": field["id"], "dataset": dataset["id"], "category": category,
+            "type": field.get("type"), "coverage": coverage, "date_coverage": field.get("dateCoverage"),
+            "alpha_count": alpha_count, "user_count": field.get("userCount"),
+            "pyramid_multiplier": incentives.reported_multiplier(field.get("pyramidMultiplier")),
+            "description": description.strip()[:120] if isinstance(description, str) else "",
+        })
+    return matches, unknown_alpha_count
+
+
+def _find_in_dataset(access, scope, dataset, args, filters):
+    metadata = {}
+    fields = ml.get_datafields(access, **scope, dataset_id=dataset["id"],
+                               field_type=filters["field_type"], report=metadata)
+    if not isinstance(fields, list) or any(
+        not isinstance(field, dict) or not isinstance(field.get("id"), str) or not field["id"]
+        for field in fields
+    ):
+        raise ml.ServiceError("catalog returned an invalid field ID or collection")
+    matches, unknown_alpha_count = _find_field_matches(fields, dataset, args, filters["max_alpha_count"])
+    complete = _catalog_complete(metadata)
+    return matches, {
+        "dataset": dataset["id"], "state": "verified" if complete and not metadata.get("hit") else "unknown",
+        "complete": complete, "fields_scanned": len(fields), "metadata": metadata,
+        "matches": len(matches), "alpha_count_unknown": unknown_alpha_count,
+    }
+
+
+def cmd_catalog_find(args, sink):
+    """Search or filter scoped field catalogs and retain per-dataset evidence."""
+    query = args.query
+    max_alpha_count = getattr(args, "max_alpha_count", None)
+    field_type = getattr(args, "field_type", None)
+    sort_by = getattr(args, "sort", "relevance")
+    if query is None and max_alpha_count is None and args.min_coverage is None and not field_type:
+        raise CliError("INVALID_INPUT", "provide a search query or a field filter",
+                       "use --max-alpha-count, --min-coverage or --type to scan without a query")
+    if max_alpha_count is not None and max_alpha_count < 0:
+        raise CliError("INVALID_INPUT", "--max-alpha-count must be zero or greater")
+    if args.min_coverage is not None and not 0 <= args.min_coverage <= 1:
+        raise CliError("INVALID_INPUT", "--min-coverage must be between 0 and 1")
+
+    scope = {"region": args.region, "universe": args.universe, "delay": args.delay,
+             "instrument_type": args.instrument_type}
+    filters = {"field_type": field_type, "max_alpha_count": max_alpha_count, "min_coverage": args.min_coverage}
+    if sink is not None:
+        sink("catalog_scope_started", scope)
     cache_report = {}
     access = _catalog_access(args)
-    datasets = ml.get_datasets(
-        access, instrument_type=args.instrument_type, region=args.region,
-        delay=args.delay, universe=args.universe, limit=None, report=cache_report,
-    )
-    wanted = [part.strip() for part in (args.dataset or "").split(",") if part.strip()]
+    datasets = ml.get_datasets(access, **scope, report=cache_report)
+    wanted = dict.fromkeys(part.strip() for part in (args.dataset or "").split(",") if part.strip())
+    if not isinstance(datasets, list) or any(
+        not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]
+        for row in datasets
+    ):
+        raise CliError("SERVICE_ERROR", "catalog returned an invalid dataset ID", details={"cache": cache_report})
+    available = {row["id"] for row in datasets}
+    missing = [dataset_id for dataset_id in wanted if dataset_id not in available]
     if wanted:
-        datasets = [d for d in datasets if d.get("id") in wanted]
+        datasets = [row for row in datasets if row["id"] in wanted]
     if not datasets:
         raise CliError("INVALID_INPUT", "no datasets for %s/%s/delay %s"
-                       % (args.region, args.universe, args.delay), details={"cache": cache_report})
+                       % (args.region, args.universe, args.delay),
+                       details={"cache": cache_report, "missing_datasets": missing})
 
-    rows, scanned = [], 0
-    catalogs = []
-    for dataset in datasets:
-        dataset_id = dataset.get("id")
-        metadata = {}
+    rows, catalogs = [], []
+    rate_limited = False
+    for index, dataset in enumerate(datasets, 1):
+        dataset_id = dataset["id"]
+        if rate_limited:
+            catalogs.append({"dataset": dataset_id, "state": "not_scanned", "matches": None,
+                             "fields_scanned": 0, "error_code": "RATE_LIMITED"})
+            continue
+        progress = {"dataset": dataset_id, "index": index, "total": len(datasets)}
+        if sink is not None:
+            sink("catalog_scan_started", progress)
         try:
-            fields = ml.get_datafields(
-                access, instrument_type=args.instrument_type, region=args.region,
-                delay=args.delay, universe=args.universe, dataset_id=dataset_id,
-                search="", field_type=None, limit=None, report=metadata)
+            matches, evidence = _find_in_dataset(access, scope, dataset, args, filters)
         except ml.AuthError:
             raise
-        except Exception as exc:  # noqa: BLE001 - retain unavailable discovery evidence
-            catalogs.append({"dataset": dataset_id, "state": "unknown", "error": str(exc)})
-            continue
-        fresh = metadata.get("complete") is True and not any(
-            metadata.get(key) for key in ("hit", "stale", "degraded", "error"))
-        catalogs.append({"dataset": dataset_id, "state": "verified" if fresh else "unknown",
-                         "metadata": metadata})
-        scanned += len(fields)
-        hits = field_search.search_records(
-            fields, args.query, limit=None, fuzzy=args.fuzzy,
-            match_all=not args.any_term)
-        for hit in hits:
-            coverage = hit.get("coverage")
-            if args.min_coverage is not None and (coverage or 0) < args.min_coverage:
-                continue
-            rows.append({
-                "id": hit.get("id"), "dataset": dataset_id,
-                "category": (dataset.get("category") or {}).get("name")
-                if isinstance(dataset.get("category"), dict) else dataset.get("category"),
-                "type": hit.get("type"), "coverage": coverage,
-                "date_coverage": hit.get("dateCoverage"),
-                "description": (hit.get("description") or "").strip()[:120],
-            })
-    lowered = args.query.strip().lower()
-    rows.sort(key=lambda row: (0 if (row["id"] or "").lower() == lowered else 1,
-                               -(row["coverage"] or 0), row["id"] or ""))
-    limited = rows[: args.limit]
-    data = {"query": args.query, "region": args.region, "universe": args.universe,
-            "delay": args.delay, "datasets_scanned": len(datasets),
-            "fields_scanned": scanned, "count": len(rows), "fields": limited,
-            "cache": cache_report,
-            "ranking": "exact id, then coverage, then id"}
-    discovery_complete = cache_report.get("complete") is True and not any(
-        cache_report.get(key) for key in ("hit", "stale", "degraded", "error"))
-    data["discovery"] = {"state": "verified" if discovery_complete and all(
-        row["state"] == "verified" for row in catalogs) else "unknown",
-        "full_scope": not bool(wanted), "catalogs": catalogs}
+        except ml.BrainError as exc:
+            matches = []
+            evidence = {"dataset": dataset_id, "state": "unknown", "error": str(exc),
+                        "error_code": exc.code, "fields_scanned": 0, "matches": None}
+        rows.extend(matches)
+        catalogs.append(evidence)
+        metadata = evidence.get("metadata", {})
+        error_code = evidence.get("error_code") or metadata.get("error")
+        rate_limited = error_code == "RATE_LIMITED"
+        if sink is not None:
+            sink("catalog_scan_finished", {**progress, "fields_scanned": evidence["fields_scanned"],
+                                           "matches": evidence["matches"], "cache_hit": bool(metadata.get("hit")),
+                                           "error_code": error_code})
+    attempted = sum(row["state"] != "not_scanned" for row in catalogs)
+    catalogs.extend({"dataset": dataset_id, "state": "unknown", "fields_scanned": 0, "matches": None}
+                    for dataset_id in missing)
+
+    lowered = (query or "").strip().lower()
+    if sort_by == "pyramid-multiplier":
+        rows.sort(key=lambda row: (row["pyramid_multiplier"] is None, -(row["pyramid_multiplier"] or 0),
+                                   -(row["coverage"] or 0), row["id"]))
+        ranking = "reported pyramid multiplier descending, then coverage, then id"
+    else:
+        rows.sort(key=lambda row: (row["id"].lower() != lowered, -(row["coverage"] or 0), row["id"]))
+        ranking = "exact id, then coverage, then id"
+
+    complete = _catalog_complete(cache_report) and all(row.get("complete") for row in catalogs)
+    live_verified = complete and not cache_report.get("hit") and all(row["state"] == "verified" for row in catalogs)
+    data = {"query": query, "region": args.region, "universe": args.universe, "delay": args.delay,
+            "filters": filters, "datasets_scanned": attempted,
+            "fields_scanned": sum(row["fields_scanned"] for row in catalogs), "count": len(rows),
+            "fields": rows[:args.limit], "cache": cache_report, "ranking": ranking,
+            "discovery": {"state": "verified" if live_verified else "unknown", "complete": complete,
+                          "full_scope": not bool(wanted), "catalogs": catalogs, "missing_datasets": missing}}
     if not rows:
-        data["hint"] = ("nothing matched across %d datasets; try --fuzzy or --any-term"
-                        % len(datasets))
+        if not complete:
+            data["hint"] = "scan incomplete; no matches were observed in the available results"
+        elif query:
+            data["hint"] = "nothing matched; try --fuzzy or --any-term, or adjust the filters"
+        else:
+            data["hint"] = "nothing matched the filters in the available catalog records"
     return data
 
 
