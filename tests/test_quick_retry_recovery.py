@@ -165,6 +165,31 @@ def test_poll_retry_after_survives_restart_and_suppresses_orphan_poll(offline):
     client.get.assert_called_once()
 
 
+def test_short_retry_after_takes_precedence_over_progress_interval(offline):
+    client = Mock()
+    client.post.return_value = response(201, Location=PROGRESS)
+    client.get.side_effect = [response(200, {"progress": 0.9}, **{"Retry-After": "0.25"}),
+                              finished(PROGRESS), finished(ALPHA)]
+
+    assert offline(client, timeout=1).run(ARM)["status"] == "COMPLETE"
+    assert batch_quick.time.monotonic() == pytest.approx(0.75)
+
+
+def test_resumed_progress_uses_remaining_retry_after(offline):
+    client = Mock()
+    client.post.return_value = response(201, Location=PROGRESS)
+    client.get.side_effect = [response(200, **{"Retry-After": "0.75"}), finished(PROGRESS), finished(ALPHA)]
+
+    first = offline(client, timeout=1).run(ARM)
+    assert first["status"] == "PENDING"
+    assert first["next_poll_at"] == pytest.approx(1001.25)
+
+    batch_quick.time.sleep(0.5)
+    assert offline(client, timeout=0.5).run(ARM)["status"] == "COMPLETE"
+    assert batch_quick.time.monotonic() == pytest.approx(1.25)
+    client.post.assert_called_once()
+
+
 def test_metrics_retry_after_survives_runner_restart(offline):
     client = Mock()
     client.post.return_value = response(201, Location=PROGRESS)

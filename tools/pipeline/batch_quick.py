@@ -372,7 +372,8 @@ class Runner:
         delay = 0.5
         previous_progress = None
         refresh = False
-        wait = max(delay if simulation_id else 0, next_poll_at - time.time())
+        initial_wait = delay if simulation_id else 0
+        wait = max(0, next_poll_at - time.time()) if next_poll_at else initial_wait
         while not self.stop_requested.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0 or wait >= remaining:
@@ -408,7 +409,7 @@ class Runner:
                 delay, previous_progress = _poll_interval(body, delay, previous_progress)
             else:
                 delay = min(4.0, 1.5 * delay)
-            wait = max(delay, retry_after)
+            wait = retry_after or delay
 
     def _post(self, payload, key, row, *, existing_url, next_retry_at=0, identity_unverified=False):
         delay = 0.5

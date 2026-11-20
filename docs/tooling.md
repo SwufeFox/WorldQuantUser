@@ -860,6 +860,7 @@ python3 tools/pipeline/batch_quick.py arms.json --out ledgers/quick.jsonl --conc
 
 阶段预算包含该阶段的会话获取和重试，用于决定能否继续等待或发起下一次请求。HTTP 超时限制连接和读取间隔。已发出的回测 POST
 使用独立的 90 秒网络超时接收 `Location`，因此整个命令的耗时还取决于各阶段和正在执行的请求。
+进度和指标轮询优先采用平台给出的 `Retry-After`。响应未给出有效的正值时，使用本地轮询间隔。
 
 续跑时用同一份 arms 和 `--out` 原样重跑。JSONL 保存结果，旁边的 `.state/` 保存已受理任务的
 `Location` 和待补取的结果。跨台账只复用可核实为同账号、同规范化表达式和同完整请求设置的结果。
