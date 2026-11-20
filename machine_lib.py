@@ -1278,6 +1278,89 @@ def read_simulation_snapshot(s, simulation_id, *, deadline):
     return payload, retry_after
 
 
+def recover_quick_orphans(s, account, *, deadline=None, exclude_job=None, limit=None, offset=0):
+    """Reclaim orphaned Quick slots only after an authenticated terminal receipt."""
+    import simulation_slots
+    from requests.exceptions import RequestException
+
+    if not account.get("fingerprint"):
+        return 0
+    jobs = [job for job in simulation_slots.quick_orphans(account, exclude_job=exclude_job)
+            if not job.get("manual_location")]
+    if not jobs:
+        return 0
+    start = offset % len(jobs)
+    jobs = (jobs[start:] + jobs[:start])[:limit]
+    short_deadline = time.monotonic() + 5
+    deadline = min(deadline, short_deadline) if deadline is not None else short_deadline
+    released = 0
+    for job in jobs:
+        if time.monotonic() >= deadline:
+            break
+        try:
+            url = _validated_progress_url(job["progress_url"])
+            simulation_id = simulation_reference_id(urlsplit(url)._replace(query="").geturl())
+            response = s.get(url, timeout=_request_timeout(deadline), allow_redirects=False)
+        except (SimulationError, ValueError, RequestException):
+            continue
+        if response.status_code in (401, 403):
+            raise AuthError("session rejected while recovering a Quick simulation")
+        delay = _retry_after_seconds(response, cap_error_wait=False)
+        if math.isfinite(delay) and delay > 0:
+            simulation_slots.quick_defer(account, job["id"], time.time() + delay)
+            continue
+        if response.status_code not in (200, 400):
+            continue
+        try:
+            payload = response.json()
+        except ValueError:
+            continue
+        if not isinstance(payload, dict) or payload.get("id") not in (None, simulation_id):
+            continue
+        status = str(payload.get("status", "")).upper()
+        if response.status_code == 400 and (payload.get("id") != simulation_id
+                or status not in simulation_slots.TERMINAL_FAILURE_STATUSES):
+            continue
+        alpha_id = payload.get("alpha") or payload.get("alphaId")
+        if alpha_id is not None and (not isinstance(alpha_id, str) or not alpha_id.isalnum()):
+            continue
+        if status not in simulation_slots.TERMINAL_STATUSES or (
+                status not in simulation_slots.TERMINAL_FAILURE_STATUSES and not alpha_id):
+            continue
+        released += simulation_slots.quick_update(account, job["id"], "terminal", retain=True,
+                                                  terminal_result={"status": status, "alpha_id": alpha_id})
+    return released
+
+
+def attach_quick_location(s, account, job_key, location, *, deadline=None):
+    """Attach the original, independently recovered Location of an ambiguous Quick POST."""
+    import simulation_capabilities
+    import simulation_slots
+
+    fingerprint = account.get("fingerprint")
+    if not fingerprint or simulation_capabilities.account_provenance(s).get("fingerprint") != fingerprint:
+        raise ValueError("Quick Location recovery requires its authenticated account")
+    if not isinstance(job_key, str) or not job_key:
+        raise ValueError("Quick Location recovery requires a job key")
+    url = _validated_progress_url(location)
+    simulation_id = simulation_reference_id(urlsplit(url)._replace(query="").geturl())
+    short_deadline = time.monotonic() + 5
+    deadline = min(deadline, short_deadline) if deadline is not None else short_deadline
+    payload, delay = read_simulation_snapshot(s, simulation_id, deadline=deadline)
+    status = str(payload.get("status") or "").upper()
+    progress = payload.get("progress")
+    if (payload.get("id") not in (None, simulation_id)
+            or not (payload.get("id") == simulation_id or status
+                    or type(progress) in (int, float) and 0 <= progress <= 1)):
+        raise ServiceError("BRAIN did not confirm the recovered Quick simulation identity")
+    slot = simulation_slots.quick_attach_location(account, job_key, url)
+    if delay:
+        next_poll_at = time.time() + delay
+        simulation_slots.quick_defer(account, slot["id"], next_poll_at)
+        slot["next_poll_at"] = next_poll_at
+    return slot
+
+
 def poll_simulation(s, progress_url, on_event=None, deadline=None):
     """Poll a simulation until completion or an optional monotonic deadline.
 
@@ -2133,6 +2216,7 @@ def simulate_alphas(
     stop_submitting = recover_only or any(record.get("status") == "UNKNOWN_SUBMISSION" for record in records)
     unresolved_polls = 0
     read_workers = max(2, batch_size)
+    attempted_orphan_recovery = launched_here = False
 
     with (ThreadPoolExecutor(max_workers=read_workers) as progress_pool,
           ThreadPoolExecutor(max_workers=read_workers) as metrics_pool):
@@ -2183,8 +2267,19 @@ def simulate_alphas(
                    and (deadline is None or time.monotonic() < deadline)):
                 outcome, accepted = dispatch(next_group)
                 if outcome == "accepted":
+                    launched_here = True
                     read_progress(accepted)
                 elif outcome in {"contended", "blocked"}:
+                    if outcome == "contended" and not attempted_orphan_recovery:
+                        attempted_orphan_recovery = True
+                        try:
+                            if recover_quick_orphans(s, plan["account"], deadline=deadline):
+                                continue
+                        except AuthError as exc:
+                            if not launched_here:
+                                raise
+                            # Keep this invocation's accepted jobs available to its caller.
+                            note(str(exc))
                     stop_submitting = outcome == "blocked"
                     break
                 next_group = next(groups, None)

@@ -50,3 +50,14 @@ def test_async_entry_point_preserves_legacy_cli_defaults(monkeypatch):
     monkeypatch.setattr(async_batch, "run_batch", shared_main)
     assert async_batch.main() == 0
     shared_main.assert_called_once_with(default_out="ledgers/async.jsonl", default_concurrency=6)
+
+
+def test_interrupted_consumer_leaves_unstarted_arms_unscheduled():
+    arms = [{"label": name, "expr": name} for name in ("first", "second", "third")]
+    runner = Mock()
+    runner.run.side_effect = lambda arm, **_: {**arm, "status": "COMPLETE"}
+    with ThreadPoolExecutor(max_workers=1) as simulations, ThreadPoolExecutor(max_workers=1) as metrics:
+        rows = batch_quick._completed_arms(runner, arms, simulations, metrics, workers=1)
+        assert next(rows)[0] == arms[0]
+        rows.close()
+    runner.run.assert_called_once_with(arms[0], fetch_metrics=False)

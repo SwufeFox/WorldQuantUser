@@ -763,7 +763,7 @@ python3 research_cli.py resume checkpoint.json --batch-size 6 --max-wait-seconds
 
 需要进一步分析时，用 `--save` 保存回执，对未入账的 Alpha 显式执行
 `ledger record ALPHA_ID`，再用 `triage --batch PATH` 读取对应训练证据。
-`triage --batch` 也接受 `simulate` 的 `records` 和检查回执的 `results`，默认仍读取训练视图。
+`triage --batch` 也接受模拟和检查回执的 `results`，以及模拟 checkpoint 的 `records`，默认仍读取训练视图。
 `--from-simulation` 本身只读现有任务，回执以任务身份和状态为主。
 [BRAIN API 的父子任务说明](https://platform.worldquantbrain.com/learn/documentation/brain-api/brain-api)
 
@@ -851,12 +851,21 @@ python3 tools/pipeline/batch_quick.py arms.json --out ledgers/quick.jsonl --conc
 输入可用 JSON 数组或 JSONL，每条包含 `label`、`expr` 和 `settings`。回测任务结束后由独立 worker 读取指标，
 回测 worker 可以继续领下一条。原 `async_batch.py` 入口使用同一执行器，沿用原输出路径与 worker 默认值。
 续跑时使用同一份 arms 和 `--out`。JSONL 保存结果，旁边的 `.state/` 保存已受理任务的 Location 和待补取的结果。
-跨台账去重以表达式和完整请求设置为准。只有部分设置的旧结果可以在原台账按 label、表达式和已记录的设置恢复。
+跨台账去重以可核实的相同账号、规范化表达式和完整请求设置为准。只在原台账使用缺少完整身份的旧完成记录。
+旧 `.loc` 只有 label 时，工具通过 Alpha 原始回执核对表达式及请求设置。身份无法核实时保留 `UNVERIFIED_RESULT`。
 429 和 401 可以重试，等待超时的任务保留为 `QUEUED` 或 `PENDING`。发送结果无法确认的 POST 标记为
-`UNKNOWN_SUBMISSION`，需先核对平台任务再决定是否补跑。旧版的 `TIMEOUT` 如果没有留下 Location，无法续轮询。
+`UNKNOWN_SUBMISSION`。如果从原始请求找回了 Location，可以用同一份 arms 和 `--out` 运行下列核对命令。
+命令验证并登记原任务的地址，随后正常续跑会处理已登记的任务。旧版 `TIMEOUT` 如果没有留下 Location，无法续轮询。
+
+```bash
+python3 tools/pipeline/batch_quick.py arms.json --out ledgers/quick.jsonl \
+    --recover-job JOB_KEY --recover-location BRAIN_LOCATION
+```
+
+`JOB_KEY` 取结果行的 `simulation_job_key`，`BRAIN_LOCATION` 必须来自那次原始请求。
 
 `tools/pipeline/pipeline_pc.py` 调用同一个槽位调度器做 Full 回测。每条回测先保存 Alpha ID 和指标，再由独立队列查 PC。
-重跑会复用已经保存的 Full 结果，仍符合筛选条件且 PC 待确认的条目继续查已有 Alpha ID。
+重跑会复用身份已核实的 Full 结果，仍符合筛选条件且 PC 待确认的条目继续查已有 Alpha ID。
 
 ### 原生 Multi 回测
 

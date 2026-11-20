@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import cache_store
 import research_paths
@@ -165,7 +166,8 @@ def _locked_quick_journal(account):
         yield _load(path, fingerprint), path
 
 
-def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False):
+def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False,
+                  identity_unverified=False):
     """Claim a recorded QUICK job or reserve one shared slot before its POST.
 
     A new ``submitting`` result authorizes exactly one POST. An old submitting
@@ -195,9 +197,10 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False):
             stored_url = entry.get("progress_url")
             if existing_url and stored_url and existing_url != stored_url:
                 raise ValueError("saved progress URL differs from the shared quick reservation")
-            if existing_url or stored_url:
-                entry.update(state="accepted", progress_url=stored_url or existing_url, quick_owner=owner)
-            elif entry.get("state") != "quick_preparing":
+            if stored_url:
+                entry.update(state="accepted", quick_owner=owner)
+            elif entry.get("state") != "quick_preparing" or existing_url:
+                # An existing unknown POST cannot inherit an unverified legacy address.
                 entry.update(state="unknown", quick_owner=None)
         else:
             if existing_url:
@@ -205,6 +208,8 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False):
                     raise ValueError("progress URL already belongs to another simulation reservation")
                 key = uuid.uuid4().hex
                 entry = {"state": "accepted", "progress_url": existing_url, "created_at": time.time()}
+                if identity_unverified:
+                    entry["identity_unverified"] = True
                 reservations[key] = entry
             else:
                 phase = "quick_preparing" if prepare else "submitting"
@@ -281,13 +286,54 @@ def quick_orphans(account, *, exclude_job=None):
     """List accepted QUICK jobs whose poller is no longer responsible for them."""
     with _locked_quick_journal(account) as (journal, _):
         reservations = journal["reservations"]
+    now = time.time()
     return [
         {"id": key, **entry, "job_key": entry["quick_job_key"]}
         for key, entry in reservations.items()
         if entry.get("quick_job_key") and entry["quick_job_key"] != exclude_job
         and entry.get("state") == "accepted" and entry.get("progress_url")
+        and (_quota_number(entry.get("next_poll_at")) or 0) <= now
         and not _quick_owner_is_live(entry.get("quick_owner"))
     ]
+
+
+def quick_defer(account, identity, next_poll_at):
+    """Persist a server polling delay without changing accepted slot ownership."""
+    next_poll_at = _quota_number(next_poll_at)
+    if next_poll_at is None:
+        raise ValueError("quick polling deadline must be finite and non-negative")
+    with _locked_quick_journal(account) as (journal, path):
+        entry = journal["reservations"].get(identity)
+        if not entry or not entry.get("quick_job_key") or entry.get("state") != "accepted":
+            return False
+        if (_quota_number(entry.get("next_poll_at")) or 0) < next_poll_at:
+            entry["next_poll_at"] = next_poll_at
+            cache_store.write_json_atomic(path, journal)
+        return True
+
+
+def quick_attach_location(account, job_key, progress_url):
+    """Bind the caller's verified original Location to an unresolved Quick lease."""
+    target_path = urlsplit(progress_url).path.rstrip("/")
+    with _locked_quick_journal(account) as (journal, path):
+        reservations = journal["reservations"]
+        match = next(((key, entry) for key, entry in reservations.items()
+                      if entry.get("quick_job_key") == job_key), None)
+        if not match:
+            raise ValueError("no unresolved Quick reservation matches this job key")
+        key, entry = match
+        if (entry.get("state") not in {"unknown", "submitting"} or entry.get("progress_url")
+                or _quick_owner_is_live(entry.get("quick_owner"))):
+            raise ValueError("Quick reservation already has a Location or may still be posting")
+        for collection in (reservations, journal.get("quick_resolved", {})):
+            if any(isinstance(row.get("progress_url"), str)
+                   and urlsplit(row["progress_url"]).path.rstrip("/") == target_path
+                   for row in collection.values()):
+                raise ValueError("Location already belongs to another simulation reservation")
+        entry.update(state="accepted", progress_url=progress_url, quick_owner=None,
+                     identity_unverified=True, manual_location=True)
+        cache_store.write_json_atomic(path, journal)
+        return {"id": key, **entry}
 
 
 def quick_known_jobs(account):

@@ -34,12 +34,13 @@ class QuickDedupeTests(TestCase):
 
     def select(self, *arms):
         runner = batch_quick.Runner(self.out, ACCOUNT, 2, 1)
-        return batch_quick._select_arms(arms, runner, batch_quick.load_done(self.out))
+        return batch_quick._select_arms(arms, runner, batch_quick.load_done(self.out, ACCOUNT))
 
     def test_new_output_reuses_exact_sibling_completion(self):
         payload = batch_quick._payload(ARM)
         key = batch_quick._simulation_key(payload)
-        write_rows(self.out.with_name("previous.jsonl"), completed(ARM, simulation_key=key))
+        write_rows(self.out.with_name("previous.jsonl"), completed(
+            ARM, simulation_key=key, account_fingerprint=ACCOUNT["fingerprint"]))
         rerendered = {**ARM, "label": "same-mechanism", "expr": "((rank( cap )))"}
         full = {**ARM, "settings": {**ARM["settings"], "simulationMode": "FULL"}}
         self.assertFalse(self.out.exists())
@@ -76,9 +77,11 @@ class QuickDedupeTests(TestCase):
         simulation_slots.quick_acquire(ACCOUNT, 2, first_key, existing_url="/simulations/first")
         simulation_slots.quick_acquire(ACCOUNT, 2, alias_key, existing_url="/simulations/alias")
         payload_key = batch_quick._simulation_key(batch_quick._payload(ARM))
-        write_rows(self.out.with_name("other.jsonl"), completed(ARM, simulation_key=payload_key))
+        write_rows(self.out.with_name("other.jsonl"), completed(
+            ARM, simulation_key=payload_key, account_fingerprint=ACCOUNT["fingerprint"]))
         self.assertEqual(self.select(ARM, alias), [ARM, alias])
         write_rows(self.out, completed(ARM, simulation_key=payload_key,
+                                      account_fingerprint=ACCOUNT["fingerprint"],
                                       simulation_job_key=first_key))
         self.assertEqual(self.select(ARM, alias), [alias])
 
@@ -100,3 +103,69 @@ class QuickDedupeTests(TestCase):
         self.assertEqual(batch_quick._load_arms(path), arms)
         write_rows(path, ARM)
         self.assertEqual(batch_quick._load_arms(path), [ARM])
+
+    def test_cross_ledger_completions_require_same_account(self):
+        payload = batch_quick._payload(ARM)
+        key = batch_quick._simulation_key(payload)
+        sibling = self.out.with_name("previous.jsonl")
+        write_rows(sibling, completed(ARM, simulation_key=key, account_fingerprint="different-account"))
+        self.assertEqual(self.select(ARM), [ARM])
+        write_rows(sibling, completed(ARM, simulation_key=key))
+        self.assertEqual(self.select(ARM), [ARM])
+
+        previous = batch_quick.Runner(sibling, ACCOUNT, 2, 1)
+        old_key = previous._raw_key(ARM["label"], payload)
+        previous._checkpoint(old_key, completed(ARM))
+        write_rows(sibling, completed(ARM, simulation_key=key, simulation_job_key=old_key))
+        self.assertEqual(self.select(ARM), [])
+
+    def test_terminal_failure_does_not_use_next_run_limit(self):
+        runner = batch_quick.Runner(self.out, ACCOUNT, 2, 1)
+        key = runner._key(ARM["label"], batch_quick._payload(ARM))
+        runner._checkpoint(key, {**ARM, "simulation_status": "FAIL", "alpha_id": None})
+        write_rows(self.out, {"label": ARM["label"], "status": "FAIL", "simulation_job_key": key,
+                              "account_fingerprint": ACCOUNT["fingerprint"]})
+        next_arm = {**ARM, "label": "new", "expr": "rank(close)"}
+        self.assertEqual(self.select(ARM, next_arm)[:1], [next_arm])
+
+    def test_pending_reconciliation_does_not_starve_fresh_work(self):
+        runner = batch_quick.Runner(self.out, ACCOUNT, 2, 1)
+        key = runner._key(ARM["label"], batch_quick._payload(ARM))
+        simulation_slots.quick_acquire(ACCOUNT, 2, key)
+        write_rows(self.out, {"label": ARM["label"], "status": "UNKNOWN_SUBMISSION",
+                              "simulation_job_key": key, "account_fingerprint": ACCOUNT["fingerprint"]})
+        next_arm = {**ARM, "label": "new", "expr": "rank(close)"}
+        self.assertEqual(self.select(ARM, next_arm), [next_arm, ARM])
+
+    def test_existing_result_from_legacy_location_requires_metadata_proof(self):
+        runner = batch_quick.Runner(self.out, ACCOUNT, 2, 1)
+        payload = batch_quick._payload(ARM)
+        key = runner._raw_key(ARM["label"], payload)
+        location = "/simulations/unverified"
+        write_rows(self.out.with_suffix(".jsonl.loc"), {"label": ARM["label"], "loc": location})
+        old = completed(ARM, progress_url=location, simulation_key=batch_quick._simulation_key(payload),
+                        simulation_job_key=key, account_fingerprint=ACCOUNT["fingerprint"])
+        runner._checkpoint(key, old)
+        write_rows(self.out, old)
+        self.assertEqual(self.select(ARM), [ARM])
+        write_rows(self.out, old, {**old, "identity_verified": True})
+        self.assertEqual(self.select(ARM), [])
+
+    def test_reformats_resume_legacy_job_with_proven_request_settings(self):
+        runner = batch_quick.Runner(self.out, ACCOUNT, 2, 1)
+        key = runner._raw_key(ARM["label"], batch_quick._payload(ARM))
+        runner._checkpoint(key, {**ARM, "progress_url": "/simulations/already-accepted"})
+        edited = {**ARM, "expr": "rank(  cap  )"}
+        runner = batch_quick.Runner(self.out, ACCOUNT, 2, 1)
+        self.assertEqual(runner._job_key(edited["label"], batch_quick._payload(edited)), key)
+        changed = {**edited, "settings": {**ARM["settings"], "decay": 9}}
+        self.assertNotEqual(runner._job_key(changed["label"], batch_quick._payload(changed)), key)
+
+    def test_non_finite_settings_are_rejected_in_both_input_formats(self):
+        path = self.out.with_suffix(".arms")
+        for value in ("NaN", "Infinity", "-Infinity", "1e999"):
+            arm = json.dumps(ARM).replace('"delay": 1', '"delay": ' + value)
+            for source in (f"[{arm}]", f"{arm}\n{arm}\n"):
+                path.write_text(source, encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "non-finite"):
+                    batch_quick._load_arms(path)

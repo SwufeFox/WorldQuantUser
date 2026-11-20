@@ -20,7 +20,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 
-from requests.exceptions import ConnectTimeout, RequestException
+from requests.exceptions import ConnectTimeout, InvalidJSONError, RequestException
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -38,6 +38,7 @@ SUCCESS_STATUSES = {"COMPLETE", "COMPLETED", "WARNING"}
 CHECK_NAMES = ("LOW_SUB_UNIVERSE_SHARPE", "CONCENTRATED_WEIGHT",
                "LOW_2Y_SHARPE", "LOW_SHARPE", "LOW_FITNESS")
 LEGACY_SCOPE = ("region", "universe")
+RECONCILIATION_STATUSES = {"UNKNOWN_SUBMISSION", "UNVERIFIED_RESULT"}
 
 
 def _simulation_key(payload):
@@ -47,8 +48,24 @@ def _simulation_key(payload):
         source = machine_lib.normalize_python_source(source)
     else:
         source = fastexpr_ast.canonical(source)
-    text = json.dumps({**payload, "regular": source}, sort_keys=True, ensure_ascii=False)
+    text = json.dumps({**payload, "regular": source}, sort_keys=True, ensure_ascii=False, allow_nan=False)
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _matches_alpha_payload(alpha, expected):
+    """Bind a historical Alpha only when its executed request can be verified."""
+    code, _, _ = machine_lib.regular_expression(alpha)
+    recorded = alpha.get("settings")
+    if alpha.get("type") != expected["type"] or not isinstance(code, str) or not isinstance(recorded, dict):
+        return False
+    observed = machine_lib.normalize_setting_keys(recorded)
+    requested = machine_lib.normalize_setting_keys(expected["settings"])
+    language = machine_lib.alpha_language(expected) or "FASTEXPR"
+    if machine_lib.alpha_language(alpha) != language or not all(
+        name in observed and observed[name] == value for name, value in requested.items()
+    ):
+        return False
+    return _simulation_key({**expected, "regular": code}) == _simulation_key(expected)
 
 
 def _jsonl_rows(path):
@@ -88,17 +105,60 @@ def _append(stream, row):
     os.fsync(stream.fileno())
 
 
-def load_done(path):
+def _ledger_account(path, row):
+    if fingerprint := row.get("account_fingerprint"):
+        return fingerprint
+    key = row.get("simulation_job_key")
+    if isinstance(key, str) and re.fullmatch(r"[a-f0-9]{64}", key):
+        state, error = cache_store.load_json(path.with_suffix(path.suffix + ".state") / f"{key}.json")
+        if not error and isinstance(state, dict) and state.get("alpha_id") == row.get("alpha_id"):
+            return state.get("account")
+    return None
+
+
+def _legacy_locations(path):
+    sidecar = path.with_suffix(path.suffix + ".loc")
+    return {row["label"]: row["loc"] for row in _jsonl_rows(sidecar)
+            if isinstance(row.get("label"), str) and isinstance(row.get("loc"), str)}
+
+
+def _from_legacy_location(row, locations):
+    label = row.get("label")
+    location = locations.get(label) if isinstance(label, str) else None
+    if not location or row.get("identity_verified") is True:
+        return False
+    recorded = row.get("progress_url")
+    if not recorded:
+        return True
+    try:
+        return machine_lib._validated_progress_url(recorded) == machine_lib._validated_progress_url(location)
+    except machine_lib.SimulationError:
+        return True
+
+
+def load_done(path, account):
     """Index exact completions across sibling ledgers and local legacy rows."""
     exact, own = set(), {}
     siblings = (entry for entry in path.parent.glob("*.jsonl") if entry != path)
     for ledger in (path, *siblings):
         try:
-            for row in _completed_rows(ledger):
+            legacy = _legacy_locations(ledger)
+            for row in _jsonl_rows(ledger):
+                status = row.get("status")
+                if status in simulation_slots.TERMINAL_STATUSES:
+                    if _from_legacy_location(row, legacy):
+                        continue
+                elif ledger != path or status not in RECONCILIATION_STATUSES:
+                    continue
+                provenance = _ledger_account(ledger, row)
+                if provenance is not None and provenance != account["fingerprint"]:
+                    continue
                 key = row.get("simulation_key")
-                if isinstance(key, str) and key:
+                if (provenance == account["fingerprint"] and isinstance(key, str) and key
+                        and row.get("status") in SUCCESS_STATUSES and row.get("alpha_id")):
                     exact.add(key)
-                if ledger == path and isinstance(row.get("label"), str):
+                if (ledger == path and isinstance(row.get("label"), str)
+                        and (provenance is not None or not key and not row.get("simulation_job_key"))):
                     own.setdefault(row["label"], []).append(row)
         except OSError:
             if ledger == path:
@@ -114,19 +174,28 @@ def _legacy_done(row, arm, settings):
         recorded = {}
     known = {**row, **recorded}
     keys = settings.keys() | machine_lib.DEFAULT_SETTINGS.keys() | recorded.keys()
-    return (not row.get("simulation_key") and row.get("expr") == arm["expr"]
+    return (row.get("status") in SUCCESS_STATUSES and not row.get("simulation_key")
+            and row.get("expr") == arm["expr"]
             and all(known.get(name) is not None and known[name] == settings.get(name)
                     for name in LEGACY_SCOPE)
             and known.get("simulationMode", QUICK) == settings["simulationMode"]
             and all(known[name] == settings.get(name) for name in keys if known.get(name) is not None))
 
 
+def _finite_number(value):
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite number in batch input: {value}")
+    return number
+
+
 def _load_arms(path):
     text = path.read_text(encoding="utf-8")
+    options = {"parse_float": _finite_number, "parse_constant": _finite_number}
     try:
-        value = json.loads(text)
+        value = json.loads(text, **options)
     except json.JSONDecodeError:
-        arms = [json.loads(line) for line in text.splitlines() if line.strip()]
+        arms = [json.loads(line, **options) for line in text.splitlines() if line.strip()]
     else:
         arms = value if isinstance(value, list) else [value]
     if not all(isinstance(arm, dict) and isinstance(arm.get("label"), str)
@@ -191,31 +260,36 @@ class Runner:
                 raise ValueError("quick runner checkpoint is unreadable or belongs to another account")
             self.jobs[path.stem] = saved
             self.saved_labels.add(saved["label"])
-        sidecar = self.out.with_suffix(self.out.suffix + ".loc")
-        self.legacy_locations = {row["label"]: row["loc"] for row in _jsonl_rows(sidecar)
-                                 if row.get("label") and row.get("loc")}
+        self.legacy_locations = _legacy_locations(self.out)
         self.local = threading.local()
         self.sessions = []
         self.sessions_lock = threading.Lock()
         self.reap_lock = threading.Lock()
         self.next_reap = 0.0
         self.reap_offset = 0
+        self.stop_requested = threading.Event()
+        self.quota_exhausted = threading.Event()
+        self.post_retry_lock = threading.Lock()
+        retry_at = max((job.get("next_retry_at") or 0 for job in self.jobs.values()), default=0)
+        self.post_retry_at = time.monotonic() + max(0, retry_at - time.time())
 
     def _session_generation(self):
         return cache_store.read_entry(machine_lib.session_cache_path()).get("created_at")
 
-    def _session(self, refresh=False):
+    def _session(self, refresh=False, *, deadline=None):
         previous = getattr(self.local, "session", None)
         if previous is not None and not refresh:
             return previous
 
         # An old response can arrive after a different worker refreshed the cookie.
-        guard = (cache_store.file_lock(research_paths.lock_path("quick-runner-refresh"), timeout=90)
+        timeout = 90 if deadline is None else min(90, max(0, deadline - time.monotonic()))
+        guard = (cache_store.file_lock(research_paths.lock_path("quick-runner-refresh"), timeout=timeout)
                  if refresh else nullcontext())
         with guard:
             before = self._session_generation()
             force_login = refresh and (not before or before == getattr(self.local, "generation", None))
-            session = machine_lib.load_session(refresh=force_login)
+            limits = {"deadline": deadline} if deadline is not None else {}
+            session = machine_lib.load_session(refresh=force_login, **limits)
             if simulation_capabilities.account_provenance(session)["fingerprint"] != self.account["fingerprint"]:
                 session.close()
                 raise ValueError("authenticated account changed while running simulations")
@@ -233,8 +307,30 @@ class Runner:
             session.close()
 
     def _key(self, label, payload):
-        data = json.dumps([str(self.out), label, payload], sort_keys=True, ensure_ascii=False)
+        return self._raw_key(label, _simulation_key(payload))
+
+    def _raw_key(self, label, payload):
+        data = json.dumps([str(self.out), label, payload], sort_keys=True, ensure_ascii=False, allow_nan=False)
         return hashlib.sha256(data.encode()).hexdigest()
+
+    def _job_key(self, label, payload):
+        key = self._key(label, payload)
+        raw = self._raw_key(label, payload)
+        with self.state_lock:
+            if key in self.jobs or key in self.shared_jobs:
+                return key
+            if raw in self.jobs or raw in self.shared_jobs:
+                return raw
+            if label not in self.saved_labels:
+                return key
+            for prior_key, row in self.jobs.items():
+                prior_source = row.get("expr")
+                if row.get("label") != label or not isinstance(prior_source, str):
+                    continue
+                prior = {**payload, "regular": prior_source}
+                if prior_key == self._raw_key(label, prior) and key == self._key(label, prior):
+                    return prior_key
+        return key
 
     def _checkpoint(self, key, row):
         saved = {**row, "account": self.account["fingerprint"]}
@@ -247,57 +343,69 @@ class Runner:
         with self.state_lock:
             saved = self.jobs.get(key, {})
             reused_label = label in self.saved_labels
-        if saved or reused_label or label not in self.legacy_locations:
+        if saved:
+            if saved.get("progress_url") and _from_legacy_location(saved, self.legacy_locations):
+                return {**saved, "legacy_unverified": True}
             return saved
-        return {"progress_url": machine_lib._validated_progress_url(self.legacy_locations[label])}
+        if reused_label or label not in self.legacy_locations:
+            return saved
+        return {"progress_url": machine_lib._validated_progress_url(self.legacy_locations[label]),
+                "legacy_unverified": True}
 
     def _reap(self, key):
         if time.monotonic() < self.next_reap or not self.reap_lock.acquire(blocking=False):
             return
         try:
             self.next_reap = time.monotonic() + 4
-            orphans = simulation_slots.quick_orphans(self.account, exclude_job=key)
-            if not orphans:
+            if not simulation_slots.quick_orphans(self.account, exclude_job=key):
                 return
-            orphan = orphans[self.reap_offset % len(orphans)]
+            deadline = time.monotonic() + 5
+            offset = self.reap_offset
             self.reap_offset += 1
-            url = machine_lib._validated_progress_url(orphan["progress_url"])
             try:
-                response = self._session().get(url, timeout=5, allow_redirects=False)
-            except (RequestException, machine_lib.AuthError, machine_lib.SessionBusy):
+                machine_lib.recover_quick_orphans(self._session(), self.account, deadline=deadline,
+                                                 exclude_job=key, limit=1, offset=offset)
+            except machine_lib.AuthError:
+                with suppress(RequestException, machine_lib.AuthError, machine_lib.SessionBusy, cache_store.LockTimeout):
+                    machine_lib.recover_quick_orphans(self._session(refresh=True), self.account, deadline=deadline,
+                                                     exclude_job=key, limit=1, offset=offset)
+            except (RequestException, machine_lib.SessionBusy):
                 return
-            receipt = _terminal_receipt(response, _json_object(response))
-            if receipt:
-                simulation_slots.quick_update(self.account, orphan["id"], "terminal", retain=True,
-                                              terminal_result=receipt)
         finally:
             self.reap_lock.release()
 
-    def _read(self, url, deadline, *, progress=False):
+    def _wait(self, seconds):
+        until = time.monotonic() + seconds
+        while not self.stop_requested.is_set() and (remaining := until - time.monotonic()) > 0:
+            time.sleep(min(1, remaining))
+
+    def _read(self, url, deadline, *, progress=False, next_poll_at=0, defer=None):
         delay = 0.5
         previous_progress = None
-        wait = delay if progress else 0
-        while True:
+        wait = max(delay if progress else 0, next_poll_at - time.time())
+        while not self.stop_requested.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0 or wait >= remaining:
                 return None
             if wait:
-                time.sleep(wait)
+                self._wait(wait)
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if remaining <= 0 or self.stop_requested.is_set():
                 return None
             try:
                 response = self._session().get(url, timeout=min(60, remaining),
                                                allow_redirects=False)
-            except RequestException:
+            except (RequestException, machine_lib.AuthError, machine_lib.SessionBusy):
                 wait = delay = min(4.0, 1.5 * delay)
                 continue
             body = _json_object(response)
-            if progress and (receipt := _terminal_receipt(response, body)):
-                return receipt
             retry_after = _retry_after(response)
-            if response.status_code == 401:
-                with suppress(machine_lib.AuthError, machine_lib.SessionBusy, cache_store.LockTimeout):
+            if retry_after > 0 and defer is not None:
+                defer(time.time() + retry_after)
+            if progress and not retry_after and (receipt := _terminal_receipt(response, body)):
+                return receipt
+            if response.status_code in (401, 403):
+                with suppress(RequestException, machine_lib.AuthError, machine_lib.SessionBusy, cache_store.LockTimeout):
                     self._session(refresh=True)
             elif not progress and response.status_code == 200 and body.get("is") and not retry_after:
                 return body
@@ -307,14 +415,15 @@ class Runner:
                 delay = min(4.0, 1.5 * delay)
             wait = max(delay, retry_after)
 
-    def _post(self, payload, key, row, *, existing_url):
+    def _post(self, payload, key, row, *, existing_url, next_retry_at=0, identity_unverified=False):
         delay = 0.5
         deadline = time.monotonic() + self.poll_timeout
-        retry_at = 0.0
-        while True:
+        retry_at = time.monotonic() + max(0, next_retry_at - time.time())
+        while not self.stop_requested.is_set():
             self._reap(key)
             slot = simulation_slots.quick_acquire(self.account, self.slots, key,
-                                                  existing_url=existing_url, prepare=True)
+                                                  existing_url=existing_url, prepare=True,
+                                                  identity_unverified=identity_unverified)
             if slot is not None:
                 if slot.get("progress_url"):
                     return slot, None
@@ -323,10 +432,20 @@ class Runner:
                                   "detail": "previous POST outcome is unknown"}
                 try:
                     quota = simulation_slots.quota_snapshot(self.account)
-                    if quota["blocked"]:
+                    if self.quota_exhausted.is_set() or quota["blocked"]:
                         simulation_slots.quick_update(self.account, slot["id"], "refused")
                         return None, {**row, "status": "QUEUED", "detail": "daily simulation quota exhausted",
                                       "next_retry_at": quota["reset_at"]}
+                    with self.post_retry_lock:
+                        retry_at = max(retry_at, self.post_retry_at)
+                    if retry_at > time.monotonic():
+                        simulation_slots.quick_update(self.account, slot["id"], "refused")
+                        remaining = retry_at - time.monotonic()
+                        if time.monotonic() + remaining >= deadline:
+                            return None, {**row, "status": "QUEUED", "detail": "waiting for simulation retry",
+                                          "next_retry_at": time.time() + max(0, remaining)}
+                        self._wait(remaining)
+                        continue
                     session = self._session()
                 except (RequestException, machine_lib.AuthError, machine_lib.SessionBusy):
                     simulation_slots.quick_update(self.account, slot["id"], "refused")
@@ -335,7 +454,7 @@ class Runner:
                     simulation_slots.quick_update(self.account, slot["id"], "refused")
                     raise
                 if session is None:
-                    time.sleep(min(delay, max(0, deadline - time.monotonic())))
+                    self._wait(min(delay, max(0, deadline - time.monotonic())))
                     if time.monotonic() >= deadline:
                         return None, {**row, "status": "QUEUED", "detail": "waiting for authentication"}
                     delay = min(5.0, 1.5 * delay)
@@ -343,86 +462,141 @@ class Runner:
                 if not simulation_slots.quick_update(self.account, slot["id"], "submitting"):
                     raise RuntimeError("quick reservation no longer authorizes a POST")
                 try:
+                    if self.stop_requested.is_set() or time.monotonic() >= deadline:
+                        simulation_slots.quick_update(self.account, slot["id"], "refused")
+                        return None, {**row, "status": "QUEUED", "detail": "simulation POST deferred"}
+                    if self.quota_exhausted.is_set():
+                        simulation_slots.quick_update(self.account, slot["id"], "refused")
+                        return None, {**row, "status": "QUEUED", "detail": "daily simulation quota exhausted",
+                                      "next_retry_at": simulation_slots.quota_snapshot(self.account)["reset_at"]}
                     response = session.post(machine_lib.BRAIN_API_URL + "/simulations",
-                                            json=payload, timeout=90, allow_redirects=False)
+                                            json=payload, timeout=max(0.001, min(90, deadline - time.monotonic())),
+                                            allow_redirects=False)
                 except ConnectTimeout:
                     simulation_slots.quick_update(self.account, slot["id"], "refused")
                     retry_at = time.monotonic() + delay
+                except InvalidJSONError:
+                    simulation_slots.quick_update(self.account, slot["id"], "refused")
+                    return None, {**row, "status": "POST_FAIL", "detail": "simulation payload is not valid JSON"}
                 except RequestException:
                     simulation_slots.quick_update(self.account, slot["id"], "unknown")
                     return None, {**row, "status": "UNKNOWN_SUBMISSION",
                                   "detail": "connection dropped before POST outcome was known"}
                 else:
                     status = response.status_code
-                    observation = simulation_slots.observe_quota(self.account, response.headers)
                     if status == 201:
                         try:
                             url = machine_lib._validated_progress_url(response.headers.get("Location"))
                         except machine_lib.SimulationError:
                             simulation_slots.quick_update(self.account, slot["id"], "unknown")
+                            self._observe_quota(response)
                             return None, {**row, "status": "UNKNOWN_SUBMISSION",
                                           "detail": "accepted POST did not return a usable Location"}
                         simulation_slots.quick_update(self.account, slot["id"], "accepted", progress_url=url)
+                        self._observe_quota(response)
                         return {**slot, "progress_url": url}, None
-                    if status in (401, 429):
+                    if status in (401, 403, 429):
                         simulation_slots.quick_update(self.account, slot["id"], "refused")
-                        daily = observation is not None and observation["remaining"] == 0
-                        daily = daily or _json_object(response).get("detail") == "DAILY_SIMULATION_LIMIT_EXCEEDED"
-                        if status == 429 and daily:
+                        self._observe_quota(response)
+                        retry_after = _retry_after(response)
+                        if retry_after > 0:
+                            retry_at = self._defer_post(key, row, retry_after)
+                        if status == 429 and self.quota_exhausted.is_set():
                             return None, {**row, "status": "QUEUED", "http": status,
                                           "detail": "daily simulation quota exhausted",
                                           "next_retry_at": simulation_slots.quota_snapshot(self.account)["reset_at"]}
-                        if status == 401:
-                            with suppress(machine_lib.AuthError, machine_lib.SessionBusy, cache_store.LockTimeout):
+                        if status in (401, 403):
+                            with suppress(RequestException, machine_lib.AuthError, machine_lib.SessionBusy, cache_store.LockTimeout):
                                 self._session(refresh=True)
-                        retry_at = time.monotonic() + max(delay, _retry_after(response))
+                        retry_at = max(retry_at, time.monotonic() + delay)
                     elif 400 <= status < 500 and status != 408:
                         simulation_slots.quick_update(self.account, slot["id"], "refused")
+                        self._observe_quota(response)
                         return None, {**row, "status": "POST_FAIL", "http": status,
                                       "detail": response.text[:180]}
                     else:
                         simulation_slots.quick_update(self.account, slot["id"], "unknown")
+                        self._observe_quota(response)
                         return None, {**row, "status": "UNKNOWN_SUBMISSION", "http": status}
             wait = max(delay * random.uniform(0.8, 1.2), retry_at - time.monotonic())
             if time.monotonic() + wait >= deadline:
                 return None, {**row, "status": "QUEUED", "detail": "waiting for simulation capacity or retry",
                               "next_retry_at": time.time() + wait}
-            time.sleep(wait)
+            self._wait(wait)
             delay = min(5.0, 1.5 * delay)
+        return None, {**row, "status": "QUEUED", "detail": "batch interrupted"}
+
+    def _observe_quota(self, response):
+        if response.status_code in (401, 403):
+            return
+        observation = simulation_slots.observe_quota(self.account, response.headers)
+        if ((observation and observation["remaining"] == 0)
+                or (response.status_code == 429
+                    and _json_object(response).get("detail") == "DAILY_SIMULATION_LIMIT_EXCEEDED")):
+            self.quota_exhausted.set()
+
+    def _defer_post(self, key, row, delay):
+        retry_at = time.monotonic() + delay
+        with self.post_retry_lock:
+            self.post_retry_at = max(self.post_retry_at, retry_at)
+        self._checkpoint(key, {**row, "next_retry_at": time.time() + delay})
+        return retry_at
 
     def run(self, arm, *, fetch_metrics=True):
         payload = _payload(arm)
         settings = payload["settings"]
-        row = {"label": arm["label"], "expr": arm["expr"],
+        key = self._job_key(arm["label"], payload)
+        row = {"label": arm["label"], "expr": arm["expr"], "simulation_job_key": key,
                **{name: settings.get(name) for name in ("region", "delay", "universe")}}
-        key = self._key(arm["label"], payload)
         saved = self._existing(key, arm["label"])
+        legacy_payload = saved.get("legacy_payload")
+        if legacy_payload is None and saved.get("legacy_unverified"):
+            legacy_payload = payload
         if saved.get("simulation_status"):
-            terminal = saved
+            terminal = saved if legacy_payload is None else {**saved, "legacy_payload": legacy_payload}
         else:
-            slot, deferred = self._post(payload, key, row, existing_url=saved.get("progress_url"))
+            slot, deferred = self._post(payload, key, row, existing_url=saved.get("progress_url"),
+                                        next_retry_at=saved.get("next_retry_at") or 0,
+                                        identity_unverified=legacy_payload is not None)
             if deferred is not None:
                 return deferred
             url = machine_lib._validated_progress_url(slot["progress_url"])
             started_at = saved.get("accepted_at", time.time())
             pending = {**row, "slot_id": slot["id"], "progress_url": url,
                        "accepted_at": started_at}
+            if legacy_payload is not None or slot.get("identity_unverified"):
+                pending["legacy_payload"] = legacy_payload if legacy_payload is not None else payload
+            if slot.get("manual_location"):
+                pending["manual_location"] = True
+            next_poll_at = max(saved.get("next_poll_at") or 0, slot.get("next_poll_at") or 0)
+            if next_poll_at:
+                pending["next_poll_at"] = next_poll_at
+
+            def defer(when):
+                simulation_slots.quick_defer(self.account, slot["id"], when)
+                pending["next_poll_at"] = when
+                self._checkpoint(key, pending)
+
             try:
                 self._checkpoint(key, pending)
                 receipt = slot.get("terminal_result") or self._read(
-                    url, time.monotonic() + self.poll_timeout, progress=True)
+                    url, time.monotonic() + self.poll_timeout, progress=True,
+                    next_poll_at=next_poll_at, defer=defer)
                 if receipt is not None:
                     terminal = {**pending, "simulation_status": receipt["status"],
                                 "alpha_id": receipt.get("alpha_id"),
                                 "elapsed": round(time.time() - started_at)}
+                    terminal.pop("next_poll_at", None)
                     self._checkpoint(key, terminal)
             except BaseException:
                 simulation_slots.quick_update(self.account, slot["id"], "parked")
                 raise
             if receipt is None:
                 simulation_slots.quick_update(self.account, slot["id"], "parked")
-                return {**pending, "status": "PENDING"}
-        simulation_slots.quick_update(self.account, terminal["slot_id"], "terminal")
+                return {name: value for name, value in {**pending, "status": "PENDING"}.items()
+                        if name != "legacy_payload"}
+        outcome = "parked" if terminal.get("manual_location") else "terminal"
+        simulation_slots.quick_update(self.account, terminal["slot_id"], outcome)
         row.update({name: value for name, value in terminal.items() if name != "account"})
         row["status"] = row["simulation_status"]
         if row["alpha_id"]:
@@ -430,19 +604,42 @@ class Runner:
             row["status"] = "PENDING"
             if fetch_metrics:
                 return self.finish_metrics(row)
+        elif row.pop("legacy_payload", None) is not None:
+            row.update(status="UNVERIFIED_RESULT", observed_alpha_id=None,
+                       detail="legacy simulation ended without an Alpha ID to verify")
         return row
 
     def finish_metrics(self, row):
         alpha_id = row["alpha_id"]
         if not isinstance(alpha_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", alpha_id):
             raise ValueError("simulation returned an invalid Alpha ID")
+        row = dict(row)
+
+        def defer(when):
+            row["next_metrics_at"] = when
+            self._checkpoint(row["simulation_job_key"], row)
+
         payload = self._read(f"{machine_lib.BRAIN_API_URL}/alphas/{alpha_id}",
-                             time.monotonic() + self.poll_timeout)
+                             time.monotonic() + self.poll_timeout,
+                             next_poll_at=row.get("next_metrics_at") or 0, defer=defer)
+        legacy_payload = row.pop("legacy_payload", None)
         if payload is None:
+            if legacy_payload is not None:
+                row.update(alpha_id=None, observed_alpha_id=alpha_id)
             return {**row, "detail": "waiting for Alpha metrics"}
+        if legacy_payload is not None and (payload.get("id", alpha_id) != alpha_id
+                                           or not _matches_alpha_payload(payload, legacy_payload)):
+            row.pop("metrics_pending", None)
+            return {**row, "status": "UNVERIFIED_RESULT", "alpha_id": None, "observed_alpha_id": alpha_id,
+                    "detail": "BRAIN did not confirm the legacy simulation's expression and settings"}
+        if row.pop("manual_location", False):
+            simulation_slots.quick_update(self.account, row["slot_id"], "terminal")
         metrics = payload["is"]
         row = dict(row, status=row["simulation_status"])
+        if legacy_payload is not None:
+            row["identity_verified"] = True
         row.pop("metrics_pending", None)
+        row.pop("next_metrics_at", None)
         row.update({name: metrics.get(name) for name in ("sharpe", "fitness", "turnover",
                                                         "returns", "drawdown", "longCount", "shortCount")})
         checks = {item.get("name"): item for item in metrics.get("checks") or []}
@@ -460,20 +657,34 @@ def _finished(pending):
             yield pending.pop(future), future
 
 
-def _completed_arms(runner, todo, simulation_pool, metrics_pool):
+def _completed_arms(runner, todo, simulation_pool, metrics_pool, *, workers=1):
     """Stream outcomes without using simulation workers to wait for Alpha metrics."""
-    pending = {simulation_pool.submit(runner.run, arm, fetch_metrics=False): (arm, False) for arm in todo}
-    for (arm, reading_metrics), future in _finished(pending):
-        try:
-            row = future.result()
-        except Exception as exc:
-            row = {"label": arm["label"], "expr": arm["expr"], "status": "RUNNER_ERROR",
-                   "detail": f"{type(exc).__name__}: {str(exc)[:150]}"}
-        else:
+    arms = iter(todo)
+    pending = {}
+
+    def submit_next():
+        arm = next(arms, None)
+        if arm is not None:
+            pending[simulation_pool.submit(runner.run, arm, fetch_metrics=False)] = (arm, False)
+
+    try:
+        for _ in range(workers):
+            submit_next()
+        for (arm, reading_metrics), future in _finished(pending):
+            try:
+                row = future.result()
+            except Exception as exc:
+                row = {"label": arm["label"], "expr": arm["expr"], "status": "RUNNER_ERROR",
+                       "detail": f"{type(exc).__name__}: {str(exc)[:150]}"}
             if row.get("metrics_pending") and not reading_metrics:
                 pending[metrics_pool.submit(runner.finish_metrics, row)] = (arm, True)
-                continue
-        yield arm, row
+            else:
+                yield arm, row
+            if not reading_metrics:
+                submit_next()
+    finally:
+        for future in pending:
+            future.cancel()
 
 
 def _select_arms(arms, runner, done):
@@ -481,20 +692,21 @@ def _select_arms(arms, runner, done):
     prepared, variants = {}, {}
     for arm in arms:
         payload = _payload(arm)
-        job_key = runner._key(arm["label"], payload)
+        job_key = runner._job_key(arm["label"], payload)
         if job_key in prepared:
             continue
         simulation_key = _simulation_key(payload)
         prepared[job_key] = (arm, payload["settings"], simulation_key)
         variants.setdefault(arm["label"], set()).add(simulation_key)
 
-    resume, fresh = [], []
+    resume, fresh, reconciliation = [], [], []
     seen = set(completed)
     resumed_urls = set()
     for job_key, (arm, settings, simulation_key) in prepared.items():
         label = arm["label"]
         rows = own_rows.get(label, [])
-        if any(row.get("simulation_job_key") == job_key for row in rows):
+        if any(row.get("simulation_job_key") == job_key and row.get("status") in simulation_slots.TERMINAL_STATUSES
+               for row in rows):
             continue
         if (len(variants[label]) > 1 and label in runner.legacy_locations
                 and label not in runner.saved_labels):
@@ -502,11 +714,15 @@ def _select_arms(arms, runner, done):
         saved = runner._existing(job_key, label)
         url = saved.get("progress_url")
         # Older checkpoints contained the slot identity and URL but no job key.
-        if url and any(url == row.get("progress_url") for row in rows):
+        if url and any(url == row.get("progress_url") and row.get("status") in SUCCESS_STATUSES
+                       and row.get("alpha_id") for row in rows):
             continue
         if saved or job_key in runner.shared_jobs:
             if not url or url not in resumed_urls:
-                resume.append(arm)
+                previous = next((row for row in reversed(rows) if row.get("simulation_job_key") == job_key), {})
+                pending_reconciliation = previous.get("status") in RECONCILIATION_STATUSES and not (
+                    previous.get("status") == "UNKNOWN_SUBMISSION" and url)
+                (reconciliation if pending_reconciliation else resume).append(arm)
             if url:
                 resumed_urls.add(url)
             seen.add(simulation_key)
@@ -518,19 +734,27 @@ def _select_arms(arms, runner, done):
         if simulation_key not in seen:
             resume.append(arm)
             seen.add(simulation_key)
-    return resume
+    return resume + reconciliation
 
 
 def _run_batch(args, out):
     arms = _load_arms(Path(args.arms))
     if not arms:
         return 0
-    done = load_done(out)
-
     with machine_lib.load_session() as session:
         account = simulation_capabilities.account_provenance(session)
     runner = Runner(out, account, args.account_slots, args.poll_timeout)
-    todo = _select_arms(arms, runner, done)
+    if getattr(args, "recover_job", None):
+        if not any(runner._job_key(arm["label"], _payload(arm)) == args.recover_job for arm in arms):
+            raise ValueError("recovery job key does not match an arm in the original batch")
+        try:
+            machine_lib.attach_quick_location(runner._session(), account, args.recover_job,
+                                              args.recover_location)
+        finally:
+            runner.close()
+        print(f"recovery Location verified for {args.recover_job}", flush=True)
+        return 0
+    todo = _select_arms(arms, runner, load_done(out, account))
     if args.limit:
         todo = todo[:args.limit]
     print(f"arms={len(arms)} todo={len(todo)} workers={args.concurrency} account_slots={args.account_slots}",
@@ -546,14 +770,21 @@ def _run_batch(args, out):
             ThreadPoolExecutor(max_workers=args.concurrency) as simulations,
             ThreadPoolExecutor(max_workers=min(3, args.concurrency)) as metrics,
         ):
-            for count, (arm, row) in enumerate(_completed_arms(runner, todo, simulations, metrics), 1):
-                payload = _payload(arm)
-                row["simulation_key"] = _simulation_key(payload)
-                row["simulation_job_key"] = runner._key(arm["label"], payload)
-                _append(fh, row)
-                deferred += row["status"] in {"QUEUED", "PENDING", "UNKNOWN_SUBMISSION", "RUNNER_ERROR"}
-                print(f"[{count}/{len(todo)}] {row['label'][:34]:34s} {row['status']} "
-                      f"S={row.get('sharpe')} T={row.get('turnover')} fails={row.get('fails')}", flush=True)
+            rows = _completed_arms(runner, todo, simulations, metrics, workers=args.concurrency)
+            try:
+                for count, (arm, row) in enumerate(rows, 1):
+                    payload = _payload(arm)
+                    row["account_fingerprint"] = account["fingerprint"]
+                    row["simulation_key"] = _simulation_key(payload)
+                    row["simulation_job_key"] = runner._job_key(arm["label"], payload)
+                    _append(fh, row)
+                    deferred += row["status"] in {"QUEUED", "PENDING", "UNKNOWN_SUBMISSION", "UNVERIFIED_RESULT", "RUNNER_ERROR"}
+                    print(f"[{count}/{len(todo)}] {row['label'][:34]:34s} {row['status']} "
+                          f"S={row.get('sharpe')} T={row.get('turnover')} fails={row.get('fails')}", flush=True)
+            except BaseException:
+                runner.stop_requested.set()
+                rows.close()
+                raise
     finally:
         runner.close()
     print(f"elapsed {time.monotonic() - started:.0f}s, unresolved {deferred}", flush=True)
@@ -589,9 +820,13 @@ def _batch_args(parser):
 def main(*, default_out="batch-results.jsonl", default_concurrency=DEFAULT_ACCOUNT_SLOTS):
     parser = _batch_parser(__doc__, default_out, default_concurrency)
     parser.add_argument("--poll-timeout", type=float, default=420)
+    parser.add_argument("--recover-job", help="Job key from a result with an uncertain POST outcome.")
+    parser.add_argument("--recover-location", help="Original BRAIN progress Location for that POST.")
     args = _batch_args(parser)
     if not math.isfinite(args.poll_timeout) or args.poll_timeout <= 0:
         parser.error("poll timeout must be positive and finite")
+    if bool(args.recover_job) != bool(args.recover_location):
+        parser.error("--recover-job and --recover-location must be used together")
     return _run_locked(parser, args, _run_batch)
 
 
