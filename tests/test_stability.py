@@ -210,9 +210,58 @@ def test_polars_snapshot_refresh_reads_only_changed_series(tmp_path):
         (pnl_dir / "Middle.json").write_text("[]", encoding="utf-8")
         result, state = pnl_snapshot.training_half_sharpes(pnl_dir, path, cutoffs, cutoffs)
         assert state == "rebuilt"
-        read_series.assert_called_once_with(pnl_dir / "Middle.json")
+        read_series.assert_called_once_with(pnl_dir / "Middle.json", raise_io_errors=True)
         assert result.keys() == {"Alpha", "Beta", "Unchanged"}
         assert pl.read_parquet(path).rows() == [row for row in expected_rows if row[0] != "Middle"]
+
+
+def test_polars_stability_source_read_error_preserves_snapshot(tmp_path, monkeypatch, capsys):
+    pytest.importorskip("polars")
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    registry = tmp_path / "alpha-registry.jsonl"
+    registry.write_text(json.dumps({"alpha_id": "Alpha", "status": "ACTIVE",
+                                    "out_of_sample": {"test": {"startDate": "2021-01-01"}}}) + "\n",
+                        encoding="utf-8")
+    pnl_dir = tmp_path / "pnl"
+    pnl_dir.mkdir()
+    source = pnl_dir / "Alpha.json"
+    days = _dates(2020, 140)
+    source.write_text(json.dumps(_series(days, 1, 2)), encoding="utf-8")
+
+    def invoke(*args):
+        assert app.main(["ledger", "stability", "--quiet", *args]) == 0
+        return json.loads(capsys.readouterr().out)["data"]
+
+    original = invoke("--polars")
+    parquet = Path(original.pop("pnl_snapshot")["path"])
+    manifest = parquet.with_suffix(".json")
+    published = (parquet.read_bytes(), manifest.read_bytes())
+    source.write_text(json.dumps(_series(days, 3, 4)), encoding="utf-8")
+    expected = invoke()
+    assert expected != original
+
+    read_text = Path.read_text
+    source_reads = 0
+
+    def read_with_one_error(path, *args, **kwargs):
+        nonlocal source_reads
+        if path == source:
+            source_reads += 1
+            if source_reads == 1:
+                raise OSError("transient read error")
+        return read_text(path, *args, **kwargs)
+
+    with mock.patch.object(Path, "read_text", read_with_one_error):
+        fallback = invoke("--polars")
+    assert fallback.pop("pnl_snapshot")["state"] == "source_unavailable"
+    assert fallback == expected
+    assert source_reads == 2
+    assert (parquet.read_bytes(), manifest.read_bytes()) == published
+
+    rebuilt = invoke("--polars")
+    assert rebuilt.pop("pnl_snapshot")["state"] == "rebuilt"
+    assert rebuilt == expected
+    assert invoke("--polars")["pnl_snapshot"]["state"] == "hit"
 
 
 if __name__ == "__main__":

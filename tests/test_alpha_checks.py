@@ -198,6 +198,23 @@ class BatchCheckTests(unittest.TestCase):
         self.assertFalse(payload["data"]["complete"])
         self.assertEqual(payload["data"]["summary"]["error"], 1)
 
+    def test_live_batch_keeps_peer_checks_on_empty_or_malformed_receipts(self):
+        passed = {"is": {"checks": [{"name": "PROD_CORRELATION", "result": "PASS",
+                                     "value": 0.41, "limit": 0.7}]}}
+        receipts = (passed, {"is": None}, {"is": {"checks": [None]}}, passed)
+        responses = [mock.Mock(status_code=200, headers={}, **{"json.return_value": receipt})
+                     for receipt in receipts]
+        with mock.patch.object(self.session, "get", side_effect=responses) as get:
+            data = alphas.cmd_alpha_check(arguments(("A", "B", "C", "D")), None)
+        rows = data["results"]
+        self.assertEqual([row["status"] for row in rows], ["complete", "pending", "error", "complete"])
+        self.assertTrue(rows[1]["payload_received"])
+        self.assertEqual(rows[2]["error"]["code"], "SERVICE_ERROR")
+        self.assertEqual(get.call_count, len(receipts))
+        correlation = rows[3]["checks"]["PROD_CORRELATION"]
+        self.assertEqual(correlation["expected_result"], "PASS")
+        self.assertTrue(correlation["value_consistent"])
+
     def test_invalid_wait_and_worker_limits_fail_before_authentication(self):
         for value in (-1, float("nan"), float("inf"), -float("inf")):
             with self.subTest(max_wait=value), self.assertRaises(CliError) as caught:
@@ -257,6 +274,16 @@ class BatchCheckTests(unittest.TestCase):
 
 
 class FetchCheckHttpTests(unittest.TestCase):
+    def test_no_poll_wait_allows_one_request_with_transport_timeout(self):
+        response = mock.Mock(status_code=200, headers={"Retry-After": "10"})
+        session = mock.Mock()
+        session.get.return_value = response
+        with mock.patch.object(ml.time, "sleep") as sleep:
+            result = ml.fetch_alpha_checks(session, "A", max_wait_seconds=0)
+        session.get.assert_called_once_with(ml.BRAIN_API_URL + "/alphas/A/check", timeout=60)
+        sleep.assert_not_called()
+        self.assertFalse(result["complete"])
+
     def test_http_failures_are_typed_without_polling_or_retry(self):
         for status, error in ((401, ml.AuthError), (403, ml.AuthError), (404, ml.NotFound),
                               (429, ml.RateLimited), (500, ml.ServiceError), (503, ml.ServiceError)):
@@ -302,11 +329,13 @@ class FetchCheckHttpTests(unittest.TestCase):
         response = mock.Mock(status_code=200, headers={"Retry-After": "10"})
         session = mock.Mock()
         session.get.side_effect = [response, requests.ReadTimeout()]
+        on_event = mock.Mock()
         with mock.patch.object(ml.time, "monotonic", return_value=100), \
                 mock.patch.object(ml.time, "sleep") as sleep:
-            result = ml.fetch_alpha_checks(session, "A", max_wait_seconds=2)
+            result = ml.fetch_alpha_checks(session, "A", max_wait_seconds=2, on_event=on_event)
         session.get.assert_called_once()
         sleep.assert_not_called()
+        on_event.assert_called_once_with({"event": "check_pending", "alpha_id": "A", "retry_after_seconds": 10})
         self.assertEqual(alphas._check_result("A", result)["status"], "pending")
         self.assertFalse(result["payload_received"])
 

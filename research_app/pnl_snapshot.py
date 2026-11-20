@@ -12,10 +12,10 @@ import cache_store
 from .runtime import CliError
 
 
-_VERSION = 3
+_VERSION = 4
 
 
-def read_series(path):
+def read_series(path, *, raise_io_errors=False):
     """Match the ledger's float conversion and distinguish absent from empty."""
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -23,7 +23,10 @@ def read_series(path):
             values = {day: float(value) for day, value in payload.items()}
             if all(math.isfinite(value) for value in values.values()):
                 return values
-    except (OSError, TypeError, ValueError, OverflowError):
+    except OSError:
+        if raise_io_errors:
+            raise
+    except (TypeError, ValueError, OverflowError):
         pass
     return None
 
@@ -99,7 +102,11 @@ def _rebuild(pl, path, manifest, pnl_dir, cutoffs, sources, signature, previous)
     for alpha_id, (cutoff, _) in sources.items():
         if alpha_id not in changed:
             continue
-        series = read_series(pnl_dir / f"{alpha_id}.json")
+        try:
+            series = read_series(pnl_dir / f"{alpha_id}.json", raise_io_errors=True)
+        except OSError:
+            # A failed read has not established that this source is missing or malformed.
+            return None, "source_unavailable"
         if series is None:
             continue
         training_days = sorted(day for day in series if day < cutoff) if cutoff else []
@@ -127,7 +134,7 @@ def _rebuild(pl, path, manifest, pnl_dir, cutoffs, sources, signature, previous)
         delta.sink_parquet(temporary, engine="streaming", maintain_order=True, sync_on_close="all")
         digest = _parquet_digest(temporary)
         if _sources(pnl_dir, cutoffs)[1] != signature:
-            return None
+            return None, "source_changed"
         os.replace(temporary, path)
         cache_store.write_json_atomic(manifest, {
             "sources": signature,
@@ -137,7 +144,7 @@ def _rebuild(pl, path, manifest, pnl_dir, cutoffs, sources, signature, previous)
             "present": list(sharpes),
             "half_sharpes": sharpes,
         })
-        return sharpes
+        return sharpes, "rebuilt"
     finally:
         Path(temporary).unlink(missing_ok=True)
 
@@ -160,12 +167,11 @@ def training_half_sharpes(pnl_dir, path, cutoffs, selected):
                     raise CliError("INVALID_INPUT", "--polars requires Polars",
                                    'install the optional package with pip install "polars>=2.1,<3"') from exc
                 try:
-                    sharpes = _rebuild(pl, path, manifest, pnl_dir, cutoffs, sources, signature, previous)
+                    sharpes, state = _rebuild(pl, path, manifest, pnl_dir, cutoffs, sources, signature, previous)
                 except pl.exceptions.PolarsError as exc:
                     raise cache_store.CacheError(str(exc)) from exc
-                state = "rebuilt"
             if sharpes is None:
-                return None, "source_changed"
+                return None, state
             return {alpha_id: sharpes[alpha_id] for alpha_id in selected if alpha_id in sharpes}, state
     except (OSError, cache_store.CacheError) as exc:
         raise CliError("SERVICE_ERROR", "could not access the training PnL snapshot", str(exc)) from exc

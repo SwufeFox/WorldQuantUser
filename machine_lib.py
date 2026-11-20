@@ -2422,6 +2422,7 @@ def note_operator_rejection(expression, message, context=None):
 # never made on a stale label.
 _CEILING_CHECKS = frozenset({
     "SELF_CORRELATION",
+    "PROD_CORRELATION",
     "CONCENTRATED_WEIGHT",
     "HIGH_TURNOVER",
 })
@@ -2477,12 +2478,14 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
     ``complete`` indicates a nonempty check payload was received, not that every
     check resolved. ``payload_received`` also records successful empty payloads.
     The CLI reports check resolution separately from transport completion.
+    A zero wait budget allows one request with the default transport timeout.
     """
     if max_wait_seconds is not None and (not math.isfinite(max_wait_seconds) or max_wait_seconds < 0):
         raise ValueError("max_wait_seconds must be finite and non-negative")
-    deadline = time.monotonic() + (max_wait_seconds or 0)
+    deadline = time.monotonic() + max_wait_seconds if max_wait_seconds else None
     url = BRAIN_API_URL + "/alphas/" + alpha_id + "/check"
     payload = None
+    checks = None
     while True:
         response = s.get(url, timeout=_request_timeout(deadline))
         if response.status_code in (401, 403):
@@ -2498,23 +2501,30 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
         retry_after = _retry_after_seconds(response, cap_error_wait=False)
         if retry_after > 0:
             wait = retry_after
+            if on_event and deadline is not None and time.monotonic() < deadline:
+                on_event({"event": "check_pending", "alpha_id": alpha_id,
+                          "retry_after_seconds": wait})
         else:
             try:
                 payload = response.json()
             except ValueError:
                 payload = None
-            if (payload or {}).get("is", {}).get("checks"):
-                break
+            if payload is not None:
+                try:
+                    checks = _extract_checks(payload)
+                except (AttributeError, TypeError) as exc:
+                    raise ServiceError("invalid check payload for alpha %s" % alpha_id) from exc
+                if checks:
+                    if any(check["result"] is not None and not isinstance(check["result"], str)
+                           for check in checks.values()):
+                        raise ServiceError("invalid check result for alpha %s" % alpha_id)
+                    break
             wait = 5.0
-        if wait >= deadline - time.monotonic():
+        if deadline is None or wait >= deadline - time.monotonic():
             break
-        if retry_after > 0 and on_event:
-            on_event({"event": "check_pending", "alpha_id": alpha_id,
-                      "retry_after_seconds": wait})
         time.sleep(wait)
         if time.monotonic() >= deadline:
             break
-    checks = _extract_checks(payload or {})
     return {
         "alpha_id": alpha_id,
         "checks": checks,

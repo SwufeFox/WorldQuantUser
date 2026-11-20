@@ -646,6 +646,7 @@ python3 research_cli.py ledger stability --polars --where 'family=quality'
 返回的 `pnl_snapshot.state` 表示复用或重建。命中时直接读取已算好的两半 Sharpe，
 筛选和翻转判定仍按本次参数执行。有可复用的快照时，PnL 文件或训练边界更新只重读变更的 Alpha，
 再按 `alpha_id` 和日期把新增训练行与保留行流式合并到 Parquet。旧版或损坏的快照会全量重建。
+本轮刷新遇到源文件读取错误时，`source_unavailable` 表示已回退到普通读法，后续调用会重试刷新。
 
 ### 写表达式、跑模拟
 
@@ -983,6 +984,7 @@ python3 research_cli.py alpha check ALPHA_A ALPHA_B --workers 2 --max-wait 300
 全部项证据完整时顶层 `complete` 才为 true；缺失检查不能称为通过。
 `summary` 统计三种状态及 passed/failed/warning 结果，单项错误保留在该项而不抹掉其他结果。
 `--max-wait` 是每个 alpha 异步检查的等待预算，默认 180 秒，不是整批共享预算。
+`--max-wait 0` 对每个 Alpha 发一次请求，使用常规连接和读取超时。
 
 #### 请求超时或没有结果文件时
 
