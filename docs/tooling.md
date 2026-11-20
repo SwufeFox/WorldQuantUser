@@ -841,31 +841,71 @@ FASTEXPR 从 AST 提取用到的字段与类型，Python 则使用 `@alpha` 的�
 回执以 `required_fields_only` 记录这次核验，离线所用的完整快照由独立的目录检查维护。
 
 
-### Quick 批量回测
+### Quick 批量回测与续跑
 
 ```bash
 python3 tools/pipeline/batch_quick.py arms.json --out ledgers/quick.jsonl --concurrency 4 --account-slots 5
 ```
 
-`--concurrency` 设置本进程的 worker 数，`--account-slots` 设置同账号、同研究目录内共享的槽位预算，默认 5。
-输入可用 JSON 数组或 JSONL，每条包含 `label`、`expr` 和 `settings`。回测任务结束后由独立 worker 读取指标，
-回测 worker 可以继续领下一条。原 `async_batch.py` 入口使用同一执行器，沿用原输出路径与 worker 默认值。
-续跑时使用同一份 arms 和 `--out`。JSONL 保存结果，旁边的 `.state/` 保存已受理任务的 Location 和待补取的结果。
-跨台账去重以可核实的相同账号、规范化表达式和完整请求设置为准。只在原台账使用缺少完整身份的旧完成记录。
-旧 `.loc` 只有 label 时，工具通过 Alpha 原始回执核对表达式及请求设置。身份无法核实时保留 `UNVERIFIED_RESULT`。
-429 和 401 可以重试，等待超时的任务保留为 `QUEUED` 或 `PENDING`。发送结果无法确认的 POST 标记为
-`UNKNOWN_SUBMISSION`。如果从原始请求找回了 Location，可以用同一份 arms 和 `--out` 运行下列核对命令。
-命令验证并登记原任务的地址，随后正常续跑会处理已登记的任务。旧版 `TIMEOUT` 如果没有留下 Location，无法续轮询。
+输入可用 JSON 数组或 JSONL，每条包含 `label`、`expr` 和 `settings`。默认使用 `QUICK`，
+显式 `settings.simulationMode` 优先。回测结束后由独立 worker 读取指标，回测 worker 可以接下一条。
+兼容入口 `tools/pipeline/async_batch.py` 使用同一执行器，默认输出 `ledgers/async.jsonl`，默认 worker 数为 6。
+
+| 参数 | 控制范围 |
+| --- | --- |
+| `--concurrency` | 本进程的回测 worker 数 |
+| `--account-slots` | 同账号、同研究目录内共享的本地槽位预算，默认 5 |
+| `--poll-timeout` | 启动回测重试、轮询进度、补读指标分别计时，每阶段默认 420 秒 |
+| `--limit` | 本轮处理的候选数，默认 0，表示不限 |
+
+阶段预算包含该阶段的会话获取和重试，用于决定能否继续等待或发起下一次请求。HTTP 超时限制连接和读取间隔。已发出的回测 POST
+使用独立的 90 秒网络超时接收 `Location`，因此整个命令的耗时还取决于各阶段和正在执行的请求。
+
+续跑时用同一份 arms 和 `--out` 原样重跑。JSONL 保存结果，旁边的 `.state/` 保存已受理任务的
+`Location` 和待补取的结果。跨台账只复用可核实为同账号、同规范化表达式和同完整请求设置的结果。
+原台账仍支持旧完成记录。旧 `.loc` 仅按 label 保存地址时，工具通过原始 Alpha 回执核验表达式和设置。
+
+| 台账 `status` | 续跑处理 |
+| --- | --- |
+| `QUEUED` | 尚待发单，检查槽位、配额及已有的 `next_retry_at` 后再启动 |
+| `PENDING` | 使用保存的任务地址轮询，或用已取得的 Alpha ID 补读指标，遵守已记录的 `Retry-After` |
+| `UNKNOWN_SUBMISSION` | 保留待核对的提交，找到原始 POST 的 `Location` 后登记 |
+| `UNVERIFIED_RESULT` | 保留待核实的结果，核对原始任务和表达式及设置 |
+
+退出后，平台仍可能继续执行已受理的回测。查对应候选的最新台账行及 `.state/`，完成情况以逐项状态为准。
+自动回收只查看可轮询且无人接管的任务，读到该任务的终态回执后才释放共享槽位。
+
+#### 补登记原始 Location
 
 ```bash
 python3 tools/pipeline/batch_quick.py arms.json --out ledgers/quick.jsonl \
-    --recover-job JOB_KEY --recover-location BRAIN_LOCATION
+    --recover-job JOB_KEY --recover-location 'ORIGINAL_BRAIN_LOCATION'
 ```
 
-`JOB_KEY` 取结果行的 `simulation_job_key`，`BRAIN_LOCATION` 必须来自那次原始请求。
+`JOB_KEY` 取结果行的 `simulation_job_key`，`ORIGINAL_BRAIN_LOCATION` 填那次 POST 响应的原始
+`Location`，保留查询参数。地址必须指向一个具体的回测任务。命令用原账户读取该地址并登记，
+随后用原回测命令续跑，核验 Alpha 的表达式和设置。缺少地址的旧 `TIMEOUT` 记录需要先找回原任务身份。
 
-`tools/pipeline/pipeline_pc.py` 调用同一个槽位调度器做 Full 回测。每条回测先保存 Alpha ID 和指标，再由独立队列查 PC。
-重跑会复用身份已核实的 Full 结果，仍符合筛选条件且 PC 待确认的条目继续查已有 Alpha ID。
+确认原任务已经失败且没有 Alpha ID 时，在同一条登记命令末尾加 `--confirm-original-failure`。
+平台回执必须明确返回匹配的任务 ID 和失败终态，工具才会释放槽位。随后续跑会记录该失败，
+再处理其余候选。
+
+### Full 回测与生产相关检查
+
+```bash
+python3 tools/pipeline/pipeline_pc.py arms.json --out ledgers/full-pc.jsonl --concurrency 4 --pc-max-wait 300
+```
+
+使用同一槽位调度器，固定回测模式为 `FULL` 并关闭 `visualization`，回测各阶段预算为 600 秒。
+先落账 Alpha ID 和指标，再由独立队列查询满足筛选条件的 Alpha 的生产相关性。`--pc-max-wait` 为逐条
+检查的等待预算，默认 300 秒，设为 0 时只跑回测并取指标。
+
+用相同 arms 和台账路径续跑。已核实的 Full 结果直接沿用，`check_pending` 从原 Alpha ID 继续查，
+平台 `Retry-After` 会保存为 `next_pc_poll_at`。等待期超过本轮检查预算的候选让出 `--limit` 名额。
+`REUSE_UNRESOLVED` 表示旧结果身份待核验，保留原 Alpha ID 供后续查询。
+
+Full 遇到 `UNKNOWN_SUBMISSION` 时，用 Quick 的补登记命令配合原 Full 台账路径。传入同一候选的
+label、表达式和完整设置，显式写入 `"simulationMode": "FULL"` 和 `"visualization": false`，再用 Full 命令续跑。
 
 ### 原生 Multi 回测
 
@@ -880,6 +920,8 @@ python3 research_cli.py resume multi-run.json
 python3 research_cli.py probe sample-batch.spec.json --multi-size 4 --batch-size 2 --dry-run
 python3 research_cli.py probe sample-batch.spec.json --multi-size 4 --batch-size 2 --batch-path multi-probe.json
 python3 research_cli.py probe --recover multi-probe.json
+python3 research_cli.py probe --resume multi-probe.json
+python3 research_cli.py probe --from-simulation PARENT_ID
 ```
 
 BRAIN 要求 `MULTI_SIMULATION` 权限。同一父任务内的 Alpha 类型、标的类型、Region、
@@ -895,8 +937,9 @@ Delay 和 Language 必须一致。工具沿用 `probe` 的设置分组，末尾�
 
 工具在发单前保存父任务和子配置，接受后记录父任务地址。恢复时从地址读取子任务，分别
 记录成功、失败及待确认的结果。父任务报错并返回子列表时，已确认成功的子结果仍可入账。
-任务身份不明时保留待核对状态。`probe --recover` 只读已保存的父任务，`probe --resume`
-还可继续排队的回测。`probe --from-simulation ID` 可只读检查平台上已有的父任务。
+任务身份不明时保留待核对状态。`probe --recover` 只读已登记的平台任务并补账。`probe --resume`
+还可继续排队的回测。手里只有父任务 ID 时，用 `probe --from-simulation` 查看父任务和各子任务状态。
+`--max-wait-seconds` 在原生 `simulate`、`resume` 和 `probe` 中按调用共享，包含父子任务查询。
 [BRAIN 父子任务 API](https://platform.worldquantbrain.com/learn/documentation/brain-api/brain-api#simulations)
 
 ### 合并已有结果与读取实时检查

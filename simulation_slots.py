@@ -21,7 +21,8 @@ import research_paths
 
 
 TERMINAL_FAILURE_STATUSES = frozenset({"ERROR", "FAIL", "TIMEOUT", "CANCELLED", "CANCELED"})
-TERMINAL_STATUSES = frozenset({"COMPLETE", "COMPLETED", "WARNING"}) | TERMINAL_FAILURE_STATUSES
+TERMINAL_SUCCESS_STATUSES = frozenset({"COMPLETE", "COMPLETED", "WARNING"})
+TERMINAL_STATUSES = TERMINAL_SUCCESS_STATUSES | TERMINAL_FAILURE_STATUSES
 
 
 def _workspace():
@@ -157,12 +158,13 @@ def _prune_quick_preparations(journal):
 
 
 @contextmanager
-def _locked_quick_journal(account):
+def _locked_quick_journal(account, *, deadline=None):
     fingerprint = _fingerprint(account)
     if not fingerprint:
         raise ValueError("shared quick simulation slots require an identified account")
     path, lock = _paths(fingerprint)
-    with cache_store.file_lock(lock):
+    lock_options = {} if deadline is None else {"timeout": max(0, deadline - time.monotonic())}
+    with cache_store.file_lock(lock, **lock_options):
         yield _load(path, fingerprint), path
 
 
@@ -224,7 +226,7 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False,
 
 
 def quick_update(account, identity, outcome, *, progress_url=None, retain=False,
-                 terminal_result=None):
+                 terminal_result=None, deadline=None):
     """Reconcile a QUICK reservation using the result of the corresponding HTTP request.
 
     Parking yields ownership of the poll without releasing server occupancy.
@@ -234,15 +236,17 @@ def quick_update(account, identity, outcome, *, progress_url=None, retain=False,
         raise ValueError(f"unknown quick simulation reservation outcome {outcome!r}")
     receipt = None
     if terminal_result is not None:
+        from machine_lib import valid_simulation_id
+
         if not retain or outcome != "terminal" or not isinstance(terminal_result, dict):
             raise ValueError("only retained terminal quick simulations can store a result")
         status, alpha_id = terminal_result.get("status"), terminal_result.get("alpha_id")
         if not isinstance(status, str) or status not in TERMINAL_STATUSES:
             raise ValueError("retained quick simulation result requires a terminal status")
-        if alpha_id is not None and (not isinstance(alpha_id, str) or not alpha_id.isalnum()):
+        if alpha_id is not None and not valid_simulation_id(alpha_id):
             raise ValueError("invalid Alpha ID in retained quick simulation result")
         receipt = {"status": status, "alpha_id": alpha_id}
-    with _locked_quick_journal(account) as (journal, path):
+    with _locked_quick_journal(account, deadline=deadline) as (journal, path):
         reservations = journal["reservations"]
         entry = reservations.get(identity)
         if not entry or not entry.get("quick_job_key"):
@@ -251,6 +255,9 @@ def quick_update(account, identity, outcome, *, progress_url=None, retain=False,
                 resolved.pop(identity)
                 cache_store.write_json_atomic(path, journal)
                 return True
+            return False
+        if retain and (entry.get("state") != "accepted" or entry.get("manual_location")
+                       or _quick_owner_is_live(entry.get("quick_owner"))):
             return False
         if outcome == "submitting":
             if entry.get("state") != "quick_preparing" or entry.get("quick_owner") != _quick_owner():
@@ -283,26 +290,31 @@ def quick_update(account, identity, outcome, *, progress_url=None, retain=False,
 
 
 def quick_orphans(account, *, exclude_job=None):
-    """List accepted QUICK jobs whose poller is no longer responsible for them."""
-    with _locked_quick_journal(account) as (journal, _):
-        reservations = journal["reservations"]
+    """List accepted Quick jobs that are ready for automatic recovery."""
+    fingerprint = _fingerprint(account)
+    if not fingerprint:
+        raise ValueError("shared quick simulation slots require an identified account")
+    path, _ = _paths(fingerprint)
+    # The journal is atomically replaced and updates recheck ownership under the lock.
+    reservations = _load(path, fingerprint)["reservations"]
     now = time.time()
     return [
         {"id": key, **entry, "job_key": entry["quick_job_key"]}
         for key, entry in reservations.items()
         if entry.get("quick_job_key") and entry["quick_job_key"] != exclude_job
         and entry.get("state") == "accepted" and entry.get("progress_url")
+        and not entry.get("manual_location")
         and (_quota_number(entry.get("next_poll_at")) or 0) <= now
         and not _quick_owner_is_live(entry.get("quick_owner"))
     ]
 
 
-def quick_defer(account, identity, next_poll_at):
+def quick_defer(account, identity, next_poll_at, *, deadline=None):
     """Persist a server polling delay without changing accepted slot ownership."""
     next_poll_at = _quota_number(next_poll_at)
     if next_poll_at is None:
         raise ValueError("quick polling deadline must be finite and non-negative")
-    with _locked_quick_journal(account) as (journal, path):
+    with _locked_quick_journal(account, deadline=deadline) as (journal, path):
         entry = journal["reservations"].get(identity)
         if not entry or not entry.get("quick_job_key") or entry.get("state") != "accepted":
             return False
@@ -312,26 +324,46 @@ def quick_defer(account, identity, next_poll_at):
         return True
 
 
-def quick_attach_location(account, job_key, progress_url):
+def quick_attach_location(account, job_key, progress_url, *, terminal_failure=None, next_poll_at=None):
     """Bind the caller's verified original Location to an unresolved Quick lease."""
+    if terminal_failure is not None and terminal_failure not in TERMINAL_FAILURE_STATUSES:
+        raise ValueError("manual reconciliation requires a terminal failure")
     target_path = urlsplit(progress_url).path.rstrip("/")
     with _locked_quick_journal(account) as (journal, path):
         reservations = journal["reservations"]
+        resolved = journal.get("quick_resolved", {})
+        if terminal_failure:
+            for key, entry in resolved.items():
+                if (entry.get("quick_job_key") == job_key and entry.get("progress_url") == progress_url
+                        and entry.get("manual_failure_confirmed")):
+                    return {"id": key, **entry, "resolved": True}
         match = next(((key, entry) for key, entry in reservations.items()
                       if entry.get("quick_job_key") == job_key), None)
         if not match:
             raise ValueError("no unresolved Quick reservation matches this job key")
         key, entry = match
-        if (entry.get("state") not in {"unknown", "submitting"} or entry.get("progress_url")
-                or _quick_owner_is_live(entry.get("quick_owner"))):
+        new_location = entry.get("state") in {"unknown", "submitting"} and not entry.get("progress_url")
+        parked_manual = (terminal_failure and entry.get("state") == "accepted"
+                         and entry.get("manual_location") and entry.get("progress_url") == progress_url)
+        if not (new_location or parked_manual) or _quick_owner_is_live(entry.get("quick_owner")):
             raise ValueError("Quick reservation already has a Location or may still be posting")
-        for collection in (reservations, journal.get("quick_resolved", {})):
-            if any(isinstance(row.get("progress_url"), str)
+        for collection in (reservations, resolved):
+            if any(other != key and isinstance(row.get("progress_url"), str)
                    and urlsplit(row["progress_url"]).path.rstrip("/") == target_path
-                   for row in collection.values()):
+                   for other, row in collection.items()):
                 raise ValueError("Location already belongs to another simulation reservation")
-        entry.update(state="accepted", progress_url=progress_url, quick_owner=None,
-                     identity_unverified=True, manual_location=True)
+        entry.update(state="accepted", progress_url=progress_url, quick_owner=None)
+        if terminal_failure:
+            entry.pop("next_poll_at", None)
+            entry.pop("manual_location", None)
+            entry.pop("identity_unverified", None)
+            entry.update(manual_failure_confirmed=True,
+                         terminal_result={"status": terminal_failure, "alpha_id": None})
+            journal.setdefault("quick_resolved", {})[key] = reservations.pop(key)
+        else:
+            entry.update(identity_unverified=True, manual_location=True)
+            if next_poll_at is not None:
+                entry["next_poll_at"] = next_poll_at
         cache_store.write_json_atomic(path, journal)
         return {"id": key, **entry}
 

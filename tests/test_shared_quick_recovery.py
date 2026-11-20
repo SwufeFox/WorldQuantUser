@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 import requests
 
+import cache_store
 import machine_lib as ml
 import simulation_capabilities
 import simulation_slots as slots
@@ -71,10 +72,78 @@ def test_native_can_launch_after_reclaiming_a_completed_quick_slot(tmp_path, mon
     assert resumed["terminal_result"] == {"status": "COMPLETE", "alpha_id": "OldAlpha"}
 
 
+def test_slow_first_orphan_does_not_block_native_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    monkeypatch.setattr(simulation_capabilities, "account_provenance", lambda _session=None: ACCOUNT)
+    now = 100.0
+    monkeypatch.setattr(ml.time, "monotonic", lambda: now)
+    slow_url = f"{ml.BRAIN_API_URL}/simulations/Slow"
+    for key, url in (("slow", slow_url), ("ready", ORPHAN_URL)):
+        slot = slots.quick_acquire(ACCOUNT, 2, key, existing_url=url)
+        assert slots.quick_update(ACCOUNT, slot["id"], "parked")
+
+    session = Mock(spec=requests.Session)
+    session.post.return_value = response(201, Location="/simulations/Native")
+
+    def get(url, *, timeout, **_options):
+        nonlocal now
+        if url == slow_url:
+            now += timeout
+            raise requests.ReadTimeout()
+        if url == ORPHAN_URL:
+            return response(200, {"id": "Orphan", "status": "COMPLETE", "alpha": "OldAlpha"})
+        return response(200, {"id": "Native", "status": "COMPLETE", "alpha": "NativeAlpha"})
+
+    session.get.side_effect = get
+    result, = ml.simulate_alphas(session, ["rank(close)"], concurrency=2, fetch_metrics=False,
+                                 max_wait_seconds=30)
+
+    assert result["alpha_id"] == "NativeAlpha"
+    session.post.assert_called_once()
+    assert [call.args[0] for call in session.get.call_args_list[:2]] == [slow_url, ORPHAN_URL]
+    assert slots.snapshot(ACCOUNT, 2)["active"] == 1
+
+
+def test_optional_recovery_does_not_wait_past_deadline_for_journal_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    parked_orphan()
+    now = 100.0
+    monkeypatch.setattr(ml.time, "monotonic", lambda: now)
+    session = Mock()
+
+    def get(*_args, **_options):
+        nonlocal now
+        now = 101.0
+        return response(200, {"id": "Orphan", "status": "COMPLETE", "alpha": "OldAlpha"})
+
+    session.get.side_effect = get
+    _, lock_path = slots._paths(ACCOUNT["fingerprint"])
+    with cache_store.file_lock(lock_path):
+        assert ml.recover_quick_orphans(session, ACCOUNT, deadline=101.0) == 0
+    session.get.assert_called_once()
+    assert slots.snapshot(ACCOUNT, 1)["active"] == 1
+    assert ml.recover_quick_orphans(session, ACCOUNT) == 1
+
+
+def test_orphan_recovery_leaves_job_resumed_by_owner_during_read(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    parked_orphan()
+    session = Mock()
+
+    def get(*_args, **_options):
+        assert slots.quick_acquire(ACCOUNT, 1, "old-quick-job")["state"] == "accepted"
+        return response(200, {"id": "Orphan", "status": "COMPLETE", "alpha": "OldAlpha"})
+
+    session.get.side_effect = get
+    assert ml.recover_quick_orphans(session, ACCOUNT) == 0
+    assert slots.snapshot(ACCOUNT, 1)["active"] == 1
+
+
 @pytest.mark.parametrize(("http_status", "body"), [
     (404, {"status": "FAIL"}),
     (400, {"id": "Different", "status": "FAIL"}),
     (400, {"status": "FAIL"}),
+    (200, {"id": "Different", "status": "COMPLETE", "alpha": "OtherAlpha"}),
     (200, {"status": "COMPLETE"}),
     (200, {"progress": 0.5}),
 ])

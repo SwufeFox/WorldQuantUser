@@ -345,6 +345,7 @@ class SessionCacheTests(TempCacheCase):
         self.assertEqual(len(self.calls), 1)
         self.assertFalse(meta["cached"])
         self.assertTrue(os.path.isfile(self.cache_path))
+        self.assertEqual(meta["generation"], cache_store.read_entry(self.cache_path)["created_at"])
 
         meta2 = {}
         ml.load_session(meta=meta2)
@@ -352,11 +353,21 @@ class SessionCacheTests(TempCacheCase):
         self.assertTrue(meta2["cached"])
         self.assertEqual(meta2["reason"], "reused-cache")
         self.assertEqual(meta2["cache_state"], "fresh")
+        self.assertEqual(meta2["generation"], meta["generation"])
 
     def test_refresh_forces_one_new_login(self):
         ml.load_session()
         ml.load_session(refresh=True)
         self.assertEqual(len(self.calls), 2)
+
+    def test_refresh_reuses_session_published_since_rejected_generation(self):
+        rejected, latest, reused = {}, {}, {}
+        ml.load_session(meta=rejected)
+        ml.load_session(refresh=True, rejected_generation=rejected["generation"], meta=latest)
+        ml.load_session(refresh=True, rejected_generation=rejected["generation"], meta=reused)
+        self.assertEqual(len(self.calls), 2)
+        self.assertNotEqual(latest["generation"], rejected["generation"])
+        self.assertEqual(reused["generation"], latest["generation"])
 
     def test_account_bound_session_skips_a_different_users_cookie(self):
         cache_store.write_json_atomic(

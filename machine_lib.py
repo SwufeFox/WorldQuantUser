@@ -131,6 +131,14 @@ class ReadInterrupted(ServiceError):
     """A read could not finish after transient transport or gateway errors."""
 
 
+class AuthenticationUnavailable(ServiceError):
+    """A transient transport or server failure interrupted authentication."""
+
+
+class AuthenticationDeadline(ServiceError):
+    """The caller's budget for starting or waiting for authentication expired."""
+
+
 class SessionBusy(ServiceError):
     """Another process is acquiring the shared account session."""
 
@@ -273,14 +281,19 @@ def authenticate(*, deadline=None):
     from requests import Session
     from requests.exceptions import RequestException
 
+    if deadline is not None and time.monotonic() >= deadline:
+        raise AuthenticationDeadline("authentication wait budget expired before login")
     session = Session()
     session.auth = (username, password)
-    if deadline is not None and time.monotonic() >= deadline:
-        raise ServiceError("authentication wait budget expired before login")
     try:
         response = session.post(BRAIN_API_URL + "/authentication", timeout=_request_timeout(deadline))
     except RequestException as exc:
-        raise ServiceError("authentication request failed (%s)" % type(exc).__name__) from exc
+        message = "authentication request failed (%s)" % type(exc).__name__
+        if _transient_read_error(exc):
+            if deadline is not None and time.monotonic() >= deadline:
+                raise AuthenticationDeadline("authentication wait budget expired during login") from exc
+            raise AuthenticationUnavailable(message) from exc
+        raise ServiceError(message) from exc
     if response.status_code != 201:
         status = response.status_code
         if "captcha" in response.text[:300].lower():
@@ -293,6 +306,8 @@ def authenticate(*, deadline=None):
             raise PermissionDenied("BRAIN denied access to authentication (HTTP 403)")
         if status == 429:
             raise RateLimited("BRAIN authentication is rate limited")
+        if status == 408 or status >= 500:
+            raise AuthenticationUnavailable("authentication request failed (HTTP %s)" % status)
         raise ServiceError("authentication request failed (HTTP %s)" % status)
     try:
         payload = response.json()
@@ -371,7 +386,7 @@ def _session_payload(session, info):
     }
 
 
-def save_session(session, info=None, path=None):
+def save_session(session, info=None, path=None, *, meta=None):
     """Atomically store the authenticated user's cookies in a private envelope."""
     target = Path(path or session_cache_path())
     ttl = None
@@ -381,6 +396,8 @@ def save_session(session, info=None, path=None):
     entry = cache_store.build_entry(
         "brain-session", _session_payload(session, info), ttl=ttl, source="login")
     cache_store.write_json_atomic(target, entry, mode=0o600)
+    if meta is not None:
+        meta["generation"] = entry["_cache"]["created_at"]
     return target
 
 
@@ -437,7 +454,8 @@ def login_lock_timeout():
     return timeout
 
 
-def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *, deadline=None):
+def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *,
+                 deadline=None, rejected_generation=None):
     """Return an authenticated session, reusing a cached cookie when still valid.
 
     BRAIN issues sessions that last hours but challenges repeated logins with a
@@ -448,15 +466,22 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *, d
     The login itself is single-flight: concurrent callers take a file lock, and
     the ones that lose the race re-check the cache and reuse the winner's
     session instead of adding a second login. A forced refresh may share a
-    session written by another caller after the refresh started. A lock timeout
-    with no reusable session raises ``SessionBusy``. Pass ``meta`` (a dict) to
-    receive ``cached`` and ``reason`` for diagnostics.
+    session written by another caller after the refresh started. If the caller
+    knows its rejected cookie's generation, a refresh may reuse a session
+    published since that cookie was read. A lock timeout with no reusable
+    session raises ``SessionBusy``. Pass ``meta`` (a dict) to receive ``cached``,
+    ``reason`` and the session's ``generation`` when cache-backed.
     """
     meta = meta if meta is not None else {}
+    meta.pop("generation", None)
+    if deadline is not None and time.monotonic() >= deadline:
+        raise AuthenticationDeadline("authentication wait budget expired before login")
     path = Path(cache_path or session_cache_path())
     reuse_cache = use_cache and not refresh
     credentials = get_credentials() if reuse_cache else None
-    previous_creation = None if reuse_cache else cache_store.read_entry(path).get("created_at")
+    previous_creation = rejected_generation
+    if not reuse_cache and previous_creation is None:
+        previous_creation = cache_store.read_entry(path).get("created_at")
 
     def _reuse(*, locked=False):
         entry = cache_store.read_entry(path)
@@ -474,6 +499,7 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *, d
                 return None
             meta.update({"cached": True, "reason": "reused-cache",
                          "cache_state": "fresh",
+                         "generation": entry["created_at"],
                          "expires_in": entry.get("expires_in")})
             return _session_from_entry(payload, account_credentials)
         if entry["present"]:
@@ -497,13 +523,13 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *, d
         else:
             session, info = authenticate(deadline=deadline)
         try:
-            save_session(session, info, path)
+            save_session(session, info, path, meta=meta)
         except OSError:
             pass  # a read-only volume must not break a working session
         meta.update({"cached": False, "reason": reason, "user_id": (info or {}).get("user_id")})
         return session
 
-    if reuse_cache:
+    if reuse_cache or rejected_generation is not None:
         reused = _reuse()
         if reused is not None:
             return reused
@@ -512,7 +538,7 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *, d
     if deadline is not None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise ServiceError("authentication wait budget expired before login")
+            raise AuthenticationDeadline("authentication wait budget expired before login")
         timeout = min(timeout, remaining)
     try:
         with cache_store.file_lock(research_paths.lock_path("brain-session"),
@@ -528,6 +554,8 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *, d
         if reused is not None:
             meta["reason"] = "cache-after-lock-timeout"
             return reused
+        if deadline is not None and time.monotonic() >= deadline:
+            raise AuthenticationDeadline("authentication wait budget expired waiting for login") from exc
         meta.update(cached=False, reason="session-busy")
         raise SessionBusy("another process is signing in to BRAIN") from exc
 
@@ -1074,8 +1102,18 @@ def _validated_progress_url(location):
     return resolved
 
 
+def _quick_progress_target(location):
+    """Return the original request URL and exact simulation ID for a Quick receipt."""
+    url = _validated_progress_url(location)
+    try:
+        simulation_id = simulation_reference_id(urlsplit(url)._replace(query="").geturl())
+    except ValueError as exc:
+        raise SimulationError("Quick Location must identify one BRAIN simulation") from exc
+    return url, simulation_id
+
+
 def _request_timeout(deadline):
-    """Keep a network request within the caller's remaining wait budget."""
+    """Cap a Requests connect/read timeout at the remaining phase budget."""
     if deadline is None:
         return 60
     return max(0.001, min(60, deadline - time.monotonic()))
@@ -1235,15 +1273,19 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4, *,
 
 def read_simulation_snapshot(s, simulation_id, *, deadline):
     """Read a snapshot, preserving terminal failure evidence in HTTP 400 replies."""
-    from requests.exceptions import RequestException
-
     if not valid_simulation_id(simulation_id):
         raise ValueError("invalid simulation id")
-    if time.monotonic() >= deadline:
+    url = f"{BRAIN_API_URL}/simulations/{simulation_id}"
+    return _read_simulation_snapshot(s, url, simulation_id, deadline=deadline)
+
+
+def _read_simulation_snapshot(s, url, simulation_id, *, deadline):
+    from requests.exceptions import RequestException
+
+    if deadline is not None and time.monotonic() >= deadline:
         raise ServiceError("simulation inspection wait budget expired")
     try:
-        response = s.get(f"{BRAIN_API_URL}/simulations/{simulation_id}",
-                         timeout=_request_timeout(deadline), allow_redirects=False)
+        response = s.get(url, timeout=_request_timeout(deadline), allow_redirects=False)
     except RequestException as exc:
         raise ServiceError("simulation inspection request failed") from exc
     status = response.status_code
@@ -1251,12 +1293,13 @@ def read_simulation_snapshot(s, simulation_id, *, deadline):
         raise AuthError("BRAIN denied access to this simulation")
     if status == 404:
         raise NotFound("simulation not found")
-    if status == 429:
-        raise RateLimited("simulation inspection rate limited")
-    if status not in (200, 400):
+    if status not in (200, 400, 429):
         raise ServiceError(f"simulation inspection returned HTTP {status}")
     seconds = _retry_after_seconds(response, cap_error_wait=False)
     retry_after = seconds if math.isfinite(seconds) and seconds > 0 else None
+    if status == 429:
+        wait = f", retry after {retry_after:g} seconds" if retry_after is not None else ""
+        raise RateLimited(f"simulation inspection rate limited{wait}")
     try:
         payload = response.json()
     except ValueError:
@@ -1278,36 +1321,64 @@ def read_simulation_snapshot(s, simulation_id, *, deadline):
     return payload, retry_after
 
 
+def simulation_progress_receipt(response, body, simulation_id):
+    """Return a terminal snapshot that belongs to the requested simulation."""
+    import simulation_slots
+
+    if not isinstance(body, dict) or response.status_code not in (200, 400):
+        return None
+    echoed_id = body.get("id")
+    status = str(body.get("status", "")).upper()
+    failed = status in simulation_slots.TERMINAL_FAILURE_STATUSES
+    if echoed_id not in (None, simulation_id) or status not in simulation_slots.TERMINAL_STATUSES:
+        return None
+    if response.status_code == 400 and (echoed_id != simulation_id or not failed):
+        return None
+    alpha_id = body.get("alpha") or body.get("alphaId")
+    if (alpha_id is not None and not valid_simulation_id(alpha_id)) or (not failed and not alpha_id):
+        return None
+    return {"status": status, "alpha_id": alpha_id}
+
+
+QUICK_ORPHAN_SWEEP_SECONDS = 5
+
+
 def recover_quick_orphans(s, account, *, deadline=None, exclude_job=None, limit=None, offset=0):
-    """Reclaim orphaned Quick slots only after an authenticated terminal receipt."""
+    """Reclaim orphaned Quick slots within a short, shared recovery budget."""
     import simulation_slots
     from requests.exceptions import RequestException
 
     if not account.get("fingerprint"):
         return 0
-    jobs = [job for job in simulation_slots.quick_orphans(account, exclude_job=exclude_job)
-            if not job.get("manual_location")]
+    short_deadline = time.monotonic() + QUICK_ORPHAN_SWEEP_SECONDS
+    deadline = min(deadline, short_deadline) if deadline is not None else short_deadline
+    if time.monotonic() >= deadline:
+        return 0
+    jobs = simulation_slots.quick_orphans(account, exclude_job=exclude_job)
     if not jobs:
         return 0
     start = offset % len(jobs)
     jobs = (jobs[start:] + jobs[:start])[:limit]
-    short_deadline = time.monotonic() + 5
-    deadline = min(deadline, short_deadline) if deadline is not None else short_deadline
     released = 0
-    for job in jobs:
-        if time.monotonic() >= deadline:
+    for position, job in enumerate(jobs):
+        now = time.monotonic()
+        if now >= deadline:
             break
         try:
-            url = _validated_progress_url(job["progress_url"])
-            simulation_id = simulation_reference_id(urlsplit(url)._replace(query="").geturl())
-            response = s.get(url, timeout=_request_timeout(deadline), allow_redirects=False)
-        except (SimulationError, ValueError, RequestException):
+            url, simulation_id = _quick_progress_target(job["progress_url"])
+            # Leave time to inspect later reservations if this endpoint times out.
+            request_deadline = now + (deadline - now) / (len(jobs) - position)
+            response = s.get(url, timeout=_request_timeout(request_deadline), allow_redirects=False)
+        except (SimulationError, RequestException):
             continue
         if response.status_code in (401, 403):
             raise AuthError("session rejected while recovering a Quick simulation")
         delay = _retry_after_seconds(response, cap_error_wait=False)
         if math.isfinite(delay) and delay > 0:
-            simulation_slots.quick_defer(account, job["id"], time.time() + delay)
+            try:
+                simulation_slots.quick_defer(account, job["id"], time.time() + delay, deadline=deadline)
+            except cache_store.LockTimeout:
+                break
             continue
         if response.status_code not in (200, 400):
             continue
@@ -1315,24 +1386,18 @@ def recover_quick_orphans(s, account, *, deadline=None, exclude_job=None, limit=
             payload = response.json()
         except ValueError:
             continue
-        if not isinstance(payload, dict) or payload.get("id") not in (None, simulation_id):
+        receipt = simulation_progress_receipt(response, payload, simulation_id)
+        if not receipt:
             continue
-        status = str(payload.get("status", "")).upper()
-        if response.status_code == 400 and (payload.get("id") != simulation_id
-                or status not in simulation_slots.TERMINAL_FAILURE_STATUSES):
-            continue
-        alpha_id = payload.get("alpha") or payload.get("alphaId")
-        if alpha_id is not None and (not isinstance(alpha_id, str) or not alpha_id.isalnum()):
-            continue
-        if status not in simulation_slots.TERMINAL_STATUSES or (
-                status not in simulation_slots.TERMINAL_FAILURE_STATUSES and not alpha_id):
-            continue
-        released += simulation_slots.quick_update(account, job["id"], "terminal", retain=True,
-                                                  terminal_result={"status": status, "alpha_id": alpha_id})
+        try:
+            released += simulation_slots.quick_update(account, job["id"], "terminal", retain=True,
+                                                      terminal_result=receipt, deadline=deadline)
+        except cache_store.LockTimeout:
+            break
     return released
 
 
-def attach_quick_location(s, account, job_key, location, *, deadline=None):
+def attach_quick_location(s, account, job_key, location, *, deadline=None, confirm_failure=False):
     """Attach the original, independently recovered Location of an ambiguous Quick POST."""
     import simulation_capabilities
     import simulation_slots
@@ -1342,23 +1407,22 @@ def attach_quick_location(s, account, job_key, location, *, deadline=None):
         raise ValueError("Quick Location recovery requires its authenticated account")
     if not isinstance(job_key, str) or not job_key:
         raise ValueError("Quick Location recovery requires a job key")
-    url = _validated_progress_url(location)
-    simulation_id = simulation_reference_id(urlsplit(url)._replace(query="").geturl())
-    short_deadline = time.monotonic() + 5
-    deadline = min(deadline, short_deadline) if deadline is not None else short_deadline
-    payload, delay = read_simulation_snapshot(s, simulation_id, deadline=deadline)
+    url, simulation_id = _quick_progress_target(location)
+    payload, delay = _read_simulation_snapshot(s, url, simulation_id, deadline=deadline)
     status = str(payload.get("status") or "").upper()
     progress = payload.get("progress")
     if (payload.get("id") not in (None, simulation_id)
             or not (payload.get("id") == simulation_id or status
                     or type(progress) in (int, float) and 0 <= progress <= 1)):
         raise ServiceError("BRAIN did not confirm the recovered Quick simulation identity")
-    slot = simulation_slots.quick_attach_location(account, job_key, url)
-    if delay:
-        next_poll_at = time.time() + delay
-        simulation_slots.quick_defer(account, slot["id"], next_poll_at)
-        slot["next_poll_at"] = next_poll_at
-    return slot
+    if confirm_failure:
+        if (delay or payload.get("id") != simulation_id
+                or status not in simulation_slots.TERMINAL_FAILURE_STATUSES
+                or payload.get("alpha") or payload.get("alphaId")):
+            raise ServiceError("BRAIN did not confirm a terminal failure without an Alpha for this Location")
+        return simulation_slots.quick_attach_location(account, job_key, url, terminal_failure=status)
+    next_poll_at = time.time() + delay if delay else None
+    return simulation_slots.quick_attach_location(account, job_key, url, next_poll_at=next_poll_at)
 
 
 def poll_simulation(s, progress_url, on_event=None, deadline=None):

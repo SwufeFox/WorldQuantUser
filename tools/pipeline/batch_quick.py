@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import contextmanager, nullcontext, suppress
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from requests.exceptions import ConnectTimeout, InvalidJSONError, RequestException
@@ -28,17 +28,18 @@ if __package__ in (None, ""):
 import cache_store
 import fastexpr_ast
 import machine_lib
-import research_paths
 import simulation_capabilities
 import simulation_slots
 
 QUICK = "QUICK"
 DEFAULT_ACCOUNT_SLOTS = 5
-SUCCESS_STATUSES = {"COMPLETE", "COMPLETED", "WARNING"}
+SUCCESS_STATUSES = simulation_slots.TERMINAL_SUCCESS_STATUSES
 CHECK_NAMES = ("LOW_SUB_UNIVERSE_SHARPE", "CONCENTRATED_WEIGHT",
                "LOW_2Y_SHARPE", "LOW_SHARPE", "LOW_FITNESS")
 LEGACY_SCOPE = ("region", "universe")
 RECONCILIATION_STATUSES = {"UNKNOWN_SUBMISSION", "UNVERIFIED_RESULT"}
+TRANSIENT_AUTH_ERRORS = (RequestException, machine_lib.AuthenticationUnavailable, machine_lib.SessionBusy)
+DEFERRED_AUTH_ERRORS = (machine_lib.AuthenticationDeadline, machine_lib.RateLimited)
 
 
 def _simulation_key(payload):
@@ -218,14 +219,6 @@ def _json_object(response):
     return data if isinstance(data, dict) else {}
 
 
-def _terminal_receipt(response, body):
-    status = str(body.get("status", "")).upper()
-    statuses = {200: simulation_slots.TERMINAL_STATUSES, 400: simulation_slots.TERMINAL_FAILURE_STATUSES}
-    alpha_id = body.get("alpha") or body.get("alphaId")
-    if status in statuses.get(response.status_code, ()) and (status not in SUCCESS_STATUSES or alpha_id):
-        return {"status": status, "alpha_id": alpha_id}
-
-
 def _poll_interval(body, delay, previous_progress):
     progress = body.get("progress")
     if type(progress) in (float, int) and 0 <= progress <= 1:
@@ -273,34 +266,26 @@ class Runner:
         retry_at = max((job.get("next_retry_at") or 0 for job in self.jobs.values()), default=0)
         self.post_retry_at = time.monotonic() + max(0, retry_at - time.time())
 
-    def _session_generation(self):
-        return cache_store.read_entry(machine_lib.session_cache_path()).get("created_at")
-
     def _session(self, refresh=False, *, deadline=None):
         previous = getattr(self.local, "session", None)
         if previous is not None and not refresh:
             return previous
 
-        # An old response can arrive after a different worker refreshed the cookie.
-        timeout = 90 if deadline is None else min(90, max(0, deadline - time.monotonic()))
-        guard = (cache_store.file_lock(research_paths.lock_path("quick-runner-refresh"), timeout=timeout)
-                 if refresh else nullcontext())
-        with guard:
-            before = self._session_generation()
-            force_login = refresh and (not before or before == getattr(self.local, "generation", None))
-            limits = {"deadline": deadline} if deadline is not None else {}
-            session = machine_lib.load_session(refresh=force_login, **limits)
-            if simulation_capabilities.account_provenance(session)["fingerprint"] != self.account["fingerprint"]:
-                session.close()
-                raise ValueError("authenticated account changed while running simulations")
-            self.local.session = session
-            self.local.generation = self._session_generation() if force_login else before
-            with self.sessions_lock:
-                self.sessions.append(session)
-                if previous is not None:
-                    previous.close()
-                    self.sessions.remove(previous)
-            return session
+        meta = {}
+        rejected = getattr(self.local, "generation", None) if refresh else None
+        session = machine_lib.load_session(refresh=refresh, meta=meta, deadline=deadline,
+                                           rejected_generation=rejected)
+        if simulation_capabilities.account_provenance(session)["fingerprint"] != self.account["fingerprint"]:
+            session.close()
+            raise ValueError("authenticated account changed while running simulations")
+        self.local.session = session
+        self.local.generation = meta.get("generation")
+        with self.sessions_lock:
+            self.sessions.append(session)
+            if previous is not None:
+                previous.close()
+                self.sessions.remove(previous)
+        return session
 
     def close(self):
         for session in self.sessions:
@@ -352,25 +337,29 @@ class Runner:
         return {"progress_url": machine_lib._validated_progress_url(self.legacy_locations[label]),
                 "legacy_unverified": True}
 
-    def _reap(self, key):
-        if time.monotonic() < self.next_reap or not self.reap_lock.acquire(blocking=False):
+    def _reap(self, key, deadline):
+        if not self.reap_lock.acquire(blocking=False):
             return
         try:
-            self.next_reap = time.monotonic() + 4
+            now = time.monotonic()
+            if now < self.next_reap or now >= deadline:
+                return
+            self.next_reap = now + 4
             if not simulation_slots.quick_orphans(self.account, exclude_job=key):
                 return
-            deadline = time.monotonic() + 5
+            deadline = min(deadline, now + machine_lib.QUICK_ORPHAN_SWEEP_SECONDS)
             offset = self.reap_offset
             self.reap_offset += 1
-            try:
-                machine_lib.recover_quick_orphans(self._session(), self.account, deadline=deadline,
-                                                 exclude_job=key, limit=1, offset=offset)
-            except machine_lib.AuthError:
-                with suppress(RequestException, machine_lib.AuthError, machine_lib.SessionBusy, cache_store.LockTimeout):
-                    machine_lib.recover_quick_orphans(self._session(refresh=True), self.account, deadline=deadline,
+            for refresh in (False, True):
+                session = self._session(refresh=refresh, deadline=deadline)
+                try:
+                    machine_lib.recover_quick_orphans(session, self.account, deadline=deadline,
                                                      exclude_job=key, limit=1, offset=offset)
-            except (RequestException, machine_lib.SessionBusy):
-                return
+                except machine_lib.AuthError:
+                    continue
+                break
+        except (RequestException, machine_lib.BrainError, cache_store.LockTimeout):
+            return
         finally:
             self.reap_lock.release()
 
@@ -379,37 +368,43 @@ class Runner:
         while not self.stop_requested.is_set() and (remaining := until - time.monotonic()) > 0:
             time.sleep(min(1, remaining))
 
-    def _read(self, url, deadline, *, progress=False, next_poll_at=0, defer=None):
+    def _read(self, url, deadline, *, simulation_id=None, next_poll_at=0, defer=None):
         delay = 0.5
         previous_progress = None
-        wait = max(delay if progress else 0, next_poll_at - time.time())
+        refresh = False
+        wait = max(delay if simulation_id else 0, next_poll_at - time.time())
         while not self.stop_requested.is_set():
             remaining = deadline - time.monotonic()
             if remaining <= 0 or wait >= remaining:
                 return None
             if wait:
                 self._wait(wait)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0 or self.stop_requested.is_set():
+            if time.monotonic() >= deadline or self.stop_requested.is_set():
                 return None
             try:
-                response = self._session().get(url, timeout=min(60, remaining),
-                                               allow_redirects=False)
-            except (RequestException, machine_lib.AuthError, machine_lib.SessionBusy):
+                session = self._session(refresh=refresh, deadline=deadline)
+                refresh = False
+                if time.monotonic() >= deadline or self.stop_requested.is_set():
+                    return None
+                response = session.get(url, timeout=machine_lib._request_timeout(deadline), allow_redirects=False)
+            except DEFERRED_AUTH_ERRORS:
+                return None
+            except TRANSIENT_AUTH_ERRORS:
                 wait = delay = min(4.0, 1.5 * delay)
                 continue
             body = _json_object(response)
             retry_after = _retry_after(response)
             if retry_after > 0 and defer is not None:
                 defer(time.time() + retry_after)
-            if progress and not retry_after and (receipt := _terminal_receipt(response, body)):
-                return receipt
             if response.status_code in (401, 403):
-                with suppress(RequestException, machine_lib.AuthError, machine_lib.SessionBusy, cache_store.LockTimeout):
-                    self._session(refresh=True)
-            elif not progress and response.status_code == 200 and body.get("is") and not retry_after:
-                return body
-            if progress:
+                refresh = True
+            elif not retry_after:
+                if simulation_id:
+                    if receipt := machine_lib.simulation_progress_receipt(response, body, simulation_id):
+                        return receipt
+                elif response.status_code == 200 and body.get("is"):
+                    return body
+            if simulation_id:
                 delay, previous_progress = _poll_interval(body, delay, previous_progress)
             else:
                 delay = min(4.0, 1.5 * delay)
@@ -419,8 +414,11 @@ class Runner:
         delay = 0.5
         deadline = time.monotonic() + self.poll_timeout
         retry_at = time.monotonic() + max(0, next_retry_at - time.time())
+        refresh = False
         while not self.stop_requested.is_set():
-            self._reap(key)
+            self._reap(key, deadline)
+            if time.monotonic() >= deadline:
+                return None, {**row, "status": "QUEUED", "detail": "simulation POST deferred"}
             slot = simulation_slots.quick_acquire(self.account, self.slots, key,
                                                   existing_url=existing_url, prepare=True,
                                                   identity_unverified=identity_unverified)
@@ -446,8 +444,12 @@ class Runner:
                                           "next_retry_at": time.time() + max(0, remaining)}
                         self._wait(remaining)
                         continue
-                    session = self._session()
-                except (RequestException, machine_lib.AuthError, machine_lib.SessionBusy):
+                    session = self._session(refresh=refresh, deadline=deadline)
+                    refresh = False
+                except DEFERRED_AUTH_ERRORS as exc:
+                    simulation_slots.quick_update(self.account, slot["id"], "refused")
+                    return None, {**row, "status": "QUEUED", "detail": str(exc)}
+                except TRANSIENT_AUTH_ERRORS:
                     simulation_slots.quick_update(self.account, slot["id"], "refused")
                     session = None
                 except BaseException:
@@ -469,9 +471,9 @@ class Runner:
                         simulation_slots.quick_update(self.account, slot["id"], "refused")
                         return None, {**row, "status": "QUEUED", "detail": "daily simulation quota exhausted",
                                       "next_retry_at": simulation_slots.quota_snapshot(self.account)["reset_at"]}
+                    # Once dispatched, give the POST a full chance to return its Location.
                     response = session.post(machine_lib.BRAIN_API_URL + "/simulations",
-                                            json=payload, timeout=max(0.001, min(90, deadline - time.monotonic())),
-                                            allow_redirects=False)
+                                            json=payload, timeout=90, allow_redirects=False)
                 except ConnectTimeout:
                     simulation_slots.quick_update(self.account, slot["id"], "refused")
                     retry_at = time.monotonic() + delay
@@ -486,7 +488,7 @@ class Runner:
                     status = response.status_code
                     if status == 201:
                         try:
-                            url = machine_lib._validated_progress_url(response.headers.get("Location"))
+                            url, _ = machine_lib._quick_progress_target(response.headers.get("Location"))
                         except machine_lib.SimulationError:
                             simulation_slots.quick_update(self.account, slot["id"], "unknown")
                             self._observe_quota(response)
@@ -506,8 +508,7 @@ class Runner:
                                           "detail": "daily simulation quota exhausted",
                                           "next_retry_at": simulation_slots.quota_snapshot(self.account)["reset_at"]}
                         if status in (401, 403):
-                            with suppress(RequestException, machine_lib.AuthError, machine_lib.SessionBusy, cache_store.LockTimeout):
-                                self._session(refresh=True)
+                            refresh = True
                         retry_at = max(retry_at, time.monotonic() + delay)
                     elif 400 <= status < 500 and status != 408:
                         simulation_slots.quick_update(self.account, slot["id"], "refused")
@@ -552,7 +553,8 @@ class Runner:
         legacy_payload = saved.get("legacy_payload")
         if legacy_payload is None and saved.get("legacy_unverified"):
             legacy_payload = payload
-        if saved.get("simulation_status"):
+        awaiting_manual_confirmation = saved.get("manual_location") and not saved.get("alpha_id")
+        if saved.get("simulation_status") and not awaiting_manual_confirmation:
             terminal = saved if legacy_payload is None else {**saved, "legacy_payload": legacy_payload}
         else:
             slot, deferred = self._post(payload, key, row, existing_url=saved.get("progress_url"),
@@ -560,11 +562,17 @@ class Runner:
                                         identity_unverified=legacy_payload is not None)
             if deferred is not None:
                 return deferred
-            url = machine_lib._validated_progress_url(slot["progress_url"])
+            try:
+                url, simulation_id = machine_lib._quick_progress_target(slot["progress_url"])
+            except machine_lib.SimulationError as exc:
+                simulation_slots.quick_update(self.account, slot["id"], "parked")
+                return {**row, "status": "UNVERIFIED_RESULT", "detail": str(exc)}
             started_at = saved.get("accepted_at", time.time())
             pending = {**row, "slot_id": slot["id"], "progress_url": url,
                        "accepted_at": started_at}
-            if legacy_payload is not None or slot.get("identity_unverified"):
+            if slot.get("manual_failure_confirmed"):
+                pending["identity_verified"] = True
+            elif legacy_payload is not None or slot.get("identity_unverified"):
                 pending["legacy_payload"] = legacy_payload if legacy_payload is not None else payload
             if slot.get("manual_location"):
                 pending["manual_location"] = True
@@ -578,10 +586,13 @@ class Runner:
                 self._checkpoint(key, pending)
 
             try:
-                self._checkpoint(key, pending)
-                receipt = slot.get("terminal_result") or self._read(
-                    url, time.monotonic() + self.poll_timeout, progress=True,
-                    next_poll_at=next_poll_at, defer=defer)
+                receipt = slot.get("terminal_result")
+                if receipt is None and awaiting_manual_confirmation and saved.get("simulation_status"):
+                    receipt = {"status": saved["simulation_status"], "alpha_id": None}
+                if receipt is None:
+                    self._checkpoint(key, pending)
+                    receipt = self._read(url, time.monotonic() + self.poll_timeout,
+                                         simulation_id=simulation_id, next_poll_at=next_poll_at, defer=defer)
                 if receipt is not None:
                     terminal = {**pending, "simulation_status": receipt["status"],
                                 "alpha_id": receipt.get("alpha_id"),
@@ -605,8 +616,11 @@ class Runner:
             if fetch_metrics:
                 return self.finish_metrics(row)
         elif row.pop("legacy_payload", None) is not None:
+            detail = "legacy simulation ended without an Alpha ID to verify"
+            if row.get("manual_location"):
+                detail = "verify the original Location and use --confirm-original-failure to release its slot"
             row.update(status="UNVERIFIED_RESULT", observed_alpha_id=None,
-                       detail="legacy simulation ended without an Alpha ID to verify")
+                       detail=detail)
         return row
 
     def finish_metrics(self, row):
@@ -741,19 +755,21 @@ def _run_batch(args, out):
     arms = _load_arms(Path(args.arms))
     if not arms:
         return 0
-    with machine_lib.load_session() as session:
+    recover_job = getattr(args, "recover_job", None)
+    limits = {"deadline": time.monotonic() + args.poll_timeout} if recover_job else {}
+    with machine_lib.load_session(**limits) as session:
         account = simulation_capabilities.account_provenance(session)
-    runner = Runner(out, account, args.account_slots, args.poll_timeout)
-    if getattr(args, "recover_job", None):
-        if not any(runner._job_key(arm["label"], _payload(arm)) == args.recover_job for arm in arms):
-            raise ValueError("recovery job key does not match an arm in the original batch")
-        try:
-            machine_lib.attach_quick_location(runner._session(), account, args.recover_job,
-                                              args.recover_location)
-        finally:
-            runner.close()
-        print(f"recovery Location verified for {args.recover_job}", flush=True)
-        return 0
+        runner = Runner(out, account, args.account_slots, args.poll_timeout)
+        if recover_job:
+            if not any(runner._job_key(arm["label"], _payload(arm)) == recover_job for arm in arms):
+                raise ValueError("recovery job key does not match an arm in the original batch")
+            confirm_failure = getattr(args, "confirm_original_failure", False)
+            machine_lib.attach_quick_location(session, account, recover_job, args.recover_location,
+                                              confirm_failure=confirm_failure, **limits)
+            message = ("terminal failure confirmed and slot released" if confirm_failure
+                       else "recovery Location recorded")
+            print(f"{message} for {recover_job}", flush=True)
+            return 0
     todo = _select_arms(arms, runner, load_done(out, account))
     if args.limit:
         todo = todo[:args.limit]
@@ -795,19 +811,22 @@ def _batch_parser(description, default_out, default_concurrency):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("arms")
     parser.add_argument("--out", default=default_out)
-    parser.add_argument("--concurrency", type=int, default=default_concurrency)
-    parser.add_argument("--account-slots", type=int, default=DEFAULT_ACCOUNT_SLOTS)
-    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--concurrency", type=int, default=default_concurrency,
+                        help="Number of workers in this process (default: %(default)s).")
+    parser.add_argument("--account-slots", type=int, default=DEFAULT_ACCOUNT_SLOTS,
+                        help="Shared simulation slots for this account and workspace (default: %(default)s).")
+    parser.add_argument("--limit", type=int, default=0, help="Maximum arms to process (0 means unlimited).")
     return parser
 
 
 def _run_locked(parser, args, run_batch):
     out = Path(args.out).resolve()
-    try:
-        with cache_store.file_lock(str(out) + ".run.lock", timeout=0):
-            return run_batch(args, out)
-    except cache_store.LockTimeout:
-        parser.error("another batch already owns this output ledger")
+    with ExitStack() as stack:
+        try:
+            stack.enter_context(cache_store.file_lock(str(out) + ".run.lock", timeout=0))
+        except cache_store.LockTimeout:
+            return parser.error("another batch already owns this output ledger")
+        return run_batch(args, out)
 
 
 def _batch_args(parser):
@@ -819,14 +838,20 @@ def _batch_args(parser):
 
 def main(*, default_out="batch-results.jsonl", default_concurrency=DEFAULT_ACCOUNT_SLOTS):
     parser = _batch_parser(__doc__, default_out, default_concurrency)
-    parser.add_argument("--poll-timeout", type=float, default=420)
+    parser.add_argument("--poll-timeout", type=float, default=420,
+                        help="Seconds per stage for queueing, progress, and metrics (default: %(default)s). "
+                             "An in-flight POST uses its own network timeout.")
     parser.add_argument("--recover-job", help="Job key from a result with an uncertain POST outcome.")
     parser.add_argument("--recover-location", help="Original BRAIN progress Location for that POST.")
+    parser.add_argument("--confirm-original-failure", action="store_true",
+                        help="Confirm the supplied Location is original and release its slot after a BRAIN terminal failure.")
     args = _batch_args(parser)
     if not math.isfinite(args.poll_timeout) or args.poll_timeout <= 0:
         parser.error("poll timeout must be positive and finite")
     if bool(args.recover_job) != bool(args.recover_location):
         parser.error("--recover-job and --recover-location must be used together")
+    if args.confirm_original_failure and not args.recover_job:
+        parser.error("--confirm-original-failure requires --recover-job and --recover-location")
     return _run_locked(parser, args, _run_batch)
 
 

@@ -31,6 +31,15 @@ def snapshot(option, **settings):
             "settings": {**full_settings(option), "language": "FASTEXPR", **settings}}
 
 
+def response(status, body=None, *, retry_after=None):
+    receipt = requests.Response()
+    receipt.status_code = status
+    receipt._content = json.dumps(body).encode()
+    if retry_after is not None:
+        receipt.headers["Retry-After"] = str(retry_after)
+    return receipt
+
+
 def write_rows(path, rows):
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
@@ -106,7 +115,7 @@ def test_full_simulation_is_durable_before_check_and_other_results_keep_writing(
             assert check_started.wait(timeout=2)
         return simulation(candidate, sharpe=1.3 if candidate["label"] == "first" else 0.5)
 
-    def check(_runner, alpha_id, _max_wait):
+    def check(_runner, alpha_id, _max_wait, **kwargs):
         assert alpha_id == "first-alpha"
         assert read_rows(output)[0]["stage"] == "simulate"
         check_started.set()
@@ -176,7 +185,7 @@ def test_verify_legacy_before_attaching_full_settings(monkeypatch, tmp_path):
     args, output, runner, _ = configure(tmp_path, monkeypatch, [candidate])
     old = arm("candidate", decay=7)
     write_rows(output, [simulation(old)])
-    runner._read.return_value = snapshot(old)
+    runner._session.return_value.get.return_value = response(200, snapshot(old))
     runner.run.side_effect = lambda option: {**simulation(option), "alpha_id": "NewAlpha"}
     check = Mock(return_value={"pc_result": "PASS", "prod_correlation": 0.3})
     monkeypatch.setattr(pipeline_pc, "check_pc", check)
@@ -195,7 +204,7 @@ def test_missing_legacy_settings_leave_reuse_unresolved(monkeypatch, tmp_path):
     write_rows(output, [{**simulation(candidate), "settings": full_settings(candidate)}])
     partial = snapshot(candidate)
     partial["settings"].pop("decay")
-    runner._read.return_value = partial
+    runner._session.return_value.get.return_value = response(200, partial)
     check = Mock()
     monkeypatch.setattr(pipeline_pc, "check_pc", check)
 
@@ -207,12 +216,90 @@ def test_missing_legacy_settings_leave_reuse_unresolved(monkeypatch, tmp_path):
     assert pending["status"] == "REUSE_UNRESOLVED"
     assert "settings" not in pending and "account_fingerprint" not in pending
 
-    runner._read.return_value = snapshot(candidate)
+    runner._session.return_value.get.return_value = response(200, snapshot(candidate))
     check.return_value = {"pc_result": "PASS", "prod_correlation": 0.3}
     assert pipeline_pc._run_batch(args, output) == 0
     runner.run.assert_not_called()
     assert check.call_args.args[1] == "candidate-alpha"
     assert read_rows(output)[-1]["account_fingerprint"] == "test"
+
+
+def test_stale_legacy_row_leaves_next_candidate_its_own_read_and_persists_proof(monkeypatch, tmp_path):
+    stale, valid = arm("stale"), arm("valid")
+    args, output, runner, _ = configure(tmp_path, monkeypatch, [stale, valid])
+    args.pc_max_wait = 0
+    write_rows(output, [simulation(stale), simulation(valid)])
+    now = 0
+
+    def get(url, *, timeout, **kwargs):
+        nonlocal now
+        assert timeout >= 5
+        if url.endswith("/stale-alpha"):
+            now += 29
+            return response(404)
+        assert url.endswith("/valid-alpha")
+        now += 5
+        return response(200, snapshot(valid))
+
+    monkeypatch.setattr(pipeline_pc.time, "monotonic", lambda: now)
+    client = runner._session.return_value
+    client.get.side_effect = get
+
+    assert pipeline_pc._run_batch(args, output) == 0
+    assert client.get.call_count == 2
+    assert read_rows(output)[-2]["status"] == "REUSE_UNRESOLVED"
+    verified = read_rows(output)[-1]
+    assert verified["alpha_id"] == "valid-alpha"
+    assert verified["account_fingerprint"] == "test"
+    assert verified["settings"] == full_settings(valid)
+
+    client.get.reset_mock()
+    assert pipeline_pc._run_batch(args, output) == 0
+    client.get.assert_called_once()
+    assert client.get.call_args.args[0].endswith("/stale-alpha")
+    runner.run.assert_not_called()
+
+
+def test_batch_limit_avoids_legacy_reads_after_filling_fresh_work(monkeypatch, tmp_path):
+    fresh, old = arm("fresh"), arm("old")
+    args, output, runner, _ = configure(tmp_path, monkeypatch, [fresh, old])
+    args.limit = 1
+    args.pc_max_wait = 0
+    write_rows(output, [simulation(old)])
+    runner.run.side_effect = simulation
+
+    assert pipeline_pc._run_batch(args, output) == 0
+    assert runner.run.call_args.args[0]["label"] == "fresh"
+    runner._session.return_value.get.assert_not_called()
+
+
+def test_saved_nonnumeric_turnover_keeps_result_without_blocking_next_arm(monkeypatch, tmp_path):
+    old, fresh = arm("old"), arm("fresh")
+    args, output, runner, _ = configure(tmp_path, monkeypatch, [old, fresh])
+    args.limit = 1
+    saved = {**simulation(old), "settings": full_settings(old), "account_fingerprint": "test",
+             "turnover": "0.2"}
+    write_rows(output, [saved])
+    runner.run.side_effect = lambda option: simulation(option, sharpe=0)
+
+    assert pipeline_pc._run_batch(args, output) == 0
+    assert runner.run.call_args.args[0]["label"] == "fresh"
+    runner._session.return_value.get.assert_not_called()
+    assert read_rows(output)[0] == saved
+
+
+def test_no_work_leaves_ledger_unchanged(monkeypatch, tmp_path):
+    candidate = arm("candidate")
+    args, output, runner, _ = configure(tmp_path, monkeypatch, [candidate])
+    write_rows(output, [{**simulation(candidate), "settings": full_settings(candidate),
+                         "account_fingerprint": "test", "pc_result": "PASS"}])
+    original = output.read_bytes() + b'{"stage":'
+    output.write_bytes(original)
+
+    assert pipeline_pc._run_batch(args, output) == 0
+    assert output.read_bytes() == original
+    runner.run.assert_not_called()
+    runner._session.return_value.get.assert_not_called()
 
 
 def test_other_accounts_and_terminal_failures_do_not_block_next_simulation(monkeypatch, tmp_path):
@@ -267,14 +354,67 @@ def test_pc_respects_retry_after_and_the_remaining_time(monkeypatch):
     assert now == 10
 
 
+def test_pc_retry_after_survives_restart_and_leaves_room_for_other_arms(monkeypatch, tmp_path):
+    candidate, fresh = arm("candidate"), arm("fresh")
+    args, output, runner, _ = configure(tmp_path, monkeypatch, [candidate, fresh])
+    args.limit = 1
+    args.pc_max_wait = 15
+    write_rows(output, [{**simulation(candidate), "settings": full_settings(candidate), "account_fingerprint": "test"}])
+    now = 10
+    monkeypatch.setattr(pipeline_pc.time, "time", lambda: now)
+    monkeypatch.setattr(pipeline_pc.time, "monotonic", lambda: now)
+    runner.run.side_effect = lambda option: simulation(option, sharpe=0)
+    client = runner._session.return_value
+    client.get.return_value = response(429, retry_after=60)
+
+    assert pipeline_pc._run_batch(args, output) == 0
+    assert read_rows(output)[-1]["next_pc_poll_at"] == 70
+    assert read_rows(output)[-1]["pc_error"] == "RateLimited"
+    runner.run.assert_not_called()
+
+    assert pipeline_pc._run_batch(args, output) == 0
+    client.get.assert_called_once()
+    assert runner.run.call_args.args[0]["label"] == "fresh"
+
+    now = 70
+    client.get.return_value = response(200, {"is": {"checks": [{"name": "PROD_CORRELATION", "result": "PASS"}]}})
+    assert pipeline_pc._run_batch(args, output) == 0
+    latest = read_rows(output)[-1]
+    assert latest["pc_result"] == "PASS"
+    assert "next_pc_poll_at" not in latest
+    assert "pc_error" not in latest
+
+
+def test_pc_saves_retry_after_before_waiting(monkeypatch, tmp_path):
+    candidate = arm("candidate")
+    args, output, runner, _ = configure(tmp_path, monkeypatch, [candidate])
+    args.pc_max_wait = 15
+    write_rows(output, [{**simulation(candidate), "settings": full_settings(candidate), "account_fingerprint": "test"}])
+    runner.stop_requested = Mock()
+    runner.stop_requested.is_set.return_value = False
+    runner._session.return_value.get.return_value = response(429, retry_after=10)
+    monkeypatch.setattr(pipeline_pc.time, "time", lambda: 100)
+
+    def wait(delay):
+        assert delay == 10
+        assert read_rows(output)[-1]["next_pc_poll_at"] == 110
+        return True
+
+    runner.stop_requested.wait.side_effect = wait
+    assert pipeline_pc._run_batch(args, output) == 0
+    runner.stop_requested.wait.assert_called_once()
+    assert read_rows(output)[-1]["next_pc_poll_at"] == 110
+
+
 def test_pc_does_not_start_http_after_session_setup_exhausts_its_budget(monkeypatch):
     now = 0.0
     session = Mock()
     runner = Mock()
     runner.stop_requested = threading.Event()
 
-    def slow_session(*, deadline):
+    def slow_session(*, refresh, deadline):
         nonlocal now
+        assert not refresh
         assert deadline == 2
         now = 2
         return session
@@ -284,6 +424,30 @@ def test_pc_does_not_start_http_after_session_setup_exhausts_its_budget(monkeypa
 
     assert pipeline_pc.check_pc(runner, "OfflineAlpha", 2)["pc_result"] == "UNRESOLVED"
     session.get.assert_not_called()
+
+
+def test_pc_retries_transient_session_refresh_within_check_budget(monkeypatch):
+    now = 0
+    runner = Mock()
+    runner.stop_requested.is_set.return_value = False
+    client = Mock()
+    runner._session.side_effect = [client, pipeline_pc.ml.AuthenticationUnavailable("offline"), client]
+    client.get.side_effect = [response(401), response(200, {"is": {"checks": [
+        {"name": "PROD_CORRELATION", "result": "PASS"},
+    ]}})]
+
+    def wait(delay):
+        nonlocal now
+        now += delay
+        return False
+
+    runner.stop_requested.wait.side_effect = wait
+    monkeypatch.setattr(pipeline_pc.time, "monotonic", lambda: now)
+
+    assert pipeline_pc.check_pc(runner, "OfflineAlpha", 15)["pc_result"] == "PASS"
+    assert runner._session.call_count == 3
+    assert [call.kwargs.get("refresh", False) for call in runner._session.call_args_list] == [False, True, True]
+    assert client.get.call_args.kwargs["timeout"] == 7
 
 
 def test_interrupt_does_not_start_unqueued_simulations(monkeypatch, tmp_path):
