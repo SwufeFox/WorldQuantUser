@@ -298,6 +298,38 @@ class FetchCheckHttpTests(unittest.TestCase):
                 self.assertEqual(result["payload_received"], payload_received)
                 self.assertIsNone(result["checks"])
 
+    def test_retry_after_beyond_deadline_returns_pending_without_sleeping(self):
+        response = mock.Mock(status_code=200, headers={"Retry-After": "10"})
+        session = mock.Mock()
+        session.get.side_effect = [response, requests.ReadTimeout()]
+        with mock.patch.object(ml.time, "monotonic", return_value=100), \
+                mock.patch.object(ml.time, "sleep") as sleep:
+            result = ml.fetch_alpha_checks(session, "A", max_wait_seconds=2)
+        session.get.assert_called_once()
+        sleep.assert_not_called()
+        self.assertEqual(alphas._check_result("A", result)["status"], "pending")
+        self.assertFalse(result["payload_received"])
+
+    def test_sleep_that_exhausts_deadline_does_not_poll_again(self):
+        for headers, expected_wait in (({"Retry-After": "1"}, 1), ({}, 5)):
+            with self.subTest(headers=headers):
+                now = 100
+
+                def oversleep(seconds):
+                    nonlocal now
+                    now += seconds + 6
+
+                response = mock.Mock(status_code=200, headers=headers)
+                response.json.return_value = {}
+                session = mock.Mock()
+                session.get.side_effect = [response, requests.ReadTimeout()]
+                with mock.patch.object(ml.time, "monotonic", side_effect=lambda: now), \
+                        mock.patch.object(ml.time, "sleep", side_effect=oversleep) as sleep:
+                    result = ml.fetch_alpha_checks(session, "A", max_wait_seconds=6)
+                session.get.assert_called_once()
+                sleep.assert_called_once_with(expected_wait)
+                self.assertEqual(alphas._check_result("A", result)["status"], "pending")
+
 
 if __name__ == "__main__":
     unittest.main()

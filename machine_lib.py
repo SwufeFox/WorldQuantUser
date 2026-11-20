@@ -2496,26 +2496,24 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
             raise ServiceError("HTTP %s fetching checks for alpha %s"
                                % (response.status_code, alpha_id))
         retry_after = _retry_after_seconds(response, cap_error_wait=False)
-        if retry_after:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+        if retry_after > 0:
+            wait = retry_after
+        else:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            if (payload or {}).get("is", {}).get("checks"):
                 break
-            wait = retry_after if retry_after else 5.0
-            if on_event:
-                on_event({"event": "check_pending", "alpha_id": alpha_id,
-                          "retry_after_seconds": wait})
-            time.sleep(min(wait, remaining))
-            continue
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = None
-        if (payload or {}).get("is", {}).get("checks"):
+            wait = 5.0
+        if wait >= deadline - time.monotonic():
             break
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if retry_after > 0 and on_event:
+            on_event({"event": "check_pending", "alpha_id": alpha_id,
+                      "retry_after_seconds": wait})
+        time.sleep(wait)
+        if time.monotonic() >= deadline:
             break
-        time.sleep(min(5.0, remaining))
     checks = _extract_checks(payload or {})
     return {
         "alpha_id": alpha_id,
