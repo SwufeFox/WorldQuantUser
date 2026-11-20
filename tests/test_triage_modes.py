@@ -9,9 +9,11 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from research_app import stats, triage
+from research_app.runtime import CliError
 
 
 class TriageModeTests(unittest.TestCase):
@@ -72,6 +74,75 @@ class TriageModeTests(unittest.TestCase):
         self.assertIn("internal_fitness", row)
         self.assertLessEqual(row["internal_fitness"], row["fitness"])
         self.assertEqual(row["retention"], 0.82)
+
+
+class TriageBatchInputTests(unittest.TestCase):
+    def setUp(self):
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        self.root = Path(workspace.name)
+        directory = self.root / "pnl"
+        directory.mkdir()
+        scope = patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(self.root)})
+        scope.start()
+        self.addCleanup(scope.stop)
+        rng = random.Random(7)
+        dates = [str(date(2020, 1, 1) + timedelta(days=index)) for index in range(160)]
+        entries = []
+        for alpha_id, status, train in (("B1", "ACTIVE", 1.0), ("C1", "COMPLETE", 1.4),
+                                        ("C2", "COMPLETE", 1.7)):
+            (directory / f"{alpha_id}.json").write_text(json.dumps({day: rng.random() for day in dates}))
+            entries.append({"alpha_id": alpha_id, "status": status,
+                            "metrics": {"sharpe": 3.0, "fitness": 2.0},
+                            "out_of_sample": {"train": {"sharpe": train}, "test": {"sharpe": 2.5}}})
+        self.registry = self.root / "alpha-registry.jsonl"
+        self.registry.write_text("".join(json.dumps(row) + "\n" for row in entries))
+
+    def _batch(self, name, content):
+        path = self.root / f"{name}.json"
+        path.write_text(json.dumps(content))
+        return str(path)
+
+    def test_probe_simulation_and_result_envelopes_freeze_the_same_training_evidence(self):
+        expected = None
+        for key in ("rows", "records", "results"):
+            with self.subTest(key=key):
+                batch = self._batch(key, {"data": {key: [{"alpha_id": "C1"}, {"alpha_id": None},
+                                                          {"alpha_id": "C2"}, {"alpha_id": "C1"}]}})
+                frozen = self.root / f"{key}-frozen.json"
+                result = triage.cmd_triage(SimpleNamespace(batch=batch, registry=str(self.registry),
+                                                           freeze=str(frozen)), None)
+                rows = result["rows"]
+                self.assertEqual(result["window"]["mode"], "train")
+                self.assertEqual({row["alpha_id"]: row["sharpe"] for row in rows}, {"C1": 1.4, "C2": 1.7})
+                self.assertTrue(all("test_sharpe" not in row for row in rows))
+                if expected is None:
+                    expected = rows
+                self.assertEqual(rows, expected)
+                manifest = json.loads(frozen.read_text())
+                self.assertEqual(manifest["inputs"]["files"], [batch])
+                self.assertEqual(manifest["rows"], expected)
+                with patch("research_paths.log_view"):
+                    validated = triage.cmd_triage(SimpleNamespace(show_test=True, selection=str(frozen)), None)
+                self.assertEqual([row["alpha_id"] for row in validated["rows"]],
+                                 [row["alpha_id"] for row in expected])
+
+    def test_roles_are_retained_on_the_existing_rows_view_and_the_records_fallback(self):
+        for key in ("rows", "records", "results"):
+            with self.subTest(key=key):
+                batch = self._batch(key, {key: [{"alpha_id": "C1"}], "arms": [{"role": "diagnostic"}]})
+                args = SimpleNamespace(batch=batch, registry=str(self.registry))
+                result = triage.cmd_triage(args, None)
+                self.assertEqual(result["rows"][0]["verdict"], "diagnostic")
+                args.freeze = str(self.root / "forbidden.json")
+                with self.assertRaisesRegex(CliError, "diagnostic evidence cannot be selected"):
+                    triage.cmd_triage(args, None)
+                self.assertFalse(Path(args.freeze).exists())
+
+    def test_rows_remain_the_primary_candidate_set_when_results_also_exist(self):
+        batch = self._batch("mixed", {"rows": [{"alpha_id": "C1"}], "results": [{"alpha_id": "C2"}]})
+        result = triage.cmd_triage(SimpleNamespace(batch=batch, registry=str(self.registry)), None)
+        self.assertEqual([row["alpha_id"] for row in result["rows"]], ["C1"])
 
 
 class UnresolvedCheckTests(TriageModeTests):

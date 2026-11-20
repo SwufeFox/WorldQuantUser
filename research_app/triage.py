@@ -647,10 +647,19 @@ def _cmd_triage(args):
             raise ValueError("cannot read batch file %s: %s" % (path, exc))
         while isinstance(document, dict) and isinstance(document.get("data"), dict):
             document = document["data"]
+        if not isinstance(document, dict):
+            raise ValueError("triage batch must be an object")
         evidence = []
+        batch_ids = []
+        arms = document.get("arms")
         for key in ("rows", "records", "results"):
-            source_rows = document.get(key) or []
-            arms = document.get("arms")
+            source_rows = document.get(key)
+            if source_rows is None:
+                continue
+            if not isinstance(source_rows, list) or not all(isinstance(row, dict) for row in source_rows):
+                raise ValueError("triage batch %s must be an array of objects" % key)
+            if not batch_ids:
+                batch_ids = [row["alpha_id"] for row in source_rows if row.get("alpha_id")]
             for index, row in enumerate(source_rows):
                 arm = arms[index] if isinstance(arms, list) and len(arms) == len(source_rows) else {}
                 role = alpha_registry.evidence_role(row, arm)
@@ -661,8 +670,7 @@ def _cmd_triage(args):
         if getattr(args, "freeze", None) or getattr(args, "selection", None):
             alpha_registry.require_candidate_eligible(evidence,
                                                      registry_path=getattr(args, "registry", None))
-        ids.extend(row.get("alpha_id") for row in document.get("rows") or []
-                   if row.get("alpha_id"))
+        ids.extend(batch_ids)
     ids = [alpha_id for alpha_id in dict.fromkeys(ids) if alpha_id and alpha_id != "None"]
     if not ids and not getattr(args, "book", False) and not getattr(args, "selection", None):
         raise ValueError("nothing to triage: pass a batch file, ids, --book, or --selection")

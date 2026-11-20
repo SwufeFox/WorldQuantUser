@@ -12,6 +12,8 @@ import os
 import time
 import uuid
 from collections.abc import Mapping
+from contextlib import contextmanager
+from pathlib import Path
 
 import cache_store
 import research_paths
@@ -45,6 +47,8 @@ def _load(path, fingerprint):
         or not isinstance(journal.get("reservations"), dict)
         or any(not isinstance(value, dict) for value in journal.get("reservations", {}).values())
         or not isinstance(journal.get("not_submitted", {}), dict)
+        or not isinstance(journal.get("quick_resolved", {}), dict)
+        or any(not isinstance(value, dict) for value in journal.get("quick_resolved", {}).values())
     ):
         raise cache_store.CacheError("simulation slot journal cannot be read safely: %s" % (error or path))
     return journal
@@ -71,7 +75,7 @@ def snapshot(account, limit):
     path, lock = _paths(fingerprint)
     with cache_store.file_lock(lock):
         journal = _load(path, fingerprint)
-        return _report(account, limit, len(journal["reservations"]))
+        return _report(account, _active_limit(journal, limit), len(journal["reservations"]))
 
 
 def reserve(account, limit):
@@ -86,13 +90,23 @@ def reserve(account, limit):
     path, lock = _paths(fingerprint)
     with cache_store.file_lock(lock):
         journal = _load(path, fingerprint)
+        pruned = _prune_quick_preparations(journal)
         identity, state = _reserve(journal, account, limit, "submitting")
-        if identity:
+        if identity or pruned:
             cache_store.write_json_atomic(path, journal)
         return identity, state
 
 
+def _active_limit(journal, limit):
+    for entry in journal["reservations"].values():
+        shared_limit = entry.get("quick_limit")
+        if type(shared_limit) is int and shared_limit > 0:
+            limit = min(limit, shared_limit)
+    return limit
+
+
 def _reserve(journal, account, limit, phase):
+    limit = _active_limit(journal, limit)
     active = len(journal["reservations"])
     if active >= limit:
         return None, _report(account, limit, active)
@@ -100,6 +114,191 @@ def _reserve(journal, account, limit, phase):
                 "workspace": _workspace()}
     journal["reservations"][identity["id"]] = {"state": phase, "created_at": time.time()}
     return identity, _report(account, limit, active + 1)
+
+
+def _process_stat(pid):
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return fields[0], fields[19]
+    except (OSError, IndexError):
+        return None, None
+
+
+def _quick_owner():
+    pid = os.getpid()
+    return {"pid": pid, "start": _process_stat(pid)[1]}
+
+
+def _quick_owner_is_live(owner):
+    pid = owner.get("pid") if isinstance(owner, dict) else None
+    if type(pid) is not int or pid < 1:
+        return False
+    state, start = _process_stat(pid)
+    if state is not None:
+        return state not in {"Z", "X"} and (owner.get("start") is None or owner["start"] == start)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _prune_quick_preparations(journal):
+    reservations = journal["reservations"]
+    abandoned = [key for key, entry in reservations.items()
+                 if entry.get("state") == "quick_preparing"
+                 and not _quick_owner_is_live(entry.get("quick_owner"))]
+    for key in abandoned:
+        del reservations[key]
+    return bool(abandoned)
+
+
+@contextmanager
+def _locked_quick_journal(account):
+    fingerprint = _fingerprint(account)
+    if not fingerprint:
+        raise ValueError("shared quick simulation slots require an identified account")
+    path, lock = _paths(fingerprint)
+    with cache_store.file_lock(lock):
+        yield _load(path, fingerprint), path
+
+
+def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False):
+    """Claim a recorded QUICK job or reserve one shared slot before its POST.
+
+    A new ``submitting`` result authorizes exactly one POST. An old submitting
+    reservation without a URL is indeterminate, even when its owner has died.
+    With ``prepare=True``, a new reservation is reclaimable until submitting.
+    An imported URL belongs to an already accepted job and counts until terminal.
+    """
+    if type(limit) is not int or limit < 1 or not isinstance(job_key, str) or not job_key:
+        raise ValueError("quick simulation slots require a positive limit and job key")
+    owner = _quick_owner()
+    with _locked_quick_journal(account) as (journal, path):
+        if _prune_quick_preparations(journal):
+            cache_store.write_json_atomic(path, journal)
+        resolved = next(((key, entry) for key, entry in journal.get("quick_resolved", {}).items()
+                         if entry.get("quick_job_key") == job_key), None)
+        if resolved:
+            key, entry = resolved
+            return {"id": key, **entry, "resolved": True}
+        reservations = journal["reservations"]
+        prior = next(((key, entry) for key, entry in reservations.items()
+                      if entry.get("quick_job_key") == job_key), None)
+        if prior:
+            key, entry = prior
+            current_owner = entry.get("quick_owner")
+            if current_owner != owner and _quick_owner_is_live(current_owner):
+                return None
+            stored_url = entry.get("progress_url")
+            if existing_url and stored_url and existing_url != stored_url:
+                raise ValueError("saved progress URL differs from the shared quick reservation")
+            if existing_url or stored_url:
+                entry.update(state="accepted", progress_url=stored_url or existing_url, quick_owner=owner)
+            elif entry.get("state") != "quick_preparing":
+                entry.update(state="unknown", quick_owner=None)
+        else:
+            if existing_url:
+                if any(entry.get("progress_url") == existing_url for entry in reservations.values()):
+                    raise ValueError("progress URL already belongs to another simulation reservation")
+                key = uuid.uuid4().hex
+                entry = {"state": "accepted", "progress_url": existing_url, "created_at": time.time()}
+                reservations[key] = entry
+            else:
+                phase = "quick_preparing" if prepare else "submitting"
+                identity, _ = _reserve(journal, account, limit, phase)
+                if identity is None:
+                    return None
+                key = identity["id"]
+                entry = reservations[key]
+            entry.update(quick_job_key=job_key, quick_limit=limit, quick_owner=owner)
+        cache_store.write_json_atomic(path, journal)
+        return {"id": key, **entry}
+
+
+def quick_update(account, identity, outcome, *, progress_url=None, retain=False,
+                 terminal_result=None):
+    """Reconcile a QUICK reservation using the result of the corresponding HTTP request.
+
+    Parking yields ownership of the poll without releasing server occupancy.
+    An orphan's observed terminal URL can be retained for the original ledger.
+    """
+    if outcome not in {"submitting", "accepted", "refused", "terminal", "unknown", "parked"}:
+        raise ValueError(f"unknown quick simulation reservation outcome {outcome!r}")
+    receipt = None
+    if terminal_result is not None:
+        if not retain or outcome != "terminal" or not isinstance(terminal_result, dict):
+            raise ValueError("only retained terminal quick simulations can store a result")
+        status, alpha_id = terminal_result.get("status"), terminal_result.get("alpha_id")
+        if not isinstance(status, str) or status not in TERMINAL_STATUSES:
+            raise ValueError("retained quick simulation result requires a terminal status")
+        if alpha_id is not None and (not isinstance(alpha_id, str) or not alpha_id.isalnum()):
+            raise ValueError("invalid Alpha ID in retained quick simulation result")
+        receipt = {"status": status, "alpha_id": alpha_id}
+    with _locked_quick_journal(account) as (journal, path):
+        reservations = journal["reservations"]
+        entry = reservations.get(identity)
+        if not entry or not entry.get("quick_job_key"):
+            resolved = journal.get("quick_resolved", {})
+            if outcome == "terminal" and not retain and identity in resolved:
+                resolved.pop(identity)
+                cache_store.write_json_atomic(path, journal)
+                return True
+            return False
+        if outcome == "submitting":
+            if entry.get("state") != "quick_preparing" or entry.get("quick_owner") != _quick_owner():
+                return False
+            entry["state"] = "submitting"
+        elif outcome == "accepted":
+            if not progress_url:
+                raise ValueError("accepting a quick simulation requires its progress URL")
+            if entry.get("progress_url") not in (None, progress_url):
+                raise ValueError("cannot replace a quick simulation's progress URL")
+            entry.update(state="accepted", progress_url=progress_url)
+        elif outcome == "parked":
+            if entry.get("state") != "accepted" or not entry.get("progress_url"):
+                raise ValueError("only accepted quick simulations can be parked")
+            entry["quick_owner"] = None
+        elif outcome == "unknown":
+            if entry.get("state") == "accepted":
+                raise ValueError("an accepted quick simulation keeps its progress URL")
+            entry.update(state="unknown", quick_owner=None)
+        else:
+            if outcome == "refused" and entry.get("state") == "accepted":
+                raise ValueError("an accepted quick simulation is not a refused POST")
+            if outcome == "terminal" and retain and entry.get("progress_url"):
+                journal.setdefault("quick_resolved", {})[identity] = {
+                    **entry, "quick_owner": None, "terminal_result": receipt,
+                }
+            reservations.pop(identity)
+        cache_store.write_json_atomic(path, journal)
+        return True
+
+
+def quick_orphans(account, *, exclude_job=None):
+    """List accepted QUICK jobs whose poller is no longer responsible for them."""
+    with _locked_quick_journal(account) as (journal, _):
+        reservations = journal["reservations"]
+    return [
+        {"id": key, **entry, "job_key": entry["quick_job_key"]}
+        for key, entry in reservations.items()
+        if entry.get("quick_job_key") and entry["quick_job_key"] != exclude_job
+        and entry.get("state") == "accepted" and entry.get("progress_url")
+        and not _quick_owner_is_live(entry.get("quick_owner"))
+    ]
+
+
+def quick_known_jobs(account):
+    """Return durable Quick job keys without changing the shared journal."""
+    with _locked_quick_journal(account) as (journal, _):
+        return {
+            entry["quick_job_key"]
+            for collection in (journal["reservations"], journal.get("quick_resolved", {}))
+            for entry in collection.values()
+            if entry.get("quick_job_key")
+        }
 
 
 def _record_unposted(journal, identity):
@@ -123,12 +322,13 @@ def prepare_submission(account, limit, checkpoint):
     with cache_store.file_lock(lock + ".prepare"):
         with cache_store.file_lock(lock):
             journal = _load(path, fingerprint)
+            pruned = _prune_quick_preparations(journal)
             abandoned = [identity for identity, entry in journal["reservations"].items()
                          if entry.get("state") == "preparing"]
             for identity in abandoned:
                 _record_unposted(journal, identity)
             identity, state = _reserve(journal, account, limit, "preparing")
-            if identity or abandoned:
+            if identity or abandoned or pruned:
                 cache_store.write_json_atomic(path, journal)
         if identity is None:
             return identity, state
