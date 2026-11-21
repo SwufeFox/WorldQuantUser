@@ -139,7 +139,8 @@ _CHECKPOINT_EVENTS = {"submitting", "submitted", "pending", "completed", "failed
 _CHECKPOINT_POLL_FIELDS = ("progress_url", "next_poll_at", "poll_after_seconds", "metrics_pending")
 _MULTI_CHECKPOINT_EVENTS = {"multi_submitting", "multi_submitted", "multi_pending"}
 _MULTI_CHECKPOINT_FIELDS = ("multi_request_id", "multi_member", "multi_size", "multi_parent_url",
-                            "multi_child_id", "multi_parent_terminal", "multi_parent_status")
+                            "multi_child_id", "multi_parent_terminal", "multi_parent_status",
+                            "multi_terminal_evidence", "multi_failure_attribution")
 
 
 def _merge_checkpoint_record(previous, payload):
@@ -1411,10 +1412,12 @@ def _recovery_language(row, signature):
     return settings.get("language") if isinstance(settings, dict) else None
 
 
-def _load_probe_batch(value, *, source_paths=None):
+def _load_probe_batch(value, *, source_paths=None, within=None):
     path = Path(value).expanduser().resolve()
     visited = set()
     while True:
+        if within is not None and not path.is_relative_to(within):
+            raise CliError("INVALID_INPUT", "probe response path is outside the research directory")
         if path in visited:
             raise CliError("INVALID_INPUT", "cyclic probe response path")
         visited.add(path)
@@ -1429,6 +1432,8 @@ def _load_probe_batch(value, *, source_paths=None):
         if not isinstance(document, dict):
             raise CliError("INVALID_INPUT", "probe batch must be an object")
         if document.get("path") and not document.get("arms"):
+            if not isinstance(document["path"], str):
+                raise CliError("INVALID_INPUT", "probe response path must be a string")
             destination = Path(document["path"]).expanduser()
             path = (destination if destination.is_absolute() else path.parent / destination).resolve()
             continue

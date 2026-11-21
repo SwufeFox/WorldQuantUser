@@ -187,6 +187,54 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual([row["status"] for row in records], ["UNKNOWN_SUBMISSION", "QUEUED", "UNKNOWN_SUBMISSION"])
         self.assertEqual(json.loads(self.batch.read_text()), document)
 
+    def test_native_batch_preserves_terminal_evidence_in_train_only_recovery(self):
+        self.spec.write_text(json.dumps({"design": "explore", "settings": {"simulationMode": "QUICK"},
+            "arms": [{"label": "first", "expression": "rank(close)"},
+                     {"label": "second", "expression": "rank(volume)"}]}), encoding="utf-8")
+        parent_url = ml.BRAIN_API_URL + "/simulations/NativeParent"
+        payloads = {
+            "NativeParent": {"status": "ERROR", "children": ["Child2", "Child1"], "message": "batch failed"},
+            "Child2": {"id": "Child2", "parent": "NativeParent", "status": "TIMEOUT", "test_sharpe": 91},
+            "Child1": {"id": "Child1", "parent": "NativeParent", "status": "FAIL", "detail": "resource limit"},
+        }
+        evidence = {"parent": {"status": "ERROR", "message": "batch failed"},
+                    "children": {"Child2": {"status": "TIMEOUT"},
+                                 "Child1": {"status": "FAIL", "message": "resource limit"}}}
+        account = {"state": "known", "fingerprint": "probe-native-evidence-offline"}
+        session = mock.Mock(_brain_permissions=["MULTI_SIMULATION"])
+
+        def preflight(_session, pairs, settings, _args, **kwargs):
+            return {"checked_requests": {"settings": settings, "pairs": [list(pair) for pair in pairs]},
+                    "errors": []}
+
+        with mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(self.root)}), \
+                mock.patch.object(app, "with_session", side_effect=lambda args, fn, **kw: fn(session)), \
+                mock.patch.object(app, "_preflight_lint", side_effect=preflight), \
+                mock.patch.object(app.simulation_capabilities, "account_provenance", return_value=account), \
+                mock.patch.object(ml, "submit_multi_simulation", return_value=parent_url) as post, \
+                mock.patch.object(ml, "submit_single_simulation", side_effect=AssertionError("single POST")), \
+                mock.patch.object(ml, "read_simulation_snapshot",
+                                  side_effect=lambda s, identity, **kw: (payloads[identity], None)):
+            result = self.run_probe(multi_size=2, no_record=True)
+        post.assert_called_once()
+        self.assertEqual(result["execution"]["terminal"], 2)
+        self.assertEqual(result["rows"][0]["multi_terminal_evidence"], evidence)
+        saved = json.loads(self.batch.read_text(encoding="utf-8"))
+        self.assertEqual(saved["records"][0]["multi_terminal_evidence"], evidence)
+        self.assertEqual(saved["rows"][0]["multi_terminal_evidence"], evidence)
+
+        with mock.patch.object(app, "with_session", side_effect=AssertionError("already terminal")):
+            recovered = app.cmd_probe(arguments(recover=str(self.batch)), None)
+        self.assertFalse(recovered["show_test"])
+        self.assertEqual(recovered["rows"][0]["multi_terminal_evidence"], evidence)
+        self.assertIsNone(recovered["rows"][1].get("multi_terminal_evidence"))
+        for row in recovered["rows"]:
+            self.assertEqual(row["submission_state"], "terminal")
+            self.assertEqual(row["multi_failure_attribution"], "unattributed")
+            self.assertIsNone(row.get("multi_child_id"))
+            self.assertIsNone(row["alpha_id"])
+            self.assertNotIn("test_sharpe", row)
+
     def test_native_parent_checkpoint_recovers_entire_group_without_launching(self):
         parent_url = "https://api.worldquantbrain.com/simulations/synthetic-parent"
 

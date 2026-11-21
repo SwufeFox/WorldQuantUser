@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import time
 import uuid
 
@@ -15,8 +16,35 @@ STATE_KEYS = (
     "multi_request_id", "multi_member", "multi_size", "multi_payload_sha",
     "multi_parent_url", "multi_parent_terminal", "multi_parent_status",
     "multi_children", "multi_children_complete", "multi_child_id", "multi_next_parent_poll_at",
-    "multi_child_retry",
+    "multi_child_retry", "multi_terminal_evidence", "multi_failure_attribution",
 )
+_MAX_DIAGNOSTIC_LENGTH = 512
+_PRIVATE_DIAGNOSTIC = re.compile(
+    r"https?://|\b[\w.+-]+@[\w.-]+\.[a-z]{2,}\b|\b(?:bearer|basic)\s+\S+|"
+    r"\b(?:authorization|cookie|credential|password|passwd|secret|token|api[_ -]?key|"
+    r"(?:access|refresh|auth)[_ -]?token|session[_ -]?(?:id|key))"
+    r"""["']?\s*[:=]""",
+    re.IGNORECASE,
+)
+
+
+def _terminal_observation(payload, previous=None):
+    """Keep bounded diagnostic text without copying response bodies or credentials."""
+    status = payload["status"]
+    observed = {"status": status}
+    for key in ("message", "detail", "error"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            value = value.get("message")
+        if not isinstance(value, str):
+            continue
+        message = " ".join(value.split())
+        if message and message.isprintable() and not _PRIVATE_DIAGNOSTIC.search(message):
+            observed["message"] = message[:_MAX_DIAGNOSTIC_LENGTH]
+            return observed
+    if previous and previous.get("status") == status and previous.get("message"):
+        observed["message"] = previous["message"]
+    return observed
 
 
 def payload_digest(payload):
@@ -254,10 +282,14 @@ class MultiRuns:
             ml.sleep(retry_after)
 
         status = payload.get("status")
-        if status not in simulation_slots.TERMINAL_STATUSES:
+        if not isinstance(status, str) or status not in simulation_slots.TERMINAL_STATUSES:
             self._set_unresolved(indices, "multi-simulation parent is pending")
             return
 
+        evidence = anchor.get("multi_terminal_evidence") or {}
+        anchor["multi_terminal_evidence"] = {
+            **evidence, "parent": _terminal_observation(payload, evidence.get("parent")),
+        }
         children = payload.get("children")
         if (isinstance(children, list) and 0 < len(children) <= len(indices)
                 and all(ml.valid_simulation_id(child) and child != parent_id for child in children)
@@ -310,9 +342,13 @@ class MultiRuns:
         resolved_children = {self.records[index].get("multi_child_id") for index in indices
                              if index not in remaining}
         retries = dict(anchor.get("multi_child_retry") or {})
+        evidence = anchor.get("multi_terminal_evidence") or {}
+        known_children = anchor["multi_children"][:len(indices)]
+        previous = evidence.get("children") or {}
+        observations = {child: previous[child] for child in known_children if child in previous}
         matches = {index: [] for index in remaining}
         failures = set()
-        for child in anchor["multi_children"]:
+        for child in known_children:
             if child in resolved_children or retries.get(child, 0) > time.time() or time.monotonic() >= self.deadline:
                 continue
             try:
@@ -328,13 +364,18 @@ class MultiRuns:
                 retries[child] = time.time() + retry_after
             else:
                 retries.pop(child, None)
-                if (payload.get("status") in simulation_slots.TERMINAL_FAILURE_STATUSES
-                        and payload.get("alpha") is None and payload.get("alpha_id") is None):
-                    failures.add(child)
+                status = payload.get("status")
+                if isinstance(status, str) and status in simulation_slots.TERMINAL_STATUSES:
+                    observations[child] = _terminal_observation(payload, observations.get(child))
+                    if (status in simulation_slots.TERMINAL_FAILURE_STATUSES
+                            and payload.get("alpha") is None and payload.get("alpha_id") is None):
+                        failures.add(child)
             for index in remaining:
                 if self.records[index].get("multi_child_id") in (None, child) and self._matches(index, payload):
                     matches[index].append((child, payload, retry_after))
         anchor["multi_child_retry"] = retries
+        if observations or "children" in evidence:
+            anchor["multi_terminal_evidence"] = {**evidence, "children": observations}
 
         for index, children in matches.items():
             row = self.records[index]
@@ -346,10 +387,10 @@ class MultiRuns:
             child, payload, retry_after = children[0]
             row["multi_child_id"] = child
             status = payload.get("status")
-            if retry_after or status not in simulation_slots.TERMINAL_STATUSES:
+            if retry_after or not isinstance(status, str) or status not in simulation_slots.TERMINAL_STATUSES:
                 row["error"] = "multi-simulation child is pending"
             elif status in simulation_slots.TERMINAL_FAILURE_STATUSES:
-                row.update(status=status, error=payload.get("message") or "multi-simulation child failed")
+                row.update(status=status, error=observations[child].get("message") or "multi-simulation child failed")
             elif ml.valid_simulation_id(payload.get("alpha")):
                 row.update(status="PENDING", simulation_status=status, alpha_id=payload["alpha"],
                            metrics_pending=True, error=None)
@@ -374,4 +415,5 @@ class MultiRuns:
             return
         for index in unmatched:
             self.records[index].update(
-                status="ERROR", error="all remaining multi-simulation children reported terminal failures without matching requests")
+                status="ERROR", multi_failure_attribution="unattributed",
+                error="all remaining multi-simulation children reported terminal failures without matching requests")

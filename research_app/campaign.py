@@ -12,6 +12,7 @@ import correlation
 import json
 import machine_lib
 import research_paths
+import time
 
 from . import book_state, experiments, pnl_snapshot, research_route, stats
 from .runtime import CliError, OutputConflict, protect_output
@@ -235,6 +236,39 @@ def _protect_campaign_output(args, root):
                 continue
 
 
+def _archived_quick_pnl(root, args):
+    from tools._runner import probe_state
+    from tools.campaign_runner import campaign_paths
+
+    inbox = root / "backlog"
+    live = {path.name for path in inbox.glob("*.json")}
+    jobs = {}
+    unreadable = 0
+    for state in ("done", "failed"):
+        for spec in sorted((inbox / state).glob("*.json")):
+            if spec.name in live:
+                continue
+            batch, receipt = campaign_paths(root, spec)
+            source = batch if batch.exists() else receipt
+            if not source.is_file():
+                continue
+            protected = set()
+            try:
+                if source == receipt and _campaign_spec(spec)[1]["track"] == "SPC":
+                    continue
+                path, document = experiments._load_probe_batch(source, source_paths=protected, within=root)
+            except CliError:
+                unreadable += 1
+                continue
+            finally:
+                protect_output(args, *protected)
+            pending = document.get("quick_pnl")
+            if pending and probe_state(document)[0] in {"done", "failed"}:
+                jobs.setdefault(str(path), {"batch": str(path), "spec": str(spec),
+                                            "archive_state": state, "quick_pnl": pending})
+    return [jobs[key] for key in sorted(jobs)], unreadable
+
+
 def cmd_campaign_status(args, _sink):
     """Read queue progress from canonical saved probe and SPC receipts."""
     from tools._runner import probe_poll_at, probe_state, research_root
@@ -266,9 +300,57 @@ def cmd_campaign_status(args, _sink):
         except CliError as exc:
             job.update(state="invalid", error=exc.message)
         jobs.append(job)
+    pnl_jobs, unreadable = _archived_quick_pnl(root, args)
     return {"inbox": str(inbox), "pending": len(pending), "archived": counts,
+            "archived_quick_pnl": {"pending_batches": len(pnl_jobs), "unreadable_batches": unreadable,
+                "pending_arms": sum(len(job["quick_pnl"]["pending_labels"]) for job in pnl_jobs),
+                "jobs": pnl_jobs[:args.limit], "omitted": max(0, len(pnl_jobs) - args.limit)},
             "displayed_by_state": dict(Counter(job["state"] for job in jobs)),
             "jobs": jobs, "omitted": len(pending) - len(jobs)}
+
+
+def cmd_campaign_recover_pnl(args, sink):
+    """Process archived PnL independently of the simulation runner lock."""
+    from tools._runner import _RETRYABLE, research_root, run_cli
+
+    root = research_root(args.research_dir)
+    _protect_campaign_output(args, root)
+    cursor = ""
+    try:
+        with cache_store.file_lock(root / "backlog-results" / ".recover-pnl.lock", timeout=0):
+            while True:
+                pending, unreadable = _archived_quick_pnl(root, args)
+                # Rotate so a persistently unavailable batch cannot starve later jobs.
+                pending.sort(key=lambda job: (job["batch"] <= cursor, job["batch"]))
+                jobs = []
+                for job in pending[:args.limit]:
+                    cursor = job["batch"]
+                    result = run_cli(root, "probe", "--recover", Path(cursor), "--summary",
+                                     "--max-wait-seconds", args.max_wait_seconds,
+                                     timeout=args.max_wait_seconds + 15)
+                    after = result.data.get("quick_pnl") or {}
+                    remaining = after.get("pending_labels_total", len(after.get("pending_labels") or []))
+                    if result.ok:
+                        state = "deferred" if remaining else "recovered"
+                    else:
+                        state = "deferred" if result.code in _RETRYABLE else "failed"
+                    outcome = {**{key: job[key] for key in ("batch", "spec", "archive_state")},
+                               "state": state, "pending_before": len(job["quick_pnl"]["pending_labels"]),
+                               "pending_after": remaining if result.ok else None}
+                    if not result.ok:
+                        outcome["error"] = {"code": result.code, "message": result.detail}
+                    jobs.append(outcome)
+                    if sink:
+                        sink("campaign", {"kind": "quick-pnl", **outcome})
+                    if result.code in {"RATE_LIMITED", "AUTH_CAPTCHA", "AUTH_MISSING", "AUTH_FAILED"}:
+                        break
+                if not args.watch:
+                    return {"state": "done" if not unreadable and len(pending) == len(jobs) and
+                            all(job["state"] == "recovered" for job in jobs) else "deferred",
+                            "jobs": jobs, "omitted": len(pending) - len(jobs), "unreadable_batches": unreadable}
+                time.sleep(args.interval)
+    except cache_store.LockTimeout:
+        return {"state": "busy", "jobs": []}
 
 
 def cmd_campaign_run(args, sink):

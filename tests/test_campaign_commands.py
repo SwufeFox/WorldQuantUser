@@ -1,6 +1,7 @@
 """Exercise campaign routing and recovery through the public CLI."""
 
 import json
+from pathlib import Path
 
 from research_app import app
 from test_python_preflight import SOURCE
@@ -62,6 +63,9 @@ def test_campaign_runs_spc_offline_and_archives_terminal_spec(tmp_path, capsys):
     assert receipt["data"]["simulated"] == 0
     assert not (tmp_path / "backlog-results" / "prediction-batch.json").exists()
     assert capture.read_text() == SAMPLE
+    code, status = invoke(capsys, tmp_path, "campaign", "status")
+    assert code == 0
+    assert status["data"]["archived_quick_pnl"]["unreadable_batches"] == 0
 
 
 def test_campaign_routes_python_source_on_its_effective_arm_settings(tmp_path, capsys):
@@ -132,6 +136,115 @@ def write_quick_batch(path, arms, records, **extra):
              "track": "ATOM", "design": {"mode": "explore"}, "mechanism": "hypothesis A",
              "arms": arms, "records": records, "rows": [{} for _ in arms], **extra}
     path.write_text(json.dumps(batch), encoding="utf-8")
+
+
+def campaign_pnl_fixture(root, name, archive_state, *, split=False, collected=False):
+    inbox = root / "backlog"
+    archive = inbox / archive_state
+    archive.mkdir(parents=True, exist_ok=True)
+    spec = archive / f"{name}.json"
+    arms = [quick_arm("candidate", "rank(close)")]
+    record = quick_record("A1", 1.2)
+    record["out_of_sample"]["test"]["startDate"] = "2021-01-01"
+    pending = [] if collected else ["candidate"]
+    if collected:
+        record["pnl_evidence"] = {"complete": True}
+        record["half_sharpes"] = [0.8, 1.1]
+    records = [record]
+    if split:
+        arms.append(quick_arm("failed", "rank(open)"))
+        records.append({"status": "ERROR", "submission_attempted": True})
+    spec.write_text(json.dumps({"track": "ATOM", "design": "explore", "arms": arms}), encoding="utf-8")
+    results = root / "backlog-results"
+    results.mkdir(exist_ok=True)
+    batch = results / f"{name}-batch.json"
+    receipt = results / f"{name}-result.json"
+    extra = {"quick_pnl": {"pending_labels": pending}} if pending else {}
+    write_quick_batch(batch, arms, records, spec=str(inbox / spec.name), **extra)
+    receipt.write_text(json.dumps({"ok": True, "command": "probe", "data": {
+        "path": str(batch), "quick_pnl": {"pending_labels": ["stale receipt"]},
+    }}), encoding="utf-8")
+    return spec, batch, receipt
+
+
+def test_campaign_status_discovers_pending_pnl_from_canonical_archive_batches(tmp_path, capsys, monkeypatch):
+    from tools import _runner
+
+    def unexpected_cli(*args, **kwargs):
+        raise AssertionError("campaign status called a subprocess")
+
+    monkeypatch.setattr(_runner, "run_cli", unexpected_cli)
+    done, done_batch, _ = campaign_pnl_fixture(tmp_path, "done-research", "done")
+    failed, failed_batch, _ = campaign_pnl_fixture(tmp_path, "mixed-research", "failed", split=True)
+    campaign_pnl_fixture(tmp_path, "fulfilled", "done", collected=True)
+    live, _, _ = campaign_pnl_fixture(tmp_path, "still-live", "")
+
+    code, result = invoke(capsys, tmp_path, "campaign", "status")
+    assert code == 0
+    data = result["data"]
+    assert [job["spec"] for job in data["jobs"]] == [str(live)]
+    pending = data["archived_quick_pnl"]
+    assert (pending["pending_batches"], pending["pending_arms"], pending["omitted"]) == (2, 2, 0)
+    jobs = {job["spec"]: job for job in pending["jobs"]}
+    assert set(jobs) == {str(done), str(failed)}
+    for spec, batch, archive_state in ((done, done_batch, "done"), (failed, failed_batch, "failed")):
+        job = jobs[str(spec)]
+        assert (job["batch"], job["archive_state"]) == (str(batch), archive_state)
+        assert job["quick_pnl"]["pending_labels"] == ["candidate"]
+
+    code, result = invoke(capsys, tmp_path, "campaign", "status", "--limit", 1)
+    assert code == 0
+    pending = result["data"]["archived_quick_pnl"]
+    assert pending["pending_batches"] == 2
+    assert len(pending["jobs"]) == pending["omitted"] == 1
+
+
+def test_campaign_recover_pnl_uses_only_probe_recovery_and_keeps_deferred_arms(tmp_path, capsys, monkeypatch):
+    import cache_store
+    from tools import _runner
+
+    completed, completed_batch, receipt = campaign_pnl_fixture(tmp_path, "can-complete", "done")
+    deferred, deferred_batch, _ = campaign_pnl_fixture(tmp_path, "still-deferred", "failed", split=True)
+    before = receipt.read_bytes()
+    archived = {spec: spec.read_bytes() for spec in (completed, deferred)}
+    calls = []
+
+    def run_cli(root, *args, **kwargs):
+        assert root == tmp_path
+        assert args[:2] == ("probe", "--recover")
+        assert "--resume" not in args
+        assert "--show-test" not in args
+        batch = Path(args[2])
+        calls.append(batch)
+        if batch == deferred_batch:
+            return _runner.CliResult(True, {"quick_pnl": {"pending_labels": ["candidate"]}})
+        assert batch == completed_batch
+        checkpoint = json.loads(batch.read_bytes())
+        checkpoint["records"][0].update(pnl_evidence={"complete": True}, half_sharpes=[0.8, 1.1])
+        checkpoint.pop("quick_pnl", None)
+        batch.write_text(json.dumps(checkpoint), encoding="utf-8")
+        return _runner.CliResult(True, {})
+
+    monkeypatch.setattr(_runner, "run_cli", run_cli)
+    with cache_store.file_lock(tmp_path / "backlog" / ".runner.lock", timeout=0):
+        code, result = invoke(capsys, tmp_path, "campaign", "recover-pnl", "--limit", 2, "--max-wait-seconds", 8)
+    assert code == 0
+    assert set(calls) == {completed_batch, deferred_batch}
+    jobs = {job["batch"]: job for job in result["data"]["jobs"]}
+    assert set(jobs) == {str(completed_batch), str(deferred_batch)}
+    for batch, state, remaining in ((completed_batch, "recovered", 0), (deferred_batch, "deferred", 1)):
+        job = jobs[str(batch)]
+        assert (job["state"], job["pending_before"], job["pending_after"]) == (state, 1, remaining)
+    assert all(spec.read_bytes() == content for spec, content in archived.items())
+    assert receipt.read_bytes() == before
+
+    calls.clear()
+    code, result = invoke(capsys, tmp_path, "campaign", "recover-pnl", "--limit", 1)
+    assert code == 0
+    assert calls == [deferred_batch]
+    [job] = result["data"]["jobs"]
+    assert job["state"] == "deferred"
+    assert job["pending_after"] == 1
 
 
 def test_campaign_prepares_limited_full_spec_from_train_only(tmp_path, capsys, monkeypatch):

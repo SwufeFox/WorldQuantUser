@@ -982,6 +982,8 @@ Delay 和 Language 必须一致。工具沿用 `probe` 的设置分组，末尾�
 
 工具在发单前保存父任务和子配置，接受后记录父任务地址。恢复时从地址读取子任务，分别
 记录成功、失败及待确认的结果。父任务报错并返回子列表时，已确认成功的子结果仍可入账。
+检查点的父任务记录保存 `multi_terminal_evidence`，包括已核实的父子任务终态及可用的错误摘要。
+缺少逐臂映射的整批失败使用 `multi_failure_attribution: "unattributed"`，表示执行失败尚未归因到单个研究臂。
 任务身份不明时保留待核对状态。`probe --recover` 只读已登记的平台任务并补账。`probe --resume`
 还可继续排队的回测。手里只有父任务 ID 时，用 `probe --from-simulation` 查看父任务和各子任务状态。
 `--max-wait-seconds` 在原生 `simulate`、`resume` 和 `probe` 中按调用共享，包含父子任务查询。
@@ -1207,6 +1209,7 @@ python research_cli.py campaign status
 python research_cli.py campaign run --recover-only
 python research_cli.py campaign run --watch --batch-size 4 --multi-size 4 --stream
 python research_cli.py campaign run --watch --defer-quick-pnl
+python research_cli.py campaign recover-pnl --watch --stream
 ```
 
 所有新 FASTEXPR 回测请求默认先经过 `fmt` 的语法树等价检查。`simulate --dry-run` 和 `campaign preview` 的 `payload.regular` 显示实际发送的源码。单条、原生 Multi、兼容 QUICK/FULL 入口都走同一规则。含注释或无法确认改写安全的表达式保留原文。Python 源码和 SPC prompt 保持各自的校验规则。
@@ -1230,7 +1233,9 @@ Campaign 开跑前复用 Probe 的离线扫描，确定的语法错误在联网�
 `run` 默认推进一份当前可运行的规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。队列先处理可回收的检查点。剩余任务均已受理且尚未到轮询时间时，该批次让出本轮。原生 Multi 使用已登记槽位的父任务轮询时间，`status` 显示这些批次的 `next_poll_at`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
 
 批量 QUICK 初筛可用 `run --watch --defer-quick-pnl`，让队列在保存训练汇总后继续推进。
-规格归档后，仍可按回执的 `quick_pnl.recover_argv` 对原批次执行只读补查。
+`campaign status` 的 `archived_quick_pnl` 显示已归档批次还欠的日收益。
+`campaign recover-pnl` 从原检查点补读，每轮用 `--limit` 控制批次数。
+加 `--watch` 后可与模拟队列并行运行。补读复用 `probe --recover`，并把证据写回原批次。
 
 先用 `--recover-only` 回收已有检查点。需要验证 FULL Regular 候选时启用 `--validate`，或对保存的训练冻结选择单独运行 `promote --selection`。已冻结的选择和终态验证回执可以复用。QUICK、Power Pool 与 ATOM 保留各自研究证据，SPC 结果在本地完成。Alpha 和 SPC 的平台提交仍走各自授权入口。
 

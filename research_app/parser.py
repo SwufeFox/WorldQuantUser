@@ -1085,8 +1085,20 @@ def build_parser():
 
     campaign_status = campaign_sub.add_parser("status", help="Read queued specs and their saved progress offline.")
     campaign_status.add_argument("--limit", type=_non_negative_integer, default=20,
-                                 help="Maximum pending jobs to display.")
+                                 help="Maximum queued specs and archived PnL batches to display in each list.")
     campaign_status.bind_handler("campaign.cmd_campaign_status")
+
+    campaign_pnl = campaign_sub.add_parser(
+        "recover-pnl", help="Fill missing daily PnL for archived QUICK batches without starting simulations.")
+    campaign_pnl.add_argument("--limit", type=_positive_count, default=10,
+                              help="Maximum batches to attempt per pass.")
+    campaign_pnl.add_argument("--watch", action="store_true", help="Revisit pending evidence in successive passes.")
+    campaign_pnl.add_argument("--interval", type=_positive_seconds, default=30,
+                              help="Seconds between passes in watch mode.")
+    campaign_pnl.add_argument("--max-wait-seconds", type=_positive_seconds, default=60,
+                              help="Maximum wait budget for each Probe recovery.")
+    campaign_pnl.add_argument("--stream", action="store_true", help="Emit recovery events on stderr.")
+    campaign_pnl.bind_handler("campaign.cmd_campaign_recover_pnl")
 
     campaign_run = campaign_sub.add_parser(
         "run", help="Advance one queued experiment or keep watching the same inbox.")
@@ -1691,7 +1703,8 @@ _COMMAND_EXAMPLES = {
               "probe --resume BATCH.json --dry-run", "probe --from-simulation SIMULATION_ID"],
     "campaign": ["campaign status", "campaign preview batch.spec.json",
                  "campaign prepare-full quick-batch.json --out full.spec.json --limit 4",
-                 "campaign run --recover-only", "campaign run --watch --multi-size 4"],
+                 "campaign run --recover-only", "campaign run --watch --multi-size 4",
+                 "campaign recover-pnl --watch --stream"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],
     "alpha get": ["alpha get ALPHA_ID", "alpha get ALPHA_ID --performance",

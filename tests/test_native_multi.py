@@ -131,18 +131,37 @@ def anonymous_failure(child_id, message="resource limit"):
 
 
 def test_native_complete_anonymous_failures_finish_without_allocating_child_ids(simulator):
-    parent = {"status": "ERROR", "children": ["Child2", "Child1"]}
+    parent = {"status": "ERROR", "children": ["Child2", "Child1"],
+              "error": {"message": "Parent execution failed", "body": "private raw body"}}
+    second_child = {**anonymous_failure("Child2", "second error"), "status": "FAIL"}
+    first_child = {**anonymous_failure("Child1", "Authorization: Bearer synthetic-secret"),
+                   "detail": "first child\n execution timed out", "status": "TIMEOUT"}
+    events = []
     with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL) as post, \
             mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
-                (parent, None), (anonymous_failure("Child2", "second error"), None),
-                (anonymous_failure("Child1", "first error"), None),
+                (parent, None), (second_child, None), (first_child, None),
             ]):
-        records = simulator(fetch_metrics=False)
+        records = simulator(fetch_metrics=False, on_event=lambda kind, data: events.append((kind, data)))
     post.assert_called_once()
     assert [row["status"] for row in records] == ["ERROR", "ERROR"]
     assert all(row.get("multi_child_id") is None and row.get("alpha_id") is None for row in records)
+    assert [row["multi_failure_attribution"] for row in records] == ["unattributed", "unattributed"]
     assert len({row["error"] for row in records}) == 1
     assert all("all remaining multi-simulation children" in row["error"] for row in records)
+    evidence = records[0]["multi_terminal_evidence"]
+    assert evidence == {
+        "parent": {"status": "ERROR", "message": "Parent execution failed"},
+        "children": {
+            "Child2": {"status": "FAIL", "message": "second error"},
+            "Child1": {"status": "TIMEOUT", "message": "first child execution timed out"},
+        },
+    }
+    parent_checkpoint = next(data["records"][0] for event, data in events
+                             if event == "multi_pending" and data["records"][0].get("multi_parent_terminal"))
+    assert parent_checkpoint["multi_terminal_evidence"] == {"parent": evidence["parent"]}
+    assert records[1].get("multi_terminal_evidence") is None
+    assert any(event == "multi_pending" and data["records"][0].get("multi_terminal_evidence") == evidence
+               for event, data in events)
     assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0
 
     with mock.patch.object(ml, "submit_multi_simulation") as post, \
@@ -151,6 +170,36 @@ def test_native_complete_anonymous_failures_finish_without_allocating_child_ids(
     post.assert_not_called()
     read.assert_not_called()
     assert [row["status"] for row in resumed] == ["ERROR", "ERROR"]
+    assert resumed[0]["multi_terminal_evidence"] == evidence
+
+
+def test_native_recovery_keeps_safe_details_and_rejects_mismatched_child_evidence(simulator):
+    parent = {"status": "ERROR", "children": ["Child1", "Child2"], "message": "parent detail"}
+    first_child = anonymous_failure("Child1", "one " + "x" * 1024)
+    wrong_child = {**anonymous_failure("Child2"), "parent": "OtherParent"}
+    with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+            mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
+                (parent, None), (first_child, None), (wrong_child, None),
+            ]):
+        first = simulator(fetch_metrics=False)
+    children = first[0]["multi_terminal_evidence"]["children"]
+    assert children == {"Child1": {"status": "ERROR", "message": "one " + "x" * 508}}
+    assert [row["status"] for row in first] == ["PENDING", "PENDING"]
+    first[0]["multi_terminal_evidence"]["children"] = {**children, "UnknownChild": {"status": "ERROR"}}
+
+    no_message = anonymous_failure("Child1", "")
+    private_message = anonymous_failure("Child2", "See https://example.test/?key=synthetic-secret")
+    with mock.patch.object(ml, "submit_multi_simulation") as post, \
+            mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
+                (no_message, None), (private_message, None),
+            ]):
+        resumed = simulator(initial_records=first, fetch_metrics=False, recover_only=True)
+    post.assert_not_called()
+    assert resumed[0]["multi_terminal_evidence"] == {
+        "parent": {"status": "ERROR", "message": "parent detail"},
+        "children": {**children, "Child2": {"status": "ERROR"}},
+    }
+    assert all(row["multi_failure_attribution"] == "unattributed" for row in resumed)
 
 
 @pytest.mark.parametrize("second_read", [
