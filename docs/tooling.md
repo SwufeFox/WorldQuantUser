@@ -296,8 +296,8 @@ python3 research_cli.py promote ALPHA_ID --selection choice.json --max-self-corr
 
 最接近的现有入口是 `triage`，但它负责选择与验证，不负责平台检查或写入候选架。
 `promote` 只串联现有的四步实现，解决每个候选都要等待并手工衔接的问题：
-先 `triage --ids --freeze`，再 `triage --selection --show-test`，然后 `alpha check`，
-最后满足条件时调用 `buffer add`。冻结时就保存本次 retention floor 和 cost scenarios，
+先 `triage --ids --freeze`，再 `triage --selection --show-test`。测试 Sharpe 与留存通过后
+运行 `alpha check`，最后满足条件时调用 `buffer add`。冻结时就保存本次 retention floor 和 cost scenarios，
 验证沿用同一标准；入库复用第三步的实时检查结果，避免重复等待检查接口。
 
 仅当检查全部 resolved、没有 FAIL/ERROR（WARNING 允许）、`test_sharpe > 0` 且
@@ -324,12 +324,13 @@ Campaign 用同一份训练筛选生成的冻结选择调用 `promote`，沿用�
 单独运行 `promote ALPHA_ID` 仍走原有冻结流程，适合已经人工审过训练证据的候选。
 
 回执包含 `alpha_id`、`freeze_path`、`validate` 的训练/测试 Sharpe、retention、
-rho_book、max_member_rho，以及完整 `checks`、`buffered`、`outcome`、`reasons`。
+rho_book、max_member_rho，以及 `checks`、`buffered`、`outcome`、`reasons`。
+测试期门未通过时，`steps.checks` 为 `skipped`。
 `steps` 保存各步状态和已完成的冻结、验证及入库证据。任何执行异常立即停止，
 返回 `ok: false`、现有类型的 `error` 和退出码，同时在 `data` 保留已完成证据及 `failed_step`；
 `--save PATH` 保存完全相同的回执，且不能覆盖冻结文件或候选架。
 
-`promote --dry-run` 仍然读取测试期并执行实时检查。未提供 `--selection` 时也会写冻结文件。
+`promote --dry-run` 同样读取冻结后的测试期，测试期门通过后执行实时检查。未提供 `--selection` 时也会写冻结文件。
 通过时返回 `outcome: would_buffer`，候选架不写入。平台提交另见下文。
 
 ### 用现有问题文件交接
@@ -1212,7 +1213,7 @@ Campaign 开跑前复用 Probe 的离线扫描，确定的语法错误在联网�
 研究路线记录在回执和批次中。原生请求类型、语言和 QUICK/FULL 设置仍按各自的平台协议处理。
 平台原始分类随结果保存，可用 `alpha get` 或冻结后的验证视图核对。
 
-`run` 默认推进一份当前可运行的规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。队列先处理可回收的检查点，全部已受理且尚未到轮询时间的批次让出本轮。`status` 显示这类批次的 `next_poll_at`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
+`run` 默认推进一份当前可运行的规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。队列先处理可回收的检查点。剩余任务均已受理且尚未到轮询时间时，该批次让出本轮。原生 Multi 使用已登记槽位的父任务轮询时间，`status` 显示这些批次的 `next_poll_at`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
 
 先用 `--recover-only` 回收已有检查点。需要验证 FULL Regular 候选时启用 `--validate`，或对保存的训练冻结选择单独运行 `promote --selection`。已冻结的选择和终态验证回执可以复用。QUICK、Power Pool 与 ATOM 保留各自研究证据，SPC 结果在本地完成。Alpha 和 SPC 的平台提交仍走各自授权入口。
 
@@ -1247,7 +1248,7 @@ spec 去掉扩展名后的文件名。
 | Simulation queue | `queue/NAME.json` | `queue/batches/NAME-batch.json` | `NAME-result.json` | `queue/queue.log` |
 | Campaign | `backlog/NAME.json` | `backlog-results/NAME-batch.json` | `backlog-results/NAME-result.json` | `campaign-log.jsonl` |
 
-两个队列的 `--once` 只处理排序后的首份 spec。省略该选项时，worker 会持续轮询。
+两个队列的 `--once` 每次最多处理一份 spec。Campaign 优先处理到期的检查点，再处理未开始的规格。省略该选项时，worker 会持续轮询。
 已知终态才归档到对应的 `done/` 或 `failed/`。需要补证据、重新轮询或只读恢复时，原 spec
 保留在入口目录。恢复前核对源码与设置指纹以及实验角色，旧批次指向多个可能结果时要求显式恢复。
 归档会移动 spec。回读已发出的请求时，使用保存了完整源码的批次文件。

@@ -1190,11 +1190,11 @@ def _probe_visible_row(row, show_test):
     validation = {"sharpe", "fitness", "turnover", "test_sharpe", "failed_checks", "classification_ids"}
     return {key: value for key, value in row.items() if show_test or key not in validation}
 
-def _turnover_band(expression):
+def _turnover_band(expression, *, catalog=None, stats=None):
     """``{low, high, verdict, caution}`` from the fields an expression reads."""
     from . import mine
 
-    band = mine.expected_turnover(expression)
+    band = mine.expected_turnover(expression, catalog=catalog, stats=stats)
     if band is None:
         return None
     return {**band, "verdict": mine.turnover_verdict(band),
@@ -2052,6 +2052,7 @@ def _cmd_probe(args, _sink):
         results = [None] * len(arms)
         reports = []
         requests = []
+        catalog = turnover_stats = None
         for group in groups.values():
             scoped = cached_field_scope(group["settings"])
             report = _offline_simulation_lint(group["pairs"], group["settings"], scoped)
@@ -2060,14 +2061,20 @@ def _cmd_probe(args, _sink):
                 args, group, base["concurrency"], multi)
             requests.extend(group_requests)
             reports[-1]["scheduling"] = scheduling
+            python = ml.is_python_language(group["settings"].get("language"))
+            if not python and catalog is None:
+                from . import mine
+
+                catalog = mine.load_catalog()
+                turnover_stats = mine.dataset_turnover(catalog=catalog)
             for record, arm in zip(preview, group["arms"]):
                 index = arm["arm_index"]
                 results[index] = {**record, "label": arm["label"], "arm_index": index,
                     "role": arm.get("role"),
                     "design": arm.get("design"), "proxy_of": arm.get("proxy_of"),
                     "settings": arm["settings"], "gate": gate[index],
-                    "turnover_band": None if ml.is_python_language(arm["settings"].get("language"))
-                    else _turnover_band(arm["expression"])}
+                    "turnover_band": None if python else _turnover_band(
+                        arm["expression"], catalog=catalog, stats=turnover_stats)}
                 if "source_file" in arm:
                     results[index]["source_file"] = arm["source_file"]
         blocking = [item for report in reports for item in report.get("errors", [])]

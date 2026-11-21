@@ -233,23 +233,44 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
 
 
 def probe_poll_at(document):
-    """Earliest useful poll when all saved work is already accepted and timed."""
+    """Earliest useful poll when remaining saved work is accepted and timed."""
     rows = document.get("rows") or []
     execution = document.get("execution") or {}
     if (not isinstance(rows, list) or not rows or not isinstance(execution, dict)
             or execution.get("total") != len(rows) or execution.get("finished") != 0):
         return None
+    # Native Retry-After is written once on the parent anchor, rather than on
+    # every child row. A terminal parent may still expose new child evidence.
+    records = document.get("records")
+    parent_times = {
+        (record["multi_request_id"], record["multi_parent_url"]): record.get("multi_next_parent_poll_at")
+        for record in records if isinstance(record, dict)
+        and type(record.get("multi_member")) is int and record["multi_member"] == 0
+        and record.get("slot_reservation_state") == "accepted"
+        and bool(record.get("slot_reservation"))
+        and not record.get("multi_parent_terminal")
+        and isinstance(record.get("multi_request_id"), str) and isinstance(record.get("multi_parent_url"), str)
+    } if isinstance(records, list) else {}
     times = []
     for row in rows:
-        if (not isinstance(row, dict) or row.get("submission_state") != "accepted"
-                or row.get("multi_parent_url")
-                or not (row.get("progress_url") or (row.get("alpha_id") and row.get("metrics_pending")))):
+        if not isinstance(row, dict):
             return None
-        at = row.get("next_poll_at")
+        state = row.get("submission_state")
+        if state == "terminal":
+            continue
+        if state != "accepted":
+            return None
+        parent_url, request_id = row.get("multi_parent_url"), row.get("multi_request_id")
+        if isinstance(parent_url, str) and isinstance(request_id, str) and not row.get("multi_parent_terminal"):
+            at = parent_times.get((request_id, parent_url))
+        elif not parent_url and (row.get("progress_url") or (row.get("alpha_id") and row.get("metrics_pending"))):
+            at = row.get("next_poll_at")
+        else:
+            return None
         if type(at) not in (int, float) or not math.isfinite(at) or at <= 0:
             return None
         times.append(at)
-    return min(times)
+    return min(times, default=None)
 
 
 def _recovery_schedule(batch, receipt):

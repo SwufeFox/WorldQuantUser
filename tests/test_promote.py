@@ -117,7 +117,10 @@ def test_nonpositive_test_sharpe_is_rejected(flow, capsys, sharpe):
     assert output["data"]["outcome"] == "rejected"
     assert output["data"]["buffered"] is False
     assert "test_sharpe <= 0" in output["data"]["reasons"]
-    assert flow["calls"] == ["freeze", "validate", "checks"]
+    assert output["data"]["checks"] == {}
+    assert output["data"]["steps"]["checks"]["status"] == "skipped"
+    assert output["data"]["steps"]["buffer"]["status"] == "skipped"
+    assert flow["calls"] == ["freeze", "validate"]
 
 
 def test_low_retention_is_rejected(flow, capsys):
@@ -125,7 +128,7 @@ def test_low_retention_is_rejected(flow, capsys):
     _, output = invoke(capsys)
     assert output["data"]["outcome"] == "rejected"
     assert any("retention < retention_floor" in reason for reason in output["data"]["reasons"])
-    assert "buffer" not in flow["calls"]
+    assert flow["calls"] == ["freeze", "validate"]
 
 
 def test_existing_selection_reuses_frozen_criteria_without_refreezing(flow, capsys, tmp_path):
@@ -212,17 +215,18 @@ def test_dry_run_does_not_label_rejections_would_buffer(flow, capsys):
     flow["row"]["retention"] = 0.1
     _, output = invoke(capsys, "--dry-run")
     assert output["data"]["outcome"] == "rejected"
-    assert "buffer" not in flow["calls"]
+    assert flow["calls"] == ["freeze", "validate"]
 
 
 @pytest.mark.parametrize("field", ["test_sharpe", "retention"])
 @pytest.mark.parametrize("value", [None, float("nan"), float("inf")])
-def test_missing_or_nonfinite_validation_never_buffers(flow, capsys, field, value):
+def test_missing_or_nonfinite_validation_skips_live_checks(flow, capsys, field, value):
     flow["row"][field] = value
     _, output = invoke(capsys)
     assert output["data"]["outcome"] == "rejected"
     assert field + "_missing_or_nonfinite" in output["data"]["reasons"]
-    assert "buffer" not in flow["calls"]
+    assert output["data"]["steps"]["checks"]["status"] == "skipped"
+    assert flow["calls"] == ["freeze", "validate"]
 
 
 def test_retention_equal_to_floor_is_accepted(flow, capsys):

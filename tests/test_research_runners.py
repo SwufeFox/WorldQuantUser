@@ -264,6 +264,48 @@ class ResearchRunnerTests(TestCase):
         self.assertEqual(log.call_args.args[0]["next_poll_at"], 120)
         self.assertTrue(waiting.is_file())
 
+    def test_campaign_uses_the_native_parent_clock_to_advance_other_work(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        waiting, fresh = [backlog / name for name in ("a-native.json", "b-ready.json")]
+        for spec in (waiting, fresh):
+            spec.write_text("{}", encoding="utf-8")
+        batch, _ = campaign.campaign_paths(self.root, waiting)
+        parent = {"multi_request_id": "saved-native", "multi_parent_url": "https://test.invalid/parent"}
+        rows = [arm("PENDING", submission_state="accepted", **parent) for _ in range(2)]
+        self.saved(batch, rows)
+        document = json.loads(batch.read_text(encoding="utf-8"))
+        anchor = {**parent, "multi_member": 0, "multi_next_parent_poll_at": 120,
+                  "slot_reservation_state": "accepted", "slot_reservation": {"id": "saved-slot"}}
+        document.update(execution={"total": 2, "finished": 0},
+                        records=[anchor, {**parent, "multi_member": 1}])
+        batch.write_text(json.dumps(document), encoding="utf-8")
+
+        execute = mock.Mock(return_value=runner.ProbeRun("done", {}))
+        with mock.patch.object(runner.time, "time", return_value=100):
+            self.assertEqual(campaign.run_campaign(self.root, once=True, execute=execute,
+                                                   log_event=mock.Mock()), 0)
+        execute.assert_called_once_with(self.root, fresh, *campaign.campaign_paths(self.root, fresh),
+                                      max_wait=600, concurrency=3)
+        self.assertTrue(waiting.is_file())
+
+        anchor.pop("slot_reservation_state")
+        self.assertIsNone(runner.probe_poll_at(document))
+        anchor["slot_reservation_state"] = "accepted"
+        for row in rows:
+            row["multi_parent_terminal"] = True
+        document["rows"] = rows
+        self.assertIsNone(runner.probe_poll_at(document))
+
+    def test_terminal_sibling_does_not_hide_an_explicit_poll_time(self):
+        waiting = arm("PENDING", submission_state="accepted",
+                      progress_url="https://test.invalid/accepted", next_poll_at=125)
+        failed = arm("ERROR", submission_state="terminal")
+        document = {"execution": {"total": 2, "finished": 0}, "rows": [waiting, failed]}
+        self.assertEqual(runner.probe_poll_at(document), 125)
+        document["rows"] = [failed, failed]
+        self.assertIsNone(runner.probe_poll_at(document))
+
     def campaign_reply(self, *, freeze=True, **updates):
         training = {"alpha_id": "candidate", "delta": 0.01, "evidence": {"state": "measured"},
                     "training_gate": {"state": "pass", "reason": None},

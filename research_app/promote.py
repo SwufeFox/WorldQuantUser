@@ -91,6 +91,22 @@ def cmd_promote(args, sink):
                     if row.get("alpha_id") == alpha_id), {})
         data["validate"] = {key: row.get(key) for key in data["validate"]}
 
+        reasons = data["reasons"]
+        test = data["validate"]["test_sharpe"]
+        retention = data["validate"]["retention"]
+        if not _finite(test):
+            reasons.append("test_sharpe_missing_or_nonfinite")
+        elif test <= 0:
+            reasons.append("test_sharpe <= 0")
+        if not _finite(retention):
+            reasons.append("retention_missing_or_nonfinite")
+        elif retention < retention_floor:
+            reasons.append("retention < retention_floor (%s < %s)" % (retention, retention_floor))
+        if reasons:
+            data["steps"]["checks"] = {"status": "skipped"}
+            data["steps"]["buffer"] = {"status": "skipped"}
+            return data
+
         step = "checks"
         check_args = parser.parse_args(["alpha", "check", alpha_id])
         checked = alphas.cmd_alpha_check(check_args, sink)
@@ -102,7 +118,6 @@ def cmd_promote(args, sink):
             error = result["error"]
             raise CliError(error["code"], error["message"], error.get("hint"))
 
-        reasons = data["reasons"]
         summary = buffer_cmd._checks_summary(result.get("checks"))
         if (not checked.get("complete") or not result.get("complete")
                 or not result.get("checks_resolved") or not result.get("checks")
@@ -116,16 +131,6 @@ def cmd_promote(args, sink):
                 reasons.append("self_correlation_missing_or_nonfinite")
             elif value >= max_corr:
                 reasons.append("self_correlation_at_or_above_limit")
-        test = data["validate"]["test_sharpe"]
-        retention = data["validate"]["retention"]
-        if not _finite(test):
-            reasons.append("test_sharpe_missing_or_nonfinite")
-        elif test <= 0:
-            reasons.append("test_sharpe <= 0")
-        if not _finite(retention):
-            reasons.append("retention_missing_or_nonfinite")
-        elif retention < retention_floor:
-            reasons.append("retention < retention_floor (%s < %s)" % (retention, retention_floor))
         if reasons:
             data["steps"]["buffer"] = {"status": "skipped"}
             return data

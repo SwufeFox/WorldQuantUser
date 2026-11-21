@@ -104,6 +104,19 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertNotEqual(app._recovery_expression_key('bucket(close, range="0  1")', "FASTEXPR"),
                             app._recovery_expression_key('bucket(close, range="0 1")', "FASTEXPR"))
 
+    def test_preview_loads_turnover_history_once_across_fast_expression_groups(self):
+        from research_app import mine
+
+        catalog = {"close": {"dataset": "pv1"}}
+        history = {"pv1": {"median": .15}}
+        with mock.patch.object(mine, "load_catalog", return_value=catalog) as load, \
+                mock.patch.object(mine, "dataset_turnover", return_value=history) as stats:
+            preview = self.run_probe(dry_run=True)
+        load.assert_called_once_with()
+        stats.assert_called_once_with(catalog=catalog)
+        self.assertEqual(preview["groups"], 2)
+        self.assertEqual(preview["results"][0]["turnover_band"]["low"], .15)
+
     def test_native_multi_preview_groups_compatible_settings_in_arm_order(self):
         with mock.patch.object(app, "cached_field_scope", return_value={"evidence": {"state": "unknown"}}), \
                 mock.patch.object(app, "_turnover_band", return_value={}), \
