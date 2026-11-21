@@ -236,15 +236,14 @@ class ExpressionLintTests(unittest.TestCase):
         self.assertEqual(calls[0]["arg_count"], 4)
 
     def test_reserved_identifier_is_reported(self):
-        # The simulator rejects ``eps=...`` with "Variable eps is reserved and
-        # cannot be assigned". Nothing in the catalog documents this, so the
-        # offline lint carries the list; missing it burned a simulation round.
-        report = expression_lint.lint_expression("eps=ts_backfill(close,20);rank(eps)")
-        codes = [error["code"] for error in report["errors"]]
-        self.assertIn("reserved_identifier", codes)
-        offending = [e for e in report["errors"]
-                     if e["code"] == "reserved_identifier"]
-        self.assertEqual(offending[0]["identifier"], "eps")
+        for name in ("eps", "assets"):
+            with self.subTest(name=name):
+                report = expression_lint.lint_expression(f"{name}=ts_backfill(close,20);rank({name})")
+                offending = [e["identifier"] for e in report["errors"] if e["code"] == "reserved_identifier"]
+                self.assertEqual(offending, [name])
+        for expression in ("rank(assets)", "asset_level = ts_backfill(close,20); rank(asset_level)"):
+            report = expression_lint.lint_expression(expression)
+            self.assertFalse(any(e["code"] == "reserved_identifier" for e in report["errors"]))
 
     def test_reserved_check_does_not_fire_on_comparisons(self):
         report = expression_lint.lint_expression(

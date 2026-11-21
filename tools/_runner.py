@@ -20,7 +20,7 @@ import simulation_slots
 REPO = Path(__file__).resolve().parents[1]
 _FINISHED = alpha_registry.FINISHED_STATUSES | {"ACTIVE", "SUBMITTED", "UNSUBMITTED"}
 _FAILED = simulation_slots.TERMINAL_FAILURE_STATUSES | {"FAILED"}
-_RETRYABLE = {"RATE_LIMITED", "SERVICE_ERROR", "AUTH_CAPTCHA", "INTERRUPTED", "TIMEOUT",
+_RETRYABLE = {"RATE_LIMITED", "SERVICE_ERROR", "AUTH_MISSING", "AUTH_FAILED", "AUTH_CAPTCHA", "INTERRUPTED", "TIMEOUT",
               "INVALID_RESPONSE"}
 
 
@@ -71,11 +71,29 @@ def run_cli(root, *args, timeout=None, input_text=None):
                      "INVALID_RESPONSE")
 
 
-def _probe_state(data):
+def probe_state(data):
     """Return the queue state and the next action justified by saved arm evidence."""
     rows = data.get("rows")
     if not isinstance(rows, list) or not rows or not all(isinstance(row, dict) for row in rows):
         return "failed", None
+    execution = data.get("execution") or {}
+    actions = data.get("next_actions")
+    if (isinstance(execution, dict) and isinstance(actions, list)
+            and all(type(execution.get(key)) is int for key in (
+                "total", "finished", "terminal", "unknown_submission"))):
+        next_actions = {item.get("action") for item in actions if isinstance(item, dict)}
+        if execution["unknown_submission"]:
+            return "deferred", "recover"
+        if execution["finished"] + execution["terminal"] >= execution["total"]:
+            state = "failed" if execution["terminal"] else "done"
+            return state, None
+        if "recover" in next_actions:
+            return "deferred", "recover"
+        if "resume" in next_actions:
+            return "deferred", "resume"
+        return "deferred", "recover"
+
+    # Older checkpoints did not carry canonical execution counts or actions.
     pending = []
     failures = 0
     for row in rows:
@@ -95,10 +113,13 @@ def _probe_state(data):
     if pending:
         # Reconcile ambiguous POSTs before starting any known queued arms.
         return "deferred", "recover" if "recover" in pending else "resume"
-    finished = (data.get("execution") or {}).get("finished")
+    finished = execution.get("finished")
     if isinstance(finished, int) and finished + failures < len(rows):
         return "deferred", "recover"
     return ("failed", None) if failures else ("done", None)
+
+
+_probe_state = probe_state
 
 
 def _saved_probe(preview, batch):
@@ -114,6 +135,7 @@ def _saved_probe(preview, batch):
 
     if (preview.get("request_fingerprint") != saved["request_fingerprint"]
             or preview.get("design") != saved.get("design")
+            or ("track" in saved and preview.get("track") != saved["track"])
             or roles(preview.get("results") or []) != roles(saved.get("arms") or [])):
         return CliResult(False, {}, f"queued spec does not match {batch.name}; choose a new spec name")
     return CliResult(True, saved)
@@ -146,38 +168,76 @@ def _legacy_batch(root, preview, receipt):
     return candidates[0] if candidates else None
 
 
-def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None):
+def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
+              multi_size=None, recover_only=False, strict_gate=False):
     """Run or continue a probe. A CLI exit of zero can still mean deferred work."""
-    preview = run_cli(root, "probe", spec, "--dry-run", timeout=120)
-    if not preview.ok:
-        return ProbeRun("deferred" if preview.code in _RETRYABLE else "failed", {}, preview.detail)
+    from research_app.experiments import probe_spec_identity
+    from research_app.runtime import CliError
+
+    if batch.exists():
+        try:
+            identity = probe_spec_identity(spec)
+        except CliError as exc:
+            return ProbeRun("failed", {}, exc.message)
+        saved_path = batch
+    else:
+        preview = run_cli(root, "probe", spec, "--dry-run", timeout=120)
+        if not preview.ok:
+            return ProbeRun("deferred" if preview.code in _RETRYABLE else "failed", {}, preview.detail)
+        identity = preview.data
+        saved_path = _legacy_batch(root, identity, receipt)
     wait = ("--max-wait-seconds", str(max_wait))
     budget = () if concurrency is None else ("--batch-size", str(concurrency))
-    saved_path = batch if batch.exists() else _legacy_batch(root, preview.data, receipt)
     if saved_path is not None:
-        saved = _saved_probe(preview.data, saved_path)
+        saved = _saved_probe(identity, saved_path)
         if not saved.ok:
             return ProbeRun("failed", {}, saved.detail)
-        state, action = _probe_state(saved.data)
-        if state == "failed":
+        state, action = probe_state(saved.data)
+        if state == "failed" and not (saved.data.get("execution") or {}).get("finished"):
             return ProbeRun(state, {}, f"saved batch has terminal failures ({saved_path.name})")
+        if recover_only and action == "resume":
+            rows = saved.data["rows"]
+            if all(row.get("submission_state") == "not_submitted" for row in rows):
+                return ProbeRun("deferred", {}, "awaiting authorization to launch queued arms")
+            action = "recover"
         # A completed batch can still need idempotent ledger reconciliation after a crash.
         arguments = ("--" + (action or "recover"), saved_path)
+    elif recover_only:
+        return ProbeRun("deferred", {}, "awaiting authorization to launch a new batch")
     else:
         arguments = (spec, "--batch-path", batch)
+        if multi_size is not None:
+            arguments += ("--multi-size", str(multi_size))
+        if strict_gate:
+            arguments += ("--strict-gate",)
     result = run_cli(root, "probe", *arguments, *wait, *budget, "--save", receipt,
                      timeout=max_wait + 900)
     if not result.ok:
         state = "deferred" if result.code in _RETRYABLE else "failed"
         return ProbeRun(state, result.data, result.detail)
-    state, action = _probe_state(result.data)
+    state, action = probe_state(result.data)
     detail = {"done": "all arms finished", "deferred": f"awaiting probe --{action}",
               "failed": "one or more arms failed or the receipt has no arm evidence"}[state]
     return ProbeRun(state, result.data, detail)
 
 
+def _recovery_priority(spec, paths):
+    batch, receipt = paths(spec)
+    if not batch.is_file():
+        return 1 if receipt.is_file() else 2
+    try:
+        document = json.loads(batch.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    rows = document.get("rows") if isinstance(document, dict) else None
+    if isinstance(rows, list) and rows and all(
+            isinstance(row, dict) and row.get("submission_state") == "not_submitted" for row in rows):
+        return 2
+    return 0
+
+
 def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
-              concurrency=None, consume=None):
+              concurrency=None, consume=None, execute=None, recover_first=False):
     """Lock one inbox and archive only terminal outcomes.
 
     A deferred job stays with its saved batch. In once mode, process at most
@@ -191,18 +251,23 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
         with cache_store.file_lock(inbox / ".runner.lock", timeout=0):
             while True:
                 specs = sorted(inbox.glob("*.json"))
+                if recover_first:
+                    specs.sort(key=lambda spec: _recovery_priority(spec, paths))
                 for spec in specs:
                     batch, receipt = paths(spec)
                     log({"kind": "start", "spec": spec.name})
                     try:
-                        result = run_probe(root, spec, batch, receipt, max_wait=max_wait,
-                                           concurrency=concurrency)
+                        source = spec.read_bytes()
+                        result = (execute or run_probe)(root, spec, batch, receipt,
+                                                        max_wait=max_wait, concurrency=concurrency)
                         if result.state != "deferred":
                             destination = inbox / result.state / spec.name
                             if destination.exists():
                                 raise ValueError(f"archive already exists: {destination}")
                             if consume is not None and result.data.get("rows"):
                                 consume(spec, result.data)
+                            if spec.read_bytes() != source:
+                                raise ValueError(f"spec changed during processing: {spec.name}")
                             shutil.move(spec, destination)
                     except Exception as error:
                         # Leave the spec and any saved POST intent for an exact retry.

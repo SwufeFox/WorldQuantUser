@@ -261,6 +261,21 @@ class ScopedCacheTests(unittest.TestCase):
         self.assertEqual(evidence["required_fields"]["verified_ids"], ["sample_matrix"])
         self.assertEqual(evidence["required_fields"]["unverified_ids"], ["sample_vector"])
 
+    def test_required_field_search_paces_adjacent_requests(self):
+        fields = {row["id"]: row for row in FIELDS}
+
+        def lookup(session, field, scope, *, deadline):
+            return {"matches": [fields[field]], "returned_count": 1, "reported_count": 1, "complete": True}
+
+        with mock.patch.object(capabilities.time, "monotonic", side_effect=(0, 0, 0.25)), \
+                mock.patch.object(capabilities.time, "sleep") as sleep, \
+                mock.patch.object(ml, "search_datafield", side_effect=lookup) as search:
+            result = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix", "sample_vector"})
+
+        sleep.assert_called_once_with(0.75)
+        self.assertEqual([item.kwargs["deadline"] for item in search.call_args_list], [8.0, 9.0])
+        self.assertEqual(result["evidence"]["state"], "verified")
+
     def test_explicit_complete_empty_capture_replaces_removed_field_snapshot(self):
         self.capture()
 
@@ -285,6 +300,23 @@ class ScopedCacheTests(unittest.TestCase):
 
 
 class PreflightEvidenceTests(unittest.TestCase):
+    def test_field_rate_limit_has_retryable_code_before_submission(self):
+        session = mock.Mock()
+
+        def operators(_session, **kwargs):
+            kwargs["report"]["complete"] = True
+            return [{"name": "rank"}]
+
+        with mock.patch.object(ml, "fetch_operators", side_effect=operators), \
+                mock.patch.object(ml, "search_datafield", side_effect=ml.RateLimited("test limit")), \
+                mock.patch.object(simulation_capabilities, "account_provenance",
+                                  return_value={"state": "unknown"}):
+            with self.assertRaises(CliError) as caught:
+                validation._preflight_lint(session, [("rank(sample_matrix)", 0)],
+                                           SETTINGS, SimpleNamespace())
+        self.assertEqual(caught.exception.code, "RATE_LIMITED")
+        session.post.assert_not_called()
+
     def test_catalog_failure_blocks_before_submission(self):
         session = mock.Mock()
         with mock.patch.object(ml, "fetch_operators", side_effect=RuntimeError("metadata unavailable")), \

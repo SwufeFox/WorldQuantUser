@@ -81,6 +81,14 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertFalse(first["preflight_complete"])
         self.assertFalse(self.batch.exists())
 
+    def test_saved_spec_identity_does_not_repeat_history_scan(self):
+        preview = self.run_probe(dry_run=True)
+        with mock.patch.object(app, "_novelty_gate", side_effect=AssertionError("history scan")):
+            identity = app.probe_spec_identity(self.spec)
+        self.assertEqual(identity["request_fingerprint"], preview["request_fingerprint"])
+        self.assertEqual(identity["design"], preview["design"])
+        self.assertEqual(identity["track"], preview["track"])
+
     def test_native_multi_preview_groups_compatible_settings_in_arm_order(self):
         with mock.patch.object(app, "cached_field_scope", return_value={"evidence": {"state": "unknown"}}), \
                 mock.patch.object(app, "_turnover_band", return_value={}), \
@@ -93,6 +101,32 @@ class ProbeWorkflowTests(unittest.TestCase):
         payloads = [row["payload"] for row in result["results"]]
         self.assertEqual([request["payload"] for request in result["multi_requests"]],
                          [[payloads[0], payloads[2]], payloads[1]])
+
+    def test_submit_cooldown_defers_fresh_arms_before_field_preflight(self):
+        retry_at = 4000000000.0
+        with mock.patch.object(app.simulation_slots, "submission_retry_at", return_value=retry_at), \
+                mock.patch.object(app, "_preflight_lint") as preflight, \
+                mock.patch.object(app.guarded_sim, "simulate") as launch, \
+                mock.patch.object(app.ml, "simulate_alphas") as recover:
+            result = self.run_probe(no_record=True)
+        self.assertEqual(result["execution"]["not_submitted"], 3)
+        self.assertEqual(result["execution"]["unknown_submission"], 0)
+        self.assertTrue(all(item["submission_retry_at"] == retry_at
+                            for item in result["scheduling"]))
+        preflight.assert_not_called()
+        launch.assert_not_called()
+        recover.assert_not_called()
+
+    def test_platform_classification_stays_in_saved_validation_evidence(self):
+        def simulate(expressions, settings, **kwargs):
+            return [{**finished(label), "classification_ids": ["POWER_POOL_ELIGIBLE"]}
+                    for label in kwargs["labels"]]
+
+        with mock.patch.object(app.guarded_sim, "simulate", side_effect=simulate):
+            result = self.run_probe(no_record=True)
+        self.assertNotIn("classification_ids", result["rows"][0])
+        saved = json.loads(self.batch.read_text(encoding="utf-8"))
+        self.assertEqual(saved["rows"][0]["classification_ids"], ["POWER_POOL_ELIGIBLE"])
 
     def test_failed_native_progress_write_keeps_published_records_and_rows(self):
         settings = ml.resolve_settings()

@@ -1,9 +1,10 @@
-"""Bounded research briefs and train/test view history."""
+"""Research campaigns, bounded briefs, and train/test view history."""
 
 from __future__ import annotations
 
+from collections import Counter, deque
 from datetime import date
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 import alpha_registry
 import cache_store
@@ -11,8 +12,163 @@ import correlation
 import json
 import research_paths
 
-from . import book_state, experiments, pnl_snapshot, stats
-from .runtime import CliError
+from . import book_state, experiments, pnl_snapshot, research_route, stats
+from .runtime import CliError, OutputConflict, protect_output
+
+
+def _campaign_spec(path, output_args=None):
+    try:
+        spec = json.loads(path.read_text(encoding="utf-8-sig"))
+        if getattr(output_args, "save", None) not in (None, "-") and isinstance(spec, dict):
+            arms = spec.get("arms")
+            sources = ([arm.get("source_file") for arm in arms if isinstance(arm, dict)]
+                       if isinstance(arms, list) else [])
+            sources.extend(spec["runs"] if isinstance(spec.get("runs"), list) else [])
+            sources.append(spec.get("reference"))
+            protect_output(output_args, path, *((path.parent / Path(item).expanduser()).resolve()
+                                               for item in sources if isinstance(item, str) and item))
+        return spec, research_route.normalize_route(spec)
+    except (OSError, ValueError) as exc:
+        raise CliError("INVALID_INPUT", f"cannot inspect {path.name}: {exc}") from exc
+
+
+def _spc_inputs(path, spec):
+    runs = spec.get("runs")
+    reference = spec.get("reference")
+    if (not isinstance(runs, list) or not runs
+            or not all(isinstance(item, str) and item.strip() for item in runs)):
+        raise CliError("INVALID_INPUT", "SPC campaigns need a nonempty runs list of captured output files")
+    if reference is not None and (not isinstance(reference, str) or not reference.strip()):
+        raise CliError("INVALID_INPUT", "SPC reference must be a file path")
+    sources = [(path.parent / Path(item).expanduser()).resolve() for item in runs]
+    if len(set(sources)) != len(sources):
+        raise CliError("INVALID_INPUT", "SPC runs must be distinct files")
+    reference = (path.parent / Path(reference).expanduser()).resolve() if reference else None
+    return sources, reference
+
+
+def _spc_report(path, route, runs, reference):
+    from tools.spc_experiment import experiment
+
+    report = experiment(path, runs, reference_path=reference)
+    return {"track": route["track"], "routes": [route], "simulated": 0,
+            "experiment": report}
+
+
+def cmd_campaign_preview(args, _sink):
+    """Inspect one campaign input without allocating a simulation."""
+    from tools._runner import research_root, run_cli
+
+    path = Path(args.spec).expanduser().resolve()
+    protect_output(args, path)
+    spec, route = _campaign_spec(path, args)
+    if route["track"] == "SPC":
+        if args.multi_size is not None:
+            raise CliError("USAGE", "--multi-size applies to BRAIN simulations")
+        runs, reference = _spc_inputs(path, spec)
+        return _spc_report(path, route, runs, reference)
+    multi = ("--multi-size", args.multi_size) if args.multi_size else ()
+    result = run_cli(research_root(args.research_dir), "probe", path, "--dry-run",
+                     "--strict-gate", *multi, timeout=120)
+    if not result.ok:
+        raise CliError(result.code or "SERVICE_ERROR", result.detail)
+    protect_output(args, result.data.get("path"))
+    return result.data
+
+
+def _execute_campaign(root, path, batch, receipt, *, max_wait, concurrency,
+                      multi_size=None, recover_only=False):
+    from tools._runner import ProbeRun, run_probe
+
+    try:
+        spec, route = _campaign_spec(path)
+        if route["track"] == "SPC":
+            if batch.exists():
+                return ProbeRun("failed", {}, "SPC spec collides with a saved BRAIN probe")
+            runs, reference = _spc_inputs(path, spec)
+            if receipt.resolve() in {path.resolve(), *runs, reference}:
+                raise CliError("INVALID_INPUT", "the SPC receipt would overwrite an input")
+            data = _spc_report(path, route, runs, reference)
+            valid = data["experiment"]["ok"]
+            cache_store.write_json_atomic(receipt, {"ok": valid, "command": "campaign", "data": data})
+            return ProbeRun("done" if valid else "failed", data, "SPC local comparison")
+    except CliError as exc:
+        return ProbeRun("failed", {}, exc.message)
+    return run_probe(root, path, batch, receipt, max_wait=max_wait, concurrency=concurrency,
+                     multi_size=multi_size, recover_only=recover_only, strict_gate=True)
+
+
+def _protect_campaign_output(args, root):
+    if not args.save or args.save == "-":
+        return
+    target = Path(args.save).expanduser().resolve()
+    if (target == root / "campaign-log.jsonl" or target.is_relative_to(root / "backlog")
+            or target.is_relative_to(root / "backlog-results")):
+        protect_output(args, target)
+    if args.subcommand == "run":
+        for path in (root / "backlog").glob("*.json"):
+            try:
+                _campaign_spec(path, args)
+            except OutputConflict:
+                raise
+            except CliError:
+                continue
+
+
+def cmd_campaign_status(args, _sink):
+    """Read queue progress from canonical saved probe and SPC receipts."""
+    from tools._runner import probe_state, research_root
+    from tools.campaign_runner import campaign_paths
+
+    root = research_root(args.research_dir)
+    _protect_campaign_output(args, root)
+    inbox = root / "backlog"
+    pending = sorted(inbox.glob("*.json"))
+    counts = {state: sum(1 for _ in (inbox / state).glob("*.json")) for state in ("done", "failed")}
+    jobs = []
+    for path in pending[:args.limit]:
+        batch, receipt = campaign_paths(root, path)
+        job = {"spec": str(path), "state": "queued"}
+        try:
+            _, route = _campaign_spec(path)
+            job["track"] = route["track"]
+            if batch.exists() and route["track"] != "SPC":
+                source, document = experiments._load_probe_batch(batch)
+                state, action = probe_state(document)
+                job.update(state=state, next_action=action, batch=str(source), execution=document["execution"])
+            elif receipt.exists() and route["track"] == "SPC":
+                job["receipt"] = str(receipt)
+        except CliError as exc:
+            job.update(state="invalid", error=exc.message)
+        jobs.append(job)
+    return {"inbox": str(inbox), "pending": len(pending), "archived": counts,
+            "displayed_by_state": dict(Counter(job["state"] for job in jobs)),
+            "jobs": jobs, "omitted": len(pending) - len(jobs)}
+
+
+def cmd_campaign_run(args, sink):
+    """Advance the existing durable research queue."""
+    from tools._runner import research_root
+    from tools.campaign_runner import run_campaign
+
+    root = research_root(args.research_dir)
+    _protect_campaign_output(args, root)
+    if args.recover_only and args.validate:
+        raise CliError("USAGE", "--recover-only cannot open a validation view")
+    events = deque(maxlen=20)
+
+    def observe(event):
+        events.append(event)
+        if sink:
+            sink("campaign", event)
+
+    execute = partial(_execute_campaign, multi_size=args.multi_size, recover_only=args.recover_only)
+    code = run_campaign(root, once=not args.watch, max_wait=args.max_wait_seconds,
+                        interval=args.interval, concurrency=args.concurrency, validate=args.validate,
+                        log_event=observe, execute=execute, recover_only=args.recover_only)
+    state = {0: "done_or_empty", 1: "failed", 3: "deferred"}[code]
+    return {"state": state, "recover_only": args.recover_only, "validation": args.validate,
+            "events": list(events)}
 
 
 

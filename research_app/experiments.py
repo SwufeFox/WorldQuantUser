@@ -11,6 +11,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import ablation
 import alpha_registry
@@ -26,7 +27,7 @@ import simulation_slots
 from tools import guarded_sim
 
 from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, protect_output, session_reader, with_session
-from . import costs, incentives, selection, stats
+from . import costs, incentives, research_route, selection, stats
 from .validation import _preflight_lint, attach_field_contracts, cached_field_scope, lint_python_source
 
 
@@ -1011,11 +1012,19 @@ def _load_probe_spec(path):
     if not isinstance(spec, dict):
         raise CliError("INVALID_INPUT", "spec must be a JSON object",
                        "see `research_cli.py schema probe`")
+    try:
+        route = research_route.normalize_route(spec)
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc)) from exc
+    if route["track"] == "SPC":
+        raise CliError("INVALID_INPUT", "SPC uses recorded model outputs",
+                       "use campaign preview or run with an SPC experiment spec")
+    spec["track"] = route["track"]
     arms = spec.get("arms")
     if not isinstance(arms, list) or not arms:
         raise CliError("INVALID_INPUT", "spec has no arms",
                        "each arm needs at least {\"expression\": ...}")
-    known = {"name", "idea", "mechanism", "note", "settings", "arms", "design"}
+    known = {"name", "idea", "mechanism", "note", "settings", "arms", "design", "track"}
     unknown = sorted(set(spec) - known)
     if unknown:
         # A typo here is silent otherwise: `"setting"` instead of `"settings"` would
@@ -1034,6 +1043,8 @@ def _load_probe_spec(path):
             raise CliError("INVALID_INPUT", "arm %d has no expression" % index,
                            "an arm is {\"label\": ..., \"expression\": ..., "
                            "\"settings\": {...} (optional)}")
+        if "track" in arm:
+            raise CliError("INVALID_INPUT", "declare the research track on the spec, not on individual arms")
         _selection_call(alpha_registry.evidence_role, arm)
         if "source_file" in arm:
             if "expression" in arm:
@@ -1173,7 +1184,7 @@ def _probe_comparisons(rows, design):
 
 
 def _probe_visible_row(row, show_test):
-    validation = {"sharpe", "fitness", "turnover", "test_sharpe", "failed_checks"}
+    validation = {"sharpe", "fitness", "turnover", "test_sharpe", "failed_checks", "classification_ids"}
     return {key: value for key, value in row.items() if show_test or key not in validation}
 
 def _turnover_band(expression):
@@ -1359,6 +1370,9 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
                    "checks": ml._extract_checks(payload), "error": None,
                    "submission_attempted": True, "mechanism": label,
                    "decay": (row.get("settings") or {}).get("decay")}
+            classifications = ml.alpha_classification_ids(payload)
+            if classifications is not None:
+                raw["classification_ids"] = classifications
             if train.get("fitness") is not None:
                 matched[label] = alpha_id
         except ml.AuthError:
@@ -1446,7 +1460,7 @@ def _load_probe_batch(value):
         record = {**record, "expression": arm["expression"], "settings": arm["settings"],
                   "decay": arm["settings"].get("decay"), "mechanism": arm["label"]}
         record["role"] = role
-        for key in ("alpha_id", "status", "submission_attempted", "error", "simulation_status",
+        for key in ("alpha_id", "status", "submission_attempted", "error", "simulation_status", "classification_ids",
                     *_CHECKPOINT_POLL_FIELDS, *_MULTI_CHECKPOINT_FIELDS):
             if key not in record and key in row:
                 record[key] = row[key]
@@ -1469,6 +1483,11 @@ def _load_probe_batch(value):
     document.setdefault("arm_order", [arm["label"] for arm in arms])
     document.setdefault("run_id", None)
     document.setdefault("started_at", None)
+    track = document.get("track")
+    if track is None and document.get("mechanism") == research_route.ATOM_RUNNER_MECHANISM:
+        track = "ATOM"
+    document["routes"] = _probe_routes(track, arms)
+    document["track"] = document["routes"][0]["track"]
     _probe_document_update(document, path)
     return path, document
 
@@ -1818,8 +1837,8 @@ def _recoverable_probe_reference(row):
     return True
 
 
-def _prepare_probe(args):
-    """Resolve one ordered request used by preview, preflight and execution."""
+def _probe_inputs(args):
+    """Materialize request settings, source, and controls without searching history."""
     spec = _load_probe_spec(_require_spec(args))
     name = getattr(args, "name", None) or spec.get("name") or Path(args.spec).stem
     groups = {}
@@ -1853,8 +1872,20 @@ def _prepare_probe(args):
         group["arms"].append(arm)
         group["pairs"].append((expression, decay))
     design = _probe_design({**spec, "arms": arms}, {})
+    return spec, name, groups, arms, design
+
+
+def _prepare_probe(args):
+    spec, name, groups, arms, design = _probe_inputs(args)
     gate = _novelty_gate(arms, registry_path=getattr(args, "registry", None))
     return spec, name, groups, arms, design, gate
+
+
+def probe_spec_identity(path):
+    """Bind a materialized file to its checkpoint without repeating discovery."""
+    spec, _, _, arms, design = _probe_inputs(SimpleNamespace(spec=str(path)))
+    return {"track": spec["track"], "design": design,
+            "request_fingerprint": _request_fingerprint(arms), "results": arms}
 
 
 def _request_fingerprint(arms):
@@ -1867,6 +1898,16 @@ def _request_fingerprint(arms):
                 "settings": arm["settings"]} for arm in arms]
     return hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
+def _probe_routes(track, arms):
+    """Describe resolved routes without changing their platform request identity."""
+    try:
+        routes = [research_route.normalize_route({"track": track}, settings=arm["settings"])
+                  for arm in arms]
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc)) from exc
+    return list({(row["language"], row["simulation_mode"]): row for row in routes}.values())
 
 
 def cmd_probe(args, sink):
@@ -1948,6 +1989,7 @@ def _cmd_probe(args, _sink):
     protect_output(args, target, *source_paths)
     context = {key: spec[key] for key in ("idea", "mechanism", "note") if key in spec}
     base = {"name": name, **context, "path": str(target), "arms": len(arms),
+            "track": spec["track"], "routes": _probe_routes(spec["track"], arms),
             "groups": len(groups), "design": design, "arm_order": [arm["label"] for arm in arms],
             "request_fingerprint": _request_fingerprint(arms),
             "concurrency": _requested_concurrency(args),
@@ -2039,6 +2081,8 @@ def _probe_row(record, arm, gate, show_test):
            "train_sharpe_h2": (record.get("half_sharpes") or (None, None))[1],
            "ops": arm["ops"], "gate": gate}
     row["incentives"] = incentives.check_summary(record.get("checks"))
+    if "classification_ids" in record:
+        row["classification_ids"] = record["classification_ids"]
     for key in (*_CHECKPOINT_POLL_FIELDS, *_MULTI_CHECKPOINT_FIELDS, "submission_attempted"):
         if key in record:
             row[key] = record[key]
@@ -2092,7 +2136,7 @@ def _probe_document_update(document, target):
 
 
 def _probe_response(document, path, show_test=False, manifest=None, summary=False):
-    keys = ("name", "idea", "mechanism", "note", "run_id", "started_at", "request_fingerprint",
+    keys = ("name", "idea", "mechanism", "note", "track", "routes", "run_id", "started_at", "request_fingerprint",
             "arm_order", "design", "complete", "incomplete", "all_empty", "comparisons",
             "execution", "recording", "recording_policy", "next_actions", "preflight",
             "concurrency", "scheduling", "capability_snapshot", "multi_size")
@@ -2229,8 +2273,7 @@ def _execute_probe(args, document, target, groups):
                 group["settings"], session=session, preflight=preflight,
                 force=getattr(args, "allow_lint_errors", False), **options)
         else:
-            if multi:
-                options["recover_only"] = True
+            options["recover_only"] = True
             produced = ml.simulate_alphas(session, group["pairs"], settings=group["settings"], **options)
         with state_lock:
             _save_probe_records(document, target, zip(indices, produced))
@@ -2239,6 +2282,7 @@ def _execute_probe(args, document, target, groups):
     def work(session):
         _validate_saved_native_owner(session, document)
         document["capability_snapshot"] = _invocation_capabilities(session, args, deadline=deadline)
+        account = simulation_capabilities.account_provenance(session)
         document.setdefault("preflight", [])
         save()
         def launches(group):
@@ -2253,6 +2297,15 @@ def _execute_probe(args, document, target, groups):
                 break
             preflight = None
             if launching:
+                retry_at = simulation_slots.submission_retry_at(account)
+                if retry_at is not None:
+                    document.setdefault("scheduling", []).append({
+                        "state": "deferred", "reason": "submission_cooldown",
+                        "submission_retry_at": retry_at})
+                    if any(_probe_needs_recovery(document["rows"][arm["arm_index"]])
+                           for arm in group["arms"]):
+                        run_group(session, group)
+                    continue
                 preflight = _preflight_lint(session, group["pairs"], group["settings"], args,
                                             deadline=deadline, proof_cache=proof_cache)
                 document["preflight"].append(preflight)
@@ -2295,6 +2348,7 @@ def _execute_probe(args, document, target, groups):
 def _run_probe(args, spec, name, groups, design, gate, target):
     arms = sorted([arm for group in groups.values() for arm in group["arms"]], key=lambda arm: arm["arm_index"])
     document = {"format": "probe-batch", "version": 2, "spec": str(args.spec), "name": name,
+        "track": spec["track"], "routes": _probe_routes(spec["track"], arms),
         **{key: spec[key] for key in ("idea", "mechanism", "note") if key in spec},
         **_multi_options(args),
         "run_id": str(uuid.uuid4()), "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),

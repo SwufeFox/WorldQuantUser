@@ -291,6 +291,15 @@ def _preflight_lint(session, pairs, settings, args, capability_snapshot=None, *,
     report["allow_lint_errors"] = bool(getattr(args, "allow_lint_errors", False))
     if report["ok"] or (not python and report["allow_lint_errors"] and not settings_report["unsupported"]):
         return report
+    if all(finding["code"] in {"catalog_unverified", "python_language_unverified"}
+           for finding in report["errors"]):
+        catalog_errors = {row.get("error") for row in (fields["evidence"].get("catalogs") or [])
+                          if isinstance(row, dict) and isinstance(row.get("error"), str)}
+        for code in ("RATE_LIMITED", "SERVICE_ERROR"):
+            if code in catalog_errors:
+                raise CliError(code, "nothing was submitted because required field evidence could not be refreshed",
+                               "retry the existing checkpoint after the catalog recovers",
+                               details=report)
     hint = ("verify account language availability and declare data fields in a literal list" if python else
             "refresh required catalogs and fix expression or advertised setting errors; --allow-lint-errors overrides lint only")
     raise CliError("INVALID_INPUT", "simulation preflight failed; nothing was submitted",

@@ -1519,6 +1519,8 @@ def _submit_simulation_request(s, simulation_data, max_retries, on_event, deadli
             if on_event:
                 on_event("quota", quota)
             raise RateLimited("daily simulation quota exhausted; resume after the reported reset")
+        if simulation_slots.submission_retry_at(account) is not None:
+            raise RateLimited("simulation submission deferred by shared Retry-After cooldown")
         native = isinstance(simulation_data, list)
         redirect_limits = {"allow_redirects": False} if native else {}
         response = s.post(
@@ -1532,9 +1534,12 @@ def _submit_simulation_request(s, simulation_data, max_retries, on_event, deadli
         if response.status_code == 429 and observation is not None and observation["remaining"] == 0:
             raise RateLimited("daily simulation quota exhausted; resume after the reported reset")
         if response.status_code == 429:
-            wait = _retry_after_seconds(response, cap_error_wait=False) or min(
-                60.0, 5.0 * attempt
-            )
+            wait = _retry_after_seconds(response, cap_error_wait=False)
+            if not math.isfinite(wait) or wait <= 0:
+                wait = min(60.0, 5.0 * attempt)
+            retry_at = simulation_slots.defer_submission(account, wait, deadline=deadline)
+            if retry_at is not None:
+                wait = max(wait, retry_at - time.time())
             if on_event:
                 request = ({"child_count": len(simulation_data)} if isinstance(simulation_data, list)
                            else {"expression": simulation_data.get("regular")})
@@ -1591,6 +1596,17 @@ def is_quick_simulation(alpha):
     return isinstance(mode, str) and mode.strip().upper() == "QUICK"
 
 
+def alpha_classification_ids(alpha):
+    """Return native classification IDs, preserving missing versus empty evidence."""
+    classifications = alpha.get("classifications")
+    if not isinstance(classifications, list):
+        return None
+    identifiers = [item.get("id") if isinstance(item, dict) else item for item in classifications]
+    if not all(isinstance(identifier, str) and identifier for identifier in identifiers):
+        return None
+    return list(dict.fromkeys(identifiers))
+
+
 def defer_alpha_metrics(record, payload):
     """Keep a simulation resumable when the metrics response asks us to wait."""
     if not payload.get("_deferred"):
@@ -1610,10 +1626,14 @@ def normalize_setting_keys(overrides=None):
     This must run before merging files, arms or CLI flags: spelling must not
     decide which layer wins. Unknown platform extensions remain untouched.
     """
-    canonical_keys = {key.replace("_", "").casefold(): key for key in DEFAULT_SETTINGS}
+    canonical_keys = {key.replace("_", "").casefold(): key for key in (*DEFAULT_SETTINGS, "simulationMode")}
     settings, origins = {}, {}
     for key, value in (overrides or {}).items():
         canonical = canonical_keys.get(str(key).replace("_", "").casefold(), key)
+        if canonical == "simulationMode" and isinstance(value, str):
+            mode = value.strip().upper()
+            if mode in {"QUICK", "FULL"}:
+                value = mode
         if canonical in settings:
             previous = settings[canonical]
             if value is None and previous is not None:
@@ -1995,6 +2015,7 @@ def simulate_alphas(
         state = simulation_slots.snapshot(plan["account"], plan["effective"])
         if scheduling_report is not None:
             scheduling_report["shared_slots"] = state
+            scheduling_report["submission_retry_at"] = simulation_slots.submission_retry_at(plan["account"])
         return state
 
     if max_wait_seconds is not None:
@@ -2086,6 +2107,9 @@ def simulate_alphas(
             record["error"] = record.pop("simulation_error", None)
             record["metrics"] = payload.get("is")
             record["checks"] = _extract_checks(payload)
+            classifications = alpha_classification_ids(payload)
+            if classifications is not None:
+                record["classification_ids"] = classifications
             split = extract_split(payload)
             if split:
                 record["out_of_sample"] = split
@@ -2286,6 +2310,12 @@ def simulate_alphas(
             for index in group:
                 record = records[index]
                 record["error"] = "daily simulation quota exhausted; resume after the reported reset"
+                emit("deferred", index, record)
+            return "blocked", ()
+        if simulation_slots.submission_retry_at(plan["account"]) is not None:
+            for index in group:
+                record = records[index]
+                record["error"] = "simulation submission deferred by shared Retry-After cooldown"
                 emit("deferred", index, record)
             return "blocked", ()
         allowed = tuple(index for index in group if records[index].get("status") != "FAILED"

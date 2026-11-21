@@ -579,6 +579,44 @@ def _quota_number(value, integer=False):
     return number if number >= 0 and (integer or math.isfinite(number)) else None
 
 
+def submission_retry_at(account):
+    """Return an active shared simulation POST cooldown, as a wall-clock timestamp."""
+    fingerprint = _fingerprint(account)
+    if not fingerprint:
+        return None
+    path, _ = _paths(fingerprint)
+    # The journal is replaced atomically. Do not block this read on preparation.
+    retry_at = _quota_number(_load(path, fingerprint).get("submit_not_before"))
+    return retry_at if retry_at is not None and retry_at > time.time() else None
+
+
+def defer_submission(account, wait_seconds, *, deadline=None):
+    """Share a transient POST refusal's retry time without affecting accepted jobs."""
+    delay = _quota_number(wait_seconds)
+    if not delay:
+        return None
+    retry_at = time.time() + delay
+    if not math.isfinite(retry_at):
+        return None
+    fingerprint = _fingerprint(account)
+    if fingerprint:
+        path, lock = _paths(fingerprint)
+        lock_options = ({} if deadline is None or not math.isfinite(deadline)
+                        else {"timeout": max(0, deadline - time.monotonic())})
+        try:
+            with cache_store.file_lock(lock, **lock_options):
+                journal = _load(path, fingerprint)
+                previous = _quota_number(journal.get("submit_not_before")) or 0
+                if previous >= retry_at:
+                    return previous
+                journal["submit_not_before"] = retry_at
+                cache_store.write_json_atomic(path, journal)
+        except (OSError, cache_store.CacheError):
+            # The caller still honors the observed delay if it cannot be shared.
+            pass
+    return retry_at
+
+
 def observe_quota(account, headers):
     """Retain only documented simulation-quota headers, never unrelated headers."""
     if not isinstance(headers, Mapping):

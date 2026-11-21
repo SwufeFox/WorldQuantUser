@@ -44,6 +44,9 @@ class Clock:
     def monotonic(self):
         return self.now
 
+    def time(self):
+        return 100 + self.now
+
     def sleep(self, seconds):
         if seconds < 0:
             raise AssertionError(f"negative sleep: {seconds}")
@@ -60,6 +63,7 @@ class QuickRunnerTests(TestCase):
             mock.patch.dict("os.environ", {"BRAIN_RESEARCH_DIR": directory.name}),
             mock.patch.object(simulation_capabilities, "account_provenance", return_value=ACCOUNT),
             mock.patch.object(batch_quick.time, "monotonic", self.clock.monotonic),
+            mock.patch.object(batch_quick.time, "time", self.clock.time),
             mock.patch.object(batch_quick.time, "sleep", self.clock.sleep),
         ):
             patcher.start()
@@ -129,6 +133,7 @@ class QuickRunnerTests(TestCase):
         self.assertEqual(pending["progress_url"], PROGRESS_URL)
         self.assertEqual(simulation_slots.snapshot(ACCOUNT, 1)["active"], 1)
 
+        simulation_slots.defer_submission(ACCOUNT, 60)
         resumed_session = mock.Mock()
         resumed_session.get.side_effect = self.complete
         with mock.patch.object(machine_lib, "load_session", return_value=resumed_session):
@@ -139,6 +144,27 @@ class QuickRunnerTests(TestCase):
         self.assertEqual(result["fitness"], 1.5)
         resumed_session.post.assert_not_called()
         self.assertEqual(simulation_slots.snapshot(ACCOUNT, 1)["active"], 0)
+
+    def test_separate_quick_runner_defers_new_post_until_shared_retry_time(self):
+        session = mock.Mock()
+        session.post.return_value = response(429, **{"Retry-After": "5"})
+        with mock.patch.object(machine_lib, "load_session", return_value=session):
+            queued = self.runner(timeout=1).run(ARM)
+        session.post.assert_called_once()
+        self.assertEqual(queued["status"], "QUEUED")
+        self.assertEqual(simulation_slots.submission_retry_at(ACCOUNT), 105)
+
+        other = {**ARM, "label": "other", "expr": "rank(volume)"}
+        resumed = mock.Mock()
+        resumed.post.return_value = response(201, Location="/simulations/op-test")
+        resumed.get.side_effect = self.complete
+        with mock.patch.object(machine_lib, "load_session", return_value=resumed):
+            deferred = self.runner(timeout=1).run(other)
+            self.assertEqual(deferred["next_retry_at"], 105)
+            resumed.post.assert_not_called()
+            self.clock.sleep(5)
+            self.assertEqual(self.runner().run(other)["alpha_id"], ALPHA_ID)
+        resumed.post.assert_called_once()
 
     def test_daily_exhaustion_defers_posts_but_allows_recovery_from_shared_journal(self):
         first_session = mock.Mock()
@@ -202,6 +228,7 @@ class QuickRunnerTests(TestCase):
         self.assertEqual(pending["alpha_id"], ALPHA_ID)
         self.assertEqual(simulation_slots.snapshot(ACCOUNT, 1)["active"], 0)
 
+        self.clock.sleep(60)
         resumed = mock.Mock()
         resumed.get.return_value = self.complete(ALPHA_URL)
         with mock.patch.object(machine_lib, "load_session", return_value=resumed):

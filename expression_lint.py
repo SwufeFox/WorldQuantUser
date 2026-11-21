@@ -49,15 +49,8 @@ __all__ = [
 
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
-# Variable names the simulator refuses to let an expression assign to. The
-# catalog documents none of these; the entry below came from a live rejection
-# ("Variable eps is reserved and cannot be assigned"), which cost one full
-# simulation round because the offline lint had no way to know.
-#: Names the simulator refuses as variables, learned from its own errors. The catalogue
-#: documents none of them, and each one costs a submission to discover, so they accumulate
-#: here: `eps` from a four-expression batch, `sales` from a value-lens batch,
-#: and `tail` from the persistent-left-tail probe.
-_RESERVED_IDENTIFIERS = frozenset({"eps", "sales", "tail"})
+# These names were rejected as assignment targets by live simulations.
+_RESERVED_IDENTIFIERS = frozenset({"assets", "eps", "sales", "tail"})
 
 _ASSIGNMENT_TARGET = re.compile(
     r"(?:^|;)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)"

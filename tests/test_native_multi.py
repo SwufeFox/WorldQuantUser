@@ -106,12 +106,16 @@ def test_native_matches_child_echo_that_omits_request_only_settings(simulator):
     assert not [row for row in records if row.get("error")]
 
 
-def test_native_ambiguous_echo_does_not_attribute_an_alpha(simulator):
+@pytest.mark.parametrize("status", ["COMPLETE", "ERROR"])
+def test_native_ambiguous_echo_does_not_attribute_an_alpha(simulator, status):
     replies = {
-        "NativeParent": {"id": "NativeParent", "status": "COMPLETE", "children": ["Child1", "Child2"]},
-        "Child1": child(1),
-        "Child2": child(2, expression=EXPRESSIONS[0]),
+        "NativeParent": {"id": "NativeParent", "status": status, "children": ["Child1", "Child2"]},
+        "Child1": child(1, status=status),
+        "Child2": child(2, status=status, expression=EXPRESSIONS[0]),
     }
+    if status == "ERROR":
+        for child_id in ("Child1", "Child2"):
+            replies[child_id].pop("alpha")
     with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
             mock.patch.object(ml, "read_simulation_snapshot",
                               side_effect=lambda s, identity, **kw: (replies[identity], None)), \
@@ -120,6 +124,97 @@ def test_native_ambiguous_echo_does_not_attribute_an_alpha(simulator):
     assert all(row["status"] == "PENDING" and not row["alpha_id"] for row in records)
     assert "ambiguous" in records[0]["error"]
     metrics.assert_not_called()
+
+
+def anonymous_failure(child_id, message="resource limit"):
+    return {"id": child_id, "parent": "NativeParent", "status": "ERROR", "message": message}
+
+
+def test_native_complete_anonymous_failures_finish_without_allocating_child_ids(simulator):
+    parent = {"status": "ERROR", "children": ["Child2", "Child1"]}
+    with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL) as post, \
+            mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
+                (parent, None), (anonymous_failure("Child2", "second error"), None),
+                (anonymous_failure("Child1", "first error"), None),
+            ]):
+        records = simulator(fetch_metrics=False)
+    post.assert_called_once()
+    assert [row["status"] for row in records] == ["ERROR", "ERROR"]
+    assert all(row.get("multi_child_id") is None and row.get("alpha_id") is None for row in records)
+    assert len({row["error"] for row in records}) == 1
+    assert all("all remaining multi-simulation children" in row["error"] for row in records)
+    assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0
+
+    with mock.patch.object(ml, "submit_multi_simulation") as post, \
+            mock.patch.object(ml, "read_simulation_snapshot") as read:
+        resumed = simulator(initial_records=records, fetch_metrics=False, recover_only=True)
+    post.assert_not_called()
+    read.assert_not_called()
+    assert [row["status"] for row in resumed] == ["ERROR", "ERROR"]
+
+
+@pytest.mark.parametrize("second_read", [
+    ml.NotFound("simulation not found"),
+    (anonymous_failure("Child2"), 120),
+    ({"status": "COMPLETE"}, None),
+    ({**anonymous_failure("Child2"), "alpha": "AnAlpha"}, None),
+    (anonymous_failure("UnexpectedChild"), None),
+], ids=["missing", "retry", "success-without-echo", "has-alpha", "wrong-identity"])
+def test_native_anonymous_failure_keeps_unproven_siblings_recoverable(simulator, second_read):
+    parent = {"status": "ERROR", "children": ["Child1", "Child2"]}
+    with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+            mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
+                (parent, None), (anonymous_failure("Child1"), None), second_read,
+            ]):
+        records = simulator(fetch_metrics=False)
+    assert [row["status"] for row in records] == ["PENDING", "PENDING"]
+    assert all(row.get("multi_child_id") is None and row.get("alpha_id") is None for row in records)
+
+
+def test_native_partial_child_lists_do_not_prove_complete_anonymous_failure(simulator):
+    first_parent = {"status": "ERROR", "children": ["Child1"]}
+    with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+            mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
+                (first_parent, None), (anonymous_failure("Child1"), None),
+            ]):
+        records = simulator(fetch_metrics=False)
+    assert [row["status"] for row in records] == ["PENDING", "PENDING"]
+
+    second_parent = {"status": "ERROR", "children": ["Child2"]}
+    with mock.patch.object(ml, "submit_multi_simulation") as post, \
+            mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
+                (second_parent, None), (anonymous_failure("Child1"), None),
+                (anonymous_failure("Child2"), None),
+            ]):
+        records = simulator(initial_records=records, fetch_metrics=False, recover_only=True)
+    post.assert_not_called()
+    assert records[0]["multi_children"] == ["Child1", "Child2"]
+    assert [row["status"] for row in records] == ["PENDING", "PENDING"]
+
+
+@pytest.mark.parametrize("has_resolved_identity", [True, False])
+def test_native_anonymous_failure_requires_an_identity_for_each_resolved_child(simulator, has_resolved_identity):
+    partial = {"status": "ERROR", "children": ["Child1"]}
+    with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+            mock.patch.object(ml, "read_simulation_snapshot",
+                              side_effect=[(partial, None), (child(1), None)]):
+        first = simulator(fetch_metrics=False)
+    assert [row["alpha_id"] for row in first] == ["Alpha1", None]
+    assert first[1]["status"] == "PENDING"
+
+    complete = {"status": "ERROR", "children": ["Child2", "Child1"]}
+    reads = [(complete, None)]
+    if not has_resolved_identity:
+        first[0].pop("multi_child_id")
+        reads.append((anonymous_failure("Child1"), None))
+    reads.append((anonymous_failure("Child2"), None))
+    with mock.patch.object(ml, "submit_multi_simulation") as post, \
+            mock.patch.object(ml, "read_simulation_snapshot", side_effect=reads):
+        resumed = simulator(initial_records=first, fetch_metrics=False, recover_only=True)
+    post.assert_not_called()
+    assert resumed[0]["alpha_id"] == "Alpha1"
+    assert resumed[1]["status"] == ("ERROR" if has_resolved_identity else "PENDING")
+    assert resumed[1].get("multi_child_id") is None
 
 
 def test_native_resume_restores_parent_location_before_releasing_reservation(simulator):
@@ -137,6 +232,7 @@ def test_native_resume_restores_parent_location_before_releasing_reservation(sim
     post.assert_called_once()
     assert not any(row.get("multi_parent_url") for row in durable)
     assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 1
+    simulation_slots.defer_submission(ACCOUNT, 60)
     events = []
 
     def observe(event, payload):
@@ -252,3 +348,26 @@ def test_native_retry_after_and_redirect_avoid_array_replay():
             with pytest.raises(ml.SimulationError):
                 ml.submit_multi_simulation(session, array)
             session.post.assert_called_once()
+
+
+def test_native_transient_429_defers_new_requests_from_another_invocation(simulator, monkeypatch):
+    monkeypatch.setattr(simulation_slots.time, "time", lambda: 100)
+    session = mock.Mock()
+    session._brain_permissions = ["MULTI_SIMULATION"]
+    throttled = requests.Response()
+    throttled.status_code = 429
+    throttled.headers["Retry-After"] = "120"
+    session.post.return_value = throttled
+    payloads = [ml._single_simulation_data(expression, 6, ml.DEFAULT_SETTINGS) for expression in EXPRESSIONS[:2]]
+
+    with pytest.raises(ml.RateLimited, match="after 1 attempts"):
+        ml.submit_multi_simulation(session, payloads, max_retries=1)
+
+    assert simulation_slots.submission_retry_at(ACCOUNT) == 220
+    scheduling = {}
+    with mock.patch.object(ml, "submit_multi_simulation") as post:
+        rows = simulator(scheduling_report=scheduling)
+    post.assert_not_called()
+    assert all(row["status"] == "QUEUED" and not row.get("submission_attempted") for row in rows)
+    assert scheduling["submission_retry_at"] == 220
+    assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0

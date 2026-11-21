@@ -14,6 +14,7 @@ import simulation_capabilities
 DISCLOSURE_DATASETS = frozenset({"fundamental2", "fundamental6", "analyst4"})
 _REQUIRED_FIELDS_WAIT_SECONDS = 30.0
 _FIELD_SEARCH_WAIT_SECONDS = 8.0
+_FIELD_SEARCH_INTERVAL_SECONDS = 1.0
 
 
 def scope_settings(settings):
@@ -121,6 +122,8 @@ def required_field_scope(session, settings, required_fields, *, deadline=None, p
         field_deadline = min(field_deadline, deadline)
     fingerprint = account.get("fingerprint")
     cache_scope = ("field", fingerprint, tuple(scope.items())) if fingerprint and proof_cache is not None else None
+    pace_key = ("field_search_next", fingerprint)
+    next_search_at = proof_cache.get(pace_key, 0.0) if proof_cache is not None else 0.0
     for field in sorted(required):
         cache_key = (*cache_scope, field) if cache_scope is not None else None
         previous = proof_cache.get(cache_key) if cache_key is not None else None
@@ -131,13 +134,20 @@ def required_field_scope(session, settings, required_fields, *, deadline=None, p
             timestamps.append(stamp)
             continue
         now = time.monotonic()
-        if now >= field_deadline:
+        search_at = max(now, next_search_at)
+        if search_at >= field_deadline:
             continue
+        # The scoped data-fields endpoint admits one request per second.
+        if search_at > now:
+            time.sleep(search_at - now)
+        next_search_at = search_at + _FIELD_SEARCH_INTERVAL_SECONDS
+        if proof_cache is not None:
+            proof_cache[pace_key] = next_search_at
         search = {"kind": "datafield_search", "field": field, "state": "unknown"}
         catalogs.append(search)
         try:
             result = ml.search_datafield(session, field, scope,
-                                         deadline=min(field_deadline, now + _FIELD_SEARCH_WAIT_SECONDS))
+                                         deadline=min(field_deadline, search_at + _FIELD_SEARCH_WAIT_SECONDS))
         except ml.AuthError:
             raise
         except ml.RateLimited as exc:

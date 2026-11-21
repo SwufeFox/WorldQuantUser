@@ -12,9 +12,10 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import cache_store
+from research_app.research_route import ATOM_RUNNER_MECHANISM
 from tools._runner import research_root, run_cli
 
-MECHANISM = "ATOM / Power Pool scan"
+MECHANISM = ATOM_RUNNER_MECHANISM
 IS_METRICS = ("sharpe", "fitness", "turnover", "returns", "margin", "drawdown")
 
 
@@ -33,7 +34,7 @@ def _probe_spec(source):
         # Some historical scans reuse labels. Probe identities must be unique.
         arms.append({"label": f"{index + 1}: {label}", "expression": arm["expr"],
                      "settings": settings})
-    return {"name": f"atom-{source.stem}", "mechanism": MECHANISM,
+    return {"name": f"atom-{source.stem}", "track": "ATOM", "mechanism": MECHANISM,
             "design": "explore", "arms": arms}
 
 
@@ -62,6 +63,7 @@ def _result_row(batch, index, arm, record):
         "status": record.get("status"),
         **{key: metrics.get(key) for key in IS_METRICS},
         "checks": record.get("checks") or {},
+        **({"classification_ids": record["classification_ids"]} if "classification_ids" in record else {}),
         "expr": arm["expression"],
         "error": record.get("error"),
         "power_pool_sharpe": isinstance(sharpe, (int, float)) and sharpe >= 1.0,

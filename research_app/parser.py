@@ -1064,6 +1064,36 @@ def build_parser():
 
     probe.bind_handler("experiments.cmd_probe")
 
+    campaign = sub.add_parser("campaign", help="Preview, inspect and advance the durable research queue.")
+    campaign_sub = campaign.add_subparsers(dest="subcommand", metavar="<action>",
+                                           parser_class=JsonArgumentParser)
+    campaign_preview = campaign_sub.add_parser(
+        "preview", help="Inspect BRAIN arms or compare recorded SPC outputs without starting simulations.")
+    campaign_preview.add_argument("spec", metavar="SPEC")
+    _add_multi_size_arg(campaign_preview)
+    campaign_preview.bind_handler("campaign.cmd_campaign_preview")
+
+    campaign_status = campaign_sub.add_parser("status", help="Read queued specs and their saved progress offline.")
+    campaign_status.add_argument("--limit", type=_non_negative_integer, default=20,
+                                 help="Maximum pending jobs to display.")
+    campaign_status.bind_handler("campaign.cmd_campaign_status")
+
+    campaign_run = campaign_sub.add_parser(
+        "run", help="Advance one queued experiment or keep watching the same inbox.")
+    campaign_run.add_argument("--watch", action="store_true", help="Keep consuming the research inbox.")
+    campaign_run.add_argument("--interval", type=_positive_seconds, default=30,
+                              help="Seconds between passes in watch mode.")
+    campaign_run.add_argument("--max-wait-seconds", type=_positive_seconds, default=600,
+                              help="Maximum wait budget for each Probe invocation.")
+    campaign_run.add_argument("--recover-only", action="store_true",
+                              help="Recover existing simulation tasks without posting unstarted arms.")
+    campaign_run.add_argument("--validate", action="store_true",
+                              help="Validate eligible Regular FULL candidates after freezing training evidence.")
+    campaign_run.add_argument("--stream", action="store_true", help="Emit campaign events on stderr.")
+    _add_concurrency_args(campaign_run)
+    _add_multi_size_arg(campaign_run)
+    campaign_run.bind_handler("campaign.cmd_campaign_run")
+
     views = sub.add_parser(
         "views",
         help="Who looked at test-period numbers, when, and for which alphas.",
@@ -1649,6 +1679,8 @@ _COMMAND_EXAMPLES = {
               "probe batch.spec.json --batch-path BATCH.json --save response.json",
               "probe --recover BATCH.json --max-wait-seconds 60",
               "probe --resume BATCH.json --dry-run", "probe --from-simulation SIMULATION_ID"],
+    "campaign": ["campaign status", "campaign preview batch.spec.json",
+                 "campaign run --recover-only", "campaign run --watch --multi-size 4"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],
     "alpha get": ["alpha get ALPHA_ID", "alpha get ALPHA_ID --performance",
@@ -1773,10 +1805,13 @@ def cmd_help(parser, args, _sink):
 
 def cmd_schema(parser, args, _sink):
     """Emit the full machine-readable call contract or one command's schema."""
+    from .research_route import SPEC_CONTRACT
+
     if args.name:
         selected = _find_command_parser(parser, args.name)
         return {"tool": "research_cli.py", "version": VERSION,
                 "exit_codes": EXIT_CODES, "error_codes": ERROR_CODES,
+                **({"campaign_spec": SPEC_CONTRACT} if args.name[0] in {"campaign", "probe"} else {}),
                 "command": describe_parser(selected, " ".join(selected.prog.split()[1:]))}
     described = describe_parser(parser)
     contract = {
@@ -1792,6 +1827,7 @@ def cmd_schema(parser, args, _sink):
         "exit_codes": EXIT_CODES,
         "error_codes": ERROR_CODES,
         "research_file": config_io.RESEARCH_FILE_SPEC,
+        "campaign_spec": SPEC_CONTRACT,
         "settings_defaults": ml.DEFAULT_SETTINGS,
         "settings_hints": {
             "region": ml.REGIONS,

@@ -163,12 +163,19 @@ class SimulationQuotaTests(unittest.TestCase):
         session = mock.Mock()
         session.post.side_effect = [response(429, {**quota_headers(5), "Retry-After": "2"}),
                                     response(headers=quota_headers(4))]
-        with mock.patch.object(ml, "sleep") as wait:
+        now = 100
+
+        def advance_clock(seconds):
+            nonlocal now
+            now += seconds
+
+        with mock.patch.object(simulation_slots.time, "time", side_effect=lambda: now), \
+                mock.patch.object(ml, "sleep", side_effect=advance_clock) as wait:
             progress = ml.submit_single_simulation(session, {"regular": "rank(cap)"})
+            self.assertEqual(simulation_slots.quota_snapshot(ACCOUNT)["remaining"], 4)
         wait.assert_called_once_with(2)
         self.assertEqual(session.post.call_count, 2)
         self.assertEqual(progress, "https://api.worldquantbrain.com/simulations/fixture")
-        self.assertEqual(simulation_slots.quota_snapshot(ACCOUNT)["remaining"], 4)
 
     def test_throttle_beyond_wait_budget_does_not_skip_into_later_waves(self):
         session = mock.Mock()

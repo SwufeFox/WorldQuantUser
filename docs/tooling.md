@@ -1181,12 +1181,37 @@ python3 research_cli.py ledger sync --pnl
 * 仓库（`/data/src/magix/WorldQuantUser`）放**工具**：任何能把函数跑两次的东西。
 * 研究目录（`/data/worldquant-research`）放**结果**：台账、缓存、一次性脚本、报告。一次性脚本不进 git。
 
-## 后台研究工具
+## 长程研究队列
+
+把待研究的规格放入研究目录的 `backlog/`。先预览输入，再推进队列。已受理的任务、已确认未开始的臂、结果不明的请求都由 Probe 检查点记录。
+
+```bash
+python research_cli.py campaign preview SPEC.json --multi-size 4
+python research_cli.py campaign status
+python research_cli.py campaign run --recover-only
+python research_cli.py campaign run --watch --batch-size 4 --multi-size 4 --stream
+```
+
+| 规格 | 研究证据 |
+| --- | --- |
+| `track: REGULAR`，也可省略 | Probe 保存请求与训练对照。符合训练门的 FULL 候选冻结选择。 |
+| `track: POWER_POOL` 或 `track: ATOM` | 共用 Probe 请求、回测和训练证据。平台分类与资格以实时检查为准。 |
+| `settings.language: PYTHON` | 可与上述模拟研究路线组合。用 `lookback`、内联源码或相对规格的 `source_file`。预检只解析源码。 |
+| `track: SPC` | 用 SPC 规格加 `runs` 文件列表和可选 `reference`。文件路径相对规格，比较已有输出，保留哈希与逐次对照。 |
+
+研究路线记录在回执和批次中。原生请求类型、语言和 QUICK/FULL 设置仍按各自的平台协议处理。
+平台原始分类随结果保存，可用 `alpha get` 或冻结后的验证视图核对。
+
+`run` 默认推进一份规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
+
+先用 `--recover-only` 回收已有检查点。需要验证 FULL Regular 候选时启用 `--validate`，或对保存的训练冻结选择单独运行 `promote --selection`。已冻结的选择和终态验证回执可以复用。QUICK、Power Pool 与 ATOM 保留各自研究证据，SPC 结果在本地完成。Alpha 和 SPC 的平台提交仍走各自授权入口。
+
+### 兼容入口
 
 | 工具 | 职责 |
 | --- | --- |
 | `tools/sim_queue.py` | 消费 `queue/` 中的 Probe spec，保存批次与回执 |
-| `tools/campaign_runner.py` | 消费 `backlog/`，冻结训练期去重与组合边际证据后调用 `promote` |
+| `tools/campaign_runner.py` | 使用同一 `backlog/` 队列，按旧入口的默认行为冻结并验证 FULL Regular 候选 |
 | `tools/atom_runner.py` | 把 `label / expr / settings` 列表交给 `probe`，用可恢复批次保存进度，把全 IS 指标和 checks 写成 `atom-results.jsonl` |
 | `tools/atom_screen.py` | 从 ATOM 账本按平台子宇宙检查初筛，同一 Alpha 分数相同时采用最新记录 |
 | `tools/spc_client.py` | SPC 表单、提交列表、样例校验和离线输出对比 |
@@ -1232,7 +1257,7 @@ Campaign 先过滤诊断臂，再按下表筛选候选。`triage` 在同一训�
 | `triage` 冻结 | 训练边际为正，未被组合判为重复，有完整测量证据，候选架最大绝对相关低于 0.70 |
 | `promote` 验证 | test Sharpe 为正，达到冻结的留存门槛，实时平台 checks 通过，实时自相关低于 0.70 |
 
-Campaign 的冻结文件与 `promote-ALPHA_ID.json` 回执也放在 `backlog-results/`。
+Campaign 的 `campaign-freeze-ALPHA_ID.json` 和 `promote-ALPHA_ID.json` 回执也放在 `backlog-results/`。
 
 ATOM 的默认批次路径在 `checkpoints/`，以臂清单内容生成名称。已有同名批次时使用
 `--recover` 或 `--resume`。`--recover` 回读已知任务，`--resume` 也可继续已知未提交的臂。

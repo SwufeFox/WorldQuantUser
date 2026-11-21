@@ -754,9 +754,20 @@ platform results, and writes to the shelf only if the gates pass. The optional
 self-correlation ceiling is a separate live requirement. `--dry-run` still
 accesses the test view and runs the platform checks.
 
-`tools/campaign_runner.py` applies this order automatically to durable Probe
-batches. It keeps work with missing training evidence in the queue and logs
-the reason.
+`campaign` uses the existing `backlog/` inbox and durable Probe checkpoints.
+It previews or advances Regular, Power Pool, ATOM, and Python research, and
+compares recorded SPC outputs locally. See [the campaign workflow](docs/tooling.md#长程研究队列).
+
+```bash
+python research_cli.py campaign preview SPEC.json
+python research_cli.py campaign status
+python research_cli.py campaign run --recover-only
+python research_cli.py campaign run --watch --multi-size 4 --stream
+```
+
+The unified runner freezes eligible FULL Regular training choices. Use
+`--validate` to continue with validation and shelf admission. Missing
+evidence stays queued with a recorded reason.
 
 ### Inspect results
 

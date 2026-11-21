@@ -14,7 +14,8 @@ CONSULTANT_PARENT_LIMIT = 8
 STATE_KEYS = (
     "multi_request_id", "multi_member", "multi_size", "multi_payload_sha",
     "multi_parent_url", "multi_parent_terminal", "multi_parent_status",
-    "multi_children", "multi_child_id", "multi_next_parent_poll_at", "multi_child_retry",
+    "multi_children", "multi_children_complete", "multi_child_id", "multi_next_parent_poll_at",
+    "multi_child_retry",
 )
 
 
@@ -188,7 +189,7 @@ class MultiRuns:
         unresolved = any(self._unresolved(self.records[index]) for index in indices)
         return bool(anchor.get("multi_parent_url") and unresolved
                     and (self.pending_on_platform(indices)
-                         or len(anchor.get("multi_children") or []) < len(indices)))
+                         or not anchor.get("multi_children_complete")))
 
     def needs_children(self, indices):
         anchor = self.records[indices[0]]
@@ -246,6 +247,8 @@ class MultiRuns:
             observed = list(dict.fromkeys([*(anchor.get("multi_children") or []), *children]))
             if len(observed) <= len(indices):
                 anchor["multi_children"] = observed
+                if len(children) == len(indices):
+                    anchor["multi_children_complete"] = True
         for index in indices:
             row = self.records[index]
             row.update(multi_parent_terminal=True, multi_parent_status=status)
@@ -290,6 +293,7 @@ class MultiRuns:
                              if index not in remaining}
         retries = dict(anchor.get("multi_child_retry") or {})
         matches = {index: [] for index in remaining}
+        failures = set()
         for child in anchor["multi_children"]:
             if child in resolved_children or retries.get(child, 0) > time.time() or time.monotonic() >= self.deadline:
                 continue
@@ -306,6 +310,9 @@ class MultiRuns:
                 retries[child] = time.time() + retry_after
             else:
                 retries.pop(child, None)
+                if (payload.get("status") in simulation_slots.TERMINAL_FAILURE_STATUSES
+                        and payload.get("alpha") is None and payload.get("alpha_id") is None):
+                    failures.add(child)
             for index in remaining:
                 if self.records[index].get("multi_child_id") in (None, child) and self._matches(index, payload):
                     matches[index].append((child, payload, retry_after))
@@ -330,4 +337,23 @@ class MultiRuns:
                            metrics_pending=True, error=None)
             else:
                 row["error"] = "multi-simulation child did not expose a valid Alpha ID"
+        self._finish_unmatched_failures(indices, matches, failures)
         self._emit("multi_pending", indices)
+
+    def _finish_unmatched_failures(self, indices, matches, failures):
+        """Close a fully accounted parent without attributing anonymous children."""
+        anchor = self.records[indices[0]]
+        if not anchor.get("multi_children_complete"):
+            return
+        children = set(anchor["multi_children"])
+        unmatched = [index for index in indices if self._unresolved(self.records[index])]
+        if len(children) != len(indices) or not unmatched or any(matches[index] for index in unmatched):
+            return
+        resolved = {self.records[index].get("multi_child_id") for index in indices if index not in unmatched}
+        if len(resolved) != len(indices) - len(unmatched) or not resolved <= children:
+            return
+        if not (children - resolved).issubset(failures):
+            return
+        for index in unmatched:
+            self.records[index].update(
+                status="ERROR", error="all remaining multi-simulation children reported terminal failures without matching requests")

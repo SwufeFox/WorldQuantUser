@@ -437,6 +437,9 @@ class Runner:
                                       "next_retry_at": quota["reset_at"]}
                     with self.post_retry_lock:
                         retry_at = max(retry_at, self.post_retry_at)
+                    shared_retry_at = simulation_slots.submission_retry_at(self.account)
+                    if shared_retry_at is not None:
+                        retry_at = max(retry_at, time.monotonic() + shared_retry_at - time.time())
                     if retry_at > time.monotonic():
                         simulation_slots.quick_update(self.account, slot["id"], "refused")
                         remaining = retry_at - time.monotonic()
@@ -472,6 +475,9 @@ class Runner:
                         simulation_slots.quick_update(self.account, slot["id"], "refused")
                         return None, {**row, "status": "QUEUED", "detail": "daily simulation quota exhausted",
                                       "next_retry_at": simulation_slots.quota_snapshot(self.account)["reset_at"]}
+                    if simulation_slots.submission_retry_at(self.account) is not None:
+                        simulation_slots.quick_update(self.account, slot["id"], "refused")
+                        continue
                     # Once dispatched, give the POST a full chance to return its Location.
                     response = session.post(machine_lib.BRAIN_API_URL + "/simulations",
                                             json=payload, timeout=90, allow_redirects=False)
@@ -502,13 +508,16 @@ class Runner:
                         simulation_slots.quick_update(self.account, slot["id"], "refused")
                         self._observe_quota(response)
                         retry_after = _retry_after(response)
-                        if retry_after > 0:
-                            retry_at = self._defer_post(key, row, retry_after)
-                        if status == 429 and self.quota_exhausted.is_set():
-                            return None, {**row, "status": "QUEUED", "http": status,
-                                          "detail": "daily simulation quota exhausted",
-                                          "next_retry_at": simulation_slots.quota_snapshot(self.account)["reset_at"]}
-                        if status in (401, 403):
+                        if status == 429:
+                            if self.quota_exhausted.is_set():
+                                return None, {**row, "status": "QUEUED", "http": status,
+                                              "detail": "daily simulation quota exhausted",
+                                              "next_retry_at": simulation_slots.quota_snapshot(self.account)["reset_at"]}
+                            retry_at = self._defer_post(key, row, max(delay, retry_after),
+                                                       shared=True, deadline=deadline)
+                        else:
+                            if retry_after > 0:
+                                retry_at = self._defer_post(key, row, retry_after)
                             refresh = True
                         retry_at = max(retry_at, time.monotonic() + delay)
                     elif 400 <= status < 500 and status != 408:
@@ -537,11 +546,14 @@ class Runner:
                     and _json_object(response).get("detail") == "DAILY_SIMULATION_LIMIT_EXCEEDED")):
             self.quota_exhausted.set()
 
-    def _defer_post(self, key, row, delay):
-        retry_at = time.monotonic() + delay
+    def _defer_post(self, key, row, delay, *, shared=False, deadline=None):
+        retry_time = time.time() + delay
+        if shared:
+            retry_time = simulation_slots.defer_submission(self.account, delay, deadline=deadline) or retry_time
+        retry_at = time.monotonic() + max(0, retry_time - time.time())
         with self.post_retry_lock:
             self.post_retry_at = max(self.post_retry_at, retry_at)
-        self._checkpoint(key, {**row, "next_retry_at": time.time() + delay})
+        self._checkpoint(key, {**row, "next_retry_at": retry_time})
         return retry_at
 
     def run(self, arm, *, fetch_metrics=True):

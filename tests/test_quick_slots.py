@@ -88,3 +88,19 @@ def test_killed_preparation_frees_slot_before_any_post(tmp_path, monkeypatch):
     assert slots.quick_known_jobs(ACCOUNT) == {"another"}
     assert slots.quick_update(ACCOUNT, replacement["id"], "submitting")
     assert not slots.quick_update(ACCOUNT, replacement["id"], "submitting")
+
+
+def test_submission_backoff_keeps_the_latest_retry_time_in_the_same_scope(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(workspace))
+    monkeypatch.setattr(slots.time, "time", lambda: 100)
+    assert slots.defer_submission(ACCOUNT, 30) == 130
+    assert slots.defer_submission(ACCOUNT, 5) == 130
+    assert slots.submission_retry_at(ACCOUNT) == 130
+    assert slots.submission_retry_at({"fingerprint": "another"}) is None
+
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path / "another-workspace"))
+    assert slots.submission_retry_at(ACCOUNT) is None
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(workspace))
+    monkeypatch.setattr(slots.time, "time", lambda: 130)
+    assert slots.submission_retry_at(ACCOUNT) is None

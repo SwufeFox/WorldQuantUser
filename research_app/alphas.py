@@ -107,6 +107,7 @@ def cmd_alpha_get(args, _sink):
         "grade": payload.get("grade"),
         "metrics": {k: in_sample.get(k) for k in METRIC_KEYS if k in in_sample},
         "checks": ml._extract_checks(payload),
+        "classification_ids": ml.alpha_classification_ids(payload),
     }
     document["incentives"] = incentives.check_summary(document["checks"])
     split = ml.extract_split(payload)

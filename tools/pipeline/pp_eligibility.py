@@ -45,7 +45,7 @@ def probe(session, alpha_id):
         return {"alpha_id": alpha_id, "error": str(exc)}
     is_ = d.get("is") or {}
     checks = {c.get("name"): c for c in (is_.get("checks") or [])}
-    classes = [c.get("id") for c in (d.get("classifications") or [])]
+    classes = ml.alpha_classification_ids(d)
     return {
         "alpha_id": alpha_id,
         "status": d.get("status"),
@@ -54,8 +54,8 @@ def probe(session, alpha_id):
         "turnover": is_.get("turnover"),
         "universe": (d.get("settings") or {}).get("universe"),
         "region": (d.get("settings") or {}).get("region"),
-        "pp_eligible": any("POWER_POOL_ELIGIBLE" in str(c) for c in classes),
-        "single_dataset": any("SINGLE_DATA_SET" in str(c) for c in classes),
+        "pp_eligible": None if classes is None else any("POWER_POOL_ELIGIBLE" in c for c in classes),
+        "single_dataset": None if classes is None else any("SINGLE_DATA_SET" in c for c in classes),
         "classifications": classes,
         "fails": sorted(n for n, c in checks.items() if c.get("result") == "FAIL"),
         "two_year": (checks.get("LOW_2Y_SHARPE") or {}).get("value"),
