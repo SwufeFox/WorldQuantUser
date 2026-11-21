@@ -196,7 +196,7 @@ def cmd_campaign_prepare_full(args, _sink):
 
 
 def _execute_campaign(root, path, batch, receipt, *, max_wait, concurrency,
-                      multi_size=None, recover_only=False):
+                      multi_size=None, recover_only=False, defer_quick_pnl=False):
     from tools._runner import ProbeRun, run_probe
 
     try:
@@ -214,7 +214,8 @@ def _execute_campaign(root, path, batch, receipt, *, max_wait, concurrency,
     except CliError as exc:
         return ProbeRun("failed", {}, exc.message)
     return run_probe(root, path, batch, receipt, max_wait=max_wait, concurrency=concurrency,
-                     multi_size=multi_size, recover_only=recover_only, strict_gate=True)
+                     multi_size=multi_size, recover_only=recover_only, strict_gate=True,
+                     defer_quick_pnl=defer_quick_pnl)
 
 
 def _protect_campaign_output(args, root):
@@ -255,6 +256,8 @@ def cmd_campaign_status(args, _sink):
                 source, document = experiments._load_probe_batch(batch)
                 state, action = probe_state(document)
                 job.update(state=state, next_action=action, batch=str(source), execution=document["execution"])
+                if "quick_pnl" in document:
+                    job["quick_pnl"] = document["quick_pnl"]
                 poll_at = probe_poll_at(document)
                 if poll_at is not None:
                     job["next_poll_at"] = poll_at
@@ -284,7 +287,8 @@ def cmd_campaign_run(args, sink):
         if sink:
             sink("campaign", event)
 
-    execute = partial(_execute_campaign, multi_size=args.multi_size, recover_only=args.recover_only)
+    execute = partial(_execute_campaign, multi_size=args.multi_size, recover_only=args.recover_only,
+                      defer_quick_pnl=args.defer_quick_pnl)
     code = run_campaign(root, once=not args.watch, max_wait=args.max_wait_seconds,
                         interval=args.interval, concurrency=args.concurrency, validate=args.validate,
                         log_event=observe, execute=execute, recover_only=args.recover_only)

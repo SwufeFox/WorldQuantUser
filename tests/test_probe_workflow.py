@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -520,6 +521,68 @@ class ProbeWorkflowTests(unittest.TestCase):
     def test_halves_without_boundary_remain_unknown(self):
         pnl = {"2020-%03d" % day: (-1 if day % 2 else 2) for day in range(200)}
         self.assertEqual(app.half_split_sharpes(pnl), (None, None))
+
+    def test_deferred_quick_pnl_keeps_results_and_recovers_without_new_simulations(self):
+        self.spec.write_text(json.dumps({"design": "explore",
+            "settings": {"simulationMode": "QUICK", "testPeriod": "P1Y"},
+            "arms": [{"label": "quick", "expression": "rank(close)"},
+                     {"label": "full", "expression": "rank(volume)",
+                      "settings": {"simulationMode": "FULL"}}]}), encoding="utf-8")
+        boundary = "2021-01-01"
+        train_pnl = {(date(2020, 1, 1) + timedelta(days=day)).isoformat(): -1 if day % 2 else 2
+                     for day in range(120)}
+        expected_halves = app.train_half_sharpes(list(train_pnl.values()))
+
+        def simulate(expressions, settings, **kwargs):
+            records = [finished("SYNTHETIC_" + label) for label in kwargs["labels"]]
+            for record in records:
+                record["out_of_sample"]["test"] = {"startDate": boundary}
+            return records
+
+        def fetch_pnl(session, alpha_id, *, report, **kwargs):
+            report["complete"] = True
+            return {**train_pnl, boundary: -1000}
+
+        with mock.patch.object(app.guarded_sim, "simulate", side_effect=simulate) as launch, \
+                mock.patch.dict(os.environ, {app.research_paths.ENV_VAR: str(self.root)}), \
+                mock.patch.object(app.research_paths, "ensure_dir", return_value=str(self.root)), \
+                mock.patch.object(ml, "fetch_daily_pnl", side_effect=fetch_pnl) as fetch:
+            result = self.run_probe(defer_quick_pnl=True, no_record=True)
+            self.assertEqual(result["execution"]["finished"], 2)
+            self.assertEqual(result["execution"]["train_evidence"], 2)
+            self.assertEqual([row["alpha_id"] for row in result["rows"]],
+                             ["SYNTHETIC_quick", "SYNTHETIC_full"])
+            self.assertEqual([row["train_sharpe"] for row in result["rows"]], [1.4, 1.4])
+            self.assertIsNone(result["rows"][0]["train_sharpe_h1"])
+            self.assertEqual(result["rows"][1]["train_sharpe_h1"], expected_halves[0])
+            fetch.assert_called_once()
+            self.assertEqual(fetch.call_args.args[1], "SYNTHETIC_full")
+            saved = json.loads(self.batch.read_text(encoding="utf-8"))
+            pending = result["quick_pnl"]
+            self.assertEqual(pending, saved["quick_pnl"])
+            self.assertEqual(pending["pending_labels"], ["quick"])
+            self.assertEqual(pending["recover_argv"][2:],
+                             ["--research-dir", str(self.root), "probe", "--recover", str(self.batch)])
+            self.assertIs(pending["platform_read_only"], True)
+
+            with mock.patch.object(app, "with_session", side_effect=AssertionError("only deferred PnL remains")):
+                still_pending = app.cmd_probe(arguments(recover=str(self.batch), defer_quick_pnl=True), None)
+            self.assertEqual(still_pending["quick_pnl"], pending)
+
+            with mock.patch.object(ml, "submit_single_simulation") as single_post, \
+                    mock.patch.object(ml, "submit_multi_simulation") as multi_post:
+                recovered = app.cmd_probe(arguments(recover=str(self.batch)), None)
+            single_post.assert_not_called()
+            multi_post.assert_not_called()
+            self.assertEqual(launch.call_count, 2)
+            self.assertEqual([call.args[1] for call in fetch.call_args_list], ["SYNTHETIC_full", "SYNTHETIC_quick"])
+
+        self.assertEqual(recovered["request_fingerprint"], result["request_fingerprint"])
+        self.assertEqual(recovered["execution"], result["execution"])
+        quick = recovered["rows"][0]
+        self.assertEqual((quick["train_sharpe_h1"], quick["train_sharpe_h2"]), expected_halves)
+        self.assertNotIn("quick_pnl", recovered)
+        self.assertNotIn("quick_pnl", json.loads(self.batch.read_text(encoding="utf-8")))
 
     def test_probe_halves_stop_at_shared_deadline(self):
         records = [finished("FIRST"), finished("SECOND")]

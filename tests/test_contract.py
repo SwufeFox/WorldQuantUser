@@ -97,6 +97,15 @@ class SchemaContractTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertEqual(parse(result)["error"]["code"], "USAGE")
 
+    def test_quick_pnl_deferral_is_opt_in_for_probe_and_campaign(self):
+        parser = cli_parser.build_parser()
+        for command in (("probe",), ("campaign", "run")):
+            with self.subTest(command=command):
+                options = parse(run_cli("schema", *command))["data"]["command"]["options"]
+                self.assertTrue(any("--defer-quick-pnl" in option["flags"] for option in options))
+                self.assertFalse(parser.parse_args(command).defer_quick_pnl)
+                self.assertTrue(parser.parse_args((*command, "--defer-quick-pnl")).defer_quick_pnl)
+
     def test_ledger_sync_advertises_a_finite_network_wait_budget(self):
         options = parse(run_cli("schema", "ledger", "sync"))["data"]["command"]["options"]
         budget = next(option for option in options if "--max-wait-seconds" in option["flags"])

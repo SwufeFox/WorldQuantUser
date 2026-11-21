@@ -175,7 +175,7 @@ def _legacy_batch(root, preview, receipt):
 
 
 def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
-              multi_size=None, recover_only=False, strict_gate=False):
+              multi_size=None, recover_only=False, strict_gate=False, defer_quick_pnl=False):
     """Run or continue a probe. A CLI exit of zero can still mean deferred work."""
     from research_app.experiments import probe_spec_identity
     from research_app.runtime import CliError
@@ -221,7 +221,8 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
         if strict_gate and preview.data.get("gate_blocking"):
             return ProbeRun("failed", preview.data, "exact finished requests repeat under --strict-gate")
         arguments = (spec, "--batch-path", batch, *preview_options)
-    result = run_cli(root, "probe", *arguments, *wait, *budget, "--save", receipt,
+    pnl_options = ("--defer-quick-pnl",) if defer_quick_pnl else ()
+    result = run_cli(root, "probe", *arguments, *wait, *budget, *pnl_options, "--save", receipt,
                      timeout=max_wait + 900)
     if not result.ok:
         state = "deferred" if result.code in _RETRYABLE else "failed"

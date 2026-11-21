@@ -120,21 +120,27 @@ class ResearchRunnerTests(TestCase):
         observed = runner.CliResult(True, {"rows": [pending]})
         with mock.patch.object(runner, "run_cli", return_value=observed) as run:
             runner.run_probe(self.root, self.spec, self.batch, self.receipt,
-                             max_wait=30, recover_only=True, multi_size=8, strict_gate=True)
+                             max_wait=30, recover_only=True, multi_size=8, strict_gate=True,
+                             defer_quick_pnl=True)
             self.assertEqual(run.call_args.args[2:4], ("--recover", self.batch))
             self.assertNotIn("--multi-size", run.call_args.args)
             self.assertNotIn("--strict-gate", run.call_args.args)
+            self.assertIn("--defer-quick-pnl", run.call_args.args)
 
     def test_launch_options_apply_to_fresh_probe(self):
-        observed = runner.CliResult(True, {"rows": [arm("COMPLETE", alpha_id="alpha")]})
+        observed = runner.CliResult(True, {"rows": [arm("COMPLETE", alpha_id="alpha")],
+                                           "quick_pnl": {"pending_labels": ["arm"]}})
         with mock.patch.object(runner, "run_cli", side_effect=[self.preview, observed]) as run:
-            runner.run_probe(self.root, self.spec, self.batch, self.receipt,
-                             max_wait=30, multi_size=8, strict_gate=True)
+            result = runner.run_probe(self.root, self.spec, self.batch, self.receipt,
+                                      max_wait=30, multi_size=8, strict_gate=True, defer_quick_pnl=True)
         args = run.call_args.args
+        self.assertEqual(result.state, "done")
         self.assertEqual(args[args.index("--multi-size") + 1], "8")
         self.assertIn("--strict-gate", args)
+        self.assertIn("--defer-quick-pnl", args)
         self.assertIn("--strict-gate", run.call_args_list[0].args)
         self.assertIn("--multi-size", run.call_args_list[0].args)
+        self.assertNotIn("--defer-quick-pnl", run.call_args_list[0].args)
 
     def test_offline_syntax_errors_stop_before_the_live_probe(self):
         preview = runner.CliResult(True, {**self.preview.data,

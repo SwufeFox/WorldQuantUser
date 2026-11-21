@@ -1049,6 +1049,8 @@ def build_parser():
                        help="Durable batch/checkpoint path; distinct from the final --save response.")
     probe.add_argument("--summary", action="store_true",
                        help="Return a bounded train summary with a table, execution state and saved evidence paths.")
+    probe.add_argument("--defer-quick-pnl", action="store_true",
+                       help="Save QUICK results before fetching daily PnL. Run --recover without this flag to fetch it.")
     probe.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
                        help="Shared wait budget for login, preflight, simulation and recovery reads; "
                             "accepted jobs remain recoverable (default: 300).")
@@ -1095,6 +1097,8 @@ def build_parser():
                               help="Maximum wait budget for each Probe invocation.")
     campaign_run.add_argument("--recover-only", action="store_true",
                               help="Recover existing simulation tasks without posting unstarted arms.")
+    campaign_run.add_argument("--defer-quick-pnl", action="store_true",
+                              help="Let QUICK batches finish before fetching their daily PnL.")
     campaign_run.add_argument("--validate", action="store_true",
                               help="Validate eligible Regular FULL candidates after freezing training evidence.")
     campaign_run.add_argument("--stream", action="store_true", help="Emit campaign events on stderr.")

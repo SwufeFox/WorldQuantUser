@@ -765,6 +765,12 @@ def _compact_preflight(report):
 
 def _summarize_probe_response(response):
     response["summary"] = _probe_summary(response)
+    quick_pnl = response.get("quick_pnl")
+    if quick_pnl:
+        labels = quick_pnl["pending_labels"]
+        response["quick_pnl"] = {**quick_pnl, "pending_labels": labels[:20],
+                                 "pending_labels_total": len(labels),
+                                 "pending_labels_omitted": max(0, len(labels) - 20)}
     for key in ("rows", "results", "incomplete", "comparisons", "arm_order", "preflight", "multi_requests"):
         items = response.get(key)
         if isinstance(items, list):
@@ -1531,6 +1537,7 @@ def _recover_probe_batch(args, path):
     manifest = _selection_call(selection.load, args.selection) if show_test else None
     rows = document["rows"]
     multi = _multi_options(args, document)
+    defer_quick_pnl = getattr(args, "defer_quick_pnl", False)
     native_indices = list(_native_probe_groups(document))
 
     def recover(session):
@@ -1600,16 +1607,14 @@ def _recover_probe_batch(args, path):
                 elif row.get("alpha_id"):
                     outcome["matched"][label] = row["alpha_id"]
                     outcome["recovered"] += 1
-        _probe_halves(session, records, deadline=deadline)
+        _probe_halves(session, records, deadline=deadline, defer_quick_pnl=defer_quick_pnl)
         return outcome
 
     now = time.time()
     needs_platform = any(_probe_needs_recovery(row) and (row.get("next_poll_at") or 0) <= now
                          for row in rows)
-    needs_halves = any(record.get("alpha_id") and _has_finished_result(record)
-        and ((record.get("out_of_sample") or {}).get("test") or {}).get("startDate")
-        and (not record.get("half_sharpes") or any(value is None for value in record["half_sharpes"]))
-        for record in document["records"])
+    needs_halves = any(_probe_needs_train_pnl(record) for record in document["records"]
+                       if not (defer_quick_pnl and ml.is_quick_simulation(record)))
     outcome = with_session(args, recover, deadline=deadline) if needs_platform or needs_halves else recover(None)
     _probe_reconcile(document)
     _save_probe_checkpoint(document, path, indent=1)
@@ -1968,7 +1973,7 @@ def cmd_probe(args, sink):
         _reject_saved_overrides(args, mode="--from-simulation")
         incompatible = ("spec", "recover", "resume", "dry_run", "check", "show_test", "selection",
                         "name", "batch_path", "registry", "cost_bps", "concurrency", "force",
-                        "allow_lint_errors", "strict_gate")
+                        "allow_lint_errors", "strict_gate", "defer_quick_pnl")
         if any(getattr(args, key, None) is not None and getattr(args, key) is not False
                for key in incompatible):
             raise CliError("USAGE", "--from-simulation is a read-only operation on existing simulations")
@@ -2176,6 +2181,17 @@ def _probe_document_update(document, target):
         "train_evidence": len(rows) - len(incomplete),
         **{state: sum(row["submission_state"] == state for row in rows)
            for state in ("accepted", "not_submitted", "unknown_submission", "terminal")}}
+    pending_quick_pnl = [arm["label"] for arm, record in zip(arms, records)
+                         if ml.is_quick_simulation(record) and _probe_needs_train_pnl(record)
+                         and (record.get("pnl_evidence") or {}).get("complete") is not True]
+    if pending_quick_pnl:
+        document["quick_pnl"] = {
+            "pending_labels": pending_quick_pnl, "platform_read_only": True,
+            "recover_argv": ["python", "research_cli.py", "--research-dir", research_paths.research_dir(),
+                             "probe", "--recover", str(target)],
+        }
+    else:
+        document.pop("quick_pnl", None)
     actions = []
     if any(_probe_needs_recovery(row) for row in rows):
         actions.append({"action": "recover", "batch_path": str(target), "platform_read_only": True})
@@ -2194,7 +2210,7 @@ def _probe_document_update(document, target):
 def _probe_response(document, path, show_test=False, manifest=None, summary=False):
     keys = ("name", *_PROBE_CONTEXT_FIELDS, "track", "routes", "run_id", "started_at", "request_fingerprint",
             "arm_order", "design", "complete", "incomplete", "all_empty", "comparisons",
-            "execution", "recording", "recording_policy", "next_actions", "preflight",
+            "execution", "recording", "recording_policy", "next_actions", "quick_pnl", "preflight",
             "concurrency", "scheduling", "capability_snapshot", "multi_size")
     rows = [_probe_visible_row(row, show_test) for row in document["rows"]]
     if manifest is not None:
@@ -2237,10 +2253,18 @@ def _probe_reconcile(document):
         note=document.get("note"), registry_path=policy["registry"], source="simulate", batch=document.get("name"))}
 
 
-def _probe_halves(session, records, *, deadline=None):
+def _probe_needs_train_pnl(record):
+    return (bool(record.get("alpha_id")) and _has_finished_result(record)
+            and bool(((record.get("out_of_sample") or {}).get("test") or {}).get("startDate"))
+            and (not record.get("half_sharpes") or any(value is None for value in record["half_sharpes"])))
+
+
+def _probe_halves(session, records, *, deadline=None, defer_quick_pnl=False):
     for record in records:
         if deadline is not None and time.monotonic() >= deadline:
             break
+        if defer_quick_pnl and ml.is_quick_simulation(record):
+            continue
         if not _has_finished_result(record) or not record.get("alpha_id"):
             continue
         boundary = ((record.get("out_of_sample") or {}).get("test") or {}).get("startDate")
@@ -2390,7 +2414,8 @@ def _execute_probe(args, document, target, groups):
             if time.monotonic() >= deadline:
                 break
             run_group(session, group)
-        _probe_halves(session, records, deadline=deadline)
+        _probe_halves(session, records, deadline=deadline,
+                      defer_quick_pnl=getattr(args, "defer_quick_pnl", False))
 
     document["concurrency"] = _requested_concurrency(args, document)
     save()
