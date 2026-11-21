@@ -133,6 +133,25 @@ class ResearchRunnerTests(TestCase):
         args = run.call_args.args
         self.assertEqual(args[args.index("--multi-size") + 1], "8")
         self.assertIn("--strict-gate", args)
+        self.assertIn("--strict-gate", run.call_args_list[0].args)
+        self.assertIn("--multi-size", run.call_args_list[0].args)
+
+    def test_offline_syntax_errors_stop_before_the_live_probe(self):
+        preview = runner.CliResult(True, {**self.preview.data,
+            "blocking": [{"code": "reserved_identifier"}, {"code": "unknown_identifier"}]})
+        with mock.patch.object(runner, "run_cli", return_value=preview) as run:
+            result = self.run_probe()
+        run.assert_called_once()
+        self.assertEqual(result.state, "failed")
+        self.assertIn("reserved_identifier", result.detail)
+
+    def test_cached_field_findings_leave_the_live_probe_available(self):
+        preview = runner.CliResult(True, {**self.preview.data,
+            "blocking": [{"code": "unknown_identifier"}]})
+        finished = runner.CliResult(True, {"rows": [arm("COMPLETE", alpha_id="alpha")]})
+        with mock.patch.object(runner, "run_cli", side_effect=[preview, finished]) as run:
+            self.assertEqual(self.run_probe().state, "done")
+        self.assertEqual(run.call_count, 2)
 
     def test_same_wire_request_does_not_resume_under_a_new_research_track(self):
         self.saved(self.batch, [arm("QUEUED", submission_state="not_submitted")])
@@ -156,6 +175,18 @@ class ResearchRunnerTests(TestCase):
     def test_changed_spec_cannot_resume_existing_batch(self):
         self.saved(self.batch, [arm("QUEUED", submission_state="not_submitted")],
                    fingerprint="old request")
+        with mock.patch.object(runner, "run_cli") as run:
+            result = self.run_probe()
+        self.assertEqual(result.state, "failed")
+        self.assertIn("does not match", result.detail)
+        run.assert_not_called()
+
+    def test_changed_quick_provenance_cannot_resume_the_same_full_request(self):
+        self.saved(self.batch, [arm("PENDING", submission_state="accepted")])
+        payload = json.loads(self.batch.read_text(encoding="utf-8"))
+        payload["quick_source"] = {"run_id": "original"}
+        self.batch.write_text(json.dumps(payload), encoding="utf-8")
+
         with mock.patch.object(runner, "run_cli") as run:
             result = self.run_probe()
         self.assertEqual(result.state, "failed")
@@ -192,6 +223,46 @@ class ResearchRunnerTests(TestCase):
         self.assertTrue(new.is_file())
         self.assertTrue(queued.is_file())
         self.assertEqual(log.call_args.args[0]["spec"], accepted.name)
+
+    def test_campaign_advances_a_ready_spec_while_an_accepted_one_is_waiting(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        waiting, fresh, ready = [backlog / name for name in ("a-wait.json", "b-new.json", "c-ready.json")]
+        for spec in (waiting, fresh, ready):
+            spec.write_text("{}", encoding="utf-8")
+        for spec, due in ((waiting, 120), (ready, 100)):
+            batch, _ = campaign.campaign_paths(self.root, spec)
+            self.saved(batch, [arm("PENDING", submission_state="accepted",
+                                   progress_url="https://test.invalid/1", next_poll_at=due)])
+            payload = json.loads(batch.read_text(encoding="utf-8"))
+            payload["execution"] = {"total": 1, "finished": 0}
+            batch.write_text(json.dumps(payload), encoding="utf-8")
+        execute = mock.Mock(return_value=runner.ProbeRun("done", {}))
+        with mock.patch.object(runner.time, "time", return_value=100):
+            self.assertEqual(campaign.run_campaign(self.root, once=True, execute=execute,
+                                                   log_event=mock.Mock()), 0)
+        execute.assert_called_once_with(self.root, ready, *campaign.campaign_paths(self.root, ready),
+                                      max_wait=600, concurrency=3)
+        self.assertTrue(waiting.is_file())
+        self.assertTrue(fresh.is_file())
+
+    def test_campaign_reports_cooling_checkpoints_without_invoking_probe(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        waiting = backlog / "wait.json"
+        waiting.write_text("{}", encoding="utf-8")
+        batch, _ = campaign.campaign_paths(self.root, waiting)
+        self.saved(batch, [arm("PENDING", submission_state="accepted", alpha_id="alpha",
+                               metrics_pending=True, next_poll_at=120)])
+        payload = json.loads(batch.read_text(encoding="utf-8"))
+        payload["execution"] = {"total": 1, "finished": 0}
+        batch.write_text(json.dumps(payload), encoding="utf-8")
+        execute, log = mock.Mock(), mock.Mock()
+        with mock.patch.object(runner.time, "time", return_value=100):
+            self.assertEqual(campaign.run_campaign(self.root, once=True, execute=execute, log_event=log), 3)
+        execute.assert_not_called()
+        self.assertEqual(log.call_args.args[0]["next_poll_at"], 120)
+        self.assertTrue(waiting.is_file())
 
     def campaign_reply(self, *, freeze=True, **updates):
         training = {"alpha_id": "candidate", "delta": 0.01, "evidence": {"state": "measured"},

@@ -6,14 +6,17 @@ here exists because a unit or typing error cost a simulation: the point is to mo
 failure forward to the editor.
 """
 
+import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 import expression_lint
+from research_app import app
 
 
 class GroupProductTests(unittest.TestCase):
@@ -68,3 +71,116 @@ class FormatTests(unittest.TestCase):
 
     def test_a_short_expression_is_left_alone(self):
         self.assertEqual(expression_lint.pretty_expression("rank(close)"), "rank(close)")
+
+
+class SafeFormatTests(unittest.TestCase):
+    def test_unchanged_source_uses_no_parser(self):
+        with mock.patch.object(expression_lint.fastexpr_ast, "parse",
+                               side_effect=AssertionError("unchanged source was parsed")):
+            self.assertEqual(expression_lint.format_fastexpr("rank(close)"), ("rank(close)", None))
+
+    def test_formats_safe_source_and_preserves_syntax_it_cannot_verify(self):
+        safe = "x = close; rank(x)"
+        unfamiliar = "x = close; rank([x])"
+        self.assertEqual(expression_lint.format_fastexpr(safe), ("x = close;\nrank(x)", None))
+        self.assertEqual(expression_lint.format_fastexpr(unfamiliar), (unfamiliar, "unsupported_fastexpr"))
+
+    def test_keeps_comments_and_quoted_whitespace(self):
+        for comment in ("# follow-up", "// follow-up", "/* follow-up */"):
+            with self.subTest(comment=comment):
+                source = f"x = close; {comment}\n   rank(x)"
+                self.assertEqual(expression_lint.format_fastexpr(source),
+                                 (source, "formatting_would_change_comments"))
+        quoted = 'group_rank(close, bucket(rank(cap), range="0,  1, 0.5"))'
+        self.assertEqual(expression_lint.format_fastexpr(quoted), (quoted, "formatting_would_change_expression"))
+
+
+def fmt_result(capsys, root, *arguments):
+    code = app.main(["--research-dir", str(root), "--quiet", "fmt", *map(str, arguments)])
+    return code, json.loads(capsys.readouterr().out)
+
+
+def test_fmt_previews_safe_suggestions_and_only_writes_explicitly(tmp_path, capsys):
+    path = tmp_path / "draft.json"
+    unsafe = 'group_rank(close, bucket(rank(cap), range="0,  1, 0.5"))'
+    document = {"design": "explore", "arms": [
+        {"label": "safe", "expression": "price = close; rank(price)"},
+        {"label": "quoted", "expression": unsafe},
+        {"label": "python", "expression": "def alpha():\n    pass\n",
+         "settings": {"language": "PYTHON", "lookback": 5}},
+    ]}
+    path.write_text(json.dumps(document), encoding="utf-8")
+    original = path.read_bytes()
+
+    code, preview = fmt_result(capsys, tmp_path, path)
+    assert code == 0
+    data = preview["data"]
+    assert data["changed"] == 1
+    assert data["written"] is False
+    assert data["skipped"] == [
+        {"label": "quoted", "reason": "formatting_would_change_expression"},
+        {"label": "python", "reason": "python_source"},
+    ]
+    assert path.read_bytes() == original
+    code, written = fmt_result(capsys, tmp_path, path, "--write")
+    assert code == 0
+    assert written["data"]["written"] is True
+    assert json.loads(path.read_bytes()) == data["formatted"]
+    assert data["formatted"]["arms"][1:] == document["arms"][1:]
+    assert "\n" in data["formatted"]["arms"][0]["expression"]
+
+
+def test_fmt_rejects_a_batch_or_invalid_spec_without_rewriting(tmp_path, capsys):
+    path = tmp_path / "input.json"
+    for document in ({"format": "probe-batch", "arms": [{"expression": "x=close;rank(x)"}]},
+                     {"design": "explore", "arms": [{"expression": "rank("}]}):
+        original = json.dumps(document)
+        path.write_text(original, encoding="utf-8")
+        code, result = fmt_result(capsys, tmp_path, path, "--write")
+        assert code != 0 and result["error"]["code"] == "INVALID_INPUT"
+        assert path.read_text(encoding="utf-8") == original
+
+
+def test_fmt_cannot_save_over_its_input(tmp_path, capsys):
+    path = tmp_path / "draft.json"
+    original = '{"design": "explore", "arms": [{"expression": "x = close; rank(x)"}]}'
+    path.write_text(original, encoding="utf-8")
+    code, result = fmt_result(capsys, tmp_path, path, "--save", path)
+    assert code != 0 and result["error"]["code"] == "INVALID_INPUT"
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_fmt_keeps_a_published_campaign_spec_byte_exact(tmp_path, capsys):
+    path = tmp_path / "backlog" / "draft.json"
+    path.parent.mkdir()
+    original = '{"design": "explore", "arms": [{"expression": "x = close; rank(x)"}]}'
+    path.write_text(original, encoding="utf-8")
+    batch = tmp_path / "backlog-results" / "draft-batch.json"
+    batch.parent.mkdir()
+    batch.write_text("{}", encoding="utf-8")
+
+    code, preview = fmt_result(capsys, tmp_path, path)
+    assert code == 0 and preview["data"]["changed"] == 1
+    code, result = fmt_result(capsys, tmp_path, path, "--write")
+    assert code != 0 and result["error"]["code"] == "INVALID_INPUT"
+    assert path.read_text(encoding="utf-8") == original
+    assert batch.read_text(encoding="utf-8") == "{}"
+
+
+def test_fmt_rejects_and_protects_standalone_python_source(tmp_path, capsys):
+    path = tmp_path / "alpha.py"
+    path.write_text("print('alpha')\n", encoding="utf-8")
+    code, result = fmt_result(capsys, tmp_path, path, "--save", path)
+    assert code != 0 and result["error"]["code"] == "INVALID_INPUT"
+    assert path.read_text(encoding="utf-8") == "print('alpha')\n"
+
+
+def test_fmt_can_preview_a_legacy_spec_without_design(tmp_path, capsys):
+    path = tmp_path / "legacy.json"
+    original = '{"arms": [{"expression": "x = close; rank(x)"}]}'
+    path.write_text(original, encoding="utf-8")
+    code, preview = fmt_result(capsys, tmp_path, path)
+    assert code == 0 and preview["data"]["changed"] == 1
+    code, result = fmt_result(capsys, tmp_path, path, "--write")
+    assert code != 0 and result["error"]["code"] == "INVALID_INPUT"
+    assert path.read_text(encoding="utf-8") == original

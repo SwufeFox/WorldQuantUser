@@ -10,6 +10,7 @@ import alpha_registry
 import cache_store
 import correlation
 import json
+import machine_lib
 import research_paths
 
 from . import book_state, experiments, pnl_snapshot, research_route, stats
@@ -76,6 +77,124 @@ def cmd_campaign_preview(args, _sink):
     return result.data
 
 
+def _quick_training(arm, row):
+    settings = machine_lib.normalize_setting_keys(arm["settings"])
+    if settings.get("simulationMode") != "QUICK":
+        return None, "not_quick"
+    if (str(row.get("status")).upper() not in alpha_registry.FINISHED_STATUSES | {"UNSUBMITTED"}
+            or row.get("metrics_pending") or not machine_lib.valid_simulation_id(row.get("alpha_id"))):
+        return None, "unfinished"
+    if not arm["expression"].strip():
+        return None, "missing_captured_expression"
+    training = {name: row.get(f"train_{name}") for name in ("sharpe", "fitness")}
+    if not all(map(experiments._finite_metric, training.values())):
+        return None, "missing_train_metrics"
+    return training, None
+
+
+def _full_arm(arm):
+    context = ("label", "expression", "role", "design", "proxy_of", "mechanism", "name",
+               "family", "candidate_id", "idea", "hypothesis", "note")
+    return {**{key: arm[key] for key in context
+               if arm.get(key) is not None},
+            "settings": {**machine_lib.normalize_setting_keys(arm["settings"]),
+                         "simulationMode": "FULL"}}
+
+
+def cmd_campaign_prepare_full(args, _sink):
+    """Write a bounded FULL spec using only the training evidence in a saved QUICK batch."""
+    if args.out == "-":
+        raise CliError("USAGE", "--out requires a file path for the FULL spec")
+    source = Path(args.batch).expanduser().resolve()
+    output = Path(args.out).expanduser().resolve()
+    protect_output(args, source, output)
+    protected = set()
+    try:
+        path, batch = experiments._load_probe_batch(source, source_paths=protected)
+    finally:
+        protect_output(args, *protected)
+    for item in (batch.get("spec"), *(arm.get("source_file") for arm in batch["arms"])):
+        if isinstance(item, str) and item not in ("", "-"):
+            ref = Path(item).expanduser()
+            protected.update({ref.resolve(), (path.parent / ref).resolve()})
+    lock = Path(f"{output}.lock")
+    protect_output(args, lock, *protected)
+    if output in protected or lock in protected or lock.is_symlink():
+        raise CliError("INVALID_INPUT", "--out would overwrite a QUICK input")
+
+    design = batch.get("design") or {}
+    mode = design.get("mode")
+    if mode not in {"explore", "controlled"}:
+        raise CliError("INVALID_INPUT", "QUICK batch has no recorded experiment design")
+    control_label = design.get("control") if mode == "controlled" else None
+    if mode == "controlled" and (not control_label or args.limit < 2):
+        raise CliError("INVALID_INPUT", "controlled FULL specs require the original control and at least two slots")
+    control = None
+    eligible = []
+    omitted = Counter()
+    for arm, row in zip(batch["arms"], batch["rows"]):
+        is_control = arm["label"] == control_label
+        if not is_control and row.get("role") == "diagnostic":
+            omitted["diagnostic"] += 1
+            continue
+        training, reason = _quick_training(arm, row)
+        if is_control and (reason or arm.get("design") != "control"):
+            raise CliError("INVALID_INPUT", "the original control lacks completed QUICK training evidence",
+                           details={"control": control_label, "reason": reason or "invalid_design"})
+        if not reason and not is_control and min(training.values()) <= 0:
+            reason = "nonpositive_train_metrics"
+        if reason:
+            omitted[reason] += 1
+            continue
+        entry = (_full_arm(arm), {"label": arm["label"], "alpha_id": row["alpha_id"], "train": training})
+        if is_control:
+            control = entry
+        else:
+            eligible.append(entry)
+    if control_label and control is None:
+        raise CliError("INVALID_INPUT", "the original control is missing from the QUICK batch",
+                       details={"control": control_label})
+
+    selected = [control] if control else []
+    identities = {experiments._probe_identity(arm["expression"], arm["settings"]) for arm, _ in selected}
+    for arm, evidence in sorted(eligible, key=lambda entry: (-entry[1]["train"]["sharpe"], str(entry[0]["label"]))):
+        identity = experiments._probe_identity(arm["expression"], arm["settings"])
+        if identity in identities:
+            omitted["duplicate_full_request"] += 1
+        elif len(selected) >= args.limit:
+            omitted["limit"] += 1
+        else:
+            identities.add(identity)
+            selected.append((arm, evidence))
+    if not selected or (control is not None and len(selected) == 1):
+        raise CliError("INVALID_INPUT", "no completed QUICK candidate has eligible training evidence",
+                       details={"omitted": dict(omitted)})
+
+    provenance = {"batch_path": str(path), "run_id": batch.get("run_id"),
+                  "request_fingerprint": batch["request_fingerprint"],
+                  "rank_metric": "train_sharpe", "limit": args.limit,
+                  "arms": [evidence for _, evidence in selected]}
+    arms = [arm for arm, _ in selected]
+    spec = {"name": output.stem, "track": batch["track"],
+            **{key: batch[key] for key in ("idea", "mechanism", "note") if key in batch},
+            **({"design": "explore"} if mode == "explore" else {}),
+            "quick_source": provenance, "arms": arms}
+    experiments._probe_design(spec, {})
+    try:
+        with cache_store.file_lock(lock, timeout=0):
+            if output.exists():
+                if json.loads(output.read_text(encoding="utf-8")) != spec:
+                    raise CliError("INVALID_INPUT", "refusing to replace a different FULL spec")
+            else:
+                cache_store.write_json_atomic(output, spec, indent=2)
+    except cache_store.LockTimeout as exc:
+        raise CliError("SERVICE_ERROR", "the FULL spec is being prepared by another process") from exc
+    except (OSError, ValueError) as exc:
+        raise CliError("INVALID_INPUT", f"cannot save FULL spec: {exc}") from exc
+    return {"path": str(output), "track": batch["track"], "arms": len(arms),
+            "quick_source": provenance, "omitted": dict(omitted)}
+
+
 def _execute_campaign(root, path, batch, receipt, *, max_wait, concurrency,
                       multi_size=None, recover_only=False):
     from tools._runner import ProbeRun, run_probe
@@ -117,7 +236,7 @@ def _protect_campaign_output(args, root):
 
 def cmd_campaign_status(args, _sink):
     """Read queue progress from canonical saved probe and SPC receipts."""
-    from tools._runner import probe_state, research_root
+    from tools._runner import probe_poll_at, probe_state, research_root
     from tools.campaign_runner import campaign_paths
 
     root = research_root(args.research_dir)
@@ -136,6 +255,9 @@ def cmd_campaign_status(args, _sink):
                 source, document = experiments._load_probe_batch(batch)
                 state, action = probe_state(document)
                 job.update(state=state, next_action=action, batch=str(source), execution=document["execution"])
+                poll_at = probe_poll_at(document)
+                if poll_at is not None:
+                    job["next_poll_at"] = poll_at
             elif receipt.exists() and route["track"] == "SPC":
                 job["receipt"] = str(receipt)
         except CliError as exc:

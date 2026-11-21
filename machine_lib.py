@@ -19,6 +19,7 @@ import random
 import re
 import threading
 import time
+from functools import cache
 from os import environ
 from pathlib import Path
 from time import sleep
@@ -1510,6 +1511,10 @@ def _submit_simulation_request(s, simulation_data, max_retries, on_event, deadli
     import simulation_capabilities
     import simulation_slots
 
+    native = isinstance(simulation_data, list)
+    body = ([format_simulation_payload(item) for item in simulation_data]
+            if native else format_simulation_payload(simulation_data))
+    redirect_limits = {"allow_redirects": False} if native else {}
     account = simulation_capabilities.account_provenance(s)
     for attempt in range(1, max_retries + 1):
         if deadline is not None and deadline - time.monotonic() <= 0:
@@ -1521,10 +1526,8 @@ def _submit_simulation_request(s, simulation_data, max_retries, on_event, deadli
             raise RateLimited("daily simulation quota exhausted; resume after the reported reset")
         if simulation_slots.submission_retry_at(account) is not None:
             raise RateLimited("simulation submission deferred by shared Retry-After cooldown")
-        native = isinstance(simulation_data, list)
-        redirect_limits = {"allow_redirects": False} if native else {}
         response = s.post(
-            BRAIN_API_URL + "/simulations", json=simulation_data,
+            BRAIN_API_URL + "/simulations", json=body,
             timeout=_request_timeout(deadline), **redirect_limits,
         )
         observation = (simulation_slots.observe_quota(account, response.headers)
@@ -1697,11 +1700,24 @@ def regular_wire_settings(settings):
     return _omit_regular_settings(settings, _regular_unsent_settings(settings))
 
 
-def _single_simulation_data(expression, decay, settings):
+def format_simulation_payload(payload):
+    """Apply safe default FASTEXPR formatting to a native REGULAR request."""
+    if (not isinstance(payload, dict) or payload.get("type") != "REGULAR"
+            or not isinstance(payload.get("regular"), str)
+            or (alpha_language(payload) or "FASTEXPR") != "FASTEXPR"):
+        return payload
+    from expression_lint import format_fastexpr
+
+    source, _reason = format_fastexpr(payload["regular"])
+    return {**payload, "regular": source} if source != payload["regular"] else payload
+
+
+def _single_simulation_data(expression, decay, settings, *, format_source=True):
     """Build one ``POST /simulations`` payload from a resolved settings dict."""
     body = regular_wire_settings(settings)
     body["decay"] = decay
-    return {"type": "REGULAR", "settings": body, "regular": expression}
+    payload = {"type": "REGULAR", "settings": body, "regular": expression}
+    return format_simulation_payload(payload) if format_source else payload
 
 
 def regular_settings_evidence(settings, snapshot):
@@ -1932,9 +1948,13 @@ def simulate_alphas(
     if native_enabled and (type(multi_size) is not int or not 2 <= multi_size <= simulation_multi.MAX_CHILDREN):
         raise ValueError("native multi-simulation size must be an integer between 2 and 10")
 
-    def payload_for(index):
+    def original_payload_for(index):
         expression, decay = pairs[index]
-        return _single_simulation_data(expression, decay, settings)
+        return _single_simulation_data(expression, decay, settings, format_source=False)
+
+    @cache
+    def payload_for(index):
+        return format_simulation_payload(original_payload_for(index))
 
     if capability_snapshot is None and not dry_run:
         capability_snapshot = simulation_capabilities.cached()
@@ -2049,7 +2069,8 @@ def simulate_alphas(
     has_saved_native = any(record.get("multi_request_id") for record in records)
     native = (simulation_multi.MultiRuns(s, records, payload_for, plan["account"],
               plan["effective"], deadline if deadline is not None else float("inf"), emit,
-              submission_event) if native_enabled or has_saved_native else None)
+              submission_event, original_payload_for=original_payload_for)
+              if native_enabled or has_saved_native else None)
     saved_groups = list(native.restore()) if has_saved_native else []
     for record in records:
         if not record.get("multi_request_id"):
@@ -2377,11 +2398,11 @@ def simulate_alphas(
             else:
                 read_metrics(index)
 
-        # Recover accepted jobs from the checkpoint before dispatching new ones.
-        # Their metrics are independent as soon as progress establishes an Alpha ID.
-        recovering_progress = bool(progress_reads)
+        # Authenticated recovery restores shared reservations before dispatch. With
+        # unidentified legacy jobs, wait for the original reads before using slots.
+        untracked_reads = set() if plan["account"].get("fingerprint") else set(progress_reads)
         while True:
-            while (next_group is not None and not stop_submitting and not recovering_progress
+            while (next_group is not None and not stop_submitting and not untracked_reads
                    and len(progress_reads) + unresolved_polls < plan["effective"]
                    and (deadline is None or time.monotonic() < deadline)):
                 outcome, accepted = dispatch(next_group)
@@ -2411,6 +2432,9 @@ def simulate_alphas(
                 read_result(future)
                 pending = (records[group[0]].get("progress_url") if len(group) == 1
                            else native.pending_on_platform(group))
+                if future in untracked_reads:
+                    untracked_reads.remove(future)
+                    stop_submitting = stop_submitting or bool(pending)
                 if pending:
                     # The attempt still occupies a slot even though this read has yielded.
                     unresolved_polls += 1
@@ -2418,10 +2442,6 @@ def simulate_alphas(
                     read_native_results(group)
                 else:
                     read_metrics(group[0])
-
-            if recovering_progress and not progress_reads:
-                recovering_progress = False
-                stop_submitting = stop_submitting or unresolved_polls > 0
 
         for future in metrics_reads:
             read_result(future)

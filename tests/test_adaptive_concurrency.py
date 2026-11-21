@@ -3,6 +3,7 @@
 import os
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest import mock
@@ -202,6 +203,54 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertTrue(poll.call_args.args[1].endswith("/replacement"))
         self.assertEqual([record["alpha_id"] for record in records], ["alpha-saved", "alpha-new"])
         self.assertEqual([record["status"] for record in records], ["COMPLETE", "COMPLETE"])
+
+    def test_resume_refills_free_slot_while_saved_progress_is_not_due(self):
+        expressions = ["rank(cap)", "rank(close)"]
+        accepted = {"expression": expressions[0], "decay": 6, "status": "PENDING",
+                    "submission_attempted": True, "next_poll_at": time.time() + 120,
+                    "progress_url": "https://api.worldquantbrain.com/simulations/accepted"}
+        queued = {"expression": expressions[1], "decay": 6, "status": "QUEUED",
+                  "submission_attempted": False}
+        fresh_url = "https://api.worldquantbrain.com/simulations/replacement"
+        with mock.patch.object(ml, "submit_single_simulation", return_value=fresh_url) as post, \
+                mock.patch.object(ml, "poll_simulation", return_value={
+                    "status": "COMPLETE", "alpha": "alpha-new"}) as poll, \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {"fitness": 1}}):
+            at_limit = self.simulate(expressions, initial_records=[accepted, queued],
+                                     concurrency=1, max_wait_seconds=10)
+            post.assert_not_called()
+            self.assertEqual(at_limit[1]["status"], "QUEUED")
+
+            external, _ = simulation_slots.reserve(ACCOUNT, 2)
+            contended = self.simulate(expressions, initial_records=at_limit,
+                                      concurrency=2, max_wait_seconds=10)
+            post.assert_not_called()
+            self.assertEqual(contended[1]["status"], "QUEUED")
+            simulation_slots.reconcile_record({"slot_reservation": external}, ACCOUNT, outcome="terminal")
+
+            resumed = self.simulate(expressions, initial_records=contended,
+                                    concurrency=2, max_wait_seconds=10)
+
+        post.assert_called_once()
+        self.assertEqual(post.call_args.args[1]["regular"], expressions[1])
+        poll.assert_called_once()
+        self.assertEqual(poll.call_args.args[1], fresh_url)
+        self.assertEqual([row["status"] for row in resumed], ["PENDING", "COMPLETE"])
+        self.assertEqual(resumed[0]["next_poll_at"], accepted["next_poll_at"])
+        self.assertEqual(resumed[0]["progress_url"], accepted["progress_url"])
+        self.assertEqual(simulation_slots.snapshot(ACCOUNT, 2)["active"], 1)
+
+    def test_resume_does_not_use_free_slots_after_an_unknown_post(self):
+        expressions = ["rank(cap)", "rank(close)"]
+        unknown = {"expression": expressions[0], "decay": 6, "status": "UNKNOWN_SUBMISSION",
+                   "submission_attempted": True}
+        queued = {"expression": expressions[1], "decay": 6, "status": "QUEUED",
+                  "submission_attempted": False}
+        with mock.patch.object(ml, "submit_single_simulation") as post:
+            records = self.simulate(expressions, initial_records=[unknown, queued], concurrency=2)
+
+        post.assert_not_called()
+        self.assertEqual([row["status"] for row in records], ["UNKNOWN_SUBMISSION", "QUEUED"])
 
     def test_dispatch_only_keeps_alpha_id_for_later_metrics_only_recovery(self):
         events = []

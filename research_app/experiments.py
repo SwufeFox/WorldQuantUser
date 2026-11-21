@@ -9,7 +9,7 @@ import math
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1000,6 +1000,9 @@ def cmd_compare(args, _sink):
     return data
 
 
+_PROBE_CONTEXT_FIELDS = ("idea", "mechanism", "note", "quick_source")
+
+
 def _load_probe_spec(path):
     """Read and validate a probe spec: settings plus a list of labelled arms."""
     try:
@@ -1024,7 +1027,7 @@ def _load_probe_spec(path):
     if not isinstance(arms, list) or not arms:
         raise CliError("INVALID_INPUT", "spec has no arms",
                        "each arm needs at least {\"expression\": ...}")
-    known = {"name", "idea", "mechanism", "note", "settings", "arms", "design", "track"}
+    known = {"name", "settings", "arms", "design", "track", *_PROBE_CONTEXT_FIELDS}
     unknown = sorted(set(spec) - known)
     if unknown:
         # A typo here is silent otherwise: `"setting"` instead of `"settings"` would
@@ -1210,17 +1213,19 @@ def _settings_signature(settings):
     return json.dumps(settings, sort_keys=True, separators=(",", ":"))
 
 
-def _normalized_expression(text):
-    """Legacy FASTEXPR text key for matching platform expressions to saved arms."""
-    return "".join((text or "").split())
-
-
 def _recovery_expression_key(expression, language):
     if not expression:
         return None
     if ml.is_python_language(language):
         return alpha_registry.expression_hash(expression, language=language)
-    return _normalized_expression(expression)
+    from fastexpr_ast import ParseError, parse
+
+    # A formatted submission and its captured source have the same tree.
+    # Keep opaque source exact instead of dropping whitespace inside strings.
+    try:
+        return "fastexpr", parse(expression).render()
+    except (ParseError, RecursionError):
+        return "raw", expression.strip()
 
 
 def _probe_recovery_index(session, limit, pages, deadline):
@@ -1400,13 +1405,15 @@ def _recovery_language(row, signature):
     return settings.get("language") if isinstance(settings, dict) else None
 
 
-def _load_probe_batch(value):
+def _load_probe_batch(value, *, source_paths=None):
     path = Path(value).expanduser().resolve()
     visited = set()
     while True:
         if path in visited:
             raise CliError("INVALID_INPUT", "cyclic probe response path")
         visited.add(path)
+        if source_paths is not None:
+            source_paths.add(path)
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -1622,48 +1629,89 @@ def _require_spec(args):
                    "pass spec.json, or --recover BATCH_JSON to repair an existing batch")
 
 
-def cmd_fmt(args, _sink):
-    """Format alpha expressions: one statement per line, wrapped chains, indented legs.
+def _format_fastexpr(expression, label):
+    from fastexpr_ast import ParseError
 
-    Every expression written here lives as a single long line - in a spec file, in a
-    commit message, in a probe invocation - while the book's own 55 expressions are
-    stored multi-line with aligned continuations. A six-leg composite on one line cannot
-    be reviewed, and review is the only defence against silent mistakes.
-    """
+    try:
+        return expression_lint.format_fastexpr(expression, strict=True)
+    except (ParseError, RecursionError) as exc:
+        raise CliError("INVALID_INPUT", f"{label}: {exc}") from exc
+
+
+def _write_formatted_spec(path, source, document):
+    from tools.campaign_runner import campaign_paths
+
+    root = Path(research_paths.research_dir()).resolve()
+    inbox = root / "backlog"
+    try:
+        with ExitStack() as locks:
+            if path.parent in (inbox, inbox / "done", inbox / "failed"):
+                locks.enter_context(cache_store.file_lock(inbox / ".runner.lock", timeout=0))
+                if any(saved.exists() for saved in campaign_paths(root, path)):
+                    raise CliError("INVALID_INPUT", "this campaign spec already has saved execution evidence",
+                                   "preview it or format a separate draft")
+            locks.enter_context(cache_store.file_lock(str(path) + ".lock", timeout=0))
+            if path.read_bytes() != source:
+                raise CliError("INVALID_INPUT", "the draft spec changed during formatting")
+            cache_store.write_json_atomic(path, document, mode=path.stat().st_mode & 0o777, indent=2)
+    except cache_store.LockTimeout as exc:
+        raise CliError("SERVICE_ERROR", "this draft spec or its queue is already being updated") from exc
+
+
+def cmd_fmt(args, _sink):
+    """Preview FASTEXPR formatting and write only a verified draft spec."""
     target = args.target
     path = Path(target).expanduser()
-    if path.suffix == ".json" and path.exists():
+    if path.suffix.lower() == ".json":
+        path = path.resolve()
+        protect_output(args, path)
         try:
-            document = json.loads(path.read_text(encoding="utf-8"))
+            source = path.read_bytes()
+            document = json.loads(source)
         except (OSError, ValueError) as exc:
             raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc))
-        arms = document.get("arms") or []
-        if not arms:
-            raise CliError("INVALID_INPUT", "%s has no arms" % path.name)
+        if not isinstance(document, dict) or {"format", "records", "rows"} & document.keys():
+            raise CliError("INVALID_INPUT", "fmt expects a Probe draft spec")
+        if args.write:
+            spec, _, _, parsed_arms, _ = _probe_inputs(SimpleNamespace(spec=str(path)))
+        else:
+            spec = _load_probe_spec(path)
+            parsed_arms = spec["arms"]
+        protect_output(args, *(path.parent / Path(arm["source_file"]).expanduser()
+                               for arm in parsed_arms if "source_file" in arm))
+        arms = document["arms"]
+        skipped = []
         changed = 0
-        for arm in arms:
-            settings = {**(document.get("settings") or {}), **(arm.get("settings") or {})}
-            if "source_file" in arm or ml.is_python_language(settings.get("language")):
+        for arm, parsed in zip(arms, parsed_arms):
+            label = parsed["label"]
+            settings = {**spec.get("settings", {}), **parsed.get("settings", {})}
+            if "source_file" in parsed or ml.is_python_language(settings.get("language")):
+                skipped.append({"label": label, "reason": "python_source"})
                 continue
-            original = arm.get("expression") or ""
-            formatted = expression_lint.pretty_expression(original)
+            original = arm["expression"]
+            formatted, reason = _format_fastexpr(original, label)
+            if reason:
+                skipped.append({"label": label, "reason": reason})
             if formatted != original:
                 arm["expression"] = formatted
                 changed += 1
-        if args.write:
-            path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n",
-                            encoding="utf-8")
+        written = bool(args.write and changed)
+        if written:
+            _write_formatted_spec(path, source, document)
         return {"path": str(path), "arms": len(arms), "changed": changed,
-                "written": bool(args.write), "formatted": document}
+                "written": written, "skipped": skipped, "formatted": document}
 
     if path.suffix.lower() == ".py" and path.exists():
+        protect_output(args, path)
         raise CliError("INVALID_INPUT", "fmt only formats FASTEXPR")
-    # Not a spec file: treat the argument as one expression.
-    formatted = expression_lint.pretty_expression(target)
     if args.write:
         raise CliError("USAGE", "--write needs a spec file",
                        "pass the path to a JSON spec instead of a bare expression")
-    return {"formatted": formatted}
+    formatted, reason = _format_fastexpr(target, "expression")
+    result = {"formatted": formatted}
+    if reason:
+        result["skipped"] = reason
+    return result
 
 
 _PROBE_REFERENCE_LIMIT = 3
@@ -1885,6 +1933,7 @@ def probe_spec_identity(path):
     """Bind a materialized file to its checkpoint without repeating discovery."""
     spec, _, _, arms, design = _probe_inputs(SimpleNamespace(spec=str(path)))
     return {"track": spec["track"], "design": design,
+            **({"quick_source": spec["quick_source"]} if "quick_source" in spec else {}),
             "request_fingerprint": _request_fingerprint(arms), "results": arms}
 
 
@@ -1987,7 +2036,7 @@ def _cmd_probe(args, _sink):
     if target in source_paths:
         raise CliError("INVALID_INPUT", "batch path would overwrite an input source_file")
     protect_output(args, target, *source_paths)
-    context = {key: spec[key] for key in ("idea", "mechanism", "note") if key in spec}
+    context = {key: spec[key] for key in _PROBE_CONTEXT_FIELDS if key in spec}
     base = {"name": name, **context, "path": str(target), "arms": len(arms),
             "track": spec["track"], "routes": _probe_routes(spec["track"], arms),
             "groups": len(groups), "design": design, "arm_order": [arm["label"] for arm in arms],
@@ -2136,7 +2185,7 @@ def _probe_document_update(document, target):
 
 
 def _probe_response(document, path, show_test=False, manifest=None, summary=False):
-    keys = ("name", "idea", "mechanism", "note", "track", "routes", "run_id", "started_at", "request_fingerprint",
+    keys = ("name", *_PROBE_CONTEXT_FIELDS, "track", "routes", "run_id", "started_at", "request_fingerprint",
             "arm_order", "design", "complete", "incomplete", "all_empty", "comparisons",
             "execution", "recording", "recording_policy", "next_actions", "preflight",
             "concurrency", "scheduling", "capability_snapshot", "multi_size")
@@ -2349,7 +2398,7 @@ def _run_probe(args, spec, name, groups, design, gate, target):
     arms = sorted([arm for group in groups.values() for arm in group["arms"]], key=lambda arm: arm["arm_index"])
     document = {"format": "probe-batch", "version": 2, "spec": str(args.spec), "name": name,
         "track": spec["track"], "routes": _probe_routes(spec["track"], arms),
-        **{key: spec[key] for key in ("idea", "mechanism", "note") if key in spec},
+        **{key: spec[key] for key in _PROBE_CONTEXT_FIELDS if key in spec},
         **_multi_options(args),
         "run_id": str(uuid.uuid4()), "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "request_fingerprint": _request_fingerprint(arms), "arm_order": [arm["label"] for arm in arms],

@@ -109,6 +109,27 @@ class SimulationQuotaTests(unittest.TestCase):
             records = ml.simulate_alphas(session, ["rank(cap)", "rank(volume)", "rank(sales)"], **arguments)
         return records, report
 
+    def test_default_fastexpr_formatting_is_identical_in_preview_and_single_post(self):
+        original = "x = rank(close); rank(x)"
+        expected = "x = rank(close);\nrank(x)"
+        preview = ml.simulate_alphas(None, [original], dry_run=True)[0]
+        self.assertEqual(preview["expression"], original)
+        self.assertEqual(preview["payload"]["regular"], expected)
+
+        session = mock.Mock()
+        session.post.return_value = response(headers=quota_headers(5))
+        raw = {**preview["payload"], "regular": original}
+        ml.submit_single_simulation(session, raw)
+        self.assertEqual(session.post.call_args.kwargs["json"], preview["payload"])
+        self.assertEqual(raw["regular"], original)
+
+    def test_default_wire_formatting_preserves_python_and_sensitive_string_literals(self):
+        for language, source in (("PYTHON", "def alpha(data, delay):\n    return data.close\n"),
+                                 ("FASTEXPR", 'group_rank(close, "a  b")')):
+            with self.subTest(language=language):
+                payload = {"type": "REGULAR", "settings": {"language": language}, "regular": source}
+                self.assertIs(ml.format_simulation_payload(payload), payload)
+
     def test_success_exhausts_quota_without_losing_accepted_job_or_posting_later_waves(self):
         session = mock.Mock()
         session.post.return_value = response(headers=quota_headers(0))

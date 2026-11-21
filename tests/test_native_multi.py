@@ -254,6 +254,42 @@ def test_native_resume_restores_parent_location_before_releasing_reservation(sim
     assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0
 
 
+@pytest.mark.parametrize("legacy", [True, False], ids=["old-raw", "new-formatted"])
+@pytest.mark.parametrize("contradictory_echo", [False, True], ids=["exact-echo", "changed-echo"])
+def test_native_resume_matches_the_verified_wire_payload(legacy, contradictory_echo):
+    raw = ["rank( close)", "rank(close )" if legacy else "rank(open )"]
+    formatted = ["rank(close)", "rank(close)" if legacy else "rank(open)"]
+    settings = ml.regular_wire_settings(ml.resolve_settings(SETTINGS))
+
+    def payload(expression):
+        return {"type": "REGULAR", "regular": expression, "settings": settings}
+
+    submitted = raw if legacy else formatted
+    records = [{"status": "PENDING", "submission_attempted": True, "multi_request_id": "SavedParent",
+                "multi_member": index, "multi_size": 2, "multi_parent_url": PARENT_URL,
+                "multi_parent_terminal": True, "multi_children": ["Child2", "Child1"],
+                "multi_payload_sha": simulation_multi.payload_digest(payload(expression))}
+               for index, expression in enumerate(submitted)]
+    runs = simulation_multi.MultiRuns(None, records, lambda index: payload(formatted[index]), {}, 2,
+                                      None, lambda *args: None, lambda *args: None,
+                                      original_payload_for=lambda index: payload(raw[index]))
+    assert list(runs.restore()) == [(0, 1)]
+    echoed = list(submitted)
+    if contradictory_echo:
+        echoed[0] = formatted[0] if legacy else raw[0]
+    snapshots = {f"Child{number}": {**payload(expression), "id": f"Child{number}",
+                                      "status": "COMPLETE", "alpha": f"Alpha{number}"}
+                 for number, expression in enumerate(echoed, 1)}
+    with mock.patch.object(ml, "read_simulation_snapshot",
+                           side_effect=lambda _, child_id, **kwargs: (snapshots[child_id], None)):
+        runs.collect_children((0, 1))
+
+    assert [row.get("alpha_id") for row in records] == [None if contradictory_echo else "Alpha1", "Alpha2"]
+    records[0]["multi_payload_sha"] = "unverified"
+    with pytest.raises(ValueError, match="does not match"):
+        list(runs.restore())
+
+
 def test_native_lost_post_response_does_not_replay_members(simulator):
     with mock.patch.object(ml, "submit_multi_simulation", side_effect=requests.Timeout()):
         records = simulator()

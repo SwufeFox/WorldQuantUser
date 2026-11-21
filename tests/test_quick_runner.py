@@ -80,6 +80,49 @@ class QuickRunnerTests(TestCase):
         self.assertEqual(url, ALPHA_URL)
         return response(200, {"is": {"sharpe": 2.3, "fitness": 1.5, "checks": []}})
 
+    def test_quick_and_full_posts_format_source_without_changing_request_identity(self):
+        for mode in ("QUICK", "FULL"):
+            with self.subTest(mode=mode):
+                settings = dict(ARM["settings"])
+                if mode == "FULL":
+                    settings["simulationMode"] = mode
+                arm = {"label": mode, "expr": "x = rank(cap); rank(x)", "settings": settings}
+                raw = batch_quick._payload(arm)
+                session = mock.Mock()
+                session.post.return_value = response(201, Location=PROGRESS_URL)
+                session.get.side_effect = self.complete
+                with mock.patch.object(machine_lib, "load_session", return_value=session):
+                    result = self.runner().run(arm)
+
+                self.assertEqual(result["status"], "COMPLETE")
+                self.assertEqual(result["expr"], "x = rank(cap); rank(x)")
+                session.post.assert_called_once()
+                wire = session.post.call_args.kwargs["json"]
+                self.assertEqual(wire, {
+                    "type": "REGULAR",
+                    "settings": {**settings, "simulationMode": mode, "visualization": False},
+                    "regular": "x = rank(cap);\nrank(x)",
+                })
+                self.assertEqual(batch_quick._simulation_key(wire), batch_quick._simulation_key(raw))
+
+    def test_resumes_shared_legacy_raw_job_without_reposting(self):
+        arm = {**ARM, "expr": "x = rank(cap); rank(x)"}
+        old_payload = {"type": "REGULAR", "regular": arm["expr"],
+                       "settings": {**ARM["settings"], "simulationMode": "QUICK", "visualization": False}}
+        legacy_key = self.runner()._raw_key(arm["label"], old_payload)
+        slot = simulation_slots.quick_acquire(ACCOUNT, 1, legacy_key)
+        simulation_slots.quick_update(ACCOUNT, slot["id"], "accepted", progress_url=PROGRESS_URL)
+
+        session = mock.Mock()
+        session.get.side_effect = self.complete
+        with mock.patch.object(machine_lib, "load_session", return_value=session):
+            result = self.runner().run(arm)
+
+        self.assertEqual(result["status"], "COMPLETE")
+        self.assertEqual(result["simulation_job_key"], legacy_key)
+        self.assertEqual(result["alpha_id"], ALPHA_ID)
+        session.post.assert_not_called()
+
     def test_post_refreshes_auth_and_429_remains_retryable_after_four_attempts(self):
         stale, current = mock.Mock(), mock.Mock()
         stale.post.return_value = response(401)

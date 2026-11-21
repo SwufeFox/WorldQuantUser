@@ -1073,6 +1073,14 @@ def build_parser():
     _add_multi_size_arg(campaign_preview)
     campaign_preview.bind_handler("campaign.cmd_campaign_preview")
 
+    campaign_prepare = campaign_sub.add_parser(
+        "prepare-full", help="Draft bounded FULL simulations from a saved QUICK batch's training results.")
+    campaign_prepare.add_argument("batch", metavar="BATCH")
+    campaign_prepare.add_argument("--out", required=True, metavar="SPEC", help="Path for the raw Probe spec.")
+    campaign_prepare.add_argument("--limit", required=True, type=_positive_count,
+                                  help="Maximum FULL arms, including the control in a controlled experiment.")
+    campaign_prepare.bind_handler("campaign.cmd_campaign_prepare_full")
+
     campaign_status = campaign_sub.add_parser("status", help="Read queued specs and their saved progress offline.")
     campaign_status.add_argument("--limit", type=_non_negative_integer, default=20,
                                  help="Maximum pending jobs to display.")
@@ -1495,14 +1503,12 @@ def build_parser():
     b_sub.bind_handler("buffer_cmd.cmd_buffer_submit")
 
     fmt = sub.add_parser(
-        "fmt", help="Format an alpha expression (or every arm in a spec file).",
-        description="The platform accepts newlines - all 55 stored book expressions are "
-                    "multi-line with aligned continuations - but everything written here "
-                    "ends up on one line. This reformats: one statement per line, wrapped "
-                    "chains, indented legs. Idempotent and semantics-preserving.")
-    fmt.add_argument("target", help="An expression string, or the path to a spec JSON.")
+        "fmt", help="Preview review-friendly formatting of native FASTEXPR.",
+        description="Format an expression or the FASTEXPR arms in a draft spec. "
+                    "Changes are checked against the parsed expression. Python arms are skipped.")
+    fmt.add_argument("target", help="A native FASTEXPR expression or a draft spec JSON.")
     fmt.add_argument("--write", action="store_true",
-                     help="Rewrite the spec file in place (only for spec paths).")
+                     help="Write verified formatting changes to a draft spec in place.")
     fmt.bind_handler("experiments.cmd_fmt")
 
     health = sub.add_parser(
@@ -1680,6 +1686,7 @@ _COMMAND_EXAMPLES = {
               "probe --recover BATCH.json --max-wait-seconds 60",
               "probe --resume BATCH.json --dry-run", "probe --from-simulation SIMULATION_ID"],
     "campaign": ["campaign status", "campaign preview batch.spec.json",
+                 "campaign prepare-full quick-batch.json --out full.spec.json --limit 4",
                  "campaign run --recover-only", "campaign run --watch --multi-size 4"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],

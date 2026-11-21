@@ -412,6 +412,8 @@ class Runner:
             wait = retry_after or delay
 
     def _post(self, payload, key, row, *, existing_url, next_retry_at=0, identity_unverified=False):
+        # Old checkpoints may be keyed by the exact source from the arm file.
+        wire_payload = machine_lib.format_simulation_payload(payload)
         delay = 0.5
         deadline = time.monotonic() + self.poll_timeout
         retry_at = time.monotonic() + max(0, next_retry_at - time.time())
@@ -480,7 +482,7 @@ class Runner:
                         continue
                     # Once dispatched, give the POST a full chance to return its Location.
                     response = session.post(machine_lib.BRAIN_API_URL + "/simulations",
-                                            json=payload, timeout=90, allow_redirects=False)
+                                            json=wire_payload, timeout=90, allow_redirects=False)
                 except ConnectTimeout:
                     simulation_slots.quick_update(self.account, slot["id"], "refused")
                     retry_at = time.monotonic() + delay

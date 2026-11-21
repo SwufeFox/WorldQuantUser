@@ -1186,11 +1186,21 @@ python3 research_cli.py ledger sync --pnl
 把待研究的规格放入研究目录的 `backlog/`。先预览输入，再推进队列。已受理的任务、已确认未开始的臂、结果不明的请求都由 Probe 检查点记录。
 
 ```bash
+python research_cli.py fmt DRAFT.json
 python research_cli.py campaign preview SPEC.json --multi-size 4
+python research_cli.py campaign prepare-full QUICK-BATCH.json --out FULL-SPEC.json --limit 8
 python research_cli.py campaign status
 python research_cli.py campaign run --recover-only
 python research_cli.py campaign run --watch --batch-size 4 --multi-size 4 --stream
 ```
+
+所有新 FASTEXPR 回测请求默认先经过 `fmt` 的语法树等价检查。`simulate --dry-run` 和 `campaign preview` 的 `payload.regular` 显示实际发送的源码。单条、原生 Multi、兼容 QUICK/FULL 入口都走同一规则。含注释或无法确认改写安全的表达式保留原文。Python 源码和 SPC prompt 保持各自的校验规则。
+
+单独运行 `fmt` 可以审阅排版。在入队前使用 `--write` 才会改写草稿。检查点保留原始规格身份，已受理的任务按原请求回收。历史生成脚本可以用 `alpha_sugar.fs()` 生成原生表达式，正式规格保留展开后的源码。
+
+Campaign 开跑前复用 Probe 的离线扫描，确定的语法错误在联网前拦截，字段和设置仍由账号范围内的在线预检核对。`batch_quick.py` 和 `pipeline_pc.py` 仍是兼容入口。
+
+`prepare-full` 仅读取已保存的 QUICK 训练证据。它按训练 Sharpe 排序，生成带原始 Alpha ID、批次和训练分数的 FULL 草稿。`--limit` 是 FULL 臂的总数上限，对照实验的原对照计入上限。预览并确认草稿后再放入 `backlog/`。生成草稿在本地完成。
 
 | 规格 | 研究证据 |
 | --- | --- |
@@ -1202,7 +1212,7 @@ python research_cli.py campaign run --watch --batch-size 4 --multi-size 4 --stre
 研究路线记录在回执和批次中。原生请求类型、语言和 QUICK/FULL 设置仍按各自的平台协议处理。
 平台原始分类随结果保存，可用 `alpha get` 或冻结后的验证视图核对。
 
-`run` 默认推进一份规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
+`run` 默认推进一份当前可运行的规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。队列先处理可回收的检查点，全部已受理且尚未到轮询时间的批次让出本轮。`status` 显示这类批次的 `next_poll_at`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
 
 先用 `--recover-only` 回收已有检查点。需要验证 FULL Regular 候选时启用 `--validate`，或对保存的训练冻结选择单独运行 `promote --selection`。已冻结的选择和终态验证回执可以复用。QUICK、Power Pool 与 ATOM 保留各自研究证据，SPC 结果在本地完成。Alpha 和 SPC 的平台提交仍走各自授权入口。
 

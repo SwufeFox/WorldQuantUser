@@ -46,11 +46,11 @@ The ledger uses `expr2:` hashes for parseable FastExpr and keeps the legacy
 only line endings normalized. Indentation, whitespace, and string contents
 remain part of Python source identity. Existing ledger keys stay in place.
 
-## Sugar
+## Optional shorthand for script generators
 
-`alpha_sugar` registers macros that expand at parse time, so the string handed to
-the simulator contains no sugar at all. Each one encodes a decision that had already
-been paid for:
+Some older research scripts use `alpha_sugar.fs()` to generate native FASTEXPR.
+The CLI expects the expanded expression in a spec. For reusable experiment
+templates, use `alpha_unit` to track the underlying construction and its coverage.
 
 | Form | Expands to | Why it exists |
 | --- | --- | --- |

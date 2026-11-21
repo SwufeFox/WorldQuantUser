@@ -11,7 +11,7 @@ TRACKS = ("REGULAR", "POWER_POOL", "ATOM", "SPC")
 ATOM_RUNNER_MECHANISM = "ATOM / Power Pool scan"
 SPEC_CONTRACT = {
     "track": {"choices": list(TRACKS), "default_for_probe": "REGULAR"},
-    "brain_simulation": {"required": ["arms"], "optional": ["settings", "design"],
+    "brain_simulation": {"required": ["arms"], "optional": ["settings", "design", "quick_source"],
                          "native_type": "REGULAR", "languages": ["FASTEXPR", "PYTHON"]},
     "spc": {"required": ["name", "prompt", "sampleOutput", "modelFamily", "weight",
                          "updateFrequency", "runs"], "optional": ["reference", "as_of"],

@@ -48,7 +48,7 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `ablation.py` | Leave-one-out and solo variants, so a leg can be shown to earn its place. |
 | `cache_store.py` | Small JSON cache with TTL, so repeat calls do not re-fetch. |
 | `fastexpr_ast.py` | FASTEXPR parser: tree, field extraction, skeletons, transforms. |
-| `alpha_sugar.py` | Sugar that compiles to FASTEXPR (`band`, `rrank`, `deadband`, ...). |
+| `alpha_sugar.py` | Optional generator library for historical scripts that explicitly emit native FASTEXPR. |
 | `operator_semantics.py` | Invariants the operator catalogue does not publish. |
 | `annotations.py` | `@annotation` vocabulary, staleness checks, ablation derivation. |
 | `intent.py` | Rewrite "rank a level" into "rank a level over size". |
@@ -1259,6 +1259,15 @@ were never run. `python3 tools/unit_report.py --derive <key>` lists them. The ol
 text/tree macro system that did the same thing by hand-written `def` blocks was
 removed because unit templates also track derivations and coverage. Keep private
 experiment plans and their outcomes in the research directory.
+
+Probe and campaign specs use native FASTEXPR or Python. Older research generators
+can still compile shorthand explicitly with `alpha_sugar.fs()`. That shorthand
+is a generator input. Save the expanded FASTEXPR for review and execution.
+
+New FASTEXPR simulations apply the shared formatter to the wire source by default.
+Dry runs expose the same source in `payload.regular`. Existing checkpoints retain
+their original request identity. The `fmt` command previews a draft independently
+and rewrites it only with `--write`.
 
 ### Report the pool as a distribution
 

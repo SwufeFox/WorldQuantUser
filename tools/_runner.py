@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import glob
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -22,6 +23,10 @@ _FINISHED = alpha_registry.FINISHED_STATUSES | {"ACTIVE", "SUBMITTED", "UNSUBMIT
 _FAILED = simulation_slots.TERMINAL_FAILURE_STATUSES | {"FAILED"}
 _RETRYABLE = {"RATE_LIMITED", "SERVICE_ERROR", "AUTH_MISSING", "AUTH_FAILED", "AUTH_CAPTCHA", "INTERRUPTED", "TIMEOUT",
               "INVALID_RESPONSE"}
+_OFFLINE_BLOCKS = {"empty", "unbalanced_string", "unbalanced_parens", "reserved_identifier",
+                   "trailing_token", "unused_variable", "operator_budget", "python_syntax",
+                   "python_alpha_entrypoint", "python_alpha_signature", "python_data_declaration",
+                   "python_implicit_field"}
 
 
 @dataclass(frozen=True)
@@ -135,6 +140,7 @@ def _saved_probe(preview, batch):
 
     if (preview.get("request_fingerprint") != saved["request_fingerprint"]
             or preview.get("design") != saved.get("design")
+            or preview.get("quick_source") != saved.get("quick_source")
             or ("track" in saved and preview.get("track") != saved["track"])
             or roles(preview.get("results") or []) != roles(saved.get("arms") or [])):
         return CliResult(False, {}, f"queued spec does not match {batch.name}; choose a new spec name")
@@ -181,7 +187,10 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
             return ProbeRun("failed", {}, exc.message)
         saved_path = batch
     else:
-        preview = run_cli(root, "probe", spec, "--dry-run", timeout=120)
+        preview_options = ("--multi-size", str(multi_size)) if multi_size is not None else ()
+        if strict_gate:
+            preview_options += ("--strict-gate",)
+        preview = run_cli(root, "probe", spec, "--dry-run", *preview_options, timeout=120)
         if not preview.ok:
             return ProbeRun("deferred" if preview.code in _RETRYABLE else "failed", {}, preview.detail)
         identity = preview.data
@@ -205,11 +214,13 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
     elif recover_only:
         return ProbeRun("deferred", {}, "awaiting authorization to launch a new batch")
     else:
-        arguments = (spec, "--batch-path", batch)
-        if multi_size is not None:
-            arguments += ("--multi-size", str(multi_size))
-        if strict_gate:
-            arguments += ("--strict-gate",)
+        structural = sorted({item["code"] for item in preview.data.get("blocking", ())
+                             if item.get("code") in _OFFLINE_BLOCKS})
+        if structural:
+            return ProbeRun("failed", preview.data, "offline syntax gate: " + ", ".join(structural))
+        if strict_gate and preview.data.get("gate_blocking"):
+            return ProbeRun("failed", preview.data, "exact finished requests repeat under --strict-gate")
+        arguments = (spec, "--batch-path", batch, *preview_options)
     result = run_cli(root, "probe", *arguments, *wait, *budget, "--save", receipt,
                      timeout=max_wait + 900)
     if not result.ok:
@@ -221,23 +232,44 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
     return ProbeRun(state, result.data, detail)
 
 
-def _recovery_priority(spec, paths):
-    batch, receipt = paths(spec)
+def probe_poll_at(document):
+    """Earliest useful poll when all saved work is already accepted and timed."""
+    rows = document.get("rows") or []
+    execution = document.get("execution") or {}
+    if (not isinstance(rows, list) or not rows or not isinstance(execution, dict)
+            or execution.get("total") != len(rows) or execution.get("finished") != 0):
+        return None
+    times = []
+    for row in rows:
+        if (not isinstance(row, dict) or row.get("submission_state") != "accepted"
+                or row.get("multi_parent_url")
+                or not (row.get("progress_url") or (row.get("alpha_id") and row.get("metrics_pending")))):
+            return None
+        at = row.get("next_poll_at")
+        if type(at) not in (int, float) or not math.isfinite(at) or at <= 0:
+            return None
+        times.append(at)
+    return min(times)
+
+
+def _recovery_schedule(batch, receipt):
     if not batch.is_file():
-        return 1 if receipt.is_file() else 2
+        return (1 if receipt.is_file() else 2), None
     try:
         document = json.loads(batch.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return 0
-    rows = document.get("rows") if isinstance(document, dict) else None
+        return 0, None
+    if not isinstance(document, dict):
+        return 0, None
+    rows = document.get("rows")
     if isinstance(rows, list) and rows and all(
             isinstance(row, dict) and row.get("submission_state") == "not_submitted" for row in rows):
-        return 2
-    return 0
+        return 2, None
+    return 0, probe_poll_at(document)
 
 
 def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
-              concurrency=None, consume=None, execute=None, recover_first=False):
+              concurrency=None, consume=None, execute=None, schedule_recovery=False):
     """Lock one inbox and archive only terminal outcomes.
 
     A deferred job stays with its saved batch. In once mode, process at most
@@ -250,11 +282,18 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
     try:
         with cache_store.file_lock(inbox / ".runner.lock", timeout=0):
             while True:
-                specs = sorted(inbox.glob("*.json"))
-                if recover_first:
-                    specs.sort(key=lambda spec: _recovery_priority(spec, paths))
-                for spec in specs:
+                scheduled = []
+                for spec in sorted(inbox.glob("*.json")):
                     batch, receipt = paths(spec)
+                    priority, poll_at = _recovery_schedule(batch, receipt) if schedule_recovery else (0, None)
+                    scheduled.append((spec, batch, receipt, priority, poll_at))
+                if schedule_recovery:
+                    scheduled.sort(key=lambda item: item[3])
+                next_poll = None
+                for spec, batch, receipt, _, poll_at in scheduled:
+                    if poll_at is not None and poll_at > time.time():
+                        next_poll = poll_at if next_poll is None else min(next_poll, poll_at)
+                        continue
                     log({"kind": "start", "spec": spec.name})
                     try:
                         source = spec.read_bytes()
@@ -277,8 +316,13 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                     if once:
                         return {"done": 0, "failed": 1, "deferred": 3}[result.state]
                 if once:
+                    if next_poll is not None:
+                        log({"kind": "waiting", "next_poll_at": next_poll,
+                             "detail": "waiting for the next saved simulation poll"})
+                        return 3
                     return 0
-                time.sleep(interval)
+                delay = interval if next_poll is None else min(interval, max(0, next_poll - time.time()))
+                time.sleep(delay)
     except cache_store.LockTimeout:
         log({"kind": "busy", "detail": f"another runner is active for {inbox}"})
         return 3

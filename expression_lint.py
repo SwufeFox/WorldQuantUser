@@ -41,6 +41,7 @@ __all__ = [
     "build_operator_index",
     "lint_all",
     "extract_calls",
+    "format_fastexpr",
     "lint_expression",
     "load_denylist",
     "record_rejection",
@@ -790,6 +791,36 @@ def pretty_expression(expression, indent="      ", width=88):
         wrapped[-1] = wrapped[-1] + terminator
         lines.extend(wrapped)
     return "\n".join(comments + lines)
+
+
+def format_fastexpr(expression, *, strict=False):
+    """Return safe formatted source and an optional reason for preserving it.
+
+    Platform-bound calls keep source as written when the local grammar cannot
+    verify a change. Explicit formatting validates even when it is a no-op.
+    """
+    formatted = pretty_expression(expression)
+    if formatted == expression and not strict:
+        return expression, None
+    try:
+        original = fastexpr_ast.parse(expression)
+        if original.signal is None:
+            raise fastexpr_ast.ParseError("FASTEXPR has no final expression", expression, len(expression))
+    except (fastexpr_ast.ParseError, RecursionError):
+        if strict:
+            raise
+        return expression, "unsupported_fastexpr"
+    if formatted == expression:
+        return expression, None
+    if (any(marker in expression for marker in ("#", "//", "/*"))
+            and fastexpr_ast._strip_comments(expression) != expression):
+        return expression, "formatting_would_change_comments"
+    try:
+        if fastexpr_ast.parse(formatted) == original:
+            return formatted, None
+    except (fastexpr_ast.ParseError, RecursionError):
+        pass
+    return expression, "formatting_would_change_expression"
 
 
 def lint_expression(expression, operator_index=None, denylist=None,

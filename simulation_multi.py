@@ -42,10 +42,13 @@ def request_groups(indices, payload_for, size):
 class MultiRuns:
     """Manage a parent reservation and the one-to-many mapping in the arm records."""
 
-    def __init__(self, session, records, payload_for, account, limit, deadline, emit, submission_event):
+    def __init__(self, session, records, payload_for, account, limit, deadline, emit, submission_event,
+                 *, original_payload_for=None):
         self.session = session
         self.records = records
         self.payload_for = payload_for
+        self.original_payload_for = original_payload_for
+        self._wire_payloads = {}
         self.account = account
         self.limit = limit
         self.deadline = deadline if deadline is not None else float("inf")
@@ -55,6 +58,18 @@ class MultiRuns:
     def _emit(self, kind, indices):
         rows = [{**self.records[index], "index": index} for index in indices]
         self.emit(kind, indices[0], {"records": rows})
+
+    def _saved_wire_payload(self, index):
+        saved_digest = self.records[index].get("multi_payload_sha")
+        payload = self.payload_for(index)
+        if payload_digest(payload) == saved_digest:
+            return payload
+        # Pre-formatting checkpoints identify their original wire syntax by hash.
+        if self.original_payload_for is not None:
+            original = self.original_payload_for(index)
+            if payload_digest(original) == saved_digest:
+                return original
+        return None
 
     def restore(self):
         """Validate complete membership and recover parent URLs from the slot journal."""
@@ -69,10 +84,12 @@ class MultiRuns:
             if (type(size) is not int or not 2 <= size <= MAX_CHILDREN
                     or any(type(member) is not int for member in ordinals)
                     or sorted(ordinals) != list(range(size))
-                    or any(self.records[index].get("multi_size") != size
-                           or self.records[index].get("multi_payload_sha") != payload_digest(self.payload_for(index))
-                           for index in group)):
+                    or any(self.records[index].get("multi_size") != size for index in group)):
                 raise ValueError("native multi-simulation checkpoint membership does not match its requests")
+            payloads = {index: self._saved_wire_payload(index) for index in group}
+            if None in payloads.values():
+                raise ValueError("native multi-simulation checkpoint membership does not match its requests")
+            self._wire_payloads.update(payloads)
             group.sort(key=lambda index: self.records[index]["multi_member"])
             indices = tuple(group)
             saved_url = self.records[indices[0]].get("multi_parent_url")
@@ -129,6 +146,7 @@ class MultiRuns:
 
         def checkpoint(reservation):
             for member, (index, payload) in enumerate(zip(indices, payloads)):
+                self._wire_payloads[index] = payload
                 row = self.records[index]
                 row.update(dict.fromkeys(STATE_KEYS))
                 row.update(status="UNKNOWN_SUBMISSION", submission_attempted=True, error=None,
@@ -271,7 +289,7 @@ class MultiRuns:
                             "neutralization", "truncation", "language")
 
     def _matches(self, index, payload):
-        requested = self.payload_for(index)
+        requested = self._wire_payloads[index]
         if payload.get("type") not in (None, requested["type"]):
             return False
         expression, _, _ = ml.regular_expression(payload)

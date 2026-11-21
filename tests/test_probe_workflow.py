@@ -89,6 +89,21 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(identity["design"], preview["design"])
         self.assertEqual(identity["track"], preview["track"])
 
+    def test_preview_formats_the_native_request_without_rewriting_the_spec_or_its_identity(self):
+        original = "x = rank(close); rank(x)"
+        self.spec.write_text(json.dumps({"design": "explore", "arms": [{"expression": original}]}),
+                             encoding="utf-8")
+        before = self.spec.read_bytes()
+        preview = self.run_probe(dry_run=True)
+        wire = preview["results"][0]["payload"]["regular"]
+        self.assertEqual(wire, "x = rank(close);\nrank(x)")
+        self.assertEqual(self.spec.read_bytes(), before)
+        self.assertEqual(app.probe_spec_identity(self.spec)["request_fingerprint"], preview["request_fingerprint"])
+        self.assertEqual(app._recovery_expression_key(original, "FASTEXPR"),
+                         app._recovery_expression_key(wire, "FASTEXPR"))
+        self.assertNotEqual(app._recovery_expression_key('bucket(close, range="0  1")', "FASTEXPR"),
+                            app._recovery_expression_key('bucket(close, range="0 1")', "FASTEXPR"))
+
     def test_native_multi_preview_groups_compatible_settings_in_arm_order(self):
         with mock.patch.object(app, "cached_field_scope", return_value={"evidence": {"state": "unknown"}}), \
                 mock.patch.object(app, "_turnover_band", return_value={}), \
