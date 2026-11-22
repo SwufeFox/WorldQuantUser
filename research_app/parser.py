@@ -1083,6 +1083,16 @@ def build_parser():
                                   help="Maximum FULL arms, including the control in a controlled experiment.")
     campaign_prepare.bind_handler("campaign.cmd_campaign_prepare_full")
 
+    campaign_breed = campaign_sub.add_parser(
+        "breed", help="Draft a paired offspring generation from saved Probe training results.")
+    campaign_breed.add_argument("batch", metavar="BATCH")
+    campaign_breed.add_argument("--out", required=True, metavar="SPEC",
+                                help="Path for the raw offspring Probe spec.")
+    campaign_breed.add_argument("--seed", required=True, type=int, help="Seed for the parent lottery and child sampling.")
+    campaign_breed.add_argument("--limit", required=True, type=_positive_count,
+                                help="Maximum offspring per policy, one per mechanism and settings stratum.")
+    campaign_breed.bind_handler("campaign.cmd_campaign_breed")
+
     campaign_status = campaign_sub.add_parser("status", help="Read queued specs and their saved progress offline.")
     campaign_status.add_argument("--limit", type=_non_negative_integer, default=20,
                                  help="Maximum queued specs and archived PnL batches to display in each list.")
@@ -1703,6 +1713,7 @@ _COMMAND_EXAMPLES = {
               "probe --resume BATCH.json --dry-run", "probe --from-simulation SIMULATION_ID"],
     "campaign": ["campaign status", "campaign preview batch.spec.json",
                  "campaign prepare-full quick-batch.json --out full.spec.json --limit 4",
+                 "campaign breed batch.json --out offspring.spec.json --seed 17 --limit 4",
                  "campaign run --recover-only", "campaign run --watch --multi-size 4",
                  "campaign recover-pnl --watch --stream"],
     "views": ["views --limit 10"],

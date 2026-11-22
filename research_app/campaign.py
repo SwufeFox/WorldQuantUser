@@ -102,10 +102,9 @@ def _full_arm(arm):
                          "simulationMode": "FULL"}}
 
 
-def cmd_campaign_prepare_full(args, _sink):
-    """Write a bounded FULL spec using only the training evidence in a saved QUICK batch."""
+def _followup_paths(args, name, input_kind):
     if args.out == "-":
-        raise CliError("USAGE", "--out requires a file path for the FULL spec")
+        raise CliError("USAGE", f"--out requires a file path for the {name} spec")
     source = Path(args.batch).expanduser().resolve()
     output = Path(args.out).expanduser().resolve()
     protect_output(args, source, output)
@@ -121,7 +120,28 @@ def cmd_campaign_prepare_full(args, _sink):
     lock = Path(f"{output}.lock")
     protect_output(args, lock, *protected)
     if output in protected or lock in protected or lock.is_symlink():
-        raise CliError("INVALID_INPUT", "--out would overwrite a QUICK input")
+        raise CliError("INVALID_INPUT", f"--out would overwrite a {input_kind} input")
+    return path, batch, output, lock
+
+
+def _write_followup(output, lock, spec, name):
+    experiments._probe_design(spec, {})
+    try:
+        with cache_store.file_lock(lock, timeout=0):
+            if output.exists():
+                if json.loads(output.read_text(encoding="utf-8")) != spec:
+                    raise CliError("INVALID_INPUT", f"refusing to replace a different {name} spec")
+            else:
+                cache_store.write_json_atomic(output, spec, indent=2)
+    except cache_store.LockTimeout as exc:
+        raise CliError("SERVICE_ERROR", f"the {name} spec is being prepared by another process") from exc
+    except (OSError, ValueError) as exc:
+        raise CliError("INVALID_INPUT", f"cannot save {name} spec: {exc}") from exc
+
+
+def cmd_campaign_prepare_full(args, _sink):
+    """Write a bounded FULL spec using only the training evidence in a saved QUICK batch."""
+    path, batch, output, lock = _followup_paths(args, "FULL", "QUICK")
 
     design = batch.get("design") or {}
     mode = design.get("mode")
@@ -180,20 +200,26 @@ def cmd_campaign_prepare_full(args, _sink):
             **{key: batch[key] for key in ("idea", "mechanism", "note") if key in batch},
             **({"design": "explore"} if mode == "explore" else {}),
             "quick_source": provenance, "arms": arms}
-    experiments._probe_design(spec, {})
-    try:
-        with cache_store.file_lock(lock, timeout=0):
-            if output.exists():
-                if json.loads(output.read_text(encoding="utf-8")) != spec:
-                    raise CliError("INVALID_INPUT", "refusing to replace a different FULL spec")
-            else:
-                cache_store.write_json_atomic(output, spec, indent=2)
-    except cache_store.LockTimeout as exc:
-        raise CliError("SERVICE_ERROR", "the FULL spec is being prepared by another process") from exc
-    except (OSError, ValueError) as exc:
-        raise CliError("INVALID_INPUT", f"cannot save FULL spec: {exc}") from exc
+    _write_followup(output, lock, spec, "FULL")
     return {"path": str(output), "track": batch["track"], "arms": len(arms),
             "quick_source": provenance, "omitted": dict(omitted)}
+
+
+def cmd_campaign_breed(args, _sink):
+    """Freeze one parent-selection comparison as a regular Probe spec."""
+    from . import breeding
+
+    path, batch, output, lock = _followup_paths(args, "breeding", "Probe")
+    arms, report = breeding.generation(batch, alpha_registry.load_entries(),
+                                      seed=args.seed, limit=args.limit)
+    source = {"batch_path": str(path), "run_id": batch["run_id"],
+              "request_fingerprint": batch["request_fingerprint"], **report}
+    spec = {"name": output.stem, "track": batch["track"], "design": "explore",
+            "idea": "Compare train-Fitness parent selection with a seeded lottery at equal budget.",
+            "breeding_source": source, "arms": arms}
+    _write_followup(output, lock, spec, "breeding")
+    return {"path": str(output), "track": batch["track"], "arms": len(arms),
+            "breeding_source": source}
 
 
 def _execute_campaign(root, path, batch, receipt, *, max_wait, concurrency,

@@ -138,6 +138,55 @@ def write_quick_batch(path, arms, records, **extra):
     path.write_text(json.dumps(batch), encoding="utf-8")
 
 
+def test_campaign_breed_freezes_balanced_train_only_offspring(tmp_path, capsys, monkeypatch):
+    import machine_lib as ml
+    from research_app import experiments
+
+    def unexpected_session(*args, **kwargs):
+        raise AssertionError("offline breeding opened a session")
+
+    monkeypatch.setattr(experiments, "with_session", unexpected_session)
+    batch = tmp_path / "parents.json"
+    output = tmp_path / "offspring.spec.json"
+    settings = {**ml.DEFAULT_SETTINGS, "simulationMode": "QUICK", "testPeriod": "P1Y"}
+    arms = [quick_arm("winner", "rank(ts_mean(close,5)/ts_mean(volume,10))", settings=settings),
+            quick_arm("other", "rank(ts_mean(close,20)/ts_mean(volume,40))", settings=settings),
+            quick_arm("different-window", "rank(ts_mean(close,30)/ts_mean(volume,60))", settings=settings),
+            quick_arm("no-train", "rank(ts_mean(close,50)/ts_mean(volume,80))", settings=settings)]
+    records = [quick_record("A1", 2, full=0.1), quick_record("A2", 1, full=6),
+               quick_record("A3", 7), quick_record("A4", full=10)]
+    records[2]["out_of_sample"]["test"]["startDate"] = "2022-12-31"
+    write_quick_batch(batch, arms, records)
+    command = ("campaign", "breed", batch, "--out", output, "--seed", 0, "--limit", 1)
+
+    code, response = invoke(capsys, tmp_path, *command)
+
+    assert code == 0
+    spec = json.loads(output.read_text(encoding="utf-8"))
+    evidence = spec["breeding_source"]
+    assert evidence == response["data"]["breeding_source"]
+    assert evidence["scope"] == "train"
+    assert evidence["proposals_per_policy"] == evidence["contrasting_pairs"] == 1
+    [group] = evidence["comparisons"]
+    assert [row["alpha_id"] for row in group["eligible"]] == ["A1", "A2"]
+    assert group["selected"]["parent_alpha_id"] == "A1"
+    assert group["lottery"]["parent_alpha_id"] == "A2"
+    assert {arm["expression"] for arm in spec["arms"]} == {
+        "rank(ts_mean(close, 5) / ts_mean(volume, 40))",
+        "rank(ts_mean(close, 20) / ts_mean(volume, 10))",
+    }
+    assert all(arm["settings"] == settings for arm in spec["arms"])
+    assert experiments.probe_spec_identity(output)["breeding_source"] == evidence
+
+    original = output.read_bytes()
+    for record in records:
+        record["metrics"]["fitness"] += 100
+        record["out_of_sample"]["test"]["sharpe"] += 100
+    write_quick_batch(batch, arms, records)
+    code, _ = invoke(capsys, tmp_path, *command)
+    assert code == 0 and output.read_bytes() == original
+
+
 def campaign_pnl_fixture(root, name, archive_state, *, split=False, collected=False):
     inbox = root / "backlog"
     archive = inbox / archive_state

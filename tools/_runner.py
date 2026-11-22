@@ -141,6 +141,7 @@ def _saved_probe(preview, batch):
     if (preview.get("request_fingerprint") != saved["request_fingerprint"]
             or preview.get("design") != saved.get("design")
             or preview.get("quick_source") != saved.get("quick_source")
+            or preview.get("breeding_source") != saved.get("breeding_source")
             or ("track" in saved and preview.get("track") != saved["track"])
             or roles(preview.get("results") or []) != roles(saved.get("arms") or [])):
         return CliResult(False, {}, f"queued spec does not match {batch.name}; choose a new spec name")

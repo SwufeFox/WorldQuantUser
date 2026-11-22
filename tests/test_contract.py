@@ -106,6 +106,11 @@ class SchemaContractTests(unittest.TestCase):
                 self.assertFalse(parser.parse_args(command).defer_quick_pnl)
                 self.assertTrue(parser.parse_args((*command, "--defer-quick-pnl")).defer_quick_pnl)
 
+    def test_campaign_breeding_exposes_required_seed_and_budget(self):
+        command = parse(run_cli("schema", "campaign", "breed"))["data"]["command"]
+        options = {flag: option for option in command["options"] for flag in option["flags"]}
+        assert all(options[flag]["required"] for flag in ("--out", "--seed", "--limit"))
+
     def test_ledger_sync_advertises_a_finite_network_wait_budget(self):
         options = parse(run_cli("schema", "ledger", "sync"))["data"]["command"]["options"]
         budget = next(option for option in options if "--max-wait-seconds" in option["flags"])

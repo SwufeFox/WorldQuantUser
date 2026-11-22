@@ -740,6 +740,7 @@ class Variant:
     canonical: str
     status: str  # observed | tried | novel
     detail: str = ""
+    donor: str | None = None
 
 
 def _classify(canonical, observed, tried):
@@ -866,7 +867,7 @@ def _with_body(point, index, body):
     return _tidy(_sum(terms_)).render()
 
 
-def crossover(unit, corpus, observed=None, tried=None):
+def crossover(unit, corpus, observed=None, tried=None, *, reference=None):
     """Templates nobody ran, assembled from legs that each already exist.
 
     Within one kind every unit has the same assembly and the same data families, so
@@ -881,24 +882,26 @@ def crossover(unit, corpus, observed=None, tried=None):
       ratio leg may not be replaced by a dispersion leg;
     * they must read the same **data families**, or the port silently changes what
       the alpha is about;
-    * at least one other leg must be identical, otherwise the "port" is just the
-      donor construction and adds nothing.
+    * at least one other leg must share a skeleton, so the port changes one part
+      of an otherwise aligned construction.
     """
     observed = observed or set()
     tried = tried or set()
     kind = corpus.kinds.get(unit.kind)
     if kind is None or not unit.points:
         return []
-    reference = unit.points[0]
+    reference = reference or unit.points[0]
+    if reference.unit != unit.key:
+        raise ValueError("crossover reference belongs to a different unit")
     out, seen = [], set()
     for other in kind.units:
-        if other is unit or len(other.legs) != len(unit.legs):
+        if other is unit or len(other.legs) != len(reference.legs):
             continue
-        shared = sum(1 for left, right in zip(unit.legs, other.legs)
+        shared = sum(1 for left, right in zip(reference.legs, other.legs)
                      if left.shape == right.shape)
         if shared == 0:
             continue
-        for index, (mine, theirs) in enumerate(zip(unit.legs, other.legs)):
+        for index, (mine, theirs) in enumerate(zip(reference.legs, other.legs)):
             if mine.shape == theirs.shape:
                 continue
             if mine.role != theirs.role or mine.families != theirs.families:
@@ -913,7 +916,8 @@ def crossover(unit, corpus, observed=None, tried=None):
             out.append(Variant(label="port:%d" % index, rule="port",
                                expression=expression, canonical=canonical,
                                status=_classify(canonical, observed, tried),
-                               detail="%s <- %s" % (mine.role, other.key[:8])))
+                               detail="%s <- %s" % (mine.role, other.key[:8]),
+                               donor=other.points[0].canonical))
     return out
 
 
@@ -953,7 +957,7 @@ def derive(point, grid=None, observed=None, tried=None, domains=None, mechanism=
             variant = _at(point, name, value)
             if variant is None:
                 continue
-            canonical = fa.canonical(variant)
+            canonical = fa.canonical(_flatten(variant))
             out.append(Variant(label="data:%s" % name, rule="data", expression=variant,
                                canonical=canonical,
                                status=_classify(canonical, observed, tried),
@@ -967,7 +971,7 @@ def derive(point, grid=None, observed=None, tried=None, domains=None, mechanism=
             variant = _at(point, name, value)
             if variant is None:
                 continue
-            canonical = fa.canonical(variant)
+            canonical = fa.canonical(_flatten(variant))
             out.append(Variant(label="domain:%s" % name, rule="domain", expression=variant,
                                canonical=canonical,
                                status=_classify(canonical, observed, tried),
@@ -995,9 +999,19 @@ def _at(point, name, value):
     filling = dict(point.filling)
     filling[name] = value
     try:
-        return point.render(filling)
+        rendered = point.render(filling)
     except (KeyError, ValueError):
         return None
+    if name.startswith("f"):
+        # A field slot is shared by all uses of that field. Keep the original
+        # assignments when this rewrite has the intended flat tree, so reuse of
+        # a variable does not expand into repeated platform operators.
+        program = fa.parse(point.expression)
+        if program.assignments:
+            rewritten = fa.map_fields(program, {point.filling[name]: value}).render()
+            if fa.canonical(_flatten(rewritten)) == fa.canonical(rendered):
+                return rewritten
+    return rendered
 
 
 def verify(corpus):

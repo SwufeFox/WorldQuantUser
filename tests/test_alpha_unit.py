@@ -175,6 +175,16 @@ class RoundTrip(unittest.TestCase):
 
 
 class Derivation(unittest.TestCase):
+    def test_field_mutation_preserves_shared_assignments_and_flat_identity(self):
+        point = au.split("x = ts_mean(close, 5); rank(x / (x + 1))")
+        field_slot = next(name for name, value in point.filling.items() if value == "close")
+        variants = au.derive(point, grid={field_slot: ["open"]})
+        [mutation] = [variant for variant in variants if variant.rule == "data"]
+
+        self.assertIn("x = ts_mean(open, 5);", mutation.expression)
+        self.assertEqual(mutation.expression.count("ts_mean"), 1)
+        self.assertEqual(mutation.canonical, au.split(mutation.expression).canonical)
+
     def setUp(self):
         self.point = au.split(TWO_LEG, datasets=DATASETS)
 
@@ -278,6 +288,20 @@ class Crossover(unittest.TestCase):
                 if "ts_backfill" not in unit.points[0].flat][0]
         variants = au.crossover(unit, corpus, observed=known)
         self.assertEqual(variants[0].status, "observed")
+
+    def test_port_binds_the_selected_point_and_exact_donor(self):
+        alternate = self.PLAIN.replace("volume, 5", "volume, 20")
+        corpus = au.build([entry(self.PLAIN), entry(alternate), entry(self.WRAPPED)],
+                          datasets=dict(DATASETS, vwap="pv1", volume="pv1"))
+        unit = next(unit for unit in corpus.units.values() if len(unit.points) == 2)
+        donor = next(point for point in corpus.points if point.expression == self.WRAPPED)
+        reference = next(point for point in unit.points if point.expression == alternate)
+
+        [child] = au.crossover(unit, corpus, reference=reference)
+
+        self.assertIn("ts_mean(volume, 20)", child.expression)
+        self.assertIn("ts_backfill", child.expression)
+        self.assertEqual(child.donor, donor.canonical)
 
     def test_legs_with_different_jobs_are_not_ported(self):
         corpus = au.build([entry("rank(close/vwap) - 0.5 + rank(ts_mean(volume, 5))"),

@@ -1007,7 +1007,7 @@ def cmd_compare(args, _sink):
     return data
 
 
-_PROBE_CONTEXT_FIELDS = ("idea", "mechanism", "note", "quick_source")
+_PROBE_CONTEXT_FIELDS = ("idea", "mechanism", "note", "quick_source", "breeding_source")
 
 
 def _load_probe_spec(path):
@@ -1943,7 +1943,7 @@ def probe_spec_identity(path):
     """Bind a materialized file to its checkpoint without repeating discovery."""
     spec, _, _, arms, design = _probe_inputs(SimpleNamespace(spec=str(path)))
     return {"track": spec["track"], "design": design,
-            **({"quick_source": spec["quick_source"]} if "quick_source" in spec else {}),
+            **{key: spec[key] for key in ("quick_source", "breeding_source") if key in spec},
             "request_fingerprint": _request_fingerprint(arms), "results": arms}
 
 

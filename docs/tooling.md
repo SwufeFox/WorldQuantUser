@@ -1230,6 +1230,21 @@ Campaign 开跑前复用 Probe 的离线扫描，确定的语法错误在联网�
 研究路线记录在回执和批次中。原生请求类型、语言和 QUICK/FULL 设置仍按各自的平台协议处理。
 平台原始分类随结果保存，可用 `alpha get` 或冻结后的验证视图核对。
 
+```bash
+python3 research_cli.py campaign breed parent-batch.json --out offspring.spec.json --seed 17 --limit 4
+python3 research_cli.py probe offspring.spec.json --dry-run --strict-gate
+```
+
+`campaign breed` 从已保存的 FastExpr 批次离线生成下一代。每组使用同一机制、设置和已记录训练窗口，
+从拥有新子代的同一父代池中比较训练 Fitness 最高的父代和按种子抽出的父代。
+两边各取一个子代，复用 `alpha_unit` 的单槽替换和兼容信号腿交叉。相同子代在一组只模拟一次，
+两种策略共享结果。文件保存候选父代、训练指标、抽签种子、父代与供体 ID、操作和子代标签。
+已完成的同设置 AST 及本次重复子代会去重。至少有一对不同子代时写出规格。
+
+输出沿用父代的模拟模式，使用不同文件名保存后续世代。父代选择只读取训练指标。
+产生的规格可交给普通 Probe，后续验证继续使用冻结选择。档案回放可检查谱系和预检，
+比较父代选择的收益需要测量两组实际子代。
+
 `run` 默认推进一份当前可运行的规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。队列先处理可回收的检查点。剩余任务均已受理且尚未到轮询时间时，该批次让出本轮。原生 Multi 使用已登记槽位的父任务轮询时间，`status` 显示这些批次的 `next_poll_at`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
 
 批量 QUICK 初筛可用 `run --watch --defer-quick-pnl`，让队列在保存训练汇总后继续推进。
