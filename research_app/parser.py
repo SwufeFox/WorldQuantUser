@@ -518,6 +518,8 @@ def build_parser():
     promote_parser.add_argument("--dry-run", action="store_true",
                                 help="Run validation and platform checks. Report would_buffer without "
                                      "writing the shelf if eligible.")
+    promote_parser.add_argument("--review-receipt", metavar="PATH",
+                                help="Review a saved Regular promotion receipt offline. Requires --selection.")
     _add_cost_args(promote_parser)
     promote_parser.bind_handler("promote.cmd_promote")
 
@@ -1702,6 +1704,7 @@ _COMMAND_EXAMPLES = {
                "triage --show-test --selection choice.json"],
     "promote": ['promote ALPHA_ID --note "frozen validation passed" --cost-bps 5 10 20',
                 "promote ALPHA_ID --selection choice.json --max-self-correlation 0.7",
+                "promote ALPHA_ID --selection choice.json --review-receipt receipt.json",
                 "promote ALPHA_ID --dry-run"],
     "brief": ["brief", "brief --days 7 --top 5"],
     "ask": ["ask --by neutralization --stat n,median:sharpe,floor_share",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import math
 from pathlib import Path
 import re
@@ -15,12 +16,106 @@ from . import alphas, buffer_cmd, selection, triage
 from .experiments import _selection_call
 from .runtime import CliError, note, protect_output, with_session
 
+
 def _finite(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+def _validation_reasons(row, retention_floor):
+    reasons = []
+    test, retention = row.get("test_sharpe"), row.get("retention")
+    if not _finite(test):
+        reasons.append("test_sharpe_missing_or_nonfinite")
+    elif test <= 0:
+        reasons.append("test_sharpe <= 0")
+    if not _finite(retention):
+        reasons.append("retention_missing_or_nonfinite")
+    elif retention < retention_floor:
+        reasons.append("retention < retention_floor (%s < %s)" % (retention, retention_floor))
+    return reasons
+
+
+def _review_receipt(args):
+    """Review historical Regular promotion evidence without contacting BRAIN."""
+    if (not args.selection or args.dry_run or any(getattr(args, key) is not None
+            for key in ("freeze", "buffer", "note", "retention_floor", "cost_bps",
+                        "max_self_correlation"))):
+        raise CliError("INVALID_INPUT", "--review-receipt requires --selection and cannot use live promotion options")
+    protect_output(args)
+    manifest = _selection_call(selection.load, args.selection, source="triage")
+    retention_floor = manifest["criteria"].get("retention_floor", selection.DEFAULT_PROMOTION_RETENTION)
+    if not _finite(retention_floor):
+        raise CliError("INVALID_INPUT", "frozen retention floor must be finite")
+    path = Path(args.review_receipt).expanduser().resolve()
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+        data = receipt["data"]
+        steps = data["steps"]
+        frozen = steps["freeze"].get("evidence") or {}
+        validated = steps["validate"].get("evidence") or {}
+        checks = data["checks"]
+        rows = validated.get("rows", [])
+        results = checks.get("results", [])
+        if (receipt.get("command") != "promote" or data.get("alpha_id") != args.alpha_id
+                or [row["alpha_id"] for row in manifest["rows"]] != [args.alpha_id]
+                or (frozen and frozen.get("selection_id") != manifest["selection_id"])
+                or (validated and (not frozen
+                    or validated.get("selection_id") != manifest["selection_id"]
+                    or validated.get("frozen_window") != manifest["window"]
+                    or [selection.row_identity(row) for row in rows] != manifest["identities"]))
+                or (results and (not validated or [row["alpha_id"] for row in results] != [args.alpha_id]))):
+            raise ValueError("receipt, candidate and frozen selection do not match")
+        row = rows[0] if rows else {}
+        checked = results[0] if results else {}
+        observed = checked["checks"] if checked.get("payload_received") is True and not checked.get("error") else {}
+        verdicts = {name: check.get("result") for name, check in observed.items()}
+    except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
+        raise CliError("INVALID_INPUT", f"cannot review promotion receipt: {exc}") from exc
+
+    reasons = _validation_reasons(row, retention_floor)
+    source_fields = ("source_expression", "source_settings")
+    source_changed = [key for key in source_fields if row and not row.get("missing")
+                      and row.get(key) != manifest["rows"][0].get(key)]
+    missing = [reason for reason in reasons if reason.endswith("_missing_or_nonfinite")]
+    failures = [reason for reason in reasons if reason not in missing]
+    failed_checks = sorted(name for name, result in verdicts.items() if result == "FAIL")
+    unresolved = sorted(name for name, result in verdicts.items()
+                        if result not in ("PASS", "FAIL", "WARNING"))
+    checks_complete = bool(verdicts) and not unresolved and checked.get("complete") is True
+    production = observed.get("PROD_CORRELATION") or {}
+    if not checks_complete:
+        missing.append("platform_checks_not_resolved")
+    if production.get("result") not in ("PASS", "FAIL"):
+        missing.append("production_correlation_verdict_missing")
+    error = receipt.get("error") or checked.get("error")
+    if error:
+        missing.append("operational_error")
+    if source_changed:
+        missing.append("frozen_source_changed")
+    if not row or row.get("missing"):
+        missing.append("frozen_validation_missing")
+    settings = row.get("source_settings") or {}
+    if ml.is_quick_simulation({"settings": settings}):
+        missing.append("quick_simulation")
+    outcome = ("deferred" if source_changed or error or "quick_simulation" in missing
+               else "blocked" if failures or failed_checks
+               else "deferred" if missing else "passes_review")
+    return {
+        "alpha_id": args.alpha_id, "selection_id": manifest["selection_id"],
+        "receipt_path": str(path), "basis": "saved_receipt", "live_verified": False,
+        "recorded_outcome": data.get("outcome"), "review_outcome": outcome,
+        "simulation_mode": settings.get("simulationMode"),
+        "validation": {key: row.get(key) for key in ("train_sharpe", "test_sharpe", "retention", "costs")},
+        "production_correlation": production or None, "failed_checks": failed_checks,
+        "unresolved_checks": unresolved, "validation_failures": failures,
+        "missing_evidence": missing, "source_changes": source_changed, "recorded_error": error,
+    }
+
+
 def cmd_promote(args, sink):
     """Compose existing commands; operational failures carry the completed evidence."""
+    if getattr(args, "review_receipt", None):
+        return _review_receipt(args)
     alpha_id = args.alpha_id
     alphas._candidate_role(args)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -92,16 +187,7 @@ def cmd_promote(args, sink):
         data["validate"] = {key: row.get(key) for key in data["validate"]}
 
         reasons = data["reasons"]
-        test = data["validate"]["test_sharpe"]
-        retention = data["validate"]["retention"]
-        if not _finite(test):
-            reasons.append("test_sharpe_missing_or_nonfinite")
-        elif test <= 0:
-            reasons.append("test_sharpe <= 0")
-        if not _finite(retention):
-            reasons.append("retention_missing_or_nonfinite")
-        elif retention < retention_floor:
-            reasons.append("retention < retention_floor (%s < %s)" % (retention, retention_floor))
+        reasons.extend(_validation_reasons(data["validate"], retention_floor))
         if reasons:
             data["steps"]["checks"] = {"status": "skipped"}
             data["steps"]["buffer"] = {"status": "skipped"}

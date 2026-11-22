@@ -276,7 +276,7 @@ class PromoteContractTests(unittest.TestCase):
         self.assertEqual(command["command"], "promote")
         options = {flag: item for item in command["options"] for flag in item["flags"]}
         for flag in ("--save", "--compact", "--quiet", "--research-dir", "--note",
-                     "--cost-bps", "--freeze", "--buffer", "--dry-run"):
+                     "--cost-bps", "--freeze", "--buffer", "--dry-run", "--review-receipt"):
             self.assertIn(flag, options)
         self.assertEqual(options["--retention-floor"]["default"], 0.2)
         self.assertTrue(options["alpha_id"]["required"])

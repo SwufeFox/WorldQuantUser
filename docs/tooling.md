@@ -333,6 +333,16 @@ rho_book、max_member_rho，以及 `checks`、`buffered`、`outcome`、`reasons`
 `promote --dry-run` 同样读取冻结后的测试期，测试期门通过后执行实时检查。未提供 `--selection` 时也会写冻结文件。
 通过时返回 `outcome: would_buffer`，候选架不写入。平台提交另见下文。
 
+```bash
+python3 research_cli.py promote ALPHA_ID --selection choice.json --review-receipt receipt.json
+```
+
+`--review-receipt` 用冻结清单和已保存的 `promote --save` 回执离线复核 Regular 候选。
+它核对候选身份、冻结窗口和源码设置，重新读取留存、正式检查及原有成本压力情景。
+`recorded_outcome` 保留当时的决定，`review_outcome` 分别报告 `blocked`、`deferred` 或 `passes_review`。
+缺少正式 PROD 判定时会列出证据缺口，已有明确失败项也会保留。离线复核不会调用平台、重新打开测试期或写候选架。
+复核结论限于归档时的证据。Power Pool 应按专用通道检查。
+
 ### 用现有问题文件交接
 
 `<research>/open-threads.md` 是跨会话的当前问题清单，不另建一份状态摘要。

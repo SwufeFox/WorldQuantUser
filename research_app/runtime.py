@@ -54,7 +54,8 @@ ERROR_CODES = {
 
 METRIC_KEYS = ("sharpe", "fitness", "turnover", "returns", "drawdown", "margin",
                "longCount", "shortCount", "pnl")
-_PROTECTED_OUTPUT_ARGS = ("freeze", "selection", "batch_path", "checkpoint", "resume", "recover", "emit")
+_PROTECTED_OUTPUT_ARGS = ("freeze", "selection", "batch_path", "checkpoint", "resume", "recover", "emit",
+                          "review_receipt")
 
 
 class CliError(Exception):

@@ -301,3 +301,78 @@ def test_freeze_and_shelf_paths_must_differ(flow, capsys, tmp_path):
     code, output = invoke(capsys, "--freeze", path, "--buffer", path)
     assert code == 2 and output["error"]["code"] == "INVALID_INPUT"
     assert flow["calls"] == [] and not path.exists()
+
+
+@pytest.fixture
+def saved_promotion(flow, tmp_path):
+    choice = tmp_path / "choice.json"
+    row = {**flow["row"], "source_expression": "rank(close)",
+           "source_settings": {"simulationMode": "FULL"},
+           "costs": {"scope": "train", "scenarios": [{"cost_bps": 20, "net_margin_bps": 2.0}]}}
+    manifest = selection.freeze(choice, source="triage", rows=[{
+        key: row[key] for key in ("alpha_id", "train_sharpe", "source_expression", "source_settings")
+    }], criteria={"retention_floor": 0.4}, window={"mode": "train"})
+    check = deepcopy(flow["checked"])
+    receipt = {"ok": True, "command": "promote", "data": {
+        "alpha_id": "A1", "outcome": "buffered", "checks": check, "steps": {
+            "freeze": {"evidence": {"selection_id": manifest["selection_id"]}},
+            "validate": {"evidence": {"selection_id": manifest["selection_id"],
+                                      "frozen_window": manifest["window"], "rows": [row]}},
+        }}}
+    return choice, tmp_path / "receipt.json", receipt
+
+
+@pytest.mark.parametrize("pc,quality,expected", [
+    (None, "PASS", "deferred"),
+    ("PENDING", "PASS", "deferred"),
+    ("PENDING", "FAIL", "blocked"),
+    ("PASS", "FAIL", "blocked"),
+    ("PASS", "PASS", "passes_review"),
+])
+def test_review_derives_offline_verdict_from_named_checks(flow, capsys, saved_promotion, pc, quality, expected):
+    choice, saved, receipt = saved_promotion
+    checks = receipt["data"]["checks"]["results"][0]["checks"]
+    checks["LOW_SHARPE"]["result"] = quality
+    if pc is not None:
+        checks["PROD_CORRELATION"] = {"result": pc}
+    saved.write_text(json.dumps(receipt))
+    code, response = invoke(capsys, "--review-receipt", saved, "--selection", choice)
+    data = response["data"]
+    assert code == 0 and response["ok"]
+    assert data["recorded_outcome"] == "buffered" and not data["live_verified"]
+    assert data["review_outcome"] == expected
+    assert data["production_correlation"] == (None if pc is None else {"result": pc})
+    assert data["failed_checks"] == (["LOW_SHARPE"] if quality == "FAIL" else [])
+    assert data["validation"]["costs"]["scenarios"][0]["net_margin_bps"] == 2.0
+    assert not flow["calls"]
+
+
+def test_review_keeps_operational_failure_separate(flow, capsys, saved_promotion):
+    choice, saved, receipt = saved_promotion
+    receipt.update(ok=False, error={"code": "RATE_LIMITED"})
+    receipt["data"]["checks"] = {}
+    saved.write_text(json.dumps(receipt))
+    code, response = invoke(capsys, "--review-receipt", saved, "--selection", choice)
+    assert code == 0 and response["data"]["review_outcome"] == "deferred"
+    assert response["data"]["recorded_error"]["code"] == "RATE_LIMITED"
+    assert response["data"]["failed_checks"] == []
+    assert not flow["calls"]
+
+
+def test_review_rejects_different_frozen_window(flow, capsys, saved_promotion):
+    choice, saved, receipt = saved_promotion
+    receipt["data"]["steps"]["validate"]["evidence"]["frozen_window"] = {}
+    saved.write_text(json.dumps(receipt))
+    code, response = invoke(capsys, "--review-receipt", saved, "--selection", choice)
+    assert code == 2 and "do not match" in response["error"]["message"]
+    assert not flow["calls"]
+
+
+def test_review_protects_input_receipt_even_on_parse_error(flow, capsys, saved_promotion):
+    choice, saved, receipt = saved_promotion
+    content = json.dumps(receipt)
+    saved.write_text(content)
+    code, response = invoke(capsys, "--review-receipt", saved, "--selection", choice,
+                            "--save", saved, "--not-an-option")
+    assert code == 2 and response["error"]["code"] == "INVALID_INPUT"
+    assert saved.read_text() == content
