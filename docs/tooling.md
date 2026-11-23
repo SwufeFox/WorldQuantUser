@@ -1230,6 +1230,8 @@ Campaign 开跑前复用 Probe 的离线扫描，确定的语法错误在联网�
 
 `prepare-full` 仅读取已保存的 QUICK 训练证据。它按训练 Sharpe 排序，生成带原始 Alpha ID、批次和训练分数的 FULL 草稿。`--limit` 是 FULL 臂的总数上限，对照实验的原对照计入上限。预览并确认草稿后再放入 `backlog/`。生成草稿在本地完成。
 
+ASI 候选经过同样本对照、训练稳健性和成本筛选后，用 `prepare-full` 生成草稿。它会为 ASI 的 FULL 臂启用 `visualization`，方便使用 `alpha get ID --recordsets` 查询国家分项。先读正式日本与稳健宇宙检查，再用国家图表归因。通过硬检查的候选才进入会请求平台相关性的验证流程。
+
 | 规格 | 研究证据 |
 | --- | --- |
 | `track: REGULAR`，也可省略 | Probe 保存请求与训练对照。符合训练门的 FULL 候选冻结选择。 |

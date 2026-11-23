@@ -306,7 +306,10 @@ def test_campaign_prepares_limited_full_spec_from_train_only(tmp_path, capsys, m
     batch = tmp_path / "quick-batch.json"
     receipt = tmp_path / "quick-result.json"
     output = tmp_path / "full.spec.json"
-    arms = [quick_arm("win", "rank(close)"), quick_arm("second", "rank(open)"),
+    arms = [quick_arm("win", "rank(close)", settings={
+                "region": "ASI", "universe": "MINVOL1M", "delay": 1, "simulationMode": "QUICK",
+                "testPeriod": "P1Y", "visualization": False,
+            }), quick_arm("second", "rank(open)"),
             quick_arm("test-only", "rank(high)"), quick_arm("pending", "rank(low)"),
             quick_arm("diagnostic", "rank(volume)", role="diagnostic"),
             quick_arm("already-full", "rank(vwap)", settings={"simulationMode": "FULL"})]
@@ -321,7 +324,9 @@ def test_campaign_prepares_limited_full_spec_from_train_only(tmp_path, capsys, m
     spec = json.loads(output.read_text(encoding="utf-8"))
     assert spec["track"] == "ATOM"
     assert spec["mechanism"] == "hypothesis A"
-    assert spec["arms"] == [{**arms[0], "settings": {**arms[0]["settings"], "simulationMode": "FULL"}}]
+    assert spec["arms"] == [{
+        **arms[0], "settings": {**arms[0]["settings"], "simulationMode": "FULL", "visualization": True},
+    }]
     source = spec["quick_source"]
     assert source["batch_path"] == str(batch)
     assert source["run_id"] == "quick-run"

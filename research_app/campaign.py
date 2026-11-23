@@ -96,10 +96,13 @@ def _quick_training(arm, row):
 def _full_arm(arm):
     context = ("label", "expression", "role", "design", "proxy_of", "mechanism", "name",
                "family", "candidate_id", "idea", "hypothesis", "note")
+    settings = machine_lib.normalize_setting_keys(arm["settings"])
+    settings["simulationMode"] = "FULL"
+    if settings.get("region") == "ASI":
+        settings["visualization"] = True
     return {**{key: arm[key] for key in context
                if arm.get(key) is not None},
-            "settings": {**machine_lib.normalize_setting_keys(arm["settings"]),
-                         "simulationMode": "FULL"}}
+            "settings": settings}
 
 
 def _followup_paths(args, name, input_kind):
