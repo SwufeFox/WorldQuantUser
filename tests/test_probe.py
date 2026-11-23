@@ -83,6 +83,10 @@ class ProbeTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.spec_path = os.path.join(self.tmp, "spec.json")
         self.output_dir = tempfile.mkdtemp()
+        self.registry = os.path.join(self.tmp, "registry.jsonl")
+        registry_path = mock.patch.object(alpha_registry, "default_registry_path", return_value=self.registry)
+        registry_path.start()
+        self.addCleanup(registry_path.stop)
         self.spec = {
             "name": "unit-test-batch",
             "idea": "test idea", "mechanism": "test mechanism",
@@ -514,25 +518,24 @@ class ProbeTests(unittest.TestCase):
     def test_strict_repeat_is_previewed_offline_then_blocks_before_authentication(self):
         prior = {"key": "prior", "expression": "rank(close)", "status": "WARNING",
                  "settings": {**ml.DEFAULT_SETTINGS, "decay": 4}, "metrics": {"fitness": 1.2}}
-        with mock.patch.object(alpha_registry, "load_entries", return_value=[prior]) as load:
-            data = self._run(dry_run=True, strict_gate=True, registry="custom.jsonl")
-            self.assertTrue(data["would_block"])
-            self.assertEqual(data["gate_blocking"], [
-                {"code": "exact_repeat", "label": "a", "evidence_keys": ["prior"]}])
-            self.assertEqual(data["results"][0]["gate"]["exact_repeat_keys"], ["prior"])
-            # The gate must use the explicit registry; turnover estimation separately
-            # reads the default ledger for its field distribution.
-            self.assertEqual(load.call_args_list[0], mock.call("custom.jsonl"))
-            with self.assertRaises(cli_runtime.CliError):
-                self._run(strict_gate=True, registry="custom.jsonl")
+        custom = os.path.join(self.tmp, "custom.jsonl")
+        alpha_registry.record_entry(prior, custom)
+        data = self._run(dry_run=True, strict_gate=True, registry=custom)
+        self.assertTrue(data["would_block"])
+        self.assertEqual(data["gate_blocking"], [
+            {"code": "exact_repeat", "label": "a", "evidence_keys": ["prior"]}])
+        self.assertEqual(data["results"][0]["gate"]["exact_repeat_keys"], ["prior"])
+        self.assertEqual(data["results"][0]["gate"]["history_registry"], custom)
+        with self.assertRaises(cli_runtime.CliError):
+            self._run(strict_gate=True, registry=custom)
         self.load_session.assert_not_called()
         self.assertEqual(self.fake.calls, [])
 
     def test_non_strict_repeat_remains_visible_without_blocking(self):
         prior = {"key": "prior", "expression": "rank(close)", "status": "COMPLETE",
                  "settings": {**ml.DEFAULT_SETTINGS, "decay": 4}, "metrics": {"fitness": 1.2}}
-        with mock.patch.object(alpha_registry, "load_entries", return_value=[prior]):
-            data = self._run(dry_run=True)
+        alpha_registry.record_entry(prior, self.registry)
+        data = self._run(dry_run=True)
         self.assertEqual(data["gate_blocking"], [])
         self.assertTrue(data["results"][0]["gate"]["already_simulated"])
 
@@ -593,8 +596,9 @@ class ProbeTests(unittest.TestCase):
         self.spec["settings"]["language"] = "PYTHON"
         self.spec["arms"] = [{"label": "source", "expression": PYTHON_ALPHA}]
         self._write(self.spec)
-        with mock.patch.object(alpha_registry, "load_entries", return_value=[variant, exact]):
-            evidence = self._run(dry_run=True)["results"][0]["gate"]
+        alpha_registry.record_entry(variant, self.registry)
+        alpha_registry.record_entry(exact, self.registry)
+        evidence = self._run(dry_run=True)["results"][0]["gate"]
         self.assertEqual(evidence["exact_repeat_keys"], ["EXACT"])
         self.assertEqual(evidence["structural_refs"], [])
 
@@ -616,8 +620,9 @@ class ProbeTests(unittest.TestCase):
         similar = {**exact, "alpha_id": "SIMILAR", "key": "SIMILAR", "expression": "rank(returns)"}
         incomplete = {**exact, "alpha_id": "INCOMPLETE", "key": "INCOMPLETE",
                       "settings": {"decay": 4}}
-        with mock.patch.object(alpha_registry, "load_entries", return_value=[exact, similar, incomplete]):
-            preview = self._run(dry_run=True)
+        for entry in (exact, similar, incomplete):
+            alpha_registry.record_entry(entry, self.registry)
+        preview = self._run(dry_run=True)
         evidence = preview["results"][0]["gate"]
         self.assertEqual(evidence["exact_repeat_keys"], ["OLD"])
         self.assertEqual(evidence["completed_refs"][0]["batch"], "previous")

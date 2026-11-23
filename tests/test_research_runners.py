@@ -270,6 +270,107 @@ class ResearchRunnerTests(TestCase):
         self.assertEqual(log.call_args.args[0]["next_poll_at"], 120)
         self.assertTrue(waiting.is_file())
 
+    def test_campaign_watch_gives_due_recovery_a_turn_before_fresh_work(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        pending, fresh = [backlog / name for name in ("z-pending.json", "a-fresh.json")]
+        for spec in (pending, fresh):
+            spec.write_text("{}", encoding="utf-8")
+        batch, _ = campaign.campaign_paths(self.root, pending)
+
+        def checkpoint(due):
+            self.saved(batch, [arm("PENDING", submission_state="accepted",
+                                   progress_url="https://test.invalid/1", next_poll_at=due)])
+            payload = json.loads(batch.read_text(encoding="utf-8"))
+            payload["execution"] = {"total": 1, "finished": 0}
+            batch.write_text(json.dumps(payload), encoding="utf-8")
+
+        def execute(_root, spec, _batch, _receipt, *, max_wait, concurrency):
+            calls.append((spec.name, max_wait, concurrency))
+            if spec == pending:
+                checkpoint(107)
+                return runner.ProbeRun("deferred", {})
+            return runner.ProbeRun("done", {})
+
+        calls = []
+        checkpoint(100)
+        with (mock.patch.object(runner.time, "time", return_value=100),
+              mock.patch.object(runner.time, "sleep", side_effect=InterruptedError) as sleep,
+              self.assertRaises(InterruptedError)):
+            campaign.run_campaign(self.root, max_wait=600, interval=30, execute=execute, log_event=mock.Mock())
+        self.assertEqual(calls, [(pending.name, 30, 3), (fresh.name, 600, 3)])
+        sleep.assert_called_once_with(7)
+        self.assertTrue(pending.is_file())
+        self.assertTrue((backlog / "done" / fresh.name).is_file())
+
+    def test_campaign_watch_retries_untimed_recovery_with_full_budget(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        old, fresh = [backlog / name for name in ("a-pending.json", "b-fresh.json")]
+        for spec in (old, fresh):
+            spec.write_text("{}", encoding="utf-8")
+        batch, _ = campaign.campaign_paths(self.root, old)
+        self.saved(batch, [arm("UNKNOWN_SUBMISSION", submission_state="unknown_submission")])
+        execute = mock.Mock(return_value=runner.ProbeRun("deferred", {}))
+        with (mock.patch.object(runner.time, "sleep", side_effect=[None, InterruptedError]),
+              self.assertRaises(InterruptedError)):
+            campaign.run_campaign(self.root, max_wait=600, interval=30, execute=execute, log_event=mock.Mock())
+        self.assertEqual([(call.args[1], call.kwargs["max_wait"]) for call in execute.call_args_list],
+                         [(old, 30), (fresh, 600), (old, 600), (fresh, 600)])
+
+    def test_campaign_watch_defers_an_exact_repeat_of_a_post_that_becomes_unknown(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        first, duplicate, different = [backlog / name for name in ("a-start.json", "b-repeat.json", "c-other.json")]
+        requests = {spec: {"expression": "rank(close)", "settings": {"region": "ASI", "decay": decay}}
+                    for spec, decay in ((first, 5), (duplicate, 5), (different, 10))}
+        for spec in requests:
+            spec.write_text("{}", encoding="utf-8")
+
+        def execute(_root, spec, batch, _receipt, **_options):
+            if spec == duplicate:
+                self.fail("the campaign tried to launch a request that needs POST reconciliation")
+            calls.append(spec)
+            if spec == first:
+                self.saved(batch, [arm("UNKNOWN_SUBMISSION", submission_state="unknown_submission",
+                                       submission_attempted=True, **requests[spec])])
+                return runner.ProbeRun("deferred", {})
+            return runner.ProbeRun("done", {})
+
+        calls = []
+        events = mock.Mock()
+        with (mock.patch.object(experiments, "probe_spec_identity", side_effect=lambda spec: {"results": [requests[spec]]}),
+              mock.patch.object(runner.time, "sleep", side_effect=InterruptedError),
+              self.assertRaises(InterruptedError)):
+            campaign.run_campaign(self.root, execute=execute, log_event=events)
+        self.assertEqual(calls, [first, different])
+        self.assertTrue(duplicate.is_file())
+        self.assertTrue(any(event.args[0].get("detail") == f"waiting for matching request in {first.name}"
+                            for event in events.call_args_list))
+
+    def test_campaign_once_defers_a_queued_repeat_of_a_cooling_legacy_job(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        pending, duplicate = [backlog / name for name in ("a-pending.json", "b-repeat.json")]
+        for spec in (pending, duplicate):
+            spec.write_text("{}", encoding="utf-8")
+        _, receipt = campaign.campaign_paths(self.root, pending)
+        queued, _ = campaign.campaign_paths(self.root, duplicate)
+        request = {"expression": "rank(close)", "settings": {"region": "ASI", "decay": 5}}
+        self.saved(queued, [arm("QUEUED", submission_state="not_submitted", **request)])
+        self.saved(self.default_batch, [arm("PENDING", submission_state="accepted",
+                                           progress_url="https://test.invalid/1", next_poll_at=120, **request)])
+        document = json.loads(self.default_batch.read_text(encoding="utf-8"))
+        document["execution"] = {"total": 1, "finished": 0}
+        self.default_batch.write_text(json.dumps(document), encoding="utf-8")
+        receipt.write_text(json.dumps({"data": {"path": str(self.default_batch)}}), encoding="utf-8")
+        execute, log = mock.Mock(), mock.Mock()
+        with mock.patch.object(runner.time, "time", return_value=100):
+            self.assertEqual(campaign.run_campaign(self.root, once=True, execute=execute, log_event=log), 3)
+        execute.assert_not_called()
+        self.assertEqual(log.call_args.args[0]["detail"], f"waiting for matching request in {pending.name}")
+        self.assertTrue(duplicate.is_file())
+
     def test_campaign_uses_the_native_parent_clock_to_advance_other_work(self):
         backlog = self.root / "backlog"
         backlog.mkdir()
@@ -310,6 +411,15 @@ class ResearchRunnerTests(TestCase):
         document = {"execution": {"total": 2, "finished": 0}, "rows": [waiting, failed]}
         self.assertEqual(runner.probe_poll_at(document), 125)
         document["rows"] = [failed, failed]
+        self.assertIsNone(runner.probe_poll_at(document))
+
+    def test_finished_sibling_does_not_hide_an_explicit_poll_time(self):
+        waiting = arm("PENDING", submission_state="accepted",
+                      progress_url="https://test.invalid/accepted", next_poll_at=125)
+        complete = candidate(submission_state="accepted")
+        document = {"execution": {"total": 2, "finished": 1}, "rows": [waiting, complete]}
+        self.assertEqual(runner.probe_poll_at(document), 125)
+        complete["metrics_pending"] = True
         self.assertIsNone(runner.probe_poll_at(document))
 
     def campaign_reply(self, *, freeze=True, **updates):

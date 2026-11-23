@@ -12,6 +12,7 @@ from unittest import mock
 import requests
 
 import machine_lib as ml
+from research_app import campaign
 from research_app import experiments as app
 from research_app.runtime import CliError
 
@@ -114,7 +115,7 @@ class ProbeWorkflowTests(unittest.TestCase):
                 mock.patch.object(mine, "dataset_turnover", return_value=history) as stats:
             preview = self.run_probe(dry_run=True)
         load.assert_called_once_with()
-        stats.assert_called_once_with(catalog=catalog)
+        stats.assert_called_once_with(catalog=catalog, datasets={"pv1"}, registry_path=str(self.registry))
         self.assertEqual(preview["groups"], 2)
         self.assertEqual(preview["results"][0]["turnover_band"]["low"], .15)
 
@@ -571,6 +572,11 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(app.half_split_sharpes(pnl), (None, None))
 
     def test_deferred_quick_pnl_keeps_results_and_recovers_without_new_simulations(self):
+        self.spec = self.root / "backlog" / "done" / "selective.json"
+        self.spec.parent.mkdir(parents=True)
+        self.batch = self.root / "backlog-results" / "selective-batch.json"
+        self.batch.parent.mkdir()
+        status_args = argparse.Namespace(research_dir=str(self.root), limit=20, save=None)
         self.spec.write_text(json.dumps({"design": "explore",
             "settings": {"simulationMode": "QUICK", "testPeriod": "P1Y"},
             "arms": [{"label": "quick", "expression": "rank(close)"},
@@ -613,6 +619,8 @@ class ProbeWorkflowTests(unittest.TestCase):
             self.assertEqual(pending["recover_argv"][2:],
                              ["--research-dir", str(self.root), "probe", "--recover", str(self.batch)])
             self.assertIs(pending["platform_read_only"], True)
+            status = campaign.cmd_campaign_status(status_args, None)["archived_quick_pnl"]
+            self.assertEqual(status["pending_arms"], 2)
 
             with mock.patch.object(app, "with_session", side_effect=AssertionError("only deferred PnL remains")):
                 still_pending = app.cmd_probe(arguments(recover=str(self.batch), defer_quick_pnl=True), None)
@@ -627,6 +635,8 @@ class ProbeWorkflowTests(unittest.TestCase):
                 chosen = arguments(recover=str(self.batch), pnl_alpha_id=["SYNTHETIC_quick"])
                 selective = app.cmd_probe(chosen, None)
                 self.assertEqual(selective["quick_pnl"]["pending_labels"], ["quick-other"])
+                status = campaign.cmd_campaign_status(status_args, None)["archived_quick_pnl"]
+                self.assertEqual(status["jobs"][0]["quick_pnl"], selective["quick_pnl"])
                 self.assertEqual(selective["quick_pnl"],
                                  json.loads(self.batch.read_text(encoding="utf-8"))["quick_pnl"])
                 self.assertEqual(selective["rows"][0]["train_sharpe_h1"], expected_halves[0])
@@ -642,6 +652,8 @@ class ProbeWorkflowTests(unittest.TestCase):
             self.assertEqual(launch.call_count, 2)
             self.assertEqual([call.args[1] for call in fetch.call_args_list],
                              ["SYNTHETIC_full", "SYNTHETIC_quick", "SYNTHETIC_quick-other"])
+            status = campaign.cmd_campaign_status(status_args, None)["archived_quick_pnl"]
+            self.assertEqual(status["pending_batches"], 0)
 
         self.assertEqual(recovered["request_fingerprint"], result["request_fingerprint"])
         self.assertEqual(recovered["execution"], result["execution"])

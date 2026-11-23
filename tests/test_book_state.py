@@ -217,7 +217,7 @@ class BookStateTests(unittest.TestCase):
                 mock.patch.object(ml, "fetch_alpha_metrics", side_effect=lambda _session, aid, **kw: readbacks[aid]), \
                 mock.patch.object(alpha_registry, "load_entries", wraps=alpha_registry.load_entries) as loads:
             result = ledger.cmd_ledger_sync(self.args(), None)
-        self.assertEqual(loads.call_count, 2)  # initial listing comparison and locked write batch
+        self.assertEqual(loads.call_count, 1)  # listing comparison only; the locked batch reuses its index
         by_id = {row["alpha_id"]: row for row in result["rows"]}
         self.assertFalse(by_id["MEMBER_A"]["complete"])
         self.assertIn("stored row has metrics", by_id["MEMBER_A"]["error"])

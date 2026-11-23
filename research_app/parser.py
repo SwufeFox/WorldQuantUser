@@ -1323,6 +1323,29 @@ def build_parser():
     l_list.add_argument("--registry", default=None)
     l_list.bind_handler("ledger.cmd_ledger_list")
 
+    l_analysis = ledger_sub.add_parser(
+        "analyze", help="Screen ledger cohorts and surface bounded research evidence (offline).",
+        description="Aggregate indexed train metrics and stored checks, explain attrition, "
+                    "and rank representative candidates. Optional annual checks use only "
+                    "verified local training PnL.")
+    l_analysis.add_argument("--registry")
+    l_analysis.add_argument("--region")
+    l_analysis.add_argument("--universe")
+    l_analysis.add_argument("--delay", type=int)
+    l_analysis.add_argument("--mode", choices=("QUICK", "FULL"))
+    l_analysis.add_argument("--since", help="Minimum recorded date in YYYY-MM-DD.")
+    l_analysis.add_argument("--group-by", choices=("family", "mechanism", "scope", "neutralization", "batch"),
+                            default="family")
+    l_analysis.add_argument("--cost-bps", type=float, default=10.0,
+                            help="Assumed cost per traded notional, deducted from train margin in bps.")
+    l_analysis.add_argument("--min-train-sharpe", type=float, default=1.0)
+    l_analysis.add_argument("--max-turnover", type=float,
+                            help="Optional upper bound on train turnover as a fraction.")
+    l_analysis.add_argument("--limit", type=int, default=12, help="Maximum rows per report section (1–100).")
+    l_analysis.add_argument("--yearly", action="store_true",
+                            help="Read verified cached daily PnL for selected representatives only.")
+    l_analysis.bind_handler("ledger_analysis.cmd_ledger_analyze")
+
     l_lbl = ledger_sub.add_parser(
         "label",
         help="Set family / verdict / mechanism on an existing ledger entry (offline).",

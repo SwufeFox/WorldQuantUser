@@ -239,7 +239,7 @@ class JudgementInheritanceTests(unittest.TestCase):
                 summary = alpha_registry.record_simulation([
                     record(sharpe=2.5), record(alpha_id="A2"), record(alpha_id="A3"),
                 ], {}, registry_path=path)
-            self.assertEqual(loads.call_count, 2)  # one competing writer and one batch
+            loads.assert_not_called()  # both writers reuse the lock-protected projection
             self.assertEqual(summary["appended"], 3)
             active = next(row for row in alpha_registry.load_entries(path) if row["alpha_id"] == "A1")
             self.assertEqual(active["status"], "ACTIVE")

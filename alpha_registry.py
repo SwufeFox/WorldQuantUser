@@ -47,6 +47,7 @@ __all__ = [
     "expression_hash",
     "same_expression",
     "load_entries",
+    "indexed_registry",
     "append_batch",
     "record_entry",
     "render_markdown",
@@ -362,25 +363,53 @@ def load_entries(path=None):
     by_key = {}
     with handle:
         for line in handle:
-            try:
-                entry = json.loads(line.decode("utf-8").strip())
-            except ValueError:
+            key, entry = _parse_line(line)
+            if entry is None:
                 continue
-            if not isinstance(entry, dict):
-                continue
-            key = entry.get("key") or entry.get("alpha_id")
-            if not key:
-                expression = entry.get("expression") or ""
-                language = entry_language(entry)
-                if ml.is_python_language(language):
-                    settings = {**(entry.get("settings") or {}), "language": language}
-                    key = placeholder_key(expression, settings)
-                else:
-                    key = expression_hash(expression, language)
-            entry.setdefault("key", key)
             entry["role"] = evidence_role(by_key.get(key), entry)
             by_key[key] = entry
     return list(by_key.values())
+
+
+def _parse_line(line):
+    try:
+        entry = json.loads(line.decode("utf-8").strip())
+    except ValueError:
+        return None, None
+    if not isinstance(entry, dict):
+        return None, None
+    key = entry.get("key") or entry.get("alpha_id")
+    if not key:
+        expression = entry.get("expression") or ""
+        language = entry_language(entry)
+        if ml.is_python_language(language):
+            settings = {**(entry.get("settings") or {}), "language": language}
+            key = placeholder_key(expression, settings)
+        else:
+            key = expression_hash(expression, language)
+    entry.setdefault("key", key)
+    return key, entry
+
+
+@contextmanager
+def indexed_registry(path=None):
+    """Open an indexed snapshot, yielding None when the local cache is unavailable."""
+    from registry_index import index_path, open_index, sqlite3
+
+    path = os.fspath(path or default_registry_path())
+    if not os.path.exists(path) and not os.path.exists(index_path(path)):
+        yield None
+        return
+    with ExitStack() as stack, ExitStack() as locked:
+        try:
+            locked.enter_context(cache_store.file_lock(path + ".lock", timeout=30))
+            index = stack.enter_context(open_index(path))
+            if index is not None:
+                index.begin_snapshot()
+        except (cache_store.CacheError, sqlite3.Error, OSError):
+            index = None
+        locked.close()
+        yield index
 
 
 #: Fields that change on every append and therefore cannot signal "content changed".
@@ -435,9 +464,14 @@ def append_batch(path=None):
     writes. Successful rows are individually durable and update the index.
     Collect platform data before entering the batch.
     """
+    from registry_index import LedgerRows, open_index
+
     path = os.fspath(path or default_registry_path())
     with cache_store.file_lock(path + ".lock", timeout=30), ExitStack() as stack:
-        existing = {item["key"]: item for item in load_entries(path)}
+        index = stack.enter_context(open_index(path))
+        existing = LedgerRows(index) if index is not None else {
+            item["key"]: item for item in load_entries(path)
+        }
         handle = None
         check_tail = True
 
@@ -457,7 +491,11 @@ def append_batch(path=None):
             os.fsync(handle.fileno())
             check_tail = False
 
-        yield existing, partial(_append_locked, existing, write_line)
+        try:
+            yield existing, partial(_append_locked, existing, write_line)
+        finally:
+            if index is not None and handle is not None:
+                index.refresh_after_append()
 
 
 def _append_locked(existing, write_line, entry, *, skip_unchanged=True, allow_metrics_loss=False):

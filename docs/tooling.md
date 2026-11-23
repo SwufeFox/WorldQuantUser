@@ -678,6 +678,43 @@ if_else(is_nan(s), s, m)
 | 这个数据族以前试过什么形状、最好多少分 | `python3 tools/unit_report.py --dataset model51`（数据集 id 自动映射到族） |
 | 台账的 verdict 和真实的书是否一致 | `python3 research_cli.py brief --drift` |
 
+### 给模型一份可核对的回测分析
+
+```bash
+python3 research_cli.py ledger analyze --group-by scope --limit 8
+python3 research_cli.py ledger analyze --region ASI --delay 1 --mode QUICK \
+  --group-by batch --cost-bps 10 --max-turnover 0.20 --limit 8 --yearly
+```
+
+`ledger analyze` 在本地聚合最新台账记录。先用 `scope` 看样本量和覆盖，再限定地区、
+股票池、delay、模拟模式与记录日期。可按机制、数据族、批次或中性化查看结果。
+每个列表都有上限。大范围汇总需要扫描选中的索引行。
+
+| 输出 | 用法 |
+| --- | --- |
+| `counts` 和 `funnel` | 先看分母和数据缺口。每个台账键归入一个结果状态。 |
+| `failure_drivers` | 识别常见失败项及单项失败。多项失败的行会计入多个检查项。 |
+| `groups` | 用同范围、同批次的样本量和过筛数定位优先复盘的地方。 |
+| `representatives` | 每个已声明机制保留训练 Sharpe 排首的候选，带 Alpha ID 和记录日期。没有机制标签的行共用一组。 |
+| `single_failure_leads` | 其他已存检查均有结论且仅有一项失败的诊断线索，供查明失败原因。 |
+| `yearly_train` | 可选。只对返回的候选读已验证的本地 PnL，按完整训练年度计算 Sharpe。证据不足会标为未知。 |
+
+默认初筛要求有检查记录且无已知硬失败、训练 Sharpe 至少 1.0、两侧有持仓，
+按每成交名义金额 10 bps 扣除后训练 margin 为正。待定项目随候选输出。只要同一个 Alpha ID
+有诊断标记，其他台账键里的记录也不会进入候选或单项失败线索。可用 `--min-train-sharpe`、
+`--max-turnover` 和 `--cost-bps` 调整研究口径。
+历史检查来自台账。平台当前相关性、提交资格和样本外指标要通过验证流程核对。
+机制标签提供去重线索，经济独立性仍要用持仓和收益检验。
+
+让模型先读这份报告，再沿 Alpha ID 打开少量批次。请模型解释哪项失败影响面最大、
+它是否集中于一个范围或机制、哪条假设能用一个同设置对照区分。要继续验证 QUICK 候选时，
+用 `campaign prepare-full` 从其原批次生成有来源的 FULL 草稿。
+
+台账 JSONL 保存完整证据。SQLite 索引在首次使用时重放台账，此后按已记录的字节位置
+追入新记录，服务预检去重、历史换手估计和分析查询。报告查询读取固定快照，日常回测
+继续追加台账。冷建和重建需要短期独占台账，耗时随历史增长，宜在可暂停队列的时段做。
+报告只读显式训练指标，成本后的 margin 以 bps 表示。
+
 ### 反复查询训练期 PnL
 
 跨批次查看训练期两半 Sharpe 时，可以给 `ledger stability` 加 `--polars`。
@@ -1269,11 +1306,13 @@ python3 research_cli.py probe offspring.spec.json --dry-run --strict-gate
 产生的规格可交给普通 Probe，后续验证继续使用冻结选择。档案回放可检查谱系和预检，
 比较父代选择的收益需要测量两组实际子代。
 
-`run` 默认推进一份当前可运行的规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。队列先处理可回收的检查点。剩余任务均已受理且尚未到轮询时间时，该批次让出本轮。原生 Multi 使用已登记槽位的父任务轮询时间，`status` 显示这些批次的 `next_poll_at`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
+`run` 默认推进一份当前可运行的规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。有其他规格可运行时，已受理批次的恢复可以先用短轮次；若仍待处理且没有下次轮询时间，下轮用完整等待预算。首次启动沿用命令设置的等待预算。同一队列有相同请求尚待平台核对时，后来的规格等待原检查点。队列先处理可回收的检查点。剩余任务均已受理且尚未到轮询时间时，该批次让出本轮。原生 Multi 使用已登记槽位的父任务轮询时间，`status` 显示这些批次的 `next_poll_at`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
 
 批量 QUICK 初筛可用 `run --watch --defer-quick-pnl`，让队列在保存训练汇总后继续推进。
-`campaign status` 的 `archived_quick_pnl` 显示已归档批次还欠的日收益。
+`campaign status` 的 `archived_quick_pnl` 显示已归档批次还欠的日收益。归档进度按文件版本缓存，热查询检查版本并只重读有变化的检查点。
 `campaign recover-pnl` 从原检查点补读，每轮用 `--limit` 控制批次数。
+大规模初筛时，分析报告先用汇总指标筛出 Alpha ID，再用
+`probe --recover BATCH.json --pnl-alpha-id ID` 补读候选的日收益。
 加 `--watch` 后可与模拟队列并行运行。补读复用 `probe --recover`，并把证据写回原批次。
 
 先用 `--recover-only` 回收已有检查点。需要验证 FULL Regular 候选时启用 `--validate`，或对保存的训练冻结选择单独运行 `promote --selection`。已冻结的选择和终态验证回执可以复用。QUICK、Power Pool 与 ATOM 保留各自研究证据，SPC 结果在本地完成。Alpha 和 SPC 的平台提交仍走各自授权入口。

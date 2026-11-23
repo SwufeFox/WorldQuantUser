@@ -215,7 +215,7 @@ def run_campaign(root, *, once=False, max_wait=600, interval=30, concurrency=3,
     return run_queue(root, root / "backlog", partial(campaign_paths, root), report,
                      max_wait=max_wait, interval=interval,
                      once=once, concurrency=concurrency, execute=execute,
-                     schedule_recovery=True,
+                     schedule_recovery=True, recover_only=recover_only,
                      consume=partial(process, root, results, report, validate=validate))
 
 

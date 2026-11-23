@@ -12,6 +12,7 @@ import correlation
 import json
 import machine_lib
 import research_paths
+import stat
 import time
 
 from . import book_state, experiments, pnl_snapshot, research_route, stats
@@ -265,36 +266,133 @@ def _protect_campaign_output(args, root):
                 continue
 
 
-def _archived_quick_pnl(root, args):
+def _archive_specs(inbox):
+    return {state: sorted((inbox / state).glob("*.json")) for state in ("done", "failed")}
+
+
+def _archive_revision(path, *, parent=None):
+    """Identify the exact file generation, including the destination of an alias."""
+    try:
+        info = path.lstat() if parent is not None else None
+        if info is None or stat.S_ISLNK(info.st_mode):
+            resolved = path.resolve(strict=True)
+            info = resolved.stat()
+        else:
+            resolved = parent / path.name
+    except (OSError, RuntimeError):
+        return None
+    return [str(resolved), info.st_mode, info.st_dev, info.st_ino, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns]
+
+
+def _read_archive_index(path, directory):
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return None, {}
+    except FileNotFoundError:
+        return path, {}
+    except OSError:
+        return None, {}
+    payload, _ = cache_store.load_json(path)
+    if (isinstance(payload, dict) and payload.get("version") == 1
+            and payload.get("research_dir") == directory and isinstance(payload.get("entries"), dict)):
+        return path, payload["entries"]
+    return path, {}
+
+
+def _archive_index_hit(entry, source, revision, spec_revision, root):
+    if not isinstance(entry, dict) or entry.get("spec_revision") != spec_revision:
+        return False
+    probes = entry.get("probes")
+    if not isinstance(probes, dict) or probes.get(str(source)) != revision:
+        return False
+    for alias, saved in probes.items():
+        if alias != str(source) and _archive_revision(Path(alias)) != saved:
+            return False
+        if not saved or not Path(saved[0]).is_relative_to(root):
+            return False
+    if entry.get("batch") not in {saved[0] for saved in probes.values()}:
+        return False
+    pending = entry.get("quick_pnl")
+    return pending is None or (isinstance(pending, dict)
+                               and isinstance(pending.get("pending_labels"), list)
+                               and bool(pending["pending_labels"]))
+
+
+def _archived_quick_pnl(root, args, *, live_specs=None, archived_specs=None):
     from tools._runner import probe_state
     from tools.campaign_runner import campaign_paths
 
     inbox = root / "backlog"
-    live = {path.name for path in inbox.glob("*.json")}
+    live = {path.name for path in (inbox.glob("*.json") if live_specs is None else live_specs)}
+    archives = _archive_specs(inbox) if archived_specs is None else archived_specs
+    results = root / "backlog-results"
+    try:
+        results_dir = results.resolve()
+    except (OSError, RuntimeError):
+        results_dir = None
+    directory = research_paths.research_dir()
+    index_path, previous = None, {}
+    if results_dir == results:
+        index_path, previous = _read_archive_index(results / ".archived-quick-pnl.json", directory)
+    current = {}
     jobs = {}
     unreadable = 0
-    for state in ("done", "failed"):
-        for spec in sorted((inbox / state).glob("*.json")):
+    for state, specs in archives.items():
+        for spec in specs:
             if spec.name in live:
                 continue
             batch, receipt = campaign_paths(root, spec)
-            source = batch if batch.exists() else receipt
-            if not source.is_file():
+            source = batch
+            revision = _archive_revision(batch, parent=results_dir)
+            if revision is None:
+                source = receipt
+                revision = _archive_revision(receipt, parent=results_dir)
+            if revision is None or not stat.S_ISREG(revision[1]):
                 continue
-            protected = set()
-            try:
-                if source == receipt and _campaign_spec(spec)[1]["track"] == "SPC":
+            key = f"{state}/{spec.name}"
+            spec_revision = _archive_revision(spec) if source == receipt else None
+            entry = previous.get(key)
+            if _archive_index_hit(entry, source, revision, spec_revision, root):
+                protect_output(args, *(saved[0] for saved in entry["probes"].values()))
+            else:
+                protected = set()
+                probes = {}
+
+                def observe(alias, resolved):
+                    # Keep the lexical path to detect receipt aliases retargeted after a warm scan.
+                    observed = _archive_revision(resolved, parent=resolved.parent)
+                    probes[str(alias)] = observed if observed and observed[0] == str(resolved) else None
+
+                try:
+                    if source == receipt and _campaign_spec(spec)[1]["track"] == "SPC":
+                        continue
+                    path, document = experiments._load_probe_batch(
+                        source, source_paths=protected, within=root, observe_source=observe)
+                except CliError:
+                    unreadable += 1
                     continue
-                path, document = experiments._load_probe_batch(source, source_paths=protected, within=root)
-            except CliError:
-                unreadable += 1
-                continue
-            finally:
-                protect_output(args, *protected)
-            pending = document.get("quick_pnl")
-            if pending and probe_state(document)[0] in {"done", "failed"}:
-                jobs.setdefault(str(path), {"batch": str(path), "spec": str(spec),
-                                            "archive_state": state, "quick_pnl": pending})
+                finally:
+                    protect_output(args, *protected)
+                pending = document.get("quick_pnl")
+                if pending and probe_state(document)[0] not in {"done", "failed"}:
+                    pending = None
+                entry = {"batch": str(path), "quick_pnl": pending, "probes": probes,
+                         "spec_revision": spec_revision}
+            if all(entry["probes"].values()) and (source != receipt or spec_revision is not None):
+                current[key] = entry
+            pending = entry.get("quick_pnl")
+            path = entry["batch"]
+            if pending:
+                jobs.setdefault(path, {"batch": path, "spec": str(spec),
+                                       "archive_state": state, "quick_pnl": pending})
+    if index_path is not None and current != previous:
+        try:
+            # Competing writers may replace a summary generation. Every hit checks its source.
+            cache_store.write_json_atomic(index_path, {"version": 1, "research_dir": directory,
+                                                       "entries": current})
+        except OSError:
+            pass  # The archived files are authoritative, including on read-only roots.
     return [jobs[key] for key in sorted(jobs)], unreadable
 
 
@@ -307,7 +405,8 @@ def cmd_campaign_status(args, _sink):
     _protect_campaign_output(args, root)
     inbox = root / "backlog"
     pending = sorted(inbox.glob("*.json"))
-    counts = {state: sum(1 for _ in (inbox / state).glob("*.json")) for state in ("done", "failed")}
+    archives = _archive_specs(inbox)
+    counts = {state: len(specs) for state, specs in archives.items()}
     jobs = []
     for path in pending[:args.limit]:
         batch, receipt = campaign_paths(root, path)
@@ -329,7 +428,7 @@ def cmd_campaign_status(args, _sink):
         except CliError as exc:
             job.update(state="invalid", error=exc.message)
         jobs.append(job)
-    pnl_jobs, unreadable = _archived_quick_pnl(root, args)
+    pnl_jobs, unreadable = _archived_quick_pnl(root, args, live_specs=pending, archived_specs=archives)
     return {"inbox": str(inbox), "pending": len(pending), "archived": counts,
             "archived_quick_pnl": {"pending_batches": len(pnl_jobs), "unreadable_batches": unreadable,
                 "pending_arms": sum(len(job["quick_pnl"]["pending_labels"]) for job in pnl_jobs),

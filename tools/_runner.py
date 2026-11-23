@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 import alpha_registry
@@ -42,6 +43,15 @@ class ProbeRun:
     state: str
     data: dict
     detail: str = ""
+
+
+@dataclass(frozen=True)
+class _ProbeSchedule:
+    priority: int = 0
+    poll_at: float | None = None
+    recovery: bool = False
+    occupied: frozenset[tuple[str, str]] = frozenset()
+    queued: frozenset[tuple[str, str]] | None = None
 
 
 def research_root(explicit=None):
@@ -148,19 +158,25 @@ def _saved_probe(preview, batch):
     return CliResult(True, saved)
 
 
+def _receipt_batch(root, receipt):
+    try:
+        stored = json.loads(receipt.read_text(encoding="utf-8"))
+        target = (stored.get("data") or {}).get("path")
+    except (OSError, AttributeError, ValueError):
+        return None
+    if isinstance(target, str):
+        candidate = Path(target).expanduser().resolve()
+        if candidate.is_relative_to(root) and candidate.exists():
+            return candidate
+        raise ValueError(f"saved receipt references a missing or external batch: {candidate}")
+    return None
+
+
 def _legacy_batch(root, preview, receipt):
     """The old simulation queue used the probe's default batch path."""
-    if receipt.exists():
-        try:
-            stored = json.loads(receipt.read_text(encoding="utf-8"))
-            target = (stored.get("data") or {}).get("path")
-        except (OSError, AttributeError, ValueError):
-            target = None
-        if isinstance(target, str):
-            candidate = Path(target).expanduser().resolve()
-            if candidate.is_relative_to(root) and candidate.exists():
-                return candidate
-            raise ValueError(f"saved receipt references a missing or external batch: {candidate}")
+    target = _receipt_batch(root, receipt) if receipt.exists() else None
+    if target is not None:
+        return target
     # An older worker may have saved a batch before it reached --save. Restrict
     # discovery to the exact default name and the date suffix used by probe.
     default = Path(preview["path"]).resolve()
@@ -239,7 +255,7 @@ def probe_poll_at(document):
     rows = document.get("rows") or []
     execution = document.get("execution") or {}
     if (not isinstance(rows, list) or not rows or not isinstance(execution, dict)
-            or execution.get("total") != len(rows) or execution.get("finished") != 0):
+            or execution.get("total") != len(rows) or type(execution.get("finished")) is not int):
         return None
     # Native Retry-After is written once on the parent anchor, rather than on
     # every child row. A terminal parent may still expose new child evidence.
@@ -253,7 +269,7 @@ def probe_poll_at(document):
         and not record.get("multi_parent_terminal")
         and isinstance(record.get("multi_request_id"), str) and isinstance(record.get("multi_parent_url"), str)
     } if isinstance(records, list) else {}
-    times = []
+    times, finished = [], 0
     for row in rows:
         if not isinstance(row, dict):
             return None
@@ -263,6 +279,11 @@ def probe_poll_at(document):
         if state != "accepted":
             return None
         parent_url, request_id = row.get("multi_parent_url"), row.get("multi_request_id")
+        if (not row.get("progress_url") and not row.get("metrics_pending")
+                and (not parent_url or row.get("multi_parent_terminal"))
+                and row.get("alpha_id") and str(row.get("status") or "").upper() in _FINISHED):
+            finished += 1
+            continue
         if isinstance(parent_url, str) and isinstance(request_id, str) and not row.get("multi_parent_terminal"):
             at = parent_times.get((request_id, parent_url))
         elif not parent_url and (row.get("progress_url") or (row.get("alpha_id") and row.get("metrics_pending"))):
@@ -272,56 +293,126 @@ def probe_poll_at(document):
         if type(at) not in (int, float) or not math.isfinite(at) or at <= 0:
             return None
         times.append(at)
-    return min(times, default=None)
+    return min(times, default=None) if finished == execution["finished"] else None
 
 
-def _recovery_schedule(batch, receipt):
+def _recovery_schedule(root, batch, receipt, include_requests):
     if not batch.is_file():
-        return (1 if receipt.is_file() else 2), None
+        if not receipt.is_file():
+            return _ProbeSchedule(priority=2)
+        try:
+            batch = _receipt_batch(root, receipt)
+        except (OSError, RuntimeError, ValueError):
+            batch = None  # The executor handles broken receipts on their own turn.
+        if batch is None:
+            return _ProbeSchedule(priority=1)
     try:
         document = json.loads(batch.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return 0, None
+        return _ProbeSchedule()
     if not isinstance(document, dict):
-        return 0, None
-    rows = document.get("rows")
-    if isinstance(rows, list) and rows and all(
-            isinstance(row, dict) and row.get("submission_state") == "not_submitted" for row in rows):
-        return 2, None
-    return 0, probe_poll_at(document)
+        return _ProbeSchedule()
+    rows = document.get("rows") or []
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return _ProbeSchedule()
+    queued = [row for row in rows if row.get("submission_state") == "not_submitted"]
+    state, action = probe_state(document)
+    recovery = action == "recover" or state in {"done", "failed"} or bool(rows and not queued)
+    # The pre-POST checkpoint also owns its request until reconciliation proves
+    # what happened. A wholly unstarted batch does not reserve any request.
+    active = (row for row in rows if row.get("submission_state") in {"accepted", "unknown_submission"}
+              or row.get("alpha_id") or row.get("progress_url") or row.get("multi_parent_url"))
+    return _ProbeSchedule(priority=2 if queued and len(queued) == len(rows) else 0,
+                          poll_at=probe_poll_at(document), recovery=recovery,
+                          occupied=_watch_requests(active) if include_requests else frozenset(),
+                          queued=_watch_requests(queued) if include_requests else frozenset())
+
+
+def _watch_requests(rows):
+    from research_app.experiments import _probe_identity
+
+    return frozenset(_probe_identity(row["expression"], row["settings"]) for row in rows
+                     if isinstance(row, dict) and isinstance(row.get("expression"), str)
+                     and isinstance(row.get("settings"), dict) and row["settings"])
+
+
+def _watch_occupy(occupied, spec, requests):
+    for key in requests:
+        occupied.setdefault(key, set()).add(spec)
+
+
+def _watch_conflict(spec, requests, occupied):
+    if not occupied:
+        return None
+    if requests is None:
+        from research_app.experiments import probe_spec_identity
+        from research_app.runtime import CliError
+
+        try:
+            requests = _watch_requests(probe_spec_identity(spec).get("results") or ())
+        except CliError:
+            # The executor reports invalid Probe specs and handles local SPC specs.
+            return None
+    conflicts = {owner for key in requests for owner in occupied.get(key, ()) if owner != spec}
+    return min(conflicts, default=None)
 
 
 def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
-              concurrency=None, consume=None, execute=None, schedule_recovery=False):
+              concurrency=None, consume=None, execute=None, schedule_recovery=False, recover_only=False):
     """Lock one inbox and archive only terminal outcomes.
 
     A deferred job stays with its saved batch. In once mode, process at most
     one spec and return 0 for done or empty, 1 for failed, or 3 for deferred
-    or busy. The optional consumer runs before terminal archival.
+    or busy. The optional consumer runs before terminal archival. Campaign
+    watch gives recovery a shorter turn when additional work is ready.
     """
+    if execute is None:
+        execute = partial(run_probe, recover_only=True) if recover_only else run_probe
     inbox.mkdir(parents=True, exist_ok=True)
     for state in ("done", "failed"):
         (inbox / state).mkdir(exist_ok=True)
     try:
         with cache_store.file_lock(inbox / ".runner.lock", timeout=0):
+            watch = schedule_recovery and not once
+            guard = schedule_recovery and not recover_only
+            full_recovery_turn = set()
             while True:
                 scheduled = []
-                for spec in sorted(inbox.glob("*.json")):
+                occupied = {}
+                specs = sorted(inbox.glob("*.json"))
+                full_recovery_turn.intersection_update(specs)
+                for spec in specs:
                     batch, receipt = paths(spec)
-                    priority, poll_at = _recovery_schedule(batch, receipt) if schedule_recovery else (0, None)
-                    scheduled.append((spec, batch, receipt, priority, poll_at))
+                    schedule = (_recovery_schedule(root, batch, receipt, guard)
+                                if schedule_recovery else _ProbeSchedule())
+                    scheduled.append((spec, batch, receipt, schedule))
+                    _watch_occupy(occupied, spec, schedule.occupied)
                 if schedule_recovery:
-                    scheduled.sort(key=lambda item: item[3])
+                    scheduled.sort(key=lambda item: item[3].priority)
+                now = time.time()
+                ready = {spec for spec, _, _, task in scheduled
+                         if watch and (not recover_only or task.priority < 2)
+                         and (task.poll_at is None or task.poll_at <= now)}
                 next_poll = None
-                for spec, batch, receipt, _, poll_at in scheduled:
+                for spec, batch, receipt, schedule in scheduled:
+                    ready.discard(spec)
+                    poll_at = schedule.poll_at
                     if poll_at is not None and poll_at > time.time():
                         next_poll = poll_at if next_poll is None else min(next_poll, poll_at)
                         continue
                     log({"kind": "start", "spec": spec.name})
+                    wait = max_wait
                     try:
                         source = spec.read_bytes()
-                        result = (execute or run_probe)(root, spec, batch, receipt,
-                                                        max_wait=max_wait, concurrency=concurrency)
+                        recovery = schedule.recovery or recover_only
+                        owner = _watch_conflict(spec, schedule.queued, occupied) if not recovery and guard else None
+                        if owner is not None:
+                            result = ProbeRun("deferred", {}, f"waiting for matching request in {owner.name}")
+                        else:
+                            if ready and recovery and schedule.priority == 0 and spec not in full_recovery_turn:
+                                wait = min(max_wait, interval)
+                            full_recovery_turn.discard(spec)
+                            result = execute(root, spec, batch, receipt, max_wait=wait, concurrency=concurrency)
                         if result.state != "deferred":
                             destination = inbox / result.state / spec.name
                             if destination.exists():
@@ -334,6 +425,15 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                     except Exception as error:
                         # Leave the spec and any saved POST intent for an exact retry.
                         result = ProbeRun("deferred", {}, f"{type(error).__name__}: {error}")
+                    if watch:
+                        updated = _recovery_schedule(root, batch, receipt, guard)
+                        _watch_occupy(occupied, spec, updated.occupied)
+                        updated_at = updated.poll_at
+                        if result.state == "deferred" and updated_at is not None and updated_at > time.time():
+                            next_poll = updated_at if next_poll is None else min(next_poll, updated_at)
+                        elif result.state == "deferred" and wait < max_wait:
+                            # Untimed recovery can need longer than a short turn.
+                            full_recovery_turn.add(spec)
                     log({"kind": result.state, "spec": spec.name, "detail": result.detail,
                          "batch": str(batch), "receipt": str(receipt)})
                     if once:

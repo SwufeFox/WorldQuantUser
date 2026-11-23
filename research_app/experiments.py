@@ -1412,10 +1412,14 @@ def _recovery_language(row, signature):
     return settings.get("language") if isinstance(settings, dict) else None
 
 
-def _load_probe_batch(value, *, source_paths=None, within=None):
-    path = Path(value).expanduser().resolve()
+def _load_probe_batch(value, *, source_paths=None, within=None, observe_source=None):
+    alias = Path(value).expanduser()
     visited = set()
     while True:
+        try:
+            path = alias.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise CliError("INVALID_INPUT", "cannot resolve probe response path %s" % alias, str(exc)) from exc
         if within is not None and not path.is_relative_to(within):
             raise CliError("INVALID_INPUT", "probe response path is outside the research directory")
         if path in visited:
@@ -1423,6 +1427,8 @@ def _load_probe_batch(value, *, source_paths=None, within=None):
         visited.add(path)
         if source_paths is not None:
             source_paths.add(path)
+        if observe_source is not None:
+            observe_source(alias, path)
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
@@ -1435,7 +1441,7 @@ def _load_probe_batch(value, *, source_paths=None, within=None):
             if not isinstance(document["path"], str):
                 raise CliError("INVALID_INPUT", "probe response path must be a string")
             destination = Path(document["path"]).expanduser()
-            path = (destination if destination.is_absolute() else path.parent / destination).resolve()
+            alias = destination if destination.is_absolute() else path.parent / destination
             continue
         break
     rows = document.get("rows") or []
@@ -1759,44 +1765,20 @@ def _probe_identity(expression, settings):
     return alpha_registry.expression_hash(expression, language=language), _settings_signature(settings)
 
 
-def _novelty_gate(arms, registry_path=None):
-    """Annotate resolved requests with exact-result and structural evidence.
-
-    Missing historical settings never imply today's defaults. Structural similarity
-    is independent of an exact repeat and cannot block a simulation.
-    """
+def _scan_novelty_history(registry, arm_keys, arm_identities):
+    """Scan the authoritative ledger when the derived index is unavailable."""
     from . import mechanisms
 
-    registry = registry_path or alpha_registry.default_registry_path()
-    try:
-        entries = alpha_registry.load_entries(registry)
-    except OSError as exc:
-        return [{"available": False, "reason": str(exc), "already_simulated": False,
-                 "exact_repeat_keys": [], "structural_similarity_keys": []}
-                for _ in arms]
     latest = {}
-    for entry in entries:
+    for entry in alpha_registry.load_entries(registry):
         key = entry.get("alpha_id") or entry.get("key")
         if key:
             latest[key] = entry
 
-    arm_keys = [None if ml.is_python_language(arm["settings"].get("language"))
-                else mechanisms.mechanism_key(arm["expression"]) for arm in arms]
     wanted_mechanisms = {key for key in arm_keys if key}
     wanted_blocks = {key[0] for key in wanted_mechanisms}
-    arm_identities = [_probe_identity(arm["expression"], arm["settings"]) for arm in arms]
     wanted_identities = set(arm_identities)
     wanted_settings = {signature for _, signature in arm_identities}
-
-    block_marginals = {}
-    snapshot = Path(research_paths.resolve("convergence.json"))
-    if snapshot.exists():
-        try:
-            payload = json.loads(snapshot.read_text(encoding="utf-8"))
-            block_marginals = {row["block"]: row for row in payload.get("blocks") or []}
-        except (OSError, ValueError):
-            block_marginals = {}
-
     exact_results, structural_results, book_keys = {}, {}, {}
     for entry in latest.values():
         expression = entry.get("expression")
@@ -1828,16 +1810,60 @@ def _novelty_gate(arms, registry_path=None):
             identity = _probe_identity(expression, resolved)
             if identity in wanted_identities:
                 exact_results.setdefault(identity, []).append(entry)
+    return exact_results, structural_results, book_keys
+
+
+def _novelty_gate(arms, registry_path=None):
+    """Annotate resolved requests with exact-result and structural evidence.
+
+    Missing historical settings never imply today's defaults. Structural similarity
+    is independent of an exact repeat and cannot block a simulation.
+    """
+    from . import mechanisms
+
+    registry = registry_path or alpha_registry.default_registry_path()
+    arm_keys = [None if ml.is_python_language(arm["settings"].get("language"))
+                else mechanisms.mechanism_key(arm["expression"]) for arm in arms]
+    arm_identities = [_probe_identity(arm["expression"], arm["settings"]) for arm in arms]
+    history = {}
+    try:
+        with alpha_registry.indexed_registry(registry) as index:
+            if index is None:
+                exact_rows, structural_rows, book_keys = _scan_novelty_history(
+                    registry, arm_keys, arm_identities)
+                for key, identity in zip(arm_keys, arm_identities):
+                    completed = exact_rows.get(identity, [])
+                    exact = [row.get("key") or row.get("alpha_id") for row in completed]
+                    exact_keys = set(exact)
+                    similar = [row for row in structural_rows.get(key, [])
+                               if (row.get("key") or row.get("alpha_id")) not in exact_keys]
+                    history[key, identity] = (exact, completed[:_PROBE_REFERENCE_LIMIT],
+                                              len(similar), book_keys.get(key, []),
+                                              similar[:_PROBE_REFERENCE_LIMIT])
+            else:
+                for key, identity in dict.fromkeys(zip(arm_keys, arm_identities)):
+                    exact, completed = index.exact_history(identity, limit=_PROBE_REFERENCE_LIMIT)
+                    count, structural, similar = index.mechanism_history(
+                        key, exclude_keys=exact, limit=_PROBE_REFERENCE_LIMIT)
+                    history[key, identity] = (exact, completed, count, structural, similar)
+    except OSError as exc:
+        return [{"available": False, "reason": str(exc), "already_simulated": False,
+                 "exact_repeat_keys": [], "structural_similarity_keys": []}
+                for _ in arms]
+
+    block_marginals = {}
+    snapshot = Path(research_paths.resolve("convergence.json"))
+    if snapshot.exists():
+        try:
+            payload = json.loads(snapshot.read_text(encoding="utf-8"))
+            block_marginals = {row["block"]: row for row in payload.get("blocks") or []}
+        except (OSError, ValueError):
+            block_marginals = {}
     verdicts = []
     for key, identity in zip(arm_keys, arm_identities):
         block = key[0] if key else None
         block_row = block_marginals.get(block) or {}
-        completed = exact_results.get(identity, [])
-        exact = [entry.get("key") or entry.get("alpha_id") for entry in completed]
-        exact_keys = set(exact)
-        structural = book_keys.get(key, []) if key else []
-        similar = [entry for entry in structural_results.get(key, [])
-                   if (entry.get("key") or entry.get("alpha_id")) not in exact_keys]
+        exact, completed, count, structural, similar = history[key, identity]
         verdicts.append({
             "available": True,
             "block": block,
@@ -1849,10 +1875,10 @@ def _novelty_gate(arms, registry_path=None):
             "history_registry": str(Path(registry).expanduser().resolve()),
             "completed_refs": [_probe_history_ref(entry, key=entry.get("key") or entry.get("alpha_id"),
                                                   train=True)
-                               for entry in completed[:_PROBE_REFERENCE_LIMIT]],
+                               for entry in completed],
             "structural_refs": [_probe_history_ref(entry, key=entry.get("key") or entry.get("alpha_id"))
-                                for entry in similar[:_PROBE_REFERENCE_LIMIT]],
-            "structural_history_count": len(similar),
+                                for entry in similar],
+            "structural_history_count": count,
         })
     return verdicts
 
@@ -2093,7 +2119,11 @@ def _cmd_probe(args, _sink):
                 from . import mine
 
                 catalog = mine.load_catalog()
-                turnover_stats = mine.dataset_turnover(catalog=catalog)
+                datasets = {dataset for arm in arms
+                            if not ml.is_python_language(arm["settings"].get("language"))
+                            for dataset in mine.expression_datasets(arm["expression"], catalog)}
+                turnover_stats = mine.dataset_turnover(
+                    catalog=catalog, datasets=datasets, registry_path=getattr(args, "registry", None))
             for record, arm in zip(preview, group["arms"]):
                 index = arm["arm_index"]
                 results[index] = {**record, "label": arm["label"], "arm_index": index,

@@ -217,6 +217,7 @@ def campaign_pnl_fixture(root, name, archive_state, *, split=False, collected=Fa
 
 
 def test_campaign_status_discovers_pending_pnl_from_canonical_archive_batches(tmp_path, capsys, monkeypatch):
+    from research_app import experiments
     from tools import _runner
 
     def unexpected_cli(*args, **kwargs):
@@ -241,11 +242,87 @@ def test_campaign_status_discovers_pending_pnl_from_canonical_archive_batches(tm
         assert (job["batch"], job["archive_state"]) == (str(batch), archive_state)
         assert job["quick_pnl"]["pending_labels"] == ["candidate"]
 
+    load = experiments._load_probe_batch
+    loaded = []
+
+    def record_load(path, *args, **kwargs):
+        loaded.append(path)
+        return load(path, *args, **kwargs)
+
+    monkeypatch.setattr(experiments, "_load_probe_batch", record_load)
     code, result = invoke(capsys, tmp_path, "campaign", "status", "--limit", 1)
     assert code == 0
     pending = result["data"]["archived_quick_pnl"]
     assert pending["pending_batches"] == 2
     assert len(pending["jobs"]) == pending["omitted"] == 1
+    assert loaded == [tmp_path / "backlog-results" / "still-live-batch.json"]
+
+
+def test_campaign_archive_cache_follows_receipt_alias_and_protects_cached_inputs(tmp_path, capsys, monkeypatch):
+    import cache_store
+    from research_app import experiments
+
+    root = tmp_path / "research"
+    _, batch, receipt = campaign_pnl_fixture(root, "legacy", "done")
+    checkpoint = batch.replace(root / "checkpoint.json")
+    alias = root / "checkpoint-alias.json"
+    alias.symlink_to(checkpoint)
+    cache_store.write_json_atomic(receipt, {"data": {"path": "../checkpoint-alias.json"}})
+
+    load = experiments._load_probe_batch
+    loaded = []
+
+    def record_load(path, *args, **kwargs):
+        loaded.append(path)
+        return load(path, *args, **kwargs)
+
+    monkeypatch.setattr(experiments, "_load_probe_batch", record_load)
+    for _ in range(2):
+        code, result = invoke(capsys, root, "campaign", "status")
+        assert code == 0
+        [job] = result["data"]["archived_quick_pnl"]["jobs"]
+        assert job["batch"] == str(checkpoint)
+    assert loaded == [receipt]
+
+    original = checkpoint.read_bytes()
+    code, result = invoke(capsys, root, "campaign", "status", "--save", checkpoint)
+    assert code != 0 and result["error"]["code"] == "INVALID_INPUT"
+    assert checkpoint.read_bytes() == original
+    assert loaded == [receipt]
+
+    after = json.loads(original)
+    after["records"][0]["pnl_evidence"] = {"complete": True}
+    recovered = root / "recovered.json"
+    cache_store.write_json_atomic(recovered, after)
+    alias.unlink()
+    alias.symlink_to(recovered)
+    code, result = invoke(capsys, root, "campaign", "status")
+    assert code == 0
+    assert result["data"]["archived_quick_pnl"]["pending_batches"] == 0
+    assert loaded == [receipt, receipt]
+
+    outside = tmp_path / "outside.json"
+    cache_store.write_json_atomic(outside, after)
+    alias.unlink()
+    alias.symlink_to(outside)
+    code, result = invoke(capsys, root, "campaign", "status")
+    assert code == 0
+    assert result["data"]["archived_quick_pnl"]["unreadable_batches"] == 1
+    assert loaded == [receipt, receipt, receipt]
+
+
+def test_campaign_status_can_build_archive_summary_without_a_writable_index(tmp_path, capsys, monkeypatch):
+    import cache_store
+
+    campaign_pnl_fixture(tmp_path, "pending", "done")
+
+    def cannot_save(*args, **kwargs):
+        raise PermissionError("index directory is read-only")
+
+    monkeypatch.setattr(cache_store, "write_json_atomic", cannot_save)
+    code, result = invoke(capsys, tmp_path, "campaign", "status")
+    assert code == 0
+    assert result["data"]["archived_quick_pnl"]["pending_batches"] == 1
 
 
 def test_campaign_recover_pnl_uses_only_probe_recovery_and_keeps_deferred_arms(tmp_path, capsys, monkeypatch):
@@ -271,7 +348,7 @@ def test_campaign_recover_pnl_uses_only_probe_recovery_and_keeps_deferred_arms(t
         checkpoint = json.loads(batch.read_bytes())
         checkpoint["records"][0].update(pnl_evidence={"complete": True}, half_sharpes=[0.8, 1.1])
         checkpoint.pop("quick_pnl", None)
-        batch.write_text(json.dumps(checkpoint), encoding="utf-8")
+        cache_store.write_json_atomic(batch, checkpoint)
         return _runner.CliResult(True, {})
 
     monkeypatch.setattr(_runner, "run_cli", run_cli)

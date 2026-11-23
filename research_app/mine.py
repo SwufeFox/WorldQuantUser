@@ -142,7 +142,16 @@ def used_identifiers(registry_path=None):
             for field in identifiers or ()}
 
 
-def dataset_turnover(entries=None, catalog=None):
+def expression_datasets(expression, catalog):
+    """Datasets referenced by a parseable expression with cached metadata."""
+    try:
+        identifiers = _fields(expression)
+    except fastexpr_ast.ParseError:
+        return set()
+    return {catalog[name]["dataset"] for name in identifiers if name in catalog}
+
+
+def dataset_turnover(entries=None, catalog=None, *, datasets=None, registry_path=None):
     """``{dataset: {n, median}}`` - the turnover this dataset has actually produced.
 
     Mixed expressions count for each dataset they touch. Their medians are descriptive,
@@ -150,8 +159,21 @@ def dataset_turnover(entries=None, catalog=None):
     Missing train metrics remain unknown; full-window metrics are never substituted.
     """
     catalog = load_catalog() if catalog is None else catalog
+    if datasets is not None:
+        datasets = set(datasets)
+        catalog = {name: meta for name, meta in catalog.items() if meta["dataset"] in datasets}
+    if not catalog:
+        return {}
     if entries is None:
-        entries = alpha_registry.load_entries()
+        import sqlite3
+
+        try:
+            with alpha_registry.indexed_registry(registry_path) as index:
+                if index is not None:
+                    return index.dataset_turnover({name: meta["dataset"] for name, meta in catalog.items()})
+        except sqlite3.Error:
+            pass
+        entries = alpha_registry.load_entries(registry_path)
     return _dataset_turnover(_parsed_ledger_fields(entries), catalog)
 
 
