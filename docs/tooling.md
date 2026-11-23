@@ -680,6 +680,8 @@ if_else(is_nan(s), s, m)
 
 ### 给模型一份可核对的回测分析
 
+从预览、续跑到补日收益和转 FULL 的完整流程见[批量回测与台账复盘](ledger-workflow.md)。
+
 ```bash
 python3 research_cli.py ledger analyze --group-by scope --limit 8
 python3 research_cli.py ledger analyze --region ASI --delay 1 --mode QUICK \
@@ -1257,6 +1259,8 @@ python3 research_cli.py ledger sync --pnl
 * 研究目录（`/data/worldquant-research`）放**结果**：台账、缓存、一次性脚本、报告。一次性脚本不进 git。
 
 ## 长程研究队列
+
+队列状态、检查点路径和 QUICK 分析的串联用法见[批量回测与台账复盘](ledger-workflow.md)。
 
 把待研究的规格放入研究目录的 `backlog/`。先预览输入，再推进队列。已受理的任务、已确认未开始的臂、结果不明的请求都由 Probe 检查点记录。
 

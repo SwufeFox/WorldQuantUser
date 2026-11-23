@@ -133,6 +133,7 @@ pattern-matching the string.
 | Page | Read it when |
 | --- | --- |
 | [Tool map](docs/tooling.md) | Choose a CLI command, check its evidence, or recover a runner batch. |
+| [Batch research and ledger review](docs/ledger-workflow.md) | Queue QUICK probes, read the indexed report, and prepare a FULL follow-up. |
 | [Expression pipeline](docs/ast-pipeline.md) | Understand FASTEXPR parsing, source identity, and structural analysis. |
 | [Unit compression](docs/unit-compression.md) | Inspect FASTEXPR construction coverage and reproduce the report. |
 | [Backup and replay](docs/backup-replay.md) | Archive research state, restore a workspace, or check historical results. |
