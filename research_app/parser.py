@@ -520,6 +520,8 @@ def build_parser():
                                      "writing the shelf if eligible.")
     promote_parser.add_argument("--review-receipt", metavar="PATH",
                                 help="Review a saved Regular promotion receipt offline. Requires --selection.")
+    promote_parser.add_argument("--pc-distribution", metavar="PATH",
+                                help="Attach the candidate's saved production histogram to an offline receipt review.")
     _add_cost_args(promote_parser)
     promote_parser.bind_handler("promote.cmd_promote")
 
@@ -1053,6 +1055,8 @@ def build_parser():
                        help="Return a bounded train summary with a table, execution state and saved evidence paths.")
     probe.add_argument("--defer-quick-pnl", action="store_true",
                        help="Save QUICK results before fetching daily PnL. Run --recover without this flag to fetch it.")
+    probe.add_argument("--pnl-alpha-id", action="append", metavar="ID",
+                       help="With --recover, fetch daily PnL only for these saved QUICK Alpha IDs. Repeatable.")
     probe.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
                        help="Shared wait budget for login, preflight, simulation and recovery reads; "
                             "accepted jobs remain recoverable (default: 300).")
@@ -1632,9 +1636,11 @@ def build_parser():
                     "ledger, optionally reporting how a candidate would "
                     "correlate with it. `alpha list` hides this by default.")
     a_book.add_argument("--limit", type=int, default=50)
-    a_book.add_argument("--check", default=None, metavar="ALPHA_ID",
-                        help="Also report this candidate's self-correlation "
-                             "against the whole book.")
+    a_book_mode = a_book.add_mutually_exclusive_group()
+    a_book_mode.add_argument("--check", default=None, metavar="ALPHA_ID",
+                             help="Also report this candidate's self-correlation against the whole book.")
+    a_book_mode.add_argument("--income", action="store_true",
+                             help="Count live active submission days and scope size for income prerequisites.")
     a_book.add_argument("--registry", default=None)
     _add_session_args(a_book)
 
@@ -1733,7 +1739,7 @@ _COMMAND_EXAMPLES = {
     "alpha list": ["alpha list --limit 10 --min-fitness 1"],
     "alpha self-check": ["alpha self-check ALPHA_ID"],
     "alpha corr": ["alpha corr ALPHA_A ALPHA_B --vs-book"],
-    "alpha book": ["alpha book --limit 10"],
+    "alpha book": ["alpha book --limit 10", "alpha book --income"],
     "ledger": ["ledger list --family quality", "ledger coverage --list-missing"],
     "ledger sync": ["ledger sync --dry-run", "ledger sync --pnl"],
     "ledger record": ['ledger record ALPHA_ID --family quality --mechanism "profitability"'],

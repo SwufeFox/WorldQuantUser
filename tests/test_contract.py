@@ -106,6 +106,18 @@ class SchemaContractTests(unittest.TestCase):
                 self.assertFalse(parser.parse_args(command).defer_quick_pnl)
                 self.assertTrue(parser.parse_args((*command, "--defer-quick-pnl")).defer_quick_pnl)
 
+    def test_selective_pnl_recovery_and_income_views_are_explicit(self):
+        for command, flag in ((("probe",), "--pnl-alpha-id"), (("alpha", "book"), "--income")):
+            with self.subTest(command=command):
+                options = parse(run_cli("schema", *command))["data"]["command"]["options"]
+                self.assertTrue(any(flag in option["flags"] for option in options))
+        for invalid in (("probe", "new.json", "--pnl-alpha-id", "ALPHA"),
+                        ("alpha", "book", "--income", "--check", "ALPHA")):
+            with self.subTest(invalid=invalid):
+                receipt = run_cli(*invalid)
+                self.assertEqual(receipt.returncode, 2)
+                self.assertEqual(parse(receipt)["error"]["code"], "USAGE")
+
     def test_campaign_breeding_exposes_required_seed_and_budget(self):
         command = parse(run_cli("schema", "campaign", "breed"))["data"]["command"]
         options = {flag: option for option in command["options"] for flag in option["flags"]}
@@ -276,7 +288,8 @@ class PromoteContractTests(unittest.TestCase):
         self.assertEqual(command["command"], "promote")
         options = {flag: item for item in command["options"] for flag in item["flags"]}
         for flag in ("--save", "--compact", "--quiet", "--research-dir", "--note",
-                     "--cost-bps", "--freeze", "--buffer", "--dry-run", "--review-receipt"):
+                     "--cost-bps", "--freeze", "--buffer", "--dry-run", "--review-receipt",
+                     "--pc-distribution"):
             self.assertIn(flag, options)
         self.assertEqual(options["--retention-floor"]["default"], 0.2)
         self.assertTrue(options["alpha_id"]["required"])

@@ -347,6 +347,61 @@ def test_review_derives_offline_verdict_from_named_checks(flow, capsys, saved_pr
     assert not flow["calls"]
 
 
+@pytest.mark.parametrize("pc,pc_value,histogram_max,outcome", [
+    ("PENDING", 0.63, 0.68, "deferred"),
+    ("PASS", 0.728, 0.73, "passes_review"),
+])
+def test_review_keeps_saved_production_histogram_diagnostic(
+        flow, capsys, saved_promotion, tmp_path, pc, pc_value, histogram_max, outcome):
+    choice, saved, receipt = saved_promotion
+    row = receipt["data"]["checks"]["results"][0]
+    row["checks"]["PROD_CORRELATION"] = {"result": pc, "value": pc_value, "limit": 0.7}
+    row["production_correlation_evidence"] = {"formal": {"captured_at": "2026-11-20T00:00:00+00:00"}}
+    saved.write_text(json.dumps(receipt))
+    hist = tmp_path / "histogram.json"
+    archive = {"source": "GET /alphas/{id}/correlations/prod",
+               "requested_ids": ["A1"], "results": {"A1": [{
+                   "captured_at": "2026-11-21T19:15:00Z", "http_status": 200, "retry_after": "0.00",
+                   "raw_json_response": {"schema": {"name": "prodCorrelation", "properties": [
+                                             {"name": "min"}, {"name": "max"}, {"name": "alphas"}]},
+                                         "max": histogram_max,
+                                         "records": [[0.65, 0.7, 3], [0.7, 0.8, 1 if pc == "PASS" else 0]]},
+               }, {"captured_at": "2026-11-21T21:14:00+02:00", "http_status": 429}]}}
+    hist.write_text(json.dumps(archive))
+    code, response = invoke(capsys, "--review-receipt", saved, "--selection", choice, "--pc-distribution", hist)
+    data = response["data"]
+    evidence = data["production_correlation_evidence"]
+    assert code == 0 and data["review_outcome"] == outcome
+    assert evidence["formal"]["result"] == pc and evidence["formal"]["value"] == pc_value
+    assert evidence["formal"]["basis"] == "saved_receipt"
+    assert evidence["formal"]["captured_at"] == "2026-11-20T00:00:00+00:00"
+    assert evidence["distribution"]["max"] == histogram_max
+    assert evidence["distribution"]["source"] == "GET /alphas/A1/correlations/prod"
+    assert evidence["distribution"]["captured_at"] == "2026-11-21T19:15:00+00:00"
+    assert evidence["distribution"]["count_in_bins_at_or_above_formal_limit"] == (1 if pc == "PASS" else 0)
+    assert evidence["sharpe_exception"]["state"] == "unavailable"
+    assert not flow["calls"]
+
+    archive["results"]["A1"][0]["retry_after"] = "4"
+    hist.write_text(json.dumps(archive))
+    code, response = invoke(capsys, "--review-receipt", saved, "--selection", choice, "--pc-distribution", hist)
+    assert code == 0 and response["data"]["review_outcome"] == outcome
+    distribution = response["data"]["production_correlation_evidence"]["distribution"]
+    assert distribution["state"] == "unavailable" and distribution["max"] is None
+    assert not flow["calls"]
+
+    archive["requested_ids"] = ["B2"]
+    hist.write_text(json.dumps(archive))
+    code, response = invoke(capsys, "--review-receipt", saved, "--selection", choice, "--pc-distribution", hist)
+    assert code == 2 and response["error"]["code"] == "INVALID_INPUT"
+    assert not flow["calls"]
+
+    content = hist.read_text()
+    code, response = invoke(capsys, "--pc-distribution", hist, "--save", hist, "--not-an-option")
+    assert code == 2 and response["error"]["code"] == "INVALID_INPUT"
+    assert hist.read_text() == content
+
+
 def test_review_keeps_operational_failure_separate(flow, capsys, saved_promotion):
     choice, saved, receipt = saved_promotion
     receipt.update(ok=False, error={"code": "RATE_LIMITED"})

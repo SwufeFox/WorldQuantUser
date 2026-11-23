@@ -250,6 +250,15 @@ Alpha 和 probe 的 `incentives` 摘要保留 `MATCHES_PYRAMID`、`MATCHES_THEME
 `alpha check` 的依据为实时检查端点。`effective` 与 `multiplier` 分别保留，不互相推算；
 缺失倍率保持未知，主题命中不能覆盖质量检查失败。该能力提供平台报告的信息，不实现奖励计分公式。
 
+### 核对季度提交日和 Osmosis 范围
+
+```bash
+python research_cli.py alpha book --income
+```
+
+盘点可见和隐藏的 ACTIVE Alpha，按美国东部自然季度去重计算提交日，并按 region × delay 统计范围内的数量与缺口。日期或范围缺失单独计数。结果反映读取时的活跃记录，季末资格、范围权限、计费状态和点数分配仍以平台页面为准。
+[季度资格](https://support.worldquantbrain.com/hc/en-us/articles/4702810979351) · [Osmosis 规则](https://platform.worldquantbrain.com/learn/documentation/consultant-information/osmosis-allocation-guide-consultants)
+
 ### 平台组合前后表现：显式验证视图
 
 ```bash
@@ -335,6 +344,7 @@ rho_book、max_member_rho，以及 `checks`、`buffered`、`outcome`、`reasons`
 
 ```bash
 python3 research_cli.py promote ALPHA_ID --selection choice.json --review-receipt receipt.json
+python3 research_cli.py promote ALPHA_ID --selection choice.json --review-receipt receipt.json --pc-distribution capture.json
 ```
 
 `--review-receipt` 用冻结清单和已保存的 `promote --save` 回执离线复核 Regular 候选。
@@ -342,6 +352,9 @@ python3 research_cli.py promote ALPHA_ID --selection choice.json --review-receip
 `recorded_outcome` 保留当时的决定，`review_outcome` 分别报告 `blocked`、`deferred` 或 `passes_review`。
 缺少正式 PROD 判定时会列出证据缺口，已有明确失败项也会保留。离线复核不会调用平台、重新打开测试期或写候选架。
 复核结论限于归档时的证据。Power Pool 应按专用通道检查。
+
+`alpha check` 和离线复核都会在 `production_correlation_evidence.formal` 留下原生 PC 状态、数值、门槛和已知捕获时间。可选的 `--pc-distribution` 读取同 ID 的生产相关性端点存档，以 `source`、`requested_ids` 和 `results[ID]` 定位捕获，另列最高值和分箱。候选仍以正式检查裁定，完整对照 Sharpe 缺失时，超线豁免保持未知。
+[平台提交规则](https://platform.worldquantbrain.com/learn/documentation/consultant-information/getting-started-finding-consultant-alphas-read-first)
 
 ### 用现有问题文件交接
 
@@ -854,11 +867,10 @@ QUICK 初筛可以显式加 `--defer-quick-pnl`，先保存 Alpha ID、训练期
 ```bash
 python3 research_cli.py probe quick.spec.json --dry-run
 python3 research_cli.py probe quick.spec.json --defer-quick-pnl --batch-path quick-batch.json
-python3 research_cli.py probe --recover quick-batch.json
+python3 research_cli.py probe --recover quick-batch.json --pnl-alpha-id CANDIDATE_ID --pnl-alpha-id CONTROL_ID
 ```
 
-补读时省略 `--defer-quick-pnl`。`probe --recover` 只查询已有任务和 Alpha，
-把取到的日收益证据写回原批次。
+初筛后，可重复指定批次里已记录的 QUICK Alpha ID，补读候选和必要对照。未选的日收益继续保持待补，已受理任务照常回收。省略 `--pnl-alpha-id` 会补读整批，恢复只查询已有任务和 Alpha，并把证据写回原批次。
 
 `simulate/resume` 使用 `scheduling.quota` 展示配额观察；完整 probe 批次保留
 `scheduling[].quota`，`probe --summary` 的 `summary.quota` 仅保留最近一次观察，不复制调度历史。

@@ -35,6 +35,64 @@ def _validation_reasons(row, retention_floor):
     return reasons
 
 
+def _read_production_distribution(path, alpha_id, limit):
+    path = Path(path).expanduser().resolve()
+    try:
+        archive = json.loads(path.read_text(encoding="utf-8"))
+        source = archive["source"]
+        requested_ids = archive["requested_ids"]
+        if (source != "GET /alphas/{id}/correlations/prod"
+                or not isinstance(requested_ids, list) or alpha_id not in requested_ids):
+            raise ValueError("archive does not identify this alpha and the production endpoint")
+        captures = archive["results"][alpha_id]
+        if not isinstance(captures, list) or not captures:
+            raise ValueError("archive has no captures for this alpha")
+        dated = [(datetime.fromisoformat(capture["captured_at"].replace("Z", "+00:00")), capture)
+                 for capture in captures]
+        if any(stamp.utcoffset() is None for stamp, _ in dated):
+            raise ValueError("captures must have time-zone-aware timestamps")
+        stamp, capture = max(dated, key=lambda item: item[0])
+        status, retry_after = capture["http_status"], capture.get("retry_after")
+        diagnostic = {
+            "source": source.replace("{id}", alpha_id), "path": str(path),
+            "captured_at": stamp.astimezone(timezone.utc).isoformat(),
+            "http_status": status, "retry_after": retry_after,
+            "recorded_response_sha256": capture.get("response_sha256"),
+            "state": "unavailable", "max": None, "bins": [],
+            "count_in_bins_at_or_above_formal_limit": None,
+        }
+        try:
+            retry_delay = float(str(retry_after).strip() or 0) if retry_after is not None else 0
+        except (TypeError, ValueError, OverflowError):
+            retry_delay = None
+        response = capture.get("raw_json_response")
+        if status != 200 or not _finite(retry_delay) or retry_delay > 0 or not response:
+            return diagnostic
+        schema = response["schema"]
+        columns = [prop["name"] for prop in schema["properties"]]
+        if (schema["name"] != "prodCorrelation" or columns != ["min", "max", "alphas"]
+                or not isinstance(response["records"], list)):
+            raise ValueError("capture has an unsupported production histogram")
+        observed_max = response.get("max")
+        if observed_max is not None and not alphas._correlation_number(observed_max):
+            raise ValueError("capture has an invalid maximum correlation")
+        bins = []
+        for lower, upper, count in response["records"]:
+            if (not alphas._correlation_number(lower) or not alphas._correlation_number(upper)
+                    or lower >= upper or type(count) is not int or count < 0
+                    or (bins and lower < bins[-1]["upper"])):
+                raise ValueError("capture has an invalid or overlapping correlation bin")
+            bins.append({"lower": lower, "upper": upper, "count": count})
+        if observed_max is not None or bins:
+            diagnostic.update(state="available", max=observed_max, bins=bins)
+        if bins and alphas._correlation_number(limit):
+            diagnostic["count_in_bins_at_or_above_formal_limit"] = sum(
+                row["count"] for row in bins if row["lower"] >= limit)
+        return diagnostic
+    except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise CliError("INVALID_INPUT", f"cannot review production distribution: {exc}") from exc
+
+
 def _review_receipt(args):
     """Review historical Regular promotion evidence without contacting BRAIN."""
     if (not args.selection or args.dry_run or any(getattr(args, key) is not None
@@ -69,6 +127,8 @@ def _review_receipt(args):
         checked = results[0] if results else {}
         observed = checked["checks"] if checked.get("payload_received") is True and not checked.get("error") else {}
         verdicts = {name: check.get("result") for name, check in observed.items()}
+        saved_pc = (checked.get("production_correlation_evidence") or {}).get("formal") or {}
+        captured_at = saved_pc.get("captured_at")
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
         raise CliError("INVALID_INPUT", f"cannot review promotion receipt: {exc}") from exc
 
@@ -100,6 +160,12 @@ def _review_receipt(args):
     outcome = ("deferred" if source_changed or error or "quick_simulation" in missing
                else "blocked" if failures or failed_checks
                else "deferred" if missing else "passes_review")
+    pc_evidence = alphas.production_correlation_evidence(
+        args.alpha_id, observed, basis="saved_receipt", captured_at=captured_at)
+    distribution_path = getattr(args, "pc_distribution", None)
+    if distribution_path:
+        pc_evidence["distribution"] = _read_production_distribution(
+            distribution_path, args.alpha_id, production.get("limit"))
     return {
         "alpha_id": args.alpha_id, "selection_id": manifest["selection_id"],
         "receipt_path": str(path), "basis": "saved_receipt", "live_verified": False,
@@ -107,6 +173,7 @@ def _review_receipt(args):
         "simulation_mode": settings.get("simulationMode"),
         "validation": {key: row.get(key) for key in ("train_sharpe", "test_sharpe", "retention", "costs")},
         "production_correlation": production or None, "failed_checks": failed_checks,
+        "production_correlation_evidence": pc_evidence,
         "unresolved_checks": unresolved, "validation_failures": failures,
         "missing_evidence": missing, "source_changes": source_changed, "recorded_error": error,
     }
@@ -116,6 +183,8 @@ def cmd_promote(args, sink):
     """Compose existing commands; operational failures carry the completed evidence."""
     if getattr(args, "review_receipt", None):
         return _review_receipt(args)
+    if getattr(args, "pc_distribution", None):
+        raise CliError("INVALID_INPUT", "--pc-distribution requires --review-receipt")
     alpha_id = args.alpha_id
     alphas._candidate_role(args)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")

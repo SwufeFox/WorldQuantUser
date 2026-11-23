@@ -4,6 +4,7 @@ import argparse
 import os
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -103,6 +104,43 @@ class BookStateTests(unittest.TestCase):
         self.assertTrue(result["snapshot"]["complete"])
         self.assertEqual(len(result["snapshot"]["member_ids"]), 101)
         self.assertFalse(book_state.snapshot_path(self.registry).exists())
+
+    def test_income_readiness_counts_full_live_book_and_eastern_submission_days(self):
+        def active(alpha_id, stamp, region="USA"):
+            row = alpha(alpha_id)
+            row.update(dateSubmitted=stamp, settings={"region": region, "delay": 1})
+            return row
+
+        picked = active("SAME_DAY", "2026-10-01T15:30:00+00:00")
+        first = [active(f"OLDER_{index}", "2026-09-25T12:00:00+00:00") for index in range(97)]
+        first += [active("BEFORE_QUARTER", "2026-10-01T03:30:00+00:00"),
+                  active("FIRST_DAY", "2026-10-01T04:10:00+00:00", "EUR"), picked]
+        visible_next = [active("MISSING", None, "EUR")]
+        hidden = [picked, active("SECOND_DAY", "2026-10-02T21:00:00+00:00", "EUR"),
+                  active("UNSCOPED", "2026-12-01T12:00:00+00:00", None)]
+        as_of = datetime.fromisoformat("2026-11-23T12:00:00+00:00")
+        with mock.patch.object(alphas, "with_session",
+                               lambda args, read: read(object(), as_of=as_of)), \
+                mock.patch.object(ml, "list_alphas", side_effect=[first, visible_next, hidden]) as listing:
+            result = alphas.cmd_alpha_book(self.args(income=True, limit=1), None)
+
+        self.assertEqual([(c.kwargs["hidden"], c.kwargs["offset"]) for c in listing.call_args_list],
+                         [(False, 0), (False, 100), (True, 0)])
+        self.assertTrue(all(c.kwargs["status"] == "ACTIVE" and c.kwargs["alpha_type_not"] is None
+                            for c in listing.call_args_list))
+        self.assertEqual(result["active_alphas"], 103)
+        quarterly = result["quarterly"]
+        self.assertEqual(quarterly["quarter_start"], "2026-10-01")
+        self.assertEqual(quarterly["observed_active_submission_days"], 2)
+        self.assertEqual(quarterly["observed_submission_day_gap"], 18)
+        self.assertEqual(quarterly["unverified_active_submission_dates"], 2)
+        osmosis = result["osmosis"]
+        self.assertEqual(osmosis["unscoped_active_alphas"], 1)
+        self.assertEqual(osmosis["observed_active_scope_gap"], 2)
+        self.assertEqual(osmosis["scopes"], [
+            {"region": "EUR", "delay": 1, "active_alphas": 3, "active_count_gap": 7},
+            {"region": "USA", "delay": 1, "active_alphas": 99, "active_count_gap": 0},
+        ])
 
     def test_truncated_listing_does_not_infer_reverse_drift(self):
         self.record("OLD_MEMBER")

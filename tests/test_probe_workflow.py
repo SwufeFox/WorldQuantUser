@@ -574,6 +574,7 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.spec.write_text(json.dumps({"design": "explore",
             "settings": {"simulationMode": "QUICK", "testPeriod": "P1Y"},
             "arms": [{"label": "quick", "expression": "rank(close)"},
+                     {"label": "quick-other", "expression": "rank(open)"},
                      {"label": "full", "expression": "rank(volume)",
                       "settings": {"simulationMode": "FULL"}}]}), encoding="utf-8")
         boundary = "2021-01-01"
@@ -596,34 +597,51 @@ class ProbeWorkflowTests(unittest.TestCase):
                 mock.patch.object(app.research_paths, "ensure_dir", return_value=str(self.root)), \
                 mock.patch.object(ml, "fetch_daily_pnl", side_effect=fetch_pnl) as fetch:
             result = self.run_probe(defer_quick_pnl=True, no_record=True)
-            self.assertEqual(result["execution"]["finished"], 2)
-            self.assertEqual(result["execution"]["train_evidence"], 2)
+            self.assertEqual(result["execution"]["finished"], 3)
+            self.assertEqual(result["execution"]["train_evidence"], 3)
             self.assertEqual([row["alpha_id"] for row in result["rows"]],
-                             ["SYNTHETIC_quick", "SYNTHETIC_full"])
-            self.assertEqual([row["train_sharpe"] for row in result["rows"]], [1.4, 1.4])
+                             ["SYNTHETIC_quick", "SYNTHETIC_quick-other", "SYNTHETIC_full"])
+            self.assertEqual([row["train_sharpe"] for row in result["rows"]], [1.4, 1.4, 1.4])
             self.assertIsNone(result["rows"][0]["train_sharpe_h1"])
-            self.assertEqual(result["rows"][1]["train_sharpe_h1"], expected_halves[0])
+            self.assertEqual(result["rows"][2]["train_sharpe_h1"], expected_halves[0])
             fetch.assert_called_once()
             self.assertEqual(fetch.call_args.args[1], "SYNTHETIC_full")
             saved = json.loads(self.batch.read_text(encoding="utf-8"))
             pending = result["quick_pnl"]
             self.assertEqual(pending, saved["quick_pnl"])
-            self.assertEqual(pending["pending_labels"], ["quick"])
+            self.assertEqual(pending["pending_labels"], ["quick", "quick-other"])
             self.assertEqual(pending["recover_argv"][2:],
                              ["--research-dir", str(self.root), "probe", "--recover", str(self.batch)])
             self.assertIs(pending["platform_read_only"], True)
 
             with mock.patch.object(app, "with_session", side_effect=AssertionError("only deferred PnL remains")):
                 still_pending = app.cmd_probe(arguments(recover=str(self.batch), defer_quick_pnl=True), None)
+                for unknown in ("SYNTHETIC_full", "not-in-this-batch"):
+                    with self.subTest(unknown=unknown), self.assertRaises(CliError) as invalid:
+                        app.cmd_probe(arguments(recover=str(self.batch), pnl_alpha_id=[unknown]), None)
+                    self.assertEqual(invalid.exception.code, "INVALID_INPUT")
             self.assertEqual(still_pending["quick_pnl"], pending)
 
             with mock.patch.object(ml, "submit_single_simulation") as single_post, \
                     mock.patch.object(ml, "submit_multi_simulation") as multi_post:
+                chosen = arguments(recover=str(self.batch), pnl_alpha_id=["SYNTHETIC_quick"])
+                selective = app.cmd_probe(chosen, None)
+                self.assertEqual(selective["quick_pnl"]["pending_labels"], ["quick-other"])
+                self.assertEqual(selective["quick_pnl"],
+                                 json.loads(self.batch.read_text(encoding="utf-8"))["quick_pnl"])
+                self.assertEqual(selective["rows"][0]["train_sharpe_h1"], expected_halves[0])
+                self.assertIsNone(selective["rows"][1]["train_sharpe_h1"])
+                self.assertEqual([call.args[1] for call in fetch.call_args_list],
+                                 ["SYNTHETIC_full", "SYNTHETIC_quick"])
+                with mock.patch.object(app, "with_session", side_effect=AssertionError("chosen PnL is complete")):
+                    repeated = app.cmd_probe(chosen, None)
+                self.assertEqual(repeated["quick_pnl"], selective["quick_pnl"])
                 recovered = app.cmd_probe(arguments(recover=str(self.batch)), None)
             single_post.assert_not_called()
             multi_post.assert_not_called()
             self.assertEqual(launch.call_count, 2)
-            self.assertEqual([call.args[1] for call in fetch.call_args_list], ["SYNTHETIC_full", "SYNTHETIC_quick"])
+            self.assertEqual([call.args[1] for call in fetch.call_args_list],
+                             ["SYNTHETIC_full", "SYNTHETIC_quick", "SYNTHETIC_quick-other"])
 
         self.assertEqual(recovered["request_fingerprint"], result["request_fingerprint"])
         self.assertEqual(recovered["execution"], result["execution"])

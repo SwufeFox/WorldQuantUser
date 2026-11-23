@@ -1543,7 +1543,20 @@ def _recover_probe_batch(args, path):
     rows = document["rows"]
     multi = _multi_options(args, document)
     defer_quick_pnl = getattr(args, "defer_quick_pnl", False)
+    pnl_alpha_ids = set(getattr(args, "pnl_alpha_id", None) or ())
+    if pnl_alpha_ids:
+        known_quick_ids = {record.get("alpha_id") for record in document["records"]
+                           if ml.is_quick_simulation(record)}
+        unknown_ids = pnl_alpha_ids - known_quick_ids
+        if unknown_ids:
+            raise CliError("INVALID_INPUT", "--pnl-alpha-id requires QUICK Alpha IDs in this batch",
+                           details={"unknown_quick_alpha_ids": sorted(unknown_ids)})
     native_indices = list(_native_probe_groups(document))
+
+    def pnl_records():
+        return (record for record in document["records"]
+                if not pnl_alpha_ids or (ml.is_quick_simulation(record)
+                                         and record.get("alpha_id") in pnl_alpha_ids))
 
     def recover(session):
         records = document["records"]
@@ -1612,13 +1625,13 @@ def _recover_probe_batch(args, path):
                 elif row.get("alpha_id"):
                     outcome["matched"][label] = row["alpha_id"]
                     outcome["recovered"] += 1
-        _probe_halves(session, records, deadline=deadline, defer_quick_pnl=defer_quick_pnl)
+        _probe_halves(session, pnl_records(), deadline=deadline, defer_quick_pnl=defer_quick_pnl)
         return outcome
 
     now = time.time()
     needs_platform = any(_probe_needs_recovery(row) and (row.get("next_poll_at") or 0) <= now
                          for row in rows)
-    needs_halves = any(_probe_needs_train_pnl(record) for record in document["records"]
+    needs_halves = any(_probe_needs_train_pnl(record) for record in pnl_records()
                        if not (defer_quick_pnl and ml.is_quick_simulation(record)))
     outcome = with_session(args, recover, deadline=deadline) if needs_platform or needs_halves else recover(None)
     _probe_reconcile(document)
@@ -1978,7 +1991,7 @@ def cmd_probe(args, sink):
         _reject_saved_overrides(args, mode="--from-simulation")
         incompatible = ("spec", "recover", "resume", "dry_run", "check", "show_test", "selection",
                         "name", "batch_path", "registry", "cost_bps", "concurrency", "force",
-                        "allow_lint_errors", "strict_gate", "defer_quick_pnl")
+                        "allow_lint_errors", "strict_gate", "defer_quick_pnl", "pnl_alpha_id")
         if any(getattr(args, key, None) is not None and getattr(args, key) is not False
                for key in incompatible):
             raise CliError("USAGE", "--from-simulation is a read-only operation on existing simulations")
@@ -2032,6 +2045,10 @@ def _cmd_probe(args, _sink):
     dry_run = bool(getattr(args, "dry_run", False))
     if sum(bool(value) for value in (recover, resume, check)) > 1 or check and dry_run:
         raise CliError("USAGE", "--check, --recover and --resume are exclusive; --check cannot use --dry-run")
+    if getattr(args, "pnl_alpha_id", None) and (not recover or dry_run
+            or getattr(args, "show_test", False) or getattr(args, "defer_quick_pnl", False)):
+        raise CliError("USAGE", "--pnl-alpha-id requires --recover and cannot use "
+                       "--dry-run, --show-test or --defer-quick-pnl")
     if getattr(args, "show_test", False) and (not recover or not getattr(args, "selection", None)):
         raise CliError("USAGE", "--show-test requires --recover and --selection; it cannot start simulations")
     if recover:

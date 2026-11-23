@@ -215,6 +215,23 @@ class BatchCheckTests(unittest.TestCase):
         self.assertEqual(correlation["expected_result"], "PASS")
         self.assertTrue(correlation["value_consistent"])
 
+    def test_pc_evidence_preserves_an_above_limit_platform_pass(self):
+        payload = checked("A", PROD_CORRELATION={"result": "PASS", "value": 0.73, "limit": 0.7})
+        with mock.patch.object(ml, "fetch_alpha_checks", return_value=payload) as fetch:
+            data = alphas.cmd_alpha_check(arguments(), None)
+        result = data["results"][0]
+        evidence = result["production_correlation_evidence"]
+        formal = evidence["formal"]
+        self.assertEqual(result["outcome"], "passed")
+        self.assertEqual(formal["result"], "PASS")
+        self.assertEqual(formal["value_vs_limit"], "above")
+        self.assertEqual(formal["source"], "GET /alphas/A/check")
+        self.assertEqual(formal["basis"], "live_check_endpoint")
+        self.assertTrue(formal["resolved"])
+        self.assertTrue(formal["captured_at"].endswith("+00:00"))
+        self.assertEqual(evidence["sharpe_exception"]["state"], "unavailable")
+        fetch.assert_called_once()
+
     def test_invalid_wait_and_worker_limits_fail_before_authentication(self):
         for value in (-1, float("nan"), float("inf"), -float("inf")):
             with self.subTest(max_wait=value), self.assertRaises(CliError) as caught:

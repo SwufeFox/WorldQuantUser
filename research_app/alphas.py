@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 import json
 import hashlib
 import math
@@ -226,6 +227,26 @@ def _check_error(exc):
     return {"code": exc.code, "message": str(exc), "hint": getattr(exc, "hint", None)}
 
 
+def _correlation_number(value):
+    return type(value) in (int, float) and -1 <= value <= 1
+
+
+def production_correlation_evidence(alpha_id, checks, *, basis, captured_at=None):
+    """Keep the BRAIN verdict apart from the numeric ceiling."""
+    check = checks.get("PROD_CORRELATION") or {}
+    result, value, limit = (check.get(key) for key in ("result", "value", "limit"))
+    relation = None
+    if _correlation_number(value) and _correlation_number(limit):
+        relation = "above" if value > limit else "below" if value < limit else "at"
+    return {
+        "formal": {"source": f"GET /alphas/{alpha_id}/check", "basis": basis,
+                   "captured_at": captured_at, "result": result, "value": value, "limit": limit,
+                   "resolved": result in ("PASS", "FAIL"), "value_vs_limit": relation},
+        "sharpe_exception": {"state": "unavailable",
+                             "reason": "complete_production_peer_sharpes_not_verified"},
+    }
+
+
 def _check_result(alpha_id, payload=None, error=None):
     payload = payload or {}
     checks = payload.get("checks") or {}
@@ -236,10 +257,14 @@ def _check_result(alpha_id, payload=None, error=None):
     status = "error" if error else "complete" if complete else "pending"
     outcome = ("error" if error else "failed" if "FAIL" in verdicts else
                "pending" if not complete else "warning" if "WARNING" in verdicts else "passed")
+    received = bool(payload.get("payload_received", checks))
     return {"alpha_id": alpha_id, "status": status, "outcome": outcome,
-            "complete": complete, "payload_received": bool(payload.get("payload_received", checks)),
+            "complete": complete, "payload_received": received,
             "checks_resolved": resolved, "checks": checks,
             "self_correlation": payload.get("self_correlation"), "error": error,
+            "production_correlation_evidence": production_correlation_evidence(
+                alpha_id, checks, basis="live_check_endpoint",
+                captured_at=datetime.now(timezone.utc).isoformat() if received else None),
             "incentives": incentives.check_summary(checks, basis="live_check_endpoint")}
 
 
@@ -1233,6 +1258,11 @@ def cmd_alpha_corr(args, sink):
 
 def cmd_alpha_book(args, sink):
     """Inspect currently submitted/ACTIVE alphas joined with local ledger mechanisms and families."""
+    if getattr(args, "income", False):
+        from . import book_state
+
+        return with_session(args, book_state.income_readiness)
+
     registry_path = (getattr(args, "registry", None)
                      or alpha_registry.default_registry_path())
     entries = alpha_registry.load_entries(registry_path)
