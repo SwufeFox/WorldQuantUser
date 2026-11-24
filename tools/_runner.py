@@ -252,6 +252,9 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
     state, action = probe_state(result.data)
     detail = {"done": "all arms finished", "deferred": f"awaiting probe --{action}",
               "failed": "one or more arms failed or the receipt has no arm evidence"}[state]
+    field_deferred = result.data.get("preflight_deferred")
+    if state == "deferred" and field_deferred:
+        detail += f" (field preflight deferred for {len(field_deferred)} settings groups)"
     return ProbeRun(state, result.data, detail)
 
 

@@ -260,6 +260,21 @@ class ScopedCacheTests(unittest.TestCase):
         self.assertEqual(evidence["state"], "unknown")
         self.assertEqual(evidence["required_fields"]["verified_ids"], ["sample_matrix"])
         self.assertEqual(evidence["required_fields"]["unverified_ids"], ["sample_vector"])
+        self.assertEqual(evidence["required_fields"]["budget_deferred_ids"], ["sample_vector"])
+
+    def test_wide_field_group_can_use_more_than_the_default_scope_budget(self):
+        required = {f"field_{index:02}" for index in range(36)}
+
+        def lookup(_session, field, _scope, *, deadline):
+            self.assertLessEqual(deadline, 45)
+            return {"matches": [{"id": field}], "returned_count": 1, "reported_count": 1, "complete": True}
+
+        with mock.patch.object(capabilities.time, "monotonic", side_effect=[0, *range(36)]), \
+                mock.patch.object(ml, "search_datafield", side_effect=lookup) as search:
+            result = capabilities.required_field_scope(self.session, SETTINGS, required, deadline=45)
+
+        self.assertEqual(search.call_count, len(required))
+        self.assertEqual(result["known_fields"], required)
 
     def test_required_field_search_paces_adjacent_requests(self):
         fields = {row["id"]: row for row in FIELDS}
@@ -300,6 +315,24 @@ class ScopedCacheTests(unittest.TestCase):
 
 
 class PreflightEvidenceTests(unittest.TestCase):
+    def test_field_budget_exhaustion_reports_a_retryable_error(self):
+        session = mock.Mock()
+        fields = capabilities.field_scope([], {"state": "unknown", "scope": SETTINGS,
+            "required_fields": {"budget_deferred_ids": ["sample_matrix"]}})
+
+        def operators(_session, **kwargs):
+            kwargs["report"]["complete"] = True
+            return [{"name": "rank"}]
+
+        with mock.patch.object(validation, "_field_scope", return_value=fields), \
+                mock.patch.object(ml, "fetch_operators", side_effect=operators):
+            with self.assertRaises(validation.FieldEvidenceRefreshError) as caught:
+                validation._preflight_lint(session, [("rank(sample_matrix)", 0)],
+                                           SETTINGS, SimpleNamespace())
+        self.assertEqual(caught.exception.code, "SERVICE_ERROR")
+        self.assertIn("budget expired", caught.exception.message)
+        session.post.assert_not_called()
+
     def test_field_rate_limit_has_retryable_code_before_submission(self):
         session = mock.Mock()
 
@@ -307,14 +340,18 @@ class PreflightEvidenceTests(unittest.TestCase):
             kwargs["report"]["complete"] = True
             return [{"name": "rank"}]
 
+        session.request.return_value.status_code = 429
+        session.request.return_value.headers = {"Retry-After": "150"}
         with mock.patch.object(ml, "fetch_operators", side_effect=operators), \
-                mock.patch.object(ml, "search_datafield", side_effect=ml.RateLimited("test limit")), \
+                mock.patch.object(capabilities.time, "time", return_value=100), \
                 mock.patch.object(simulation_capabilities, "account_provenance",
                                   return_value={"state": "unknown"}):
-            with self.assertRaises(CliError) as caught:
+            with self.assertRaises(validation.FieldEvidenceRefreshError) as caught:
                 validation._preflight_lint(session, [("rank(sample_matrix)", 0)],
                                            SETTINGS, SimpleNamespace())
         self.assertEqual(caught.exception.code, "RATE_LIMITED")
+        self.assertEqual(caught.exception.details["field_catalog"]["catalogs"][0]["retry_at"], 250)
+        session.request.assert_called_once()
         session.post.assert_not_called()
 
     def test_catalog_failure_blocks_before_submission(self):

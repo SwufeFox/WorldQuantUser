@@ -179,6 +179,62 @@ class ProbeWorkflowTests(unittest.TestCase):
             self.assertEqual(preflight.call_count, 2)
             self.assertEqual(launch.call_count, 2)
 
+    def test_field_service_failure_defers_only_the_affected_group_and_resumes_exactly_once(self):
+        evidence = {"scope": {"region": "USA"}, "required_fields": {"unverified_ids": ["close"]},
+                    "catalogs": [{"field": "close", "error": "SERVICE_ERROR"}]}
+
+        def preflight(_session, pairs, _settings, _args, **kwargs):
+            if pairs[0][0] == "rank(close)":
+                raise app.FieldEvidenceRefreshError("SERVICE_ERROR", "field unavailable",
+                                                    details={"field_catalog": evidence})
+            return {"ok": True}
+
+        with mock.patch.object(app, "_preflight_lint", side_effect=preflight), \
+                mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator) as launch:
+            first = self.run_probe(multi_size=2)
+            self.assertEqual(first["execution"]["not_submitted"], 2)
+            self.assertEqual(first["recording"]["appended"], 1)
+            saved = json.loads(self.batch.read_text(encoding="utf-8"))
+            self.assertEqual(saved["preflight_deferred"], first["preflight_deferred"])
+            deferred = saved["preflight_deferred"]["first"]
+            self.assertEqual(deferred["labels"], ["first", "third"])
+            self.assertEqual(deferred["catalogs"], evidence["catalogs"])
+            self.assertFalse(saved["records"][0]["submission_attempted"])
+            summary = app._summarize_probe_response(dict(first))
+            self.assertEqual(summary["preflight_deferred_total"], 1)
+            self.assertEqual(summary["preflight_deferred"]["first"]["code"], "SERVICE_ERROR")
+
+            with mock.patch.object(app, "_preflight_lint", return_value={"ok": True}):
+                resumed = app.cmd_probe(arguments(resume=str(self.batch)), None)
+
+        self.assertTrue(resumed["complete"])
+        self.assertFalse(resumed["preflight_deferred"])
+        self.assertEqual(resumed["rows"][1]["alpha_id"], first["rows"][1]["alpha_id"])
+        self.assertEqual(resumed["recording"]["appended"], 2)
+        self.assertEqual([call.kwargs["labels"] for call in launch.call_args_list],
+                         [["second"], ["first", "third"]])
+
+    def test_field_rate_limit_defers_new_preflight_until_saved_retry_time(self):
+        failure = app.FieldEvidenceRefreshError("RATE_LIMITED", "catalog rate limit", details={
+            "field_catalog": {"catalogs": [{"field": "close", "error": "RATE_LIMITED", "retry_at": 160}]}})
+        with (mock.patch.object(app.time, "time", return_value=100) as clock,
+              mock.patch.object(app, "_preflight_lint", side_effect=failure) as preflight,
+              mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator) as launch):
+            self.run_probe(multi_size=2, no_record=True)
+            app.cmd_probe(arguments(resume=str(self.batch)), None)
+            preflight.assert_called_once()
+            launch.assert_not_called()
+
+            clock.return_value = 160
+            preflight.side_effect = None
+            preflight.return_value = {"ok": True}
+            result = app.cmd_probe(arguments(resume=str(self.batch)), None)
+
+        self.assertTrue(result["complete"])
+        self.assertFalse(result["preflight_deferred"])
+        self.assertEqual([call.kwargs["labels"] for call in launch.call_args_list],
+                         [["second"], ["first", "third"]])
+
     def test_platform_classification_stays_in_saved_validation_evidence(self):
         def simulate(expressions, settings, **kwargs):
             return [{**finished(label), "classification_ids": ["POWER_POOL_ELIGIBLE"]}

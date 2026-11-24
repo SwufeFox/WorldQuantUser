@@ -1277,7 +1277,9 @@ def request_json(s, method, path, params=None, json_body=None, max_retries=4, *,
             wait = _retry_after_seconds(response)
             if not math.isfinite(wait) or wait <= 0:
                 wait = min(60.0, 5.0 * attempt)
-            last = RateLimited("%s %s is rate limited" % (method, url))
+            retry_after = _retry_after_seconds(response, cap_error_wait=False)
+            last = RateLimited("%s %s is rate limited" % (method, url),
+                               retry_after=retry_after if math.isfinite(retry_after) and retry_after > 0 else wait)
             if attempt < max_retries and wait < deadline - time.monotonic():
                 sleep(wait)
                 continue

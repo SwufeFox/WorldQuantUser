@@ -28,7 +28,8 @@ from tools import guarded_sim
 
 from .runtime import CliError, METRIC_KEYS, collect_alphas, merge_settings, note, protect_output, session_reader, with_session
 from . import costs, incentives, research_route, selection, stats
-from .validation import _preflight_lint, attach_field_contracts, cached_field_scope, lint_python_source
+from .validation import (FieldEvidenceRefreshError, _preflight_lint, attach_field_contracts,
+                         cached_field_scope, lint_python_source)
 
 
 #: Operators per arm above which the report says so. Not a hard limit (the platform's
@@ -767,6 +768,13 @@ def _compact_preflight(report):
 
 def _summarize_probe_response(response):
     response["summary"] = _probe_summary(response)
+    deferred_preflights = response.get("preflight_deferred")
+    if deferred_preflights:
+        response["preflight_deferred_total"] = len(deferred_preflights)
+        response["preflight_deferred"] = {
+            label: {key: group[key] for key in ("code", "message", "hint", "scope", "retry_at")}
+            for label, group in list(deferred_preflights.items())[:20]
+        }
     quick_pnl = response.get("quick_pnl")
     if quick_pnl:
         labels = quick_pnl["pending_labels"]
@@ -2282,6 +2290,7 @@ def _probe_response(document, path, show_test=False, manifest=None, summary=Fals
     keys = ("name", *_PROBE_CONTEXT_FIELDS, "track", "routes", "run_id", "started_at", "request_fingerprint",
             "arm_order", "design", "complete", "incomplete", "all_empty", "comparisons",
             "execution", "recording", "recording_policy", "next_actions", "quick_pnl", "preflight",
+            "preflight_deferred",
             "concurrency", "scheduling", "capability_snapshot", "multi_size")
     rows = [_probe_visible_row(row, show_test) for row in document["rows"]]
     if manifest is not None:
@@ -2398,6 +2407,7 @@ def _save_probe_progress(document, target, indices, kind, payload):
 def _execute_probe(args, document, target, groups):
     deadline = _simulation_deadline(args)
     proof_cache = {}
+    deferred_preflights = document.get("preflight_deferred") or {}
     records = document["records"]
     state_lock = threading.Lock()
     multi = _multi_options(args, document)
@@ -2442,7 +2452,12 @@ def _execute_probe(args, document, target, groups):
             return any(_submission_state(records[arm["arm_index"]]) == "not_submitted"
                        for arm in group["arms"])
 
-        ordered = sorted(((launches(group), group) for group in groups.values()), key=lambda item: item[0])
+        ordered = sorted(((launches(group), group) for group in groups.values()),
+                         key=lambda item: (item[0], deferred_preflights.get(
+                             item[1]["arms"][0]["label"], {}).get("observed_at", 0)))
+        fingerprint = account.get("fingerprint")
+        field_retry_at = max((item.get("retry_at", 0) for item in deferred_preflights.values()
+                              if item.get("account_fingerprint") == fingerprint), default=0)
         last_launch = len(ordered) - 1 if ordered[-1][0] else -1
         launch_limit = None
         if last_launch >= 0:
@@ -2456,6 +2471,8 @@ def _execute_probe(args, document, target, groups):
                 break
             preflight = None
             if launching:
+                if field_retry_at > time.time():
+                    break
                 retry_at = simulation_slots.submission_retry_at(account)
                 deferred = None
                 if retry_at is not None:
@@ -2476,8 +2493,28 @@ def _execute_probe(args, document, target, groups):
                            for arm in group["arms"]):
                         run_group(session, group)
                     continue
-                preflight = _preflight_lint(session, group["pairs"], group["settings"], args,
-                                            deadline=deadline, proof_cache=proof_cache)
+                label = group["arms"][0]["label"]
+                try:
+                    preflight = _preflight_lint(session, group["pairs"], group["settings"], args,
+                                                deadline=deadline, proof_cache=proof_cache)
+                except FieldEvidenceRefreshError as exc:
+                    evidence = exc.details["field_catalog"]
+                    catalogs = evidence.get("catalogs") or []
+                    field_retry_at = max((row.get("retry_at", 0) for row in catalogs), default=0)
+                    deferred_preflights[label] = {
+                        "labels": [arm["label"] for arm in group["arms"]],
+                        "code": exc.code, "message": exc.message, "hint": exc.hint,
+                        "observed_at": time.time(), "retry_at": field_retry_at,
+                        "account_fingerprint": fingerprint,
+                        "scope": evidence.get("scope"), "required_fields": evidence.get("required_fields"),
+                        "catalogs": [row for row in catalogs if row.get("state") != "verified"],
+                    }
+                    document["preflight_deferred"] = deferred_preflights
+                    save()
+                    if exc.code == "RATE_LIMITED":
+                        break
+                    continue
+                deferred_preflights.pop(label, None)
                 document["preflight"].append(preflight)
                 save()
             if time.monotonic() >= deadline:

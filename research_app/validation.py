@@ -18,6 +18,10 @@ from .capabilities import cached_field_scope
 from .runtime import CliError, collect_alphas, merge_settings, with_session
 
 
+class FieldEvidenceRefreshError(CliError):
+    """Temporary lack of field evidence, before any simulation was posted."""
+
+
 def _python_finding(code, message, severity="error", **location):
     return {"code": code, "message": message, "severity": severity, **location}
 
@@ -293,13 +297,19 @@ def _preflight_lint(session, pairs, settings, args, capability_snapshot=None, *,
         return report
     if all(finding["code"] in {"catalog_unverified", "python_language_unverified"}
            for finding in report["errors"]):
-        catalog_errors = {row.get("error") for row in (fields["evidence"].get("catalogs") or [])
+        evidence = report["field_catalog"]
+        catalog_errors = {row.get("error") for row in (evidence.get("catalogs") or [])
                           if isinstance(row, dict) and isinstance(row.get("error"), str)}
         for code in ("RATE_LIMITED", "SERVICE_ERROR"):
             if code in catalog_errors:
-                raise CliError(code, "nothing was submitted because required field evidence could not be refreshed",
-                               "retry the existing checkpoint after the catalog recovers",
-                               details=report)
+                raise FieldEvidenceRefreshError(
+                    code, "nothing was submitted because required field evidence could not be refreshed",
+                    "retry the existing checkpoint after the catalog recovers", details=report)
+        if (evidence.get("required_fields") or {}).get("budget_deferred_ids"):
+            raise FieldEvidenceRefreshError(
+                "SERVICE_ERROR", "the field evidence wait budget expired before preflight completed",
+                "increase --max-wait-seconds or reduce the unique fields in the affected settings group",
+                details=report)
     hint = ("verify account language availability and declare data fields in a literal list" if python else
             "refresh required catalogs and fix expression or advertised setting errors; --allow-lint-errors overrides lint only")
     raise CliError("INVALID_INPUT", "simulation preflight failed; nothing was submitted",

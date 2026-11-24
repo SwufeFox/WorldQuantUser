@@ -116,8 +116,13 @@ def required_field_scope(session, settings, required_fields, *, deadline=None, p
 
     scope, account = scope_settings(settings), simulation_capabilities.account_provenance(session)
     required = set(required_fields or ())
-    catalogs, records, timestamps = [], [], []
-    field_deadline = time.monotonic() + _REQUIRED_FIELDS_WAIT_SECONDS
+    catalogs, records, timestamps, budget_deferred = [], [], [], []
+    wait_seconds = _REQUIRED_FIELDS_WAIT_SECONDS
+    if deadline is not None and required:
+        # Allow for the paced searches without exceeding the caller's budget.
+        wait_seconds = max(wait_seconds, (len(required) - 1) * _FIELD_SEARCH_INTERVAL_SECONDS
+                           + _FIELD_SEARCH_WAIT_SECONDS)
+    field_deadline = time.monotonic() + wait_seconds
     if deadline is not None:
         field_deadline = min(field_deadline, deadline)
     fingerprint = account.get("fingerprint")
@@ -136,6 +141,7 @@ def required_field_scope(session, settings, required_fields, *, deadline=None, p
         now = time.monotonic()
         search_at = max(now, next_search_at)
         if search_at >= field_deadline:
+            budget_deferred.append(field)
             continue
         # The scoped data-fields endpoint admits one request per second.
         if search_at > now:
@@ -152,6 +158,8 @@ def required_field_scope(session, settings, required_fields, *, deadline=None, p
             raise
         except ml.RateLimited as exc:
             search["error"] = exc.code
+            if exc.retry_after is not None:
+                search["retry_at"] = time.time() + exc.retry_after
             break
         except (ml.BrainError, RequestException) as exc:
             search["error"] = getattr(exc, "code", type(exc).__name__)
@@ -184,6 +192,8 @@ def required_field_scope(session, settings, required_fields, *, deadline=None, p
                 "required_fields": {"state": state, "ids": sorted(required), "verified_ids": sorted(available),
                                     "unverified_ids": sorted(required - available),
                                     "routing_source": "scoped_live_search"}}
+    if budget_deferred:
+        evidence["required_fields"]["budget_deferred_ids"] = budget_deferred
     return field_scope(records, evidence)
 
 
