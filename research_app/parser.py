@@ -700,6 +700,9 @@ def build_parser():
                        help="Also emit ready-to-use FASTEXPR snippets.")
     cat_f.add_argument("--summary", action="store_true",
                        help="Bound field rows and show reported Pyramid/Theme metadata.")
+    cat_f.add_argument("--opportunity", action="store_true",
+                       help="Rank by coverage x pyramid multiplier / log(2+alphaCount): "
+                            "high coverage, theme bonus, little prior mining first.")
 
     _add_session_args(cat_f)
     cat_f.bind_handler("catalog.cmd_catalog_fields")
@@ -1055,6 +1058,8 @@ def build_parser():
                        help="Return a bounded train summary with a table, execution state and saved evidence paths.")
     probe.add_argument("--defer-quick-pnl", action="store_true",
                        help="Save QUICK results before fetching daily PnL. Run --recover without this flag to fetch it.")
+    probe.add_argument("--native-poll-once", action="store_true",
+                       help="For live probe runs, read each due native Multi parent once and save its next poll time.")
     probe.add_argument("--pnl-alpha-id", action="append", metavar="ID",
                        help="With --recover, fetch daily PnL only for these saved QUICK Alpha IDs. Repeatable.")
     probe.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
@@ -1125,6 +1130,8 @@ def build_parser():
                               help="Maximum wait budget for each Probe invocation.")
     campaign_run.add_argument("--recover-only", action="store_true",
                               help="Recover existing simulation tasks without posting unstarted arms.")
+    campaign_run.add_argument("--prefer", action="append", metavar="SPEC.json",
+                              help="Prioritize an unstarted BRAIN inbox spec by filename. Repeat in priority order.")
     campaign_run.add_argument("--defer-quick-pnl", action="store_true",
                               help="Let QUICK batches finish before fetching their daily PnL.")
     campaign_run.add_argument("--validate", action="store_true",

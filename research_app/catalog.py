@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import Counter
 
 import field_contract
@@ -83,6 +84,28 @@ def cmd_catalog_datasets(args, _sink):
     return incentives.catalog_summary(data, "datasets") if getattr(args, "summary", False) else data
 
 
+OPPORTUNITY_NOTE = (
+    "opportunity = coverage x pyramid multiplier / log(2 + alphaCount); "
+    "high coverage with a reported theme bonus and little prior mining first; "
+    "categorical or identifier fields can rank high, so read the description before simulating")
+
+
+def field_opportunity(field):
+    """Deterministic mining-priority score; None when coverage is unusable.
+
+    Fields with no reported alphaCount are treated as unmined (0): the catalog
+    omits the count when nobody used the field, not when it is crowded.
+    """
+    coverage = field.get("coverage")
+    if type(coverage) not in (int, float) or not 0 < coverage <= 1:
+        return None
+    multiplier = incentives.reported_multiplier(field.get("pyramidMultiplier"))
+    alpha_count = field.get("alphaCount")
+    if type(alpha_count) is not int or alpha_count < 0:
+        alpha_count = 0
+    return coverage * (multiplier if multiplier is not None else 1.0) / math.log(2 + alpha_count)
+
+
 def cmd_catalog_fields(args, _sink):
     """List a dataset's fields, with ranked local search.
 
@@ -132,8 +155,22 @@ def cmd_catalog_fields(args, _sink):
                 "each term appears somewhere in this dataset but no single field "
                 "contains all of them; try --any-term, or search the terms one at "
                 "a time with `catalog concepts`")
-    elif args.limit:
+    elif not getattr(args, "opportunity", False) and args.limit:
         fields = fields[: args.limit]
+
+    opportunity = None
+    if getattr(args, "opportunity", False):
+        scored = []
+        for field in fields:
+            score = field_opportunity(field)
+            if score is None:
+                continue
+            scored.append({**field, "opportunity": round(score, 4)})
+        scored.sort(key=lambda item: item["opportunity"], reverse=True)
+        if args.limit:
+            scored = scored[: args.limit]
+        fields = scored
+        opportunity = {"note": OPPORTUNITY_NOTE, "scored": len(scored)}
 
     type_counts = Counter(field["type"] for field in fields if isinstance(field.get("type"), str))
     data = {
@@ -145,6 +182,8 @@ def cmd_catalog_fields(args, _sink):
     }
     if search_note:
         data["search"] = search_note
+    if opportunity:
+        data["opportunity"] = opportunity
     if args.expressions:
         selected = fields[:incentives.SUMMARY_LIMIT] if getattr(args, "summary", False) else fields
         data["expressions"] = ml.process_datafields(selected)

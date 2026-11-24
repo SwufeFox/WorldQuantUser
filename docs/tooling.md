@@ -608,6 +608,17 @@ python3 research_cli.py catalog find --region EUR --universe TOP2500 --delay 1 \
   --min-coverage 0.8 --sort pyramid-multiplier --limit 20 --stream
 ```
 
+`catalog fields --opportunity` 在单个数据集内按确定性的机会分排序：
+`coverage × pyramid.multiplier / log(2 + alphaCount)`。没有 `alphaCount` 视为未被挖掘（0），
+缺失或非有限倍率按 1 处理，`coverage` 缺失或不合法（≤0 或 >1）的字段不参与打分。
+高分只说明覆盖高、主题加成存在、先验挖掘少；货币代码、编号等分类字段也会排到前面，
+模拟前仍要读字段定义。示例：
+
+```bash
+python3 research_cli.py catalog fields --dataset analyst45 --region USA --universe TOP3000 \
+  --opportunity --limit 10
+```
+
 `--max-alpha-count 0` 只接收平台目录明确报告 `alphaCount=0` 的字段。符合其他筛选条件但计数未知的字段计入
 `alpha_count_unknown`。`--sort pyramid-multiplier` 对全部匹配排序，缺失倍率排在最后，`--limit` 只限制输出。
 字段目录完整分页后按账户、数据集和范围缓存，换本地筛选条件时可重用。`--type MATRIX` 优先复用匹配缓存，
@@ -1044,6 +1055,9 @@ Delay 和 Language 必须一致。工具沿用 `probe` 的设置分组，末尾�
 工具在发单前保存父任务和子配置，接受后记录父任务地址。恢复时从地址读取子任务，分别
 记录成功、失败及待确认的结果。父任务报错并返回子列表时，已确认成功的子结果仍可入账。
 检查点的父任务记录保存 `multi_terminal_evidence`，包括已核实的父子任务终态及可用的错误摘要。
+父任务首臂保存平台确认受理、最近一次确认仍在进行、首次确认终态的本地 Unix 时间戳，字段为
+`multi_parent_accepted_at`、`multi_last_pending_observed_at` 和 `multi_parent_terminal_observed_at`。
+旧检查点缺少历史受理时间或已有终态的首次观测时间时，恢复后相应字段仍缺失。
 缺少逐臂映射的整批失败使用 `multi_failure_attribution: "unattributed"`，表示执行失败尚未归因到单个研究臂。
 任务身份不明时保留待核对状态。`probe --recover` 只读已登记的平台任务并补账。`probe --resume`
 还可继续排队的回测。手里只有父任务 ID 时，用 `probe --from-simulation` 查看父任务和各子任务状态。
