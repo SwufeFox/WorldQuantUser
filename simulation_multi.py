@@ -52,15 +52,32 @@ def payload_digest(payload):
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def _settings_digest(payload):
+    """Identify the settings a native parent would execute for this member."""
+    settings = payload.get("settings") if isinstance(payload, dict) else None
+    canonical = json.dumps(settings or {}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def request_groups(indices, payload_for, size):
-    """Preserve order and keep repeated requests out of the same native parent."""
+    """Preserve order, keep repeats apart, and never mix settings in one parent.
+
+    BRAIN applies one settings object per parent. A batch that mixed decays or
+    universes silently ran every child with the parent's settings, so split on a
+    settings change as well as on a repeated request.
+    """
     batch = []
     seen = set()
+    settings = None
     for index in indices:
-        identity = payload_digest(payload_for(index))
-        if batch and (len(batch) == size or identity in seen):
+        payload = payload_for(index)
+        identity = payload_digest(payload)
+        digest = _settings_digest(payload)
+        if batch and (len(batch) == size or identity in seen or digest != settings):
             yield tuple(batch)
-            batch, seen = [], set()
+            batch, seen, settings = [], set(), None
+        if not batch:
+            settings = digest
         batch.append(index)
         seen.add(identity)
     if batch:

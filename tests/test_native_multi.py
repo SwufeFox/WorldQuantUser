@@ -456,3 +456,24 @@ def test_native_transient_429_defers_new_requests_from_another_invocation(simula
     assert all(row["status"] == "QUEUED" and not row.get("submission_attempted") for row in rows)
     assert scheduling["submission_retry_at"] == 220
     assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0
+
+
+def test_request_groups_split_on_settings_change():
+    payloads = {
+        0: {"settings": {"decay": 4}, "regular": "rank(close)"},
+        1: {"settings": {"decay": 8}, "regular": "rank(open)"},
+        2: {"settings": {"decay": 8}, "regular": "rank(volume)"},
+        3: {"settings": {"decay": 8}, "regular": "rank(close)"},
+    }
+    groups = list(simulation_multi.request_groups([0, 1, 2, 3], payloads.__getitem__, 4))
+    assert groups == [(0,), (1, 2, 3)]
+
+
+def test_request_groups_split_on_repeat_but_keep_size():
+    payloads = {
+        0: {"settings": {"decay": 4}, "regular": "rank(close)"},
+        1: {"settings": {"decay": 4}, "regular": "rank(close)"},
+        2: {"settings": {"decay": 4}, "regular": "rank(open)"},
+    }
+    groups = list(simulation_multi.request_groups([0, 1, 2], payloads.__getitem__, 2))
+    assert groups == [(0,), (1, 2)]

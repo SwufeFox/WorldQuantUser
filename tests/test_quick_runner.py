@@ -358,3 +358,20 @@ class QuickRunnerTests(TestCase):
         self.assertEqual(result["status"], "RUNNER_ERROR")
         self.assertEqual(result["label"], ARM["label"])
         self.assertEqual(result["expr"], ARM["expr"])
+
+
+class QuickMarginTests(TestCase):
+    def test_finish_metrics_copies_margin(self):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        runner = batch_quick.Runner(Path(directory.name) / "results.jsonl", ACCOUNT, 1, 60)
+        row = {"alpha_id": ALPHA_ID, "simulation_job_key": "k1", "slot_id": "s1",
+               "simulation_status": "COMPLETE"}
+        payload = {"is": {"sharpe": 1.2, "fitness": 0.8, "turnover": 0.05, "returns": 0.1,
+                          "drawdown": 0.02, "longCount": 10, "shortCount": 9, "margin": 0.0007,
+                          "checks": []}}
+        with mock.patch.object(runner, "_read", return_value=payload), \
+                mock.patch.object(runner, "_checkpoint"), \
+                mock.patch.object(batch_quick.simulation_slots, "quick_update"):
+            result = runner.finish_metrics(row)
+        self.assertEqual(result["margin"], 0.0007)

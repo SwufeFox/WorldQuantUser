@@ -670,7 +670,8 @@ class Runner:
         row.pop("metrics_pending", None)
         row.pop("next_metrics_at", None)
         row.update({name: metrics.get(name) for name in ("sharpe", "fitness", "turnover",
-                                                        "returns", "drawdown", "longCount", "shortCount")})
+                                                        "returns", "drawdown", "longCount", "shortCount",
+                                                        "margin")})
         checks = {item.get("name"): item for item in metrics.get("checks") or []}
         row["fails"] = [name for name, item in checks.items() if item.get("result") == "FAIL"]
         for name in CHECK_NAMES:
