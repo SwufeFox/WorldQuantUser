@@ -140,13 +140,14 @@ _CHECKPOINT_POLL_FIELDS = ("progress_url", "next_poll_at", "poll_after_seconds",
 _MULTI_CHECKPOINT_EVENTS = {"multi_submitting", "multi_submitted", "multi_pending"}
 _MULTI_CHECKPOINT_FIELDS = ("multi_request_id", "multi_member", "multi_size", "multi_parent_url",
                             "multi_child_id", "multi_parent_terminal", "multi_parent_status",
-                            "multi_terminal_evidence", "multi_failure_attribution")
+                            "multi_terminal_evidence", "multi_failure_attribution",
+                            *simulation_multi.PARENT_TIMING_FIELDS)
 
 
 def _merge_checkpoint_record(previous, payload):
     updated = {**previous, **{key: value for key, value in payload.items() if key != "index"}}
     if "multi_request_id" in payload and payload["multi_request_id"] is None:
-        for key in simulation_multi.STATE_KEYS:
+        for key in (*simulation_multi.STATE_KEYS, *simulation_multi.PARENT_TIMING_FIELDS):
             updated.pop(key, None)
     if payload.get("alpha_id") or payload.get("status") in simulation_slots.TERMINAL_STATUSES:
         # Once a poll yields an Alpha ID, subsequent metrics reads use that ID.
@@ -1389,6 +1390,19 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
                 matched[label] = alpha_id
         except ml.AuthError:
             raise
+        except ml.NotFound:
+            missing_url = row.get("progress_url")
+            row["error"] = "simulation not found; reservation released for resubmission"
+            row["submission_attempted"] = False
+            row["status"] = "QUEUED"
+            for key in ("progress_url", "next_poll_at", "poll_after_seconds", "metrics_pending"):
+                row.pop(key, None)
+            if isinstance(missing_url, str):
+                simulation_slots.release_url(missing_url)
+            still_missing.add(label)
+            if on_progress:
+                on_progress(row)
+            continue
         except (ml.BrainError, RequestException) as exc:
             row["error"] = str(exc)
             still_missing.add(label)
@@ -1548,6 +1562,8 @@ def _recover_probe_batch(args, path):
     manifest = _selection_call(selection.load, args.selection) if show_test else None
     rows = document["rows"]
     multi = _multi_options(args, document)
+    if getattr(args, "native_poll_once", False):
+        multi["native_poll_once"] = True
     defer_quick_pnl = getattr(args, "defer_quick_pnl", False)
     pnl_alpha_ids = set(getattr(args, "pnl_alpha_id", None) or ())
     if pnl_alpha_ids:
@@ -2011,6 +2027,9 @@ def _probe_routes(track, arms):
 def cmd_probe(args, sink):
     """Read existing tasks or run a spec through the saved-batch workflow."""
     reference = getattr(args, "from_simulation", None)
+    if getattr(args, "native_poll_once", False) and (reference is not None
+            or getattr(args, "dry_run", False) or getattr(args, "check", False)):
+        raise CliError("USAGE", "--native-poll-once requires a live probe run, --resume or --recover")
     if reference is not None:
         from .simulation_import import read_existing_simulation
 
@@ -2382,6 +2401,8 @@ def _execute_probe(args, document, target, groups):
     records = document["records"]
     state_lock = threading.Lock()
     multi = _multi_options(args, document)
+    if multi and getattr(args, "native_poll_once", False):
+        multi["native_poll_once"] = True
 
     def save():
         _save_probe_checkpoint(document, target)
@@ -2423,6 +2444,12 @@ def _execute_probe(args, document, target, groups):
 
         ordered = sorted(((launches(group), group) for group in groups.values()), key=lambda item: item[0])
         last_launch = len(ordered) - 1 if ordered[-1][0] else -1
+        launch_limit = None
+        if last_launch >= 0:
+            plan = ml.concurrency_plan(session, document["concurrency"], document["capability_snapshot"])
+            launch_limit = plan["effective"]
+            if multi:
+                launch_limit = min(launch_limit, simulation_multi.CONSULTANT_PARENT_LIMIT)
         deferred_metrics = []
         for position, (launching, group) in enumerate(ordered):
             if time.monotonic() >= deadline:
@@ -2430,10 +2457,21 @@ def _execute_probe(args, document, target, groups):
             preflight = None
             if launching:
                 retry_at = simulation_slots.submission_retry_at(account)
+                deferred = None
                 if retry_at is not None:
-                    document.setdefault("scheduling", []).append({
+                    deferred = {
                         "state": "deferred", "reason": "submission_cooldown",
-                        "submission_retry_at": retry_at})
+                        "submission_retry_at": retry_at,
+                    }
+                elif launch_limit:
+                    accepted = simulation_slots.confirmed_accepted_count(account)
+                    if accepted is not None and accepted >= launch_limit:
+                        deferred = {
+                            "state": "deferred", "reason": "shared_slots_occupied",
+                            "confirmed_accepted_slots": accepted, "effective_limit": launch_limit,
+                        }
+                if deferred is not None:
+                    document.setdefault("scheduling", []).append(deferred)
                     if any(_probe_needs_recovery(document["rows"][arm["arm_index"]])
                            for arm in group["arms"]):
                         run_group(session, group)

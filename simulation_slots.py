@@ -80,6 +80,35 @@ def snapshot(account, limit):
         return _report(account, _active_limit(journal, limit), len(journal["reservations"]))
 
 
+def confirmed_accepted_count(account):
+    """Read a lower bound for admission without reserving or repairing slots."""
+    fingerprint = _fingerprint(account)
+    if not fingerprint:
+        return None
+    path, _ = _paths(fingerprint)
+    try:
+        # Each writer replaces the journal atomically. This hint never holds a lock.
+        reservations = _load(path, fingerprint)["reservations"]
+    except (OSError, cache_store.CacheError):
+        return None
+
+    from machine_lib import simulation_reference_id
+
+    accepted = set()
+    for entry in reservations.values():
+        # Legacy Quick reservations and unfinished preparations can be reclaimed by
+        # normal dispatch. They cannot establish that preflight should be deferred.
+        url = entry.get("progress_url")
+        if (entry.get("state") != "accepted" or "quick_job_key" in entry
+                or not isinstance(url, str) or not url.startswith("https://")):
+            continue
+        try:
+            accepted.add(simulation_reference_id(url))
+        except ValueError:
+            continue
+    return len(accepted)
+
+
 def reserve(account, limit):
     """Atomically reserve before POST; return ``(identity, shared_state)``.
 
@@ -97,6 +126,34 @@ def reserve(account, limit):
         if identity or pruned:
             cache_store.write_json_atomic(path, journal)
         return identity, state
+
+
+def release_url(url):
+    """Drop reservations that point at a simulation URL the platform no longer knows.
+
+    A 404 means the job was cancelled outside this workspace; keeping its
+    reservation would hold a slot forever and block new submissions.
+    """
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return []
+    root = Path(research_paths.resolve("simulation-slots"))
+    released = []
+    for path in sorted(root.glob("*.json")):
+        journal, error = cache_store.load_json(str(path))
+        if error or not isinstance(journal, dict) or not isinstance(journal.get("reservations"), dict):
+            continue
+        reservations = journal["reservations"]
+        dropped = [key for key, entry in reservations.items()
+                   if isinstance(entry, dict) and entry.get("progress_url") == url]
+        if not dropped:
+            continue
+        for key in dropped:
+            reservations.pop(key, None)
+        journal.setdefault("quick_resolved", {})[url.rstrip("/").split("/")[-1]] = {
+            "state": "released", "progress_url": url}
+        cache_store.write_json_atomic(str(path), journal)
+        released.extend(dropped)
+    return released
 
 
 def _active_limit(journal, limit):
