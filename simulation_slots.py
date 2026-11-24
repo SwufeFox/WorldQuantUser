@@ -103,6 +103,12 @@ def _active_limit(journal, limit):
     for entry in journal["reservations"].values():
         shared_limit = entry.get("quick_limit")
         if type(shared_limit) is int and shared_limit > 0:
+            owner = entry.get("quick_owner")
+            # A reservation whose worker is gone must not keep throttling the
+            # workspace at the budget it happened to request. Probe reservations
+            # carry no owner and no quick_limit, so they are unaffected.
+            if owner is not None and not _quick_owner_is_live(owner):
+                continue
             limit = min(limit, shared_limit)
     return limit
 
