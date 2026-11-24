@@ -12,6 +12,10 @@ import simulation_slots
 
 MAX_CHILDREN = 10
 CONSULTANT_PARENT_LIMIT = 8
+PARENT_TIMING_FIELDS = (
+    "multi_parent_accepted_at", "multi_last_pending_observed_at", "multi_parent_terminal_observed_at",
+)
+_PARENT_PENDING_STATUSES = frozenset({"PENDING", "QUEUED", "WAITING", "SIMULATING", "RUNNING"})
 STATE_KEYS = (
     "multi_request_id", "multi_member", "multi_size", "multi_payload_sha",
     "multi_parent_url", "multi_parent_terminal", "multi_parent_status",
@@ -88,7 +92,7 @@ class MultiRuns:
     """Manage a parent reservation and the one-to-many mapping in the arm records."""
 
     def __init__(self, session, records, payload_for, account, limit, deadline, emit, submission_event,
-                 *, original_payload_for=None):
+                 *, original_payload_for=None, poll_once=False):
         self.session = session
         self.records = records
         self.payload_for = payload_for
@@ -97,6 +101,7 @@ class MultiRuns:
         self.account = account
         self.limit = limit
         self.deadline = deadline if deadline is not None else float("inf")
+        self.poll_once = poll_once
         self.emit = emit
         self.submission_event = submission_event
 
@@ -179,6 +184,8 @@ class MultiRuns:
         for index in indices:
             row = self.records[index]
             row.update(dict.fromkeys(STATE_KEYS))
+            for key in PARENT_TIMING_FIELDS:
+                row.pop(key, None)
             row.update(status=status, submission_attempted=status != "QUEUED", error=error)
         self._emit("multi_pending", indices)
 
@@ -237,9 +244,11 @@ class MultiRuns:
             self._set_unresolved(indices, "multi-simulation submission outcome needs reconciliation (%s)" % type(exc).__name__)
             return "blocked"
 
+        accepted_at = time.time()
         simulation_slots.reconcile_record(parent, self.account, outcome="accepted", progress_url=url)
         self._save_reservation(indices, parent)
         self._save_parent_url(indices, url)
+        self.records[indices[0]]["multi_parent_accepted_at"] = accepted_at
         self._emit("multi_submitted", indices)
         return "accepted"
 
@@ -275,7 +284,7 @@ class MultiRuns:
         parent_id = ml.simulation_reference_id(anchor["multi_parent_url"])
         wait = max(0, (anchor.get("multi_next_parent_poll_at") or 0) - time.time())
         if wait:
-            if wait >= self.deadline - time.monotonic():
+            if self.poll_once or wait >= self.deadline - time.monotonic():
                 return
             ml.sleep(wait)
         while True:
@@ -283,22 +292,31 @@ class MultiRuns:
                 payload, retry_after = ml.read_simulation_snapshot(
                     self.session, parent_id, deadline=self.deadline)
             except ml.BrainError as exc:
+                if self.poll_once and isinstance(exc, ml.RateLimited) and exc.retry_after:
+                    anchor["multi_next_parent_poll_at"] = time.time() + exc.retry_after
                 self._set_unresolved(indices, "multi-simulation parent read failed (%s)" % exc.code)
                 return
             if payload.get("id") not in (None, parent_id):
                 self._set_unresolved(indices, "multi-simulation parent identity mismatch")
                 return
+            observed_at = time.time()
+            status = payload.get("status")
+            pending = not anchor.get("multi_parent_terminal") and (
+                retry_after or (isinstance(status, str) and status in _PARENT_PENDING_STATUSES))
+            if pending:
+                anchor["multi_last_pending_observed_at"] = observed_at
             if not retry_after:
                 anchor["multi_next_parent_poll_at"] = None
                 break
-            if retry_after >= self.deadline - time.monotonic():
-                anchor["multi_next_parent_poll_at"] = time.time() + retry_after
+            if self.poll_once or retry_after >= self.deadline - time.monotonic():
+                anchor["multi_next_parent_poll_at"] = observed_at + retry_after
                 self._set_unresolved(indices, "multi-simulation parent is pending")
                 return
+            if pending:
+                self._emit("multi_pending", indices)
             self.emit("polling", indices[0], {"retry_after": retry_after})
             ml.sleep(retry_after)
 
-        status = payload.get("status")
         if not isinstance(status, str) or status not in simulation_slots.TERMINAL_STATUSES:
             self._set_unresolved(indices, "multi-simulation parent is pending")
             return
@@ -307,6 +325,8 @@ class MultiRuns:
         anchor["multi_terminal_evidence"] = {
             **evidence, "parent": _terminal_observation(payload, evidence.get("parent")),
         }
+        if not anchor.get("multi_parent_terminal"):
+            anchor.setdefault("multi_parent_terminal_observed_at", observed_at)
         children = payload.get("children")
         if (isinstance(children, list) and 0 < len(children) <= len(indices)
                 and all(ml.valid_simulation_id(child) and child != parent_id for child in children)

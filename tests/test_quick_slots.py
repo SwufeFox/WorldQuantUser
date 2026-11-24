@@ -1,4 +1,5 @@
 import multiprocessing
+from pathlib import Path
 
 import pytest
 
@@ -104,3 +105,51 @@ def test_submission_backoff_keeps_the_latest_retry_time_in_the_same_scope(tmp_pa
     monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(workspace))
     monkeypatch.setattr(slots.time, "time", lambda: 130)
     assert slots.submission_retry_at(ACCOUNT) is None
+
+
+def test_admission_evidence_counts_only_distinct_durable_ordinary_acceptances(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    path = Path(slots._paths(ACCOUNT["fingerprint"])[0])
+    accepted = {"state": "accepted", "progress_url": URL}
+    slots.cache_store.write_json_atomic(path, {
+        "version": 1, "account_fingerprint": ACCOUNT["fingerprint"],
+        "reservations": {
+            "ordinary": accepted,
+            "alias": {**accepted, "progress_url": URL.replace(".com/", ".com:443/")},
+            "legacy_quick": {**accepted, "quick_job_key": "legacy"},
+            "preparing": {**accepted, "state": "preparing"},
+            "unknown": {**accepted, "state": "unknown"},
+            "invalid": {**accepted, "progress_url": "https://example.invalid/simulations/first"},
+            "without_location": {"state": "accepted"},
+        },
+    })
+    before = path.read_bytes()
+    assert slots.confirmed_accepted_count(ACCOUNT) == 1
+    assert slots.confirmed_accepted_count({"fingerprint": "another"}) == 0
+    assert slots.confirmed_accepted_count({}) is None
+    assert path.read_bytes() == before
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path / "another-workspace"))
+    assert slots.confirmed_accepted_count(ACCOUNT) == 0
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    path.write_text("unreadable", encoding="utf-8")
+    assert slots.confirmed_accepted_count(ACCOUNT) is None
+
+
+def test_dead_quick_owner_does_not_cap_the_workspace(tmp_path, monkeypatch):
+    import json
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    account = {"fingerprint": "dead-owner-test"}
+    path, _lock = slots._paths(slots._fingerprint(account))
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    journal = {
+        "version": 1,
+        "account_fingerprint": slots._fingerprint(account),
+        "reservations": {
+            "stale": {"state": "accepted", "quick_limit": 1,
+                      "quick_owner": {"pid": 999999, "start": "0"}},
+        },
+    }
+    Path(path).write_text(json.dumps(journal))
+    identity, state = slots.reserve(account, 4)
+    assert identity is not None
+    assert state["active"] == 2

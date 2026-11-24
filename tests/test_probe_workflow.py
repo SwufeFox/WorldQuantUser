@@ -135,6 +135,7 @@ class ProbeWorkflowTests(unittest.TestCase):
     def test_submit_cooldown_defers_fresh_arms_before_field_preflight(self):
         retry_at = 4000000000.0
         with mock.patch.object(app.simulation_slots, "submission_retry_at", return_value=retry_at), \
+                mock.patch.object(app.simulation_slots, "confirmed_accepted_count") as admission, \
                 mock.patch.object(app, "_preflight_lint") as preflight, \
                 mock.patch.object(app.guarded_sim, "simulate") as launch, \
                 mock.patch.object(app.ml, "simulate_alphas") as recover:
@@ -143,9 +144,40 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual(result["execution"]["unknown_submission"], 0)
         self.assertTrue(all(item["submission_retry_at"] == retry_at
                             for item in result["scheduling"]))
+        admission.assert_not_called()
         preflight.assert_not_called()
         launch.assert_not_called()
         recover.assert_not_called()
+
+    def test_full_native_slots_defer_preflight_and_resume_when_evidence_is_unavailable(self):
+        limit = app.simulation_multi.CONSULTANT_PARENT_LIMIT
+        account = {"fingerprint": "probe-admission-test"}
+        with mock.patch.object(app.simulation_capabilities, "account_provenance", return_value=account), \
+                mock.patch.object(app.simulation_slots, "submission_retry_at", return_value=None), \
+                mock.patch.object(app.simulation_slots, "confirmed_accepted_count", return_value=limit) as occupied, \
+                mock.patch.object(app, "_preflight_lint", return_value={"ok": True}) as preflight, \
+                mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator) as launch:
+            deferred = self.run_probe(multi_size=2, concurrency=limit + 2, no_record=True)
+            preflight.assert_not_called()
+            launch.assert_not_called()
+            occupied.assert_called_with(account)
+            self.assertEqual(deferred["execution"]["not_submitted"], 3)
+            self.assertEqual(deferred["execution"]["unknown_submission"], 0)
+            self.assertTrue(all(item == {
+                "state": "deferred", "reason": "shared_slots_occupied",
+                "confirmed_accepted_slots": limit, "effective_limit": limit,
+            } for item in deferred["scheduling"]))
+
+            checked = self.run_probe(multi_size=2, concurrency=limit + 2, check=True, no_record=True)
+            self.assertTrue(checked["preflight_complete"])
+            launch.assert_not_called()
+            preflight.reset_mock()
+
+            occupied.return_value = None
+            resumed = app.cmd_probe(arguments(resume=str(self.batch)), None)
+            self.assertTrue(resumed["complete"])
+            self.assertEqual(preflight.call_count, 2)
+            self.assertEqual(launch.call_count, 2)
 
     def test_platform_classification_stays_in_saved_validation_evidence(self):
         def simulate(expressions, settings, **kwargs):
@@ -261,8 +293,18 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual([(request["indices"], request["labels"]) for request in preview["multi_requests"]],
                          [([1], ["second"])])
 
+        with mock.patch.object(ml, "simulate_alphas", side_effect=lambda *a, **kw: kw["initial_records"]) as watch:
+            app.cmd_probe(arguments(recover=str(self.batch), native_poll_once=True), None)
+        watch.assert_called_once()
+        self.assertIs(watch.call_args.kwargs["native_poll_once"], True)
+        for overrides in ({"resume": str(self.batch), "dry_run": True},
+                          {"spec": str(self.spec), "check": True}, {"from_simulation": "NativeParent"}):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(CliError, "requires a live probe run"):
+                app.cmd_probe(arguments(native_poll_once=True, **overrides), None)
+
         def read_parent(session, expressions, **kwargs):
             self.assertIs(kwargs["recover_only"], True)
+            self.assertNotIn("native_poll_once", kwargs)
             self.assertEqual(kwargs["multi_size"], 2)
             self.assertEqual(kwargs["labels"], ["first", "third"])
             records = kwargs["initial_records"]
@@ -271,10 +313,12 @@ class ProbeWorkflowTests(unittest.TestCase):
                     for row, label in zip(records, ("SYNTHETIC_FIRST", "SYNTHETIC_THIRD"))]
 
         with mock.patch.object(ml, "simulate_alphas", side_effect=read_parent) as recover, \
+                mock.patch.object(app.simulation_slots, "confirmed_accepted_count") as admission, \
                 mock.patch.object(ml, "poll_simulation", side_effect=AssertionError("parent is not a single job")), \
                 mock.patch.object(ml, "list_alphas", side_effect=AssertionError("no heuristic recovery")):
             result = app.cmd_probe(arguments(recover=str(self.batch)), None)
         recover.assert_called_once()
+        admission.assert_not_called()
         self.assertEqual(result["multi_size"], 2)
         self.assertEqual(result["matched"], {"first": "SYNTHETIC_FIRST", "third": "SYNTHETIC_THIRD"})
         self.assertEqual(result["not_submitted"], ["second"])
@@ -290,6 +334,66 @@ class ProbeWorkflowTests(unittest.TestCase):
                 app.cmd_probe(arguments(resume=str(self.batch)), None)
         capabilities.assert_not_called()
         launch.assert_not_called()
+
+    def test_watch_native_launch_publishes_acceptance_before_poll_and_resumes_without_post(self):
+        from tools._runner import probe_poll_at
+
+        self.spec.write_text(json.dumps({"design": "explore", "arms": [
+            {"label": "first", "expression": "rank(close)"},
+            {"label": "second", "expression": "rank(volume)"}]}), encoding="utf-8")
+        parent_url = ml.BRAIN_API_URL + "/simulations/NativeParent"
+        account = {"state": "known", "fingerprint": "probe-watch-launch-offline"}
+        accepted = requests.Response()
+        accepted.status_code = 201
+        accepted.headers["Location"] = parent_url
+        pending = mock.Mock(status_code=200, headers={"Retry-After": "5"})
+        pending.json.return_value = {"id": "NativeParent", "status": "SIMULATING"}
+        session = mock.Mock(_brain_permissions=["MULTI_SIMULATION"])
+        session.post.return_value = accepted
+
+        def preflight(_session, pairs, settings, _args, **kwargs):
+            return {"checked_requests": {"settings": settings, "pairs": [list(pair) for pair in pairs]},
+                    "errors": []}
+
+        def inspect(url, **kwargs):
+            self.assertEqual(url, parent_url)
+            saved = json.loads(self.batch.read_text(encoding="utf-8"))
+            self.assertEqual([row["submission_state"] for row in saved["rows"]], ["accepted"] * 2)
+            self.assertEqual(saved["records"][0]["slot_reservation_state"], "accepted")
+            self.assertEqual(saved["records"][0]["multi_parent_accepted_at"], 100)
+            self.assertNotIn("multi_parent_accepted_at", saved["records"][1])
+            self.assertEqual(app.simulation_slots.confirmed_accepted_count(account), 1)
+            return pending
+
+        session.get.side_effect = inspect
+        with (mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(self.root)}),
+              mock.patch.object(app, "with_session", side_effect=lambda args, fn, **kw: fn(session)),
+              mock.patch.object(app, "_preflight_lint", side_effect=preflight) as check,
+              mock.patch.object(app.simulation_capabilities, "account_provenance", return_value=account),
+              mock.patch.object(ml.time, "time", return_value=100) as wall,
+              mock.patch.object(ml, "sleep", side_effect=AssertionError("no native polling delay"))):
+            result = self.run_probe(multi_size=2, native_poll_once=True, no_record=True)
+            self.assertEqual(result["execution"]["accepted"], 2)
+            self.assertEqual(result["execution"]["unknown_submission"], 0)
+            session.get.assert_called_once()
+            saved = json.loads(self.batch.read_text(encoding="utf-8"))
+            self.assertEqual(probe_poll_at(saved), 105)
+            self.assertEqual(saved["records"][0]["multi_last_pending_observed_at"], 100)
+            self.assertEqual(result["rows"][0]["multi_parent_accepted_at"], 100)
+            self.assertNotIn("multi_parent_accepted_at", result["rows"][1])
+            self.assertNotIn("native_poll_once", saved)
+
+            app.cmd_probe(arguments(resume=str(self.batch), native_poll_once=True), None)
+            session.get.assert_called_once()
+            wall.return_value = 105
+            app.cmd_probe(arguments(recover=str(self.batch), native_poll_once=True), None)
+            self.assertEqual(session.get.call_count, 2)
+            recovered = json.loads(self.batch.read_text(encoding="utf-8"))
+            self.assertEqual(probe_poll_at(recovered), 110)
+            self.assertEqual(recovered["records"][0]["multi_parent_accepted_at"], 100)
+            self.assertEqual(recovered["records"][0]["multi_last_pending_observed_at"], 105)
+        session.post.assert_called_once()
+        check.assert_called_once()
 
     def test_check_reports_incomplete_without_simulating(self):
         with mock.patch.object(app, "_preflight_lint", return_value={"ok": False,

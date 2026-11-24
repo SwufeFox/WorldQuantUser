@@ -227,7 +227,7 @@ def cmd_campaign_breed(args, _sink):
 
 
 def _execute_campaign(root, path, batch, receipt, *, max_wait, concurrency,
-                      multi_size=None, recover_only=False, defer_quick_pnl=False):
+                      multi_size=None, recover_only=False, defer_quick_pnl=False, native_poll_once=False):
     from tools._runner import ProbeRun, run_probe
 
     try:
@@ -246,7 +246,7 @@ def _execute_campaign(root, path, batch, receipt, *, max_wait, concurrency,
         return ProbeRun("failed", {}, exc.message)
     return run_probe(root, path, batch, receipt, max_wait=max_wait, concurrency=concurrency,
                      multi_size=multi_size, recover_only=recover_only, strict_gate=True,
-                     defer_quick_pnl=defer_quick_pnl)
+                     defer_quick_pnl=defer_quick_pnl, native_poll_once=native_poll_once)
 
 
 def _protect_campaign_output(args, root):
@@ -481,6 +481,19 @@ def cmd_campaign_recover_pnl(args, sink):
         return {"state": "busy", "jobs": []}
 
 
+def _preferred_launch_rank(ranks, path):
+    rank = ranks.get(path.name)
+    if rank is not None:
+        try:
+            _, route = _campaign_spec(path)
+        except CliError:
+            pass  # The executor reports invalid specs on their normal turns.
+        else:
+            if route["protocol"] == "brain_simulation":
+                return rank
+    return len(ranks)
+
+
 def cmd_campaign_run(args, sink):
     """Advance the existing durable research queue."""
     from tools._runner import research_root
@@ -490,6 +503,10 @@ def cmd_campaign_run(args, sink):
     _protect_campaign_output(args, root)
     if args.recover_only and args.validate:
         raise CliError("USAGE", "--recover-only cannot open a validation view")
+    preferred = getattr(args, "prefer", None) or ()
+    if any(Path(name).name != name or Path(name).suffix != ".json" for name in preferred):
+        raise CliError("USAGE", "--prefer takes a .json filename from the campaign inbox")
+    ranks = {name: rank for rank, name in enumerate(dict.fromkeys(preferred))}
     events = deque(maxlen=20)
 
     def observe(event):
@@ -498,10 +515,11 @@ def cmd_campaign_run(args, sink):
             sink("campaign", event)
 
     execute = partial(_execute_campaign, multi_size=args.multi_size, recover_only=args.recover_only,
-                      defer_quick_pnl=args.defer_quick_pnl)
+                      defer_quick_pnl=args.defer_quick_pnl, native_poll_once=args.watch)
     code = run_campaign(root, once=not args.watch, max_wait=args.max_wait_seconds,
                         interval=args.interval, concurrency=args.concurrency, validate=args.validate,
-                        log_event=observe, execute=execute, recover_only=args.recover_only)
+                        log_event=observe, execute=execute, recover_only=args.recover_only,
+                        launch_rank=partial(_preferred_launch_rank, ranks) if ranks else None)
     state = {0: "done_or_empty", 1: "failed", 3: "deferred"}[code]
     return {"state": state, "recover_only": args.recover_only, "validation": args.validate,
             "events": list(events)}

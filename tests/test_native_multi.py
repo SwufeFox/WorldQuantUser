@@ -26,9 +26,9 @@ def simulator(tmp_path):
     session = Session()
     with mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(tmp_path)}), \
             mock.patch.object(simulation_capabilities, "account_provenance", return_value=ACCOUNT):
-        def run(expressions=EXPRESSIONS[:2], **kwargs):
+        def run(expressions=EXPRESSIONS[:2], *, max_wait_seconds=1, **kwargs):
             return ml.simulate_alphas(session, expressions, settings=SETTINGS, capability_snapshot={},
-                                      multi_size=2, max_wait_seconds=1, **kwargs)
+                                      multi_size=2, max_wait_seconds=max_wait_seconds, **kwargs)
 
         yield run
 
@@ -296,8 +296,12 @@ def test_native_resume_restores_parent_location_before_releasing_reservation(sim
     resumed_post.assert_not_called()
     assert events[0][0:2] == ("multi_submitted", 1)
     assert events[0][2][0]["multi_parent_url"] == PARENT_URL
+    assert "multi_parent_accepted_at" not in events[0][2][0]
     assert events[1][0:2] == ("multi_pending", 1)
     assert events[1][2][0]["multi_parent_terminal"]
+    assert events[1][2][0]["multi_parent_terminal_observed_at"] > 0
+    assert "multi_parent_accepted_at" not in records[0]
+    assert not any(key in records[1] for key in simulation_multi.PARENT_TIMING_FIELDS)
     assert [row["alpha_id"] for row in records] == ["Alpha1", "Alpha2"]
     assert all(row["metrics_pending"] for row in records)
     assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0
@@ -353,18 +357,27 @@ def test_native_lost_post_response_does_not_replay_members(simulator):
     assert all(row["status"] == "UNKNOWN_SUBMISSION" for row in resumed)
 
 
-def test_native_partial_parent_receipt_can_recover_a_later_child(simulator):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_native_partial_parent_receipt_can_recover_a_later_child(simulator, legacy):
     partial = {"status": "ERROR", "children": ["Child1"]}
     complete = {"status": "ERROR", "children": ["Child2", "Child1"]}
-    with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+    with mock.patch.object(simulation_multi.time, "time", return_value=100), \
+            mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
             mock.patch.object(ml, "read_simulation_snapshot", side_effect=[(partial, None), (child(1), None)]):
         first = simulator(fetch_metrics=False)
     assert [row["alpha_id"] for row in first] == ["Alpha1", None]
-    with mock.patch.object(ml, "submit_multi_simulation") as post, \
+    assert first[0]["multi_parent_terminal_observed_at"] == 100
+    if legacy:
+        for key in simulation_multi.PARENT_TIMING_FIELDS:
+            first[0].pop(key, None)
+    with mock.patch.object(simulation_multi.time, "time", return_value=101), \
+            mock.patch.object(ml, "submit_multi_simulation") as post, \
             mock.patch.object(ml, "read_simulation_snapshot", side_effect=[(complete, None), (child(2), None)]):
         second = simulator(initial_records=first, fetch_metrics=False, recover_only=True)
     post.assert_not_called()
     assert [row["alpha_id"] for row in second] == ["Alpha1", "Alpha2"]
+    assert second[0].get("multi_parent_terminal_observed_at") == (None if legacy else 100)
+    assert second[0].get("multi_parent_accepted_at") == (None if legacy else 100)
 
 
 def test_native_parent_and_child_retry_after_survive_resume(simulator):
@@ -399,6 +412,113 @@ def test_native_parent_and_child_retry_after_survive_resume(simulator):
         records = simulator(initial_records=records, fetch_metrics=False, recover_only=True)
     assert read.call_args.args[1] == "Child1"
     assert [row["alpha_id"] for row in records] == ["Alpha1", "Alpha2"]
+
+
+@pytest.mark.parametrize("status", [200, 429])
+def test_native_watch_parent_reads_once_and_retains_retry_before_terminal(simulator, status):
+    pending = {"id": "NativeParent", "status": "SIMULATING"}
+    with mock.patch.object(simulation_multi.time, "time", return_value=100), \
+            mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+            mock.patch.object(ml, "read_simulation_snapshot", return_value=(pending, 5)):
+        saved = simulator(fetch_metrics=False)
+    assert saved[0]["multi_next_parent_poll_at"] == 105
+    assert saved[0]["multi_parent_accepted_at"] == 100
+    assert saved[0]["multi_last_pending_observed_at"] == 100
+    assert "multi_parent_terminal_observed_at" not in saved[0]
+
+    response = mock.Mock(status_code=status, headers={"Retry-After": "5"})
+    response.json.return_value = pending
+    session = mock.Mock()
+    session.get.return_value = response
+    inspect = ml.read_simulation_snapshot
+    recovery = {"fetch_metrics": False, "recover_only": True, "native_poll_once": True,
+                "max_wait_seconds": 60}
+    progress = []
+    with mock.patch.object(ml, "sleep", side_effect=AssertionError("watch recovery must not wait")), \
+            mock.patch.object(ml, "submit_multi_simulation") as post:
+        with mock.patch.object(simulation_multi.time, "time", return_value=105), \
+                mock.patch.object(ml, "read_simulation_snapshot", side_effect=lambda _, identity, **kw:
+                                  inspect(session, identity, **kw)):
+            saved = simulator(initial_records=saved, on_event=lambda kind, payload:
+                              progress.append((kind, payload)), **recovery)
+        session.get.assert_called_once()
+        assert saved[0]["multi_next_parent_poll_at"] == 110
+        last_pending = 105 if status == 200 else 100
+        assert saved[0]["multi_last_pending_observed_at"] == last_pending
+        assert [(kind, payload["records"][0]["multi_next_parent_poll_at"])
+                for kind, payload in progress if kind == "multi_pending"] == [("multi_pending", 110)]
+        assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 1
+
+        with mock.patch.object(simulation_multi.time, "time", return_value=109), \
+                mock.patch.object(ml, "read_simulation_snapshot") as read:
+            saved = simulator(initial_records=saved, **recovery)
+        read.assert_not_called()
+        assert saved[0]["multi_next_parent_poll_at"] == 110
+
+        completed = {"id": "NativeParent", "status": "COMPLETE", "children": ["Child1", "Child2"]}
+        with mock.patch.object(simulation_multi.time, "time", return_value=110), \
+                mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
+                    (completed, None), (child(1), None), (child(2), None)]) as read:
+            saved = simulator(initial_records=saved, **recovery)
+        assert [call.args[1] for call in read.call_args_list] == ["NativeParent", "Child1", "Child2"]
+    post.assert_not_called()
+    assert [row["alpha_id"] for row in saved] == ["Alpha1", "Alpha2"]
+    assert saved[0]["multi_next_parent_poll_at"] is None
+    assert saved[0]["multi_parent_accepted_at"] == 100
+    assert saved[0]["multi_last_pending_observed_at"] == last_pending
+    assert saved[0]["multi_parent_terminal_observed_at"] == 110
+    assert not any(key in saved[1] for key in simulation_multi.PARENT_TIMING_FIELDS)
+    assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0
+
+
+def test_direct_native_recovery_waits_within_its_budget(simulator):
+    pending = {"id": "NativeParent", "status": "SIMULATING"}
+    with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+            mock.patch.object(ml, "read_simulation_snapshot", return_value=(pending, 60)):
+        saved = simulator(fetch_metrics=False)
+    terminal = {"id": "NativeParent", "status": "COMPLETE", "children": ["Child1", "Child2"]}
+    seen = []
+    with mock.patch.object(ml, "sleep", side_effect=lambda _delay: seen.append("sleep")) as sleep, \
+            mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
+                (pending, 5), (terminal, None), (child(1), None), (child(2), None)]) as read:
+        saved = simulator(initial_records=saved, fetch_metrics=False, recover_only=True, max_wait_seconds=120,
+                          on_event=lambda kind, _: seen.append(kind))
+    assert [call.args[1] for call in read.call_args_list] == ["NativeParent", "NativeParent", "Child1", "Child2"]
+    assert sleep.call_count == 2
+    assert sleep.call_args.args == (5,)
+    assert seen[:4] == ["sleep", "multi_pending", "polling", "sleep"]
+    assert [row["alpha_id"] for row in saved] == ["Alpha1", "Alpha2"]
+
+
+@pytest.mark.parametrize("payload,expected", [({"id": "NativeParent", "status": "RUNNING"}, 101),
+                                             ({"id": "Other", "status": "PENDING"}, 100),
+                                             ({"id": "NativeParent", "status": "UNRECOGNIZED"}, 100)])
+def test_native_pending_observation_requires_valid_pending_snapshot(simulator, payload, expected):
+    with mock.patch.object(simulation_multi.time, "time", return_value=100), \
+            mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+            mock.patch.object(ml, "read_simulation_snapshot", return_value=({"progress": 0.25}, 1)):
+        saved = simulator(native_poll_once=True, fetch_metrics=False)
+    with mock.patch.object(simulation_multi.time, "time", return_value=101), \
+            mock.patch.object(ml, "read_simulation_snapshot", return_value=(payload, None)):
+        saved = simulator(initial_records=saved, recover_only=True, native_poll_once=True, fetch_metrics=False)
+    assert saved[0]["multi_last_pending_observed_at"] == expected
+    assert "multi_parent_terminal_observed_at" not in saved[0]
+
+
+def test_native_watch_flag_keeps_singleton_on_ordinary_polling_route(simulator):
+    url = ml.BRAIN_API_URL + "/simulations/Single"
+    with (mock.patch.object(ml, "submit_single_simulation", return_value=url) as post,
+          mock.patch.object(ml, "poll_simulation", return_value={
+              "status": "PENDING", "next_poll_after_seconds": 5}) as poll,
+          mock.patch.object(ml, "read_simulation_snapshot") as read_native):
+        rows = simulator(EXPRESSIONS[:1], native_poll_once=True, fetch_metrics=False)
+    post.assert_called_once()
+    poll.assert_called_once()
+    assert poll.call_args.args[1] == url
+    read_native.assert_not_called()
+    assert rows[0]["progress_url"] == url
+    assert rows[0]["poll_after_seconds"] == 5
+    assert not rows[0].get("multi_request_id")
 
 
 def test_native_retry_after_and_redirect_avoid_array_replay():

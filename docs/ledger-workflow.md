@@ -24,15 +24,20 @@ python research_cli.py campaign status --limit 10
 python research_cli.py campaign run --watch --defer-quick-pnl --stream
 ```
 
+需要优先启动指定对照时，可加 `--prefer control.json`。参数填写 `backlog/` 中的文件名，
+重复指定时按给定顺序安排尚未启动的 BRAIN 规格。恢复任务仍先推进。
+
 | 场景 | 读哪个状态 |
 | --- | --- |
 | 首次推进 | `campaign status` 的 `data.jobs` 显示规格、批次和已保存的执行状态。首次启动使用配置的等待预算。 |
-| 回合结束时仍在等平台 | 检查点保留已受理的请求。存在其他就绪规格时，`--watch` 可用较短的恢复轮次推进已受理任务。没有下次轮询时间且仍需恢复时，下轮使用完整等待预算。 |
+| 回合结束时仍在等平台 | `--watch` 每轮只读一次新受理或已到期的 native Multi 父任务，将平台的 `Retry-After` 保存到检查点后推进队列。直接运行 `probe` 时默认按指定预算等待。 |
 | 有 `next_poll_at` | 这是检查点记录的下次轮询时间。监视器按时间推进，原生 Multi 的时间来自父任务。 |
 | 进程或连接中断 | 先读原批次。用 `campaign run --recover-only` 补回已受理的结果。需要继续未启动的臂时，再让普通队列推进。 |
 | QUICK 训练已记录，日 PnL 尚欠 | `data.archived_quick_pnl` 有待补批次、臂数和不可读批次数。用其中的 `jobs[].batch` 定位原批次。 |
 
 同一队列的在途或待核实请求会占用其精确请求身份，后来的重复规格等待原检查点。
+同一账号和研究目录已确认占满槽位时，启动流程先暂缓新请求的字段和算子预检。监视器在同一轮复用刚取得的满槽证据，暂缓同账号、同并发设置且尚未启动的 native Multi 批次。每轮重新核对，检查点的回收仍可继续。
+要单独查看预检结果，可以运行 `probe --check`。
 平台槽位、限流和结果可见时间仍由账号与平台决定。若 `campaign status` 的列表被截断，
 看 `omitted` 和汇总计数。运行中的状态可从另一终端查询，`--stream` 事件写到 stderr。
 

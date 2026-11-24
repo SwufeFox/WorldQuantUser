@@ -132,7 +132,8 @@ class ResearchRunnerTests(TestCase):
                                            "quick_pnl": {"pending_labels": ["arm"]}})
         with mock.patch.object(runner, "run_cli", side_effect=[self.preview, observed]) as run:
             result = runner.run_probe(self.root, self.spec, self.batch, self.receipt,
-                                      max_wait=30, multi_size=8, strict_gate=True, defer_quick_pnl=True)
+                                      max_wait=30, multi_size=8, strict_gate=True, defer_quick_pnl=True,
+                                      native_poll_once=True)
         args = run.call_args.args
         self.assertEqual(result.state, "done")
         self.assertEqual(args[args.index("--multi-size") + 1], "8")
@@ -141,6 +142,25 @@ class ResearchRunnerTests(TestCase):
         self.assertIn("--strict-gate", run.call_args_list[0].args)
         self.assertIn("--multi-size", run.call_args_list[0].args)
         self.assertNotIn("--defer-quick-pnl", run.call_args_list[0].args)
+        self.assertIn("--native-poll-once", args)
+        self.assertNotIn("--native-poll-once", run.call_args_list[0].args)
+
+    def test_watch_poll_flag_follows_final_live_action(self):
+        rows = [arm("PENDING", progress_url="https://test.invalid/1", submission_state="accepted"),
+                arm("QUEUED", submission_state="not_submitted")]
+        self.saved(self.batch, rows)
+        reply = runner.CliResult(True, {"rows": rows})
+        for recover_only, watch, action, use_flag in [(False, True, "--resume", True),
+                (False, False, "--resume", False),
+                (True, False, "--recover", False), (True, True, "--recover", True)]:
+            with self.subTest(recover_only=recover_only, watch=watch), \
+                    mock.patch.object(runner, "run_cli", return_value=reply) as run:
+                result = runner.run_probe(self.root, self.spec, self.batch, self.receipt,
+                    max_wait=30, recover_only=recover_only, native_poll_once=watch)
+                self.assertEqual(result.state, "deferred")
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[2:4], (action, self.batch))
+                self.assertEqual("--native-poll-once" in run.call_args.args, use_flag)
 
     def test_offline_syntax_errors_stop_before_the_live_probe(self):
         preview = runner.CliResult(True, {**self.preview.data,
@@ -317,6 +337,51 @@ class ResearchRunnerTests(TestCase):
             campaign.run_campaign(self.root, max_wait=600, interval=30, execute=execute, log_event=mock.Mock())
         self.assertEqual([(call.args[1], call.kwargs["max_wait"]) for call in execute.call_args_list],
                          [(old, 30), (fresh, 600), (old, 600), (fresh, 600)])
+
+    def test_campaign_watch_reuses_only_fresh_saturation_for_matching_unstarted_batches(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        names = ("recovery", "a-first", "b-same", "c-other", "d-local")
+        specs = {name: backlog / (name + ".json") for name in names}
+        for spec in specs.values():
+            spec.write_text("{}", encoding="utf-8")
+
+        def save_native(name, fingerprint, events):
+            batch, _ = campaign.campaign_paths(self.root, specs[name])
+            self.saved(batch, [arm("QUEUED", submission_state="not_submitted")])
+            document = json.loads(batch.read_text(encoding="utf-8"))
+            document.update(format="probe-batch", concurrency=8, multi_size=8, scheduling=events,
+                            capability_snapshot={"account": {"fingerprint": fingerprint}})
+            batch.write_text(json.dumps(document), encoding="utf-8")
+
+        for name, fingerprint in (("a-first", "account-a"), ("b-same", "account-a"), ("c-other", "account-b")):
+            save_native(name, fingerprint, [])
+        recovery, _ = campaign.campaign_paths(self.root, specs["recovery"])
+        self.saved(recovery, [arm("PENDING", submission_state="accepted")])
+
+        calls = []
+        proof = [{"state": "deferred", "reason": "shared_slots_occupied"}]
+
+        def execute(_root, spec, _batch, _receipt, **_options):
+            calls.append(spec.stem)
+            if spec == specs["a-first"]:
+                if calls.count("a-first") == 1:
+                    save_native("a-first", "account-a", proof)
+                return runner.ProbeRun("deferred", {"scheduling": proof})
+            if spec == specs["d-local"]:
+                return runner.ProbeRun("done", {})
+            return runner.ProbeRun("deferred", {})
+
+        log = mock.Mock()
+        with (mock.patch.object(runner.time, "sleep", side_effect=[None, InterruptedError]),
+              self.assertRaises(InterruptedError)):
+            campaign.run_campaign(self.root, concurrency=8, execute=execute, log_event=log)
+        self.assertEqual(calls, ["recovery", "a-first", "c-other", "d-local",
+                                 "recovery", "a-first", "b-same", "c-other"])
+        skips = [call.args[0]["deferred_specs"] for call in log.call_args_list
+                 if call.args[0]["kind"] == "waiting-for-slots"]
+        self.assertEqual(skips, [1])
+        self.assertTrue(specs["b-same"].is_file())
 
     def test_campaign_watch_defers_an_exact_repeat_of_a_post_that_becomes_unknown(self):
         backlog = self.root / "backlog"

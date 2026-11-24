@@ -51,7 +51,9 @@ __all__ = [
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 # These names were rejected as assignment targets by live simulations.
-_RESERVED_IDENTIFIERS = frozenset({"assets", "eps", "sales", "tail"})
+# User log is ours, not the platform's: every name here came from a live
+# "Variable <name> is reserved and cannot be assigned" rejection. Keep adding.
+_RESERVED_IDENTIFIERS = frozenset({"assets", "eps", "sales", "tail", "ebit"})
 
 _ASSIGNMENT_TARGET = re.compile(
     r"(?:^|;)\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)"

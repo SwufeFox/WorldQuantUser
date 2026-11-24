@@ -52,6 +52,8 @@ class _ProbeSchedule:
     recovery: bool = False
     occupied: frozenset[tuple[str, str]] = frozenset()
     queued: frozenset[tuple[str, str]] | None = None
+    native_admission_scope: tuple[str, int, int] | None = None
+    scheduling_events: int = 0
 
 
 def research_root(explicit=None):
@@ -192,7 +194,8 @@ def _legacy_batch(root, preview, receipt):
 
 
 def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
-              multi_size=None, recover_only=False, strict_gate=False, defer_quick_pnl=False):
+              multi_size=None, recover_only=False, strict_gate=False, defer_quick_pnl=False,
+              native_poll_once=False):
     """Run or continue a probe. A CLI exit of zero can still mean deferred work."""
     from research_app.experiments import probe_spec_identity
     from research_app.runtime import CliError
@@ -238,8 +241,10 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
         if strict_gate and preview.data.get("gate_blocking"):
             return ProbeRun("failed", preview.data, "exact finished requests repeat under --strict-gate")
         arguments = (spec, "--batch-path", batch, *preview_options)
-    pnl_options = ("--defer-quick-pnl",) if defer_quick_pnl else ()
-    result = run_cli(root, "probe", *arguments, *wait, *budget, *pnl_options, "--save", receipt,
+    run_options = ("--defer-quick-pnl",) if defer_quick_pnl else ()
+    if native_poll_once:
+        run_options += ("--native-poll-once",)
+    result = run_cli(root, "probe", *arguments, *wait, *budget, *run_options, "--save", receipt,
                      timeout=max_wait + 900)
     if not result.ok:
         state = "deferred" if result.code in _RETRYABLE else "failed"
@@ -316,16 +321,28 @@ def _recovery_schedule(root, batch, receipt, include_requests):
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         return _ProbeSchedule()
     queued = [row for row in rows if row.get("submission_state") == "not_submitted"]
+    wholly_queued = bool(queued) and len(queued) == len(rows)
     state, action = probe_state(document)
     recovery = action == "recover" or state in {"done", "failed"} or bool(rows and not queued)
     # The pre-POST checkpoint also owns its request until reconciliation proves
     # what happened. A wholly unstarted batch does not reserve any request.
     active = (row for row in rows if row.get("submission_state") in {"accepted", "unknown_submission"}
               or row.get("alpha_id") or row.get("progress_url") or row.get("multi_parent_url"))
-    return _ProbeSchedule(priority=2 if queued and len(queued) == len(rows) else 0,
+    scope = None
+    events = document.get("scheduling")
+    if wholly_queued and document.get("format") == "probe-batch" and isinstance(events, list):
+        snapshot = document.get("capability_snapshot")
+        account = snapshot.get("account") if isinstance(snapshot, dict) else None
+        fingerprint = account.get("fingerprint") if isinstance(account, dict) else None
+        concurrency, multi_size = document.get("concurrency"), document.get("multi_size")
+        if (isinstance(fingerprint, str) and fingerprint and type(concurrency) is int and concurrency > 0
+                and type(multi_size) is int and multi_size >= 2):
+            scope = (fingerprint, concurrency, multi_size)
+    return _ProbeSchedule(priority=2 if wholly_queued else 0,
                           poll_at=probe_poll_at(document), recovery=recovery,
                           occupied=_watch_requests(active) if include_requests else frozenset(),
-                          queued=_watch_requests(queued) if include_requests else frozenset())
+                          queued=_watch_requests(queued) if include_requests else frozenset(),
+                          native_admission_scope=scope, scheduling_events=len(events) if isinstance(events, list) else 0)
 
 
 def _watch_requests(rows):
@@ -358,13 +375,15 @@ def _watch_conflict(spec, requests, occupied):
 
 
 def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
-              concurrency=None, consume=None, execute=None, schedule_recovery=False, recover_only=False):
+              concurrency=None, consume=None, execute=None, schedule_recovery=False, recover_only=False,
+              launch_rank=None):
     """Lock one inbox and archive only terminal outcomes.
 
     A deferred job stays with its saved batch. In once mode, process at most
     one spec and return 0 for done or empty, 1 for failed, or 3 for deferred
     or busy. The optional consumer runs before terminal archival. Campaign
     watch gives recovery a shorter turn when additional work is ready.
+    The optional launch rank orders only wholly unstarted specs within their tier.
     """
     if execute is None:
         execute = partial(run_probe, recover_only=True) if recover_only else run_probe
@@ -388,14 +407,20 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                     scheduled.append((spec, batch, receipt, schedule))
                     _watch_occupy(occupied, spec, schedule.occupied)
                 if schedule_recovery:
-                    scheduled.sort(key=lambda item: item[3].priority)
+                    scheduled.sort(key=lambda item: (item[3].priority,
+                        launch_rank(item[0]) if launch_rank and guard and item[3].priority == 2 else 0))
                 now = time.time()
                 ready = {spec for spec, _, _, task in scheduled
                          if watch and (not recover_only or task.priority < 2)
                          and (task.poll_at is None or task.poll_at <= now)}
                 next_poll = None
+                saturated = set()
+                skipped_launches = 0
                 for spec, batch, receipt, schedule in scheduled:
                     ready.discard(spec)
+                    if schedule.native_admission_scope in saturated:
+                        skipped_launches += 1
+                        continue
                     poll_at = schedule.poll_at
                     if poll_at is not None and poll_at > time.time():
                         next_poll = poll_at if next_poll is None else min(next_poll, poll_at)
@@ -428,6 +453,14 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                     if watch:
                         updated = _recovery_schedule(root, batch, receipt, guard)
                         _watch_occupy(occupied, spec, updated.occupied)
+                        events = result.data.get("scheduling")
+                        # Reuse only fresh authenticated capacity evidence for this sweep.
+                        # Saved evidence alone can outlive a released slot or account change.
+                        if (guard and result.state == "deferred" and updated.native_admission_scope
+                                and isinstance(events, list) and len(events) == updated.scheduling_events
+                                and len(events) > schedule.scheduling_events and isinstance(events[-1], dict)
+                                and events[-1].get("reason") == "shared_slots_occupied"):
+                            saturated.add(updated.native_admission_scope)
                         updated_at = updated.poll_at
                         if result.state == "deferred" and updated_at is not None and updated_at > time.time():
                             next_poll = updated_at if next_poll is None else min(next_poll, updated_at)
@@ -438,6 +471,8 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                          "batch": str(batch), "receipt": str(receipt)})
                     if once:
                         return {"done": 0, "failed": 1, "deferred": 3}[result.state]
+                if skipped_launches:
+                    log({"kind": "waiting-for-slots", "deferred_specs": skipped_launches})
                 if once:
                     if next_poll is not None:
                         log({"kind": "waiting", "next_poll_at": next_poll,

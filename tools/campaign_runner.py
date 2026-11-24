@@ -204,18 +204,18 @@ def campaign_paths(root, spec):
 
 def run_campaign(root, *, once=False, max_wait=600, interval=30, concurrency=3,
                  log_event=None, execute=None, validate=True, multi_size=None,
-                 recover_only=False, strict_gate=False):
+                 recover_only=False, strict_gate=False, launch_rank=None):
     results = root / "backlog-results"
     results.mkdir(parents=True, exist_ok=True)
     report = partial(log, root / "campaign-log.jsonl", log_event=log_event)
 
-    if execute is None and (multi_size is not None or recover_only or strict_gate):
+    if execute is None and (not once or multi_size is not None or recover_only or strict_gate):
         execute = partial(run_probe, multi_size=multi_size, recover_only=recover_only,
-                          strict_gate=strict_gate)
+                          strict_gate=strict_gate, native_poll_once=not once)
     return run_queue(root, root / "backlog", partial(campaign_paths, root), report,
                      max_wait=max_wait, interval=interval,
                      once=once, concurrency=concurrency, execute=execute,
-                     schedule_recovery=True, recover_only=recover_only,
+                     schedule_recovery=True, recover_only=recover_only, launch_rank=launch_rank,
                      consume=partial(process, root, results, report, validate=validate))
 
 

@@ -94,6 +94,10 @@ class NotFound(BrainError):
 class RateLimited(BrainError):
     code = "RATE_LIMITED"
 
+    def __init__(self, *args, retry_after=None):
+        super().__init__(*args)
+        self.retry_after = retry_after
+
 
 class SimulationError(BrainError):
     code = "SIMULATION_FAILED"
@@ -1323,7 +1327,7 @@ def _read_simulation_snapshot(s, url, simulation_id, *, deadline):
     retry_after = seconds if math.isfinite(seconds) and seconds > 0 else None
     if status == 429:
         wait = f", retry after {retry_after:g} seconds" if retry_after is not None else ""
-        raise RateLimited(f"simulation inspection rate limited{wait}")
+        raise RateLimited(f"simulation inspection rate limited{wait}", retry_after=retry_after)
     try:
         payload = response.json()
     except ValueError:
@@ -1896,6 +1900,7 @@ def simulate_alphas(
     fetch_metrics=True,
     multi_size=None,
     recover_only=False,
+    native_poll_once=False,
 ):
     """Simulate a list of alphas and return one record per expression.
 
@@ -1919,10 +1924,13 @@ def simulate_alphas(
     the checkpoint for a later metrics-only read of those records.
     ``multi_size`` sends native batches of compatible arms with a maximum size
     between two and ten. ``recover_only`` reads existing work without creating it.
+    ``native_poll_once`` checks each due native parent once and saves its next poll time.
     Reservations survive interruptions and are
     reconciled by ``simulation_slots.reconcile_record``; other workspaces and
     unidentified accounts cannot share these reservations.
     """
+    if native_poll_once and dry_run:
+        raise ValueError("native_poll_once requires live simulation or recovery")
     settings = resolve_settings(settings)
     pairs = normalize_alphas(alphas, settings)
     roles = [item.get("role") if isinstance(item, dict) else None for item in alphas]
@@ -2069,7 +2077,7 @@ def simulate_alphas(
     has_saved_native = any(record.get("multi_request_id") for record in records)
     native = (simulation_multi.MultiRuns(s, records, payload_for, plan["account"],
               plan["effective"], deadline if deadline is not None else float("inf"), emit,
-              submission_event, original_payload_for=original_payload_for)
+              submission_event, original_payload_for=original_payload_for, poll_once=native_poll_once)
               if native_enabled or has_saved_native else None)
     saved_groups = list(native.restore()) if has_saved_native else []
     for record in records:

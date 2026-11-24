@@ -2,8 +2,10 @@
 
 import json
 from pathlib import Path
+from unittest import mock
 
-from research_app import app
+from research_app import app, campaign
+from tools import _runner, campaign_runner
 from test_python_preflight import SOURCE
 from test_spc_specs import SAMPLE, spec as spc_spec
 
@@ -96,6 +98,63 @@ def test_recover_only_does_not_create_a_batch_for_an_unstarted_spec(tmp_path, ca
     assert result["data"]["state"] == "deferred"
     assert source.exists()
     assert not list((tmp_path / "backlog-results").glob("*.json"))
+
+
+def test_recover_only_enables_single_parent_poll_in_watch_mode(tmp_path, capsys):
+    source = tmp_path / "research.json"
+    source.write_text(json.dumps({"design": "explore", "arms": [{"expression": "rank(close)"}]}))
+
+    def run(root, *, execute, once, recover_only, **kwargs):
+        assert recover_only
+        execute(root, source, *campaign_runner.campaign_paths(root, source), max_wait=30, concurrency=8)
+        return 3
+
+    with (mock.patch.object(campaign_runner, "run_campaign", side_effect=run),
+          mock.patch.object(_runner, "run_probe", return_value=_runner.ProbeRun("deferred", {})) as probe):
+        for watch in (False, True):
+            code, result = invoke(capsys, tmp_path, "campaign", "run", "--recover-only",
+                                  *(('--watch',) if watch else ()))
+            assert code == 0
+            assert result["data"]["state"] == "deferred"
+            assert probe.call_args.kwargs["recover_only"]
+            assert probe.call_args.kwargs["native_poll_once"] is watch
+
+
+def test_campaign_watch_prioritizes_only_named_unstarted_brain_specs(tmp_path, capsys):
+    inbox = tmp_path / "backlog"
+    inbox.mkdir()
+    ordinary, local, fresh, queued, recovery, named_recovery = names = (
+        "a-ordinary.json", "b-local.json", "c-fresh.json", "d-queued.json", "y-recovery.json", "z-recovery.json")
+    brain = {"design": "explore", "arms": [{"expression": "rank(close)"}]}
+    for name in names:
+        source = spc_spec(track="SPC") if name == local else brain
+        (inbox / name).write_text(json.dumps(source), encoding="utf-8")
+    results = tmp_path / "backlog-results"
+    results.mkdir()
+    for name in (queued, recovery, named_recovery):
+        batch, _ = campaign_runner.campaign_paths(tmp_path, inbox / name)
+        row = ({"status": "QUEUED", "submission_state": "not_submitted"} if name == queued
+               else {"status": "PENDING", "submission_state": "accepted"})
+        batch.write_text(json.dumps({"rows": [row]}), encoding="utf-8")
+
+    preferences = ("--prefer", local, "--prefer", queued, "--prefer", named_recovery,
+                   "--prefer", fresh, "--prefer", queued, "--prefer", "archived.json")
+    scenarios = [((), [recovery, named_recovery, ordinary, local, fresh, queued]),
+                 (preferences, [recovery, named_recovery, queued, fresh, ordinary, local]),
+                 ((*preferences, "--recover-only"), [recovery, named_recovery, ordinary, local, fresh, queued])]
+    for options, expected in scenarios:
+        with (mock.patch.object(_runner.time, "sleep", side_effect=KeyboardInterrupt),
+              mock.patch.object(campaign, "_execute_campaign", return_value=_runner.ProbeRun("deferred", {})) as run):
+            code, result = invoke(capsys, tmp_path, "campaign", "run", "--watch", *options)
+        assert code != 0
+        assert result["error"]["code"] == "INTERRUPTED"
+        assert [call.args[1].name for call in run.call_args_list] == expected
+
+
+def test_campaign_prefer_requires_an_inbox_filename(tmp_path, capsys):
+    code, result = invoke(capsys, tmp_path, "campaign", "run", "--prefer", "elsewhere/research.json")
+    assert code != 0
+    assert result["error"]["code"] == "USAGE"
 
 
 def test_spc_preview_protects_recorded_output(tmp_path, capsys):
