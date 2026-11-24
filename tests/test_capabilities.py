@@ -249,6 +249,42 @@ class ScopedCacheTests(unittest.TestCase):
         for key in ("account", "scope", "source", "as_of", "age_seconds", "capability_id"):
             self.assertIsNotNone(result["evidence"][key])
 
+    def test_verified_field_proof_is_reused_across_preflight_calls(self):
+        self.session._brain_account_id = "synthetic-account-id"
+        field = "sample_matrix"
+        matches = {"matches": [FIELDS[0]], "returned_count": 1, "reported_count": 1, "complete": True}
+        with mock.patch.object(ml, "search_datafield", return_value=matches) as search:
+            first = capabilities.required_field_scope(self.session, SETTINGS, {field})
+            second = capabilities.required_field_scope(self.session, SETTINGS, {field})
+        search.assert_called_once()
+        self.assertEqual(first["evidence"]["state"], "verified")
+        self.assertEqual(second["evidence"]["state"], "verified")
+        self.assertTrue(second["evidence"]["catalogs"][0]["reused_in_invocation"])
+
+    def test_field_proof_cache_never_stores_misses(self):
+        self.session._brain_account_id = "synthetic-account-id"
+        misses = {"matches": [], "returned_count": 0, "reported_count": 4000, "complete": False}
+        with mock.patch.object(ml, "search_datafield", return_value=misses) as search:
+            first = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"})
+            second = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"})
+        self.assertEqual(first["evidence"]["state"], "unknown")
+        self.assertEqual(second["evidence"]["state"], "unknown")
+        self.assertEqual(search.call_count, 2)
+
+    def test_expired_field_proof_is_researched(self):
+        self.session._brain_account_id = "synthetic-account-id"
+        matches = {"matches": [FIELDS[0]], "returned_count": 1, "reported_count": 1, "complete": True}
+        with mock.patch.object(ml, "search_datafield", return_value=matches) as search:
+            capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"})
+            path = capabilities._proof_cache_path(
+                capabilities.simulation_capabilities.account_provenance(self.session)["fingerprint"])
+            payload = cache_store.read_entry(path)["payload"]
+            old = cache_store.utc_now() - timedelta(hours=2)
+            cache_store.write_json_atomic(
+                path, cache_store.build_entry("field-proofs", payload, ttl=3600, now=old))
+            capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"})
+        self.assertEqual(search.call_count, 2)
+
     def test_required_field_search_honors_per_scope_budget(self):
         field = FIELDS[0]
         matches = {"matches": [field], "returned_count": 1, "reported_count": 1, "complete": True}

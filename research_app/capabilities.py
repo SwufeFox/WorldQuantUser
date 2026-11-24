@@ -110,6 +110,55 @@ def fetch_fields(session, region="USA", universe="TOP3000", delay=1,
     return records
 
 
+def _proof_cache_path(fingerprint):
+    return ml.metadata_cache_path("field-proofs", {"account": fingerprint})
+
+
+def _load_field_proofs(fingerprint):
+    """Durable exact-match proofs keyed by account, scope and field.
+
+    Preflight used to verify every field with a live search on every call, which
+    is slow and rate-limited. A verified exact match is account/scope bound and
+    stable for the metadata cache lifetime, so it is safe to reuse across calls
+    and across batches until the entry expires.
+    """
+    if not fingerprint:
+        return {}
+    entry = cache_store.read_entry(_proof_cache_path(fingerprint))
+    if not entry.get("fresh"):
+        return {}
+    proofs = {}
+    for item in (entry.get("payload") or {}).get("entries") or []:
+        try:
+            scope = tuple(sorted((item.get("scope") or {}).items()))
+            proofs[("field", fingerprint, scope, item["field"])] = (
+                item["search"], item["row"], item["stamp"])
+        except (KeyError, TypeError):
+            continue
+    return proofs
+
+
+def _save_field_proofs(fingerprint, proofs):
+    """Persist only verified proofs; unknown/miss results are never cached."""
+    if not fingerprint:
+        return
+    entries = []
+    for key, value in proofs.items():
+        if not (isinstance(key, tuple) and len(key) == 4 and key[0] == "field"):
+            continue
+        search, row, stamp = value
+        if not isinstance(search, dict) or search.get("state") != "verified":
+            continue
+        entries.append({"scope": dict(key[2]), "field": key[3],
+                        "search": search, "row": row, "stamp": stamp})
+    policy_age = ml.metadata_cache_policy().get("max_age")
+    ttl = float(policy_age) if isinstance(policy_age, (int, float)) else 86400.0
+    cache_store.write_json_atomic(
+        _proof_cache_path(fingerprint),
+        cache_store.build_entry("field-proofs", {"entries": entries}, ttl=ttl,
+                                source="capabilities.required_field_scope"))
+
+
 def required_field_scope(session, settings, required_fields, *, deadline=None, proof_cache=None):
     """Verify exact required IDs using bounded, live searches in the current scope."""
     from requests.exceptions import RequestException
@@ -126,7 +175,11 @@ def required_field_scope(session, settings, required_fields, *, deadline=None, p
     if deadline is not None:
         field_deadline = min(field_deadline, deadline)
     fingerprint = account.get("fingerprint")
-    cache_scope = ("field", fingerprint, tuple(scope.items())) if fingerprint and proof_cache is not None else None
+    durable_proofs = None
+    if proof_cache is None and fingerprint:
+        durable_proofs = _load_field_proofs(fingerprint)
+        proof_cache = durable_proofs
+    cache_scope = ("field", fingerprint, tuple(sorted(scope.items()))) if fingerprint and proof_cache is not None else None
     pace_key = ("field_search_next", fingerprint)
     next_search_at = proof_cache.get(pace_key, 0.0) if proof_cache is not None else 0.0
     for field in sorted(required):
@@ -194,6 +247,8 @@ def required_field_scope(session, settings, required_fields, *, deadline=None, p
                                     "routing_source": "scoped_live_search"}}
     if budget_deferred:
         evidence["required_fields"]["budget_deferred_ids"] = budget_deferred
+    if durable_proofs is not None:
+        _save_field_proofs(fingerprint, proof_cache)
     return field_scope(records, evidence)
 
 
