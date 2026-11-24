@@ -162,6 +162,11 @@ class PermissionDenied(ServiceError):
 # ---------------------------------------------------------------------------
 #: Base payload for ``POST /simulations``. Callers override individual keys;
 #: see ``resolve_settings`` for merge + validation rules.
+# Platform simulation slots are a token bucket with a measured burst capacity of
+# about 7 (wqb-concurrency skill, 2026-08). Local workers above this only produce
+# 429 backoff; every runner clamps its concurrency to this value.
+PLATFORM_BURST_LIMIT = 7
+
 DEFAULT_SETTINGS = {
     "instrumentType": "EQUITY",
     "region": "USA",

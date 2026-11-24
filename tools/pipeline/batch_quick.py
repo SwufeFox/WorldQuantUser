@@ -33,6 +33,7 @@ import simulation_slots
 
 QUICK = "QUICK"
 DEFAULT_ACCOUNT_SLOTS = 5
+PLATFORM_BURST_LIMIT = machine_lib.PLATFORM_BURST_LIMIT
 SUCCESS_STATUSES = simulation_slots.TERMINAL_SUCCESS_STATUSES
 CHECK_NAMES = ("LOW_SUB_UNIVERSE_SHARPE", "CONCENTRATED_WEIGHT",
                "LOW_2Y_SHARPE", "LOW_SHARPE", "LOW_FITNESS")
@@ -849,6 +850,12 @@ def _batch_args(parser):
     args = parser.parse_args()
     if min(args.concurrency, args.account_slots) <= 0 or args.limit < 0:
         parser.error("workers and account slots must be positive and limit cannot be negative")
+    if args.concurrency > PLATFORM_BURST_LIMIT or args.account_slots > PLATFORM_BURST_LIMIT:
+        print(f"note: clamping concurrency/account slots to the platform burst limit "
+              f"({PLATFORM_BURST_LIMIT}); requested {args.concurrency}/{args.account_slots}",
+              file=sys.stderr)
+        args.concurrency = min(args.concurrency, PLATFORM_BURST_LIMIT)
+        args.account_slots = min(args.account_slots, PLATFORM_BURST_LIMIT)
     return args
 
 
