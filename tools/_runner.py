@@ -706,8 +706,8 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                     timed_wait = type(diagnosis.get("next_poll_at")) in (int, float) and diagnosis["next_poll_at"] > observed
                     retry_at = observed + interval
                     for candidate in (updated.poll_at, diagnosis.get("next_poll_at")):
-                        if type(candidate) in (int, float) and candidate > observed:
-                            retry_at = min(retry_at, candidate)
+                        if type(candidate) in (int, float) and candidate > retry_at:
+                            retry_at = candidate
                     if (result.state == "deferred" and diagnosis.get("reason") in {
                             "platform_pending", "queued_work", "shared_slots_occupied",
                             "submission_cooldown", "preflight_backoff"}):
