@@ -27,6 +27,7 @@ if __package__ in (None, ""):
 
 import cache_store
 import fastexpr_ast
+import alpha_registry
 import machine_lib
 import simulation_capabilities
 import simulation_slots
@@ -813,6 +814,23 @@ def _run_batch(args, out):
                     row["simulation_key"] = _simulation_key(payload)
                     row["simulation_job_key"] = runner._job_key(arm["label"], payload)
                     _append(fh, row)
+                    # Seed ledger: every arm leaves a row, whatever the outcome.
+                    try:
+                        entry = alpha_registry.build_entry(
+                            {"alpha_id": row.get("alpha_id"),
+                             "expression": row.get("expr"),
+                             "settings": payload["settings"],
+                             "metrics": {k: row.get(k) for k in
+                                         ("sharpe", "fitness", "turnover", "returns", "margin")},
+                             "checks": {k: v for k, v in row.items()
+                                        if isinstance(v, dict) and v.get("result")},
+                             "failing_checks": row.get("fails") or [],
+                             "status": row.get("status")},
+                            idea=arm.get("idea"), mechanism=arm.get("mechanism") or arm.get("label"),
+                            source="quick-batch", batch=str(Path(args.arms)))
+                        alpha_registry.record_arm(entry)
+                    except ValueError as exc:
+                        print(f"seed not recorded for {row.get('label')}: {exc}", file=sys.stderr)
                     deferred += row["status"] in {"QUEUED", "PENDING", "UNKNOWN_SUBMISSION", "UNVERIFIED_RESULT", "RUNNER_ERROR"}
                     print(f"[{count}/{len(todo)}] {row['label'][:34]:34s} {row['status']} "
                           f"S={row.get('sharpe')} T={row.get('turnover')} fails={row.get('fails')}", flush=True)

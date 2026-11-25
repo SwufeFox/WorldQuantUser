@@ -77,7 +77,9 @@ def test_all_pass_buffers_with_forwarded_options(flow, capsys, tmp_path):
     freeze, shelf, saved = (tmp_path / name for name in ("choice.json", "shelf.jsonl", "saved.json"))
     code, output = invoke(capsys, "--freeze", freeze, "--buffer", shelf, "--save", saved,
                           "--note", "chosen candidate", "--cost-bps", 5, 10, 20,
-                          "--retention-floor", 0.4, "--compact", "--quiet")
+                          "--retention-floor", 0.4, "--compact", "--quiet",
+                          "--name", "seed A1", "--category", "FUNDAMENTAL",
+                          "--tags", "quality", "--description", "d" * 120)
     assert code == 0 and output["ok"] and output["command"] == "promote"
     data = output["data"]
     assert data["outcome"] == "buffered" and data["buffered"] is True
@@ -277,7 +279,9 @@ def test_real_buffer_add_reuses_checks_without_second_request(flow, capsys, monk
     monkeypatch.setattr(ml, "fetch_alpha_metrics", lambda *args: {
         "id": "A1", "status": "COMPLETE", "regular": {"code": "rank(close)"},
         "is": {}, "oos": {"train": {"sharpe": 2.0}, "test": {"sharpe": 1.0}}})
-    code, output = invoke(capsys, "--note", "keep", "--cost-bps", 5, 10, 20)
+    code, output = invoke(capsys, "--note", "keep", "--cost-bps", 5, 10, 20,
+                          "--name", "seed A1", "--category", "FUNDAMENTAL", "--tags", "quality",
+                          "--description", "d" * 120)
     assert code == 0 and output["data"]["buffered"] is True
     entries = buffer_cmd.read_events(buffer_cmd.buffer_path())
     assert len(entries) == 1 and entries[0]["note"] == "keep"

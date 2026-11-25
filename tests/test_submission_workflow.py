@@ -52,11 +52,18 @@ class SubmissionWorkflowTests(unittest.TestCase):
         self.registry = str(self.root / "ledger.jsonl")
         self.shelf = str(self.root / "shelf.jsonl")
         self.manifest_path = self.root / "selection.json"
+        for aid in ("CANDIDATE", "OTHER"):
+            buffer_cmd._write_seed(buffer_cmd.seeds_path(),
+                                   {"alpha_id": aid, "name": "seed " + aid,
+                                    "category": "FUNDAMENTAL", "tags": ["test"],
+                                    "description": "y" * 120})
         self.manifest = selection.freeze(self.manifest_path, source="triage",
                                          rows=[{"alpha_id": "CANDIDATE"}, {"alpha_id": "OTHER"}])
 
     def args(self, **overrides):
         values = {"alpha_id": "CANDIDATE", "registry": self.registry,
+                  "name": "seed CANDIDATE", "category": "FUNDAMENTAL", "tags": ["test"],
+                  "description": "y" * 120, "seeds": str(buffer_cmd.seeds_path()),
                   "buffer": self.shelf, "selection": str(self.manifest_path),
                   "yes": True, "max_wait": 0, "force": False, "note": None, "cost_bps": [5]}
         values.update(overrides)

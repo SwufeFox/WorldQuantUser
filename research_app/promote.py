@@ -325,6 +325,10 @@ def cmd_promote(args, sink):
         step = "buffer"
         buffer_args = parser.parse_args(["buffer", "add", alpha_id, "--selection", str(freeze)])
         buffer_args.buffer, buffer_args.note = args.buffer, args.note
+        buffer_args.name = getattr(args, "name", None)
+        buffer_args.category = getattr(args, "category", None)
+        buffer_args.tags = getattr(args, "tags", None)
+        buffer_args.description = getattr(args, "description", None)
         buffer_args.cost_bps = cost_bps
         buffered = buffer_cmd.cmd_buffer_add(buffer_args, sink, checked=result)
         data["steps"][step] = {"status": "completed", "evidence": buffered}

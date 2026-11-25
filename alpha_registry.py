@@ -272,6 +272,32 @@ def _failing_checks(checks):
     )
 
 
+_FIELD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_GROUPING = {"country", "industry", "subindustry", "currency", "market", "sector", "exchange"}
+
+
+def arm_skeleton(expression):
+    """Numbers -> #, data field ids -> F: the structural shape used for dedupe."""
+    text = re.sub(r"\s+", "", expression or "")
+    fields = [t for t in _FIELD_RE.findall(text)
+              if "_" in t and t.lower() not in _GROUPING
+              and not re.search(r"\b%s\s*\(" % re.escape(t), text)]
+    for field in set(fields):
+        text = text.replace(field, "F")
+    return re.sub(r"(?<![A-Za-z0-9_])\d+(\.\d+)?", "#", text)
+
+
+def arm_fields(expression):
+    text = expression or ""
+    return sorted({t for t in _FIELD_RE.findall(text)
+                   if "_" in t and t.lower() not in _GROUPING
+                   and not re.search(r"\b%s\s*\(" % re.escape(t), text)})
+
+
+def arm_key(expression, settings):
+    return "arm:%s:%s" % (expression_hash(expression, None), settings_fingerprint(settings or {}))
+
+
 def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
                 source="manual", extra=None, family=None, batch=None):
     """Build one ledger entry from a normalized alpha fact.
@@ -314,6 +340,8 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
         "note": note,
         "expression": expression,
         "expression_hash": expression_hash(expression, language),
+        "skeleton": arm_skeleton(expression),
+        "fields": arm_fields(expression),
         "settings": settings,
         "settings_fingerprint": settings_fingerprint(settings),
         "metrics": metrics,
@@ -469,6 +497,37 @@ def record_entry(entry, path=None, skip_unchanged=True, allow_metrics_loss=False
     """
     with append_batch(path) as (_, append):
         return append(entry, skip_unchanged=skip_unchanged, allow_metrics_loss=allow_metrics_loss)
+
+
+def record_arm(entry, path=None):
+    """Record one arm whatever its outcome, deduped by expression+settings.
+
+    Unlike ``record_entry`` this keys on the arm identity, not the alpha id: a
+    failed arm has no alpha and must still leave a row. Duplicates keep the best
+    metrics, keep the first non-empty idea, and increment ``attempts``.
+    """
+    idea = (entry.get("idea") or "").strip()
+    if not idea:
+        raise ValueError("arm entry requires a non-empty idea")
+    settings = entry.get("settings") or {}
+    entry = dict(entry)
+    entry["key"] = arm_key(entry.get("expression") or "", settings)
+    entry["idea"] = idea
+    with append_batch(path) as (index, append):
+        prior = index.get(entry["key"])
+        if prior:
+            entry["attempts"] = int(prior.get("attempts") or 1) + 1
+            old_metrics, new_metrics = prior.get("metrics") or {}, entry.get("metrics") or {}
+            def score(m):
+                return ((m.get("fitness") or float("-inf")), (m.get("sharpe") or float("-inf")))
+            if score(old_metrics) > score(new_metrics):
+                entry["metrics"] = old_metrics
+                entry["failing_checks"] = prior.get("failing_checks")
+                entry["status"] = prior.get("status")
+            entry["idea"] = prior.get("idea") or idea
+        else:
+            entry["attempts"] = 1
+        return append(entry, skip_unchanged=False, allow_metrics_loss=True)
 
 
 @contextmanager

@@ -33,6 +33,8 @@ import research_paths
 from .runtime import CliError, with_session
 
 BUFFER_FILENAME = "submit-buffer.jsonl"
+SEEDS_FILENAME = "seeds.jsonl"
+SEED_CATEGORIES = ("ANALYST", "FUNDAMENTAL", "PRICE_VOLUME", "SENTIMENT", "VOLUME")
 
 #: Above this, the platform would refuse the submission.
 GATE = 0.70
@@ -195,11 +197,71 @@ def _checks_summary(checks):
             "pending": sorted(pending), "warned": sorted(warned)}
 
 
+def seeds_path(args=None):
+    explicit = getattr(args, "seeds", None) if args is not None else None
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path(research_paths.research_dir()) / SEEDS_FILENAME
+
+
+def read_seeds(path):
+    """Latest seed row per alpha id; malformed lines are skipped."""
+    state = {}
+    if not Path(path).exists():
+        return state
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("alpha_id"):
+            state[row["alpha_id"]] = row
+    return state
+
+
+def validate_seed(name, category, tags, description):
+    """Return the list of missing/invalid seed fields; empty means valid."""
+    problems = []
+    if not isinstance(name, str) or not name.strip():
+        problems.append("name")
+    if category not in SEED_CATEGORIES:
+        problems.append("category (one of %s)" % ", ".join(SEED_CATEGORIES))
+    if not isinstance(tags, (list, tuple)) or not [t for t in tags if str(t).strip()]:
+        problems.append("tags (at least one)")
+    if not isinstance(description, str) or len(description.strip()) < 100:
+        problems.append("description (>=100 characters)")
+    return problems
+
+
+def _write_seed(path, row):
+    path = Path(path)
+    with cache_store.file_lock(str(path) + ".lock"):
+        existing = read_seeds(path)
+        if row["alpha_id"] in existing:
+            merged = {**existing[row["alpha_id"]], **row}
+            row = merged
+        lines = [json.dumps(r, ensure_ascii=False) for r in existing.values()
+                 if r.get("alpha_id") != row["alpha_id"]]
+        lines.append(json.dumps(row, ensure_ascii=False))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix="." + path.name, suffix=".tmp", dir=path.parent)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+
+
 def cmd_buffer_add(args, _sink, *, checked=None):
     """Run the checks on a finished alpha and put it on the shelf without submitting."""
     from .alphas import _candidate_role, _reject_quick_simulation, _selection_id
     role = _candidate_role(args)
     selection_id = _selection_id(args)
+    problems = validate_seed(getattr(args, "name", None), getattr(args, "category", None),
+                             getattr(args, "tags", None), getattr(args, "description", None))
+    if problems:
+        raise CliError("INVALID_INPUT", "seed missing or invalid: " + ", ".join(problems),
+                       "supply name, category, at least one tag, and a >=100 character description")
     def work(session):
         payload = ml.fetch_alpha_metrics(session, args.alpha_id)
         if str(payload.get("status") or "").upper() in {"ACTIVE", "SUBMITTED"}:
@@ -259,7 +321,23 @@ def cmd_buffer_add(args, _sink, *, checked=None):
                            "record failed research with ledger record instead")
         path = buffer_path(args)
         written = _append(path, entry)
-    return {"path": str(path), "entry": entry, "written": written}
+        seed = {
+            "alpha_id": args.alpha_id,
+            "name": args.name.strip(),
+            "category": args.category,
+            "tags": [str(t).strip() for t in args.tags if str(t).strip()],
+            "description": args.description.strip(),
+            "expression": entry.get("expression"),
+            "settings": (entry.get("settings") or {}),
+            "metrics": {"train": entry.get("train"), "test": entry.get("test"),
+                        "full": entry.get("full")},
+            "self_corr": entry.get("self_correlation"),
+            "recorded_at": entry["at"],
+        }
+        seed_path = seeds_path(args)
+        _write_seed(seed_path, seed)
+    return {"path": str(path), "seeds": str(seed_path), "entry": entry,
+            "seed": seed, "written": written}
 
 
 def cmd_buffer_list(args, _sink):

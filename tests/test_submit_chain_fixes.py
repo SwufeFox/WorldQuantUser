@@ -32,6 +32,11 @@ class SubmitReconcileTests(unittest.TestCase):
         for patch in (mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": temp.name}),
                       mock.patch.object(alphas, "with_session", lambda args, work: work(object()))):
             patch.start(); self.addCleanup(patch.stop)
+        from research_app import buffer_cmd
+        buffer_cmd._write_seed(buffer_cmd.seeds_path(),
+                               {"alpha_id": "mLKwo5Nx", "name": "seed",
+                                "category": "FUNDAMENTAL", "tags": ["test"],
+                                "description": "z" * 120})
 
     def args(self, **kw):
         base = {"alpha_id": "mLKwo5Nx", "yes": False, "max_wait": 0, "selection": None,
@@ -97,3 +102,52 @@ class BatchArmAliasTests(unittest.TestCase):
                                         "settings": {}}) + "\n")
             arms = _load_arms(path)
         self.assertEqual(arms[0]["expr"], "rank(close)")
+
+
+class SeedStoreTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        os.environ["BRAIN_RESEARCH_DIR"] = temp.name
+        self.root = Path(temp.name)
+        from research_app import buffer_cmd
+        self.buffer = buffer_cmd
+
+    def args(self, **overrides):
+        base = {"alpha_id": "A1", "buffer": str(self.root / "buffer.jsonl"),
+                "seeds": str(self.root / "seeds.jsonl"), "note": None,
+                "name": "seed", "category": "FUNDAMENTAL", "tags": ["quality"],
+                "description": "d" * 120, "max_wait": 0, "force": False,
+                "selection": None, "cost_bps": [5]}
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def test_missing_fields_are_named_and_rejected(self):
+        from research_app.runtime import CliError
+        with self.assertRaises(CliError) as caught:
+            self.buffer.cmd_buffer_add(self.args(name=None, category=None, tags=None,
+                                                 description="short"), None)
+        message = caught.exception.message
+        for field in ("name", "category", "tags", "description"):
+            self.assertIn(field, message)
+
+
+class SeedArmLedgerTests(unittest.TestCase):
+    def test_record_arm_requires_idea_and_accumulates_attempts(self):
+        import alpha_registry
+        with tempfile.TemporaryDirectory() as temp:
+            path = str(Path(temp) / "registry.jsonl")
+            base = {"alpha_id": None, "expression": "rank(ts_mean(fnd6_x,20))",
+                    "settings": {"decay": 8, "region": "USA", "universe": "TOP3000"},
+                    "metrics": {"sharpe": 0.1, "fitness": 0.05}, "checks": {},
+                    "status": "COMPLETE"}
+            with self.assertRaises(ValueError):
+                alpha_registry.record_arm(alpha_registry.build_entry(base, idea=None), path)
+            first, _ = alpha_registry.record_arm(alpha_registry.build_entry(base, idea="momentum"), path)
+            best = {**base, "metrics": {"sharpe": 2.0, "fitness": 1.5}, "status": "WARNING"}
+            second, _ = alpha_registry.record_arm(alpha_registry.build_entry(best, idea="momentum"), path)
+            stored = alpha_registry.load_entries(path)
+            row = next(r for r in stored if r.get("key") == first["key"])
+            self.assertEqual(row["attempts"], 2)
+            self.assertEqual(row["metrics"]["sharpe"], 2.0)
+            self.assertEqual(row["idea"], "momentum")

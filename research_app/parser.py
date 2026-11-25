@@ -522,6 +522,12 @@ def build_parser():
                                 help="Review a saved Regular promotion receipt offline. Requires --selection.")
     promote_parser.add_argument("--pc-distribution", metavar="PATH",
                                 help="Attach the candidate's saved production histogram to an offline receipt review.")
+    promote_parser.add_argument("--name", default=None, help="Seed name (required to buffer).")
+    promote_parser.add_argument("--category", default=None,
+                                help="Seed category: ANALYST, FUNDAMENTAL, PRICE_VOLUME, SENTIMENT, VOLUME.")
+    promote_parser.add_argument("--tags", nargs="+", default=None, help="At least one seed tag.")
+    promote_parser.add_argument("--description", default=None,
+                                help="Seed rationale, at least 100 characters.")
     _add_cost_args(promote_parser)
     promote_parser.bind_handler("promote.cmd_promote")
 
@@ -1532,6 +1538,13 @@ def build_parser():
     b_add = buf_sub.add_parser("add", help="Run the checks and shelve the alpha.")
     b_add.add_argument("alpha_id")
     b_add.add_argument("--note", default=None)
+    b_add.add_argument("--name", default=None, help="Seed name (required).")
+    b_add.add_argument("--category", default=None,
+                       help="Seed category: ANALYST, FUNDAMENTAL, PRICE_VOLUME, SENTIMENT, VOLUME.")
+    b_add.add_argument("--tags", nargs="+", default=None, help="At least one tag.")
+    b_add.add_argument("--description", default=None,
+                       help="Seed rationale, at least 100 characters.")
+    b_add.add_argument("--seeds", default=None, help="Seed store path (default: seeds.jsonl).")
     b_add.add_argument("--max-wait", type=int, default=None, dest="max_wait")
     b_add.add_argument("--buffer", default=None, help="Shelf file (default: in research dir).")
     b_add.add_argument("--registry", default=None)

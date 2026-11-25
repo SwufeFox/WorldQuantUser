@@ -530,6 +530,13 @@ def submit_workflow(session, args, shelf_entry=None):
         elif getattr(args, "selection", None):
             selection_id = _selection_id(args)
         if not confirmed:
+            from .buffer_cmd import read_seeds, seeds_path
+            seeds = read_seeds(seeds_path(args))
+            if args.alpha_id not in seeds:
+                raise CliError("INVALID_INPUT",
+                               "%s is not in the seed store" % args.alpha_id,
+                               "add it with `buffer add ALPHA_ID --name ... --category ... "
+                               "--tags ... --description ...` first")
             _candidate_role(args, shelf_entry)
             missing_meta = [field for field in ("name", "category") if not current.get(field)]
             if missing_meta:

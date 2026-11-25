@@ -1,3 +1,4 @@
+from pathlib import Path
 #!/usr/bin/env python3
 """Tests for `buffer`: the shelf of checked-but-unsubmitted alphas.
 
@@ -59,6 +60,8 @@ class BufferTests(unittest.TestCase):
 
     def _args(self, **overrides):
         base = dict(alpha_id="A1", buffer=self.shelf, note=None,
+                    name="seed A1", category="FUNDAMENTAL", tags=["quality"],
+                    description="x" * 120, seeds=str(Path(self.shelf).with_name("seeds.jsonl")),
                     registry=os.path.join(self.tmp, "ledger.jsonl"),
                     selection=self.selection_path, max_wait=None, yes=False, force=False)
         base.update(overrides)
