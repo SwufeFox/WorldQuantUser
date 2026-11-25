@@ -54,6 +54,10 @@ def _load(path, fingerprint):
         or any(not isinstance(value, dict) for value in journal.get("quick_resolved", {}).values())
         or not isinstance(journal.get("resolved", {}), dict)
         or any(not isinstance(value, dict) for value in journal.get("resolved", {}).values())
+        or not isinstance(journal.get("stuck", {}), dict)
+        or any(not isinstance(value, dict) for value in journal.get("stuck", {}).values())
+        or not isinstance(journal.get("cancelled", {}), dict)
+        or any(not isinstance(value, dict) for value in journal.get("cancelled", {}).values())
     ):
         raise cache_store.CacheError("simulation slot journal cannot be read safely: %s" % (error or path))
     return journal
@@ -135,7 +139,8 @@ ORPHAN_RELEASE_STATUSES = TERMINAL_STATUSES
 
 
 def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0,
-                      now=None, deadline=None, ordinary_only=False):
+                      now=None, deadline=None, ordinary_only=False, stuck_after_min=None,
+                      cancel=None):
     """Release only observed terminal acceptances, retaining their receipts.
 
     ``poll(url)`` supplies an authenticated observation for that exact URL.
@@ -153,7 +158,7 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                        "overdue_after_min": min(max_age_min, hard_max_age_min)}
     fingerprint = _fingerprint(account)
     if not fingerprint:
-        return {"released": [], "kept": [], "state": "account_unknown",
+        return {"released": [], "cancelled": [], "kept": [], "state": "account_unknown",
                 "age_diagnostics": age_diagnostics}
     path, lock = _paths(fingerprint)
     stamp = time.time() if now is None else now
@@ -166,7 +171,7 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
     with cache_store.file_lock(lock, **lock_options()):
         snapshot = dict((_load(path, fingerprint).get("reservations") or {}))
 
-    decisions, kept = [], []
+    decisions, kept, observations = [], [], {}
     for key, entry in snapshot.items():
         if ordinary_only and entry.get("quick_job_key"):
             continue
@@ -188,17 +193,89 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
         answer = poll(url)
         if isinstance(answer, dict):
             status, alpha = answer.get("status"), answer.get("alpha") or answer.get("alpha_id")
+            progress = answer.get("progress")
+            children = answer.get("children")
         else:
             status, alpha = answer, None
+            progress = children = None
         status = status.upper() if isinstance(status, str) else None
+        if status == "NOT_FOUND" and not entry.get("quick_job_key"):
+            decisions.append({**item, "kind": "already_gone", "reason": "already_gone",
+                              "state": "already_gone",
+                              "status": status, "status_code": 404,
+                              "progress_url": url, "progress": entry.get("progress"),
+                              "last_progress_at": entry.get("last_progress_at"),
+                              "cancelled_at": stamp})
+            continue
         if status in ORPHAN_RELEASE_STATUSES:
-            decisions.append({**item, "status": status, "alpha": alpha})
-        else:
-            kept.append({**item, "status": status,
-                         "reason": "platform_pending" if status not in {None, "NOT_FOUND"} else "outcome_unknown"})
+            decisions.append({**item, "kind": "terminal", "status": status, "alpha": alpha})
+            continue
+        progress_value = _quota_number(progress)
+        if (stuck_after_min is not None and not entry.get("quick_job_key")
+                and status not in {None, "NOT_FOUND"} and progress_value is not None):
+            child_count = len(children) if isinstance(children, list) else 0
+            progress_fingerprint = f"{status}:{progress_value:.12g}:{child_count}"
+            previous = _quota_number(entry.get("last_progress_at"))
+            prior_fingerprint = entry.get("progress_fingerprint")
+            if prior_fingerprint == progress_fingerprint:
+                last_progress_at = previous if previous is not None else stamp
+            elif prior_fingerprint is None:
+                last_progress_at = created if created is not None else stamp
+                last_progress_at = min(last_progress_at, stamp)
+            else:
+                last_progress_at = stamp
+            unchanged_min = max(0, stamp - last_progress_at) / 60.0
+            observed = {
+                "progress": progress_value,
+                "progress_fingerprint": progress_fingerprint,
+                "last_progress_at": last_progress_at,
+                "progress_observed_at": stamp,
+                "platform_status": status,
+            }
+            observations[key] = observed
+            evidence = {
+                "reason": "progress_unchanged",
+                "minutes_unchanged": round(unchanged_min, 1),
+                "threshold_min": stuck_after_min,
+                "progress_url": url,
+                "created_at": created,
+                "stuck_at": stamp,
+                **observed,
+            }
+            if unchanged_min >= stuck_after_min and cancel is not None:
+                status_code = cancel(url)
+                evidence.update(status_code=status_code, cancelled_at=stamp)
+                if status_code in {200, 204}:
+                    decisions.append({**item, "kind": "cancelled", "reason": "cancelled",
+                                      "state": "cancelled",
+                                      "status": status, "status_code": status_code,
+                                      "progress": progress_value,
+                                      "last_progress_at": last_progress_at,
+                                      "minutes_unchanged": round(unchanged_min, 1),
+                                      "cancelled_at": stamp, "evidence": evidence})
+                    continue
+                if status_code == 404:
+                    decisions.append({**item, "kind": "already_gone", "reason": "already_gone",
+                                      "state": "already_gone",
+                                      "status": status, "status_code": 404,
+                                      "progress": progress_value,
+                                      "last_progress_at": last_progress_at,
+                                      "minutes_unchanged": round(unchanged_min, 1),
+                                      "cancelled_at": stamp, "evidence": evidence})
+                    continue
+                kept.append({**item, "status": status, "reason": "cancel_failed",
+                             "status_code": status_code, "progress": progress_value,
+                             "minutes_unchanged": round(unchanged_min, 1)})
+                continue
+            kept.append({**item, "status": status, "reason": "progress_unchanged",
+                         "progress": progress_value, "minutes_unchanged": round(unchanged_min, 1)})
+            continue
+        kept.append({**item, "status": status,
+                     "reason": "platform_pending" if status not in {None, "NOT_FOUND"} else "outcome_unknown"})
 
     released = []
-    if decisions:
+    cancelled = []
+    if decisions or observations:
         with cache_store.file_lock(lock, **lock_options()):
             journal = _load(path, fingerprint)
             reservations = journal.get("reservations") or {}
@@ -207,6 +284,18 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                 if reservations.get(key) != snapshot[key]:
                     kept.append({**item, "reason": "reservation_changed"})
                     continue
+                if item["kind"] in {"cancelled", "already_gone"}:
+                    entry = reservations.pop(key)
+                    evidence = item.get("evidence") or {
+                        "reason": item["reason"], "progress_url": item.get("progress_url"),
+                        "progress": item.get("progress"), "last_progress_at": item.get("last_progress_at"),
+                        "status_code": item.get("status_code"), "cancelled_at": item.get("cancelled_at"),
+                    }
+                    entry.update(evidence, state=item["kind"], cancel_evidence=evidence)
+                    journal.setdefault("cancelled", {})[key] = entry
+                    cancelled.append({k: v for k, v in item.items() if k != "evidence"})
+                    released.append({k: v for k, v in item.items() if k != "evidence"})
+                    continue
                 entry = reservations.pop(key)
                 collection = "quick_resolved" if entry.get("quick_job_key") else "resolved"
                 journal.setdefault(collection, {})[key] = {
@@ -214,9 +303,13 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                     "terminal_result": {"status": item["status"], "alpha_id": item["alpha"]},
                 }
                 released.append(item)
-            if released:
+            for key, observed in observations.items():
+                if key in reservations and reservations.get(key) == snapshot.get(key):
+                    reservations[key].update(observed)
+            if decisions or observations:
                 cache_store.write_json_atomic(path, journal)
-    return {"released": released, "kept": kept, "age_diagnostics": age_diagnostics}
+    return {"released": released, "cancelled": cancelled, "kept": kept,
+            "age_diagnostics": age_diagnostics}
 
 
 def _active_limit(journal, limit):
@@ -718,6 +811,16 @@ def restore_record(record, account=None):
     resolved = journal.get("resolved", {}).get(attempt)
     if resolved and _restore_terminal(record, resolved):
         return True
+    stuck = journal.get("stuck", {}).get(attempt)
+    if stuck:
+        record["slot_reservation_state"] = "stuck"
+        record["slot_stuck_evidence"] = stuck.get("stuck_evidence") or stuck
+        return True
+    cancelled = journal.get("cancelled", {}).get(attempt)
+    if cancelled:
+        record["slot_reservation_state"] = cancelled.get("state", "cancelled")
+        record["slot_cancel_evidence"] = cancelled.get("cancel_evidence") or cancelled
+        return True
     if record.get("progress_url"):
         return False
     entry = journal["reservations"].get(attempt, {})
@@ -770,6 +873,16 @@ def reconcile_record(record, account=None, *, outcome=None, progress_url=None, a
                 journal["reservations"].pop(identity["id"], None)
             else:
                 entry = journal["reservations"].get(identity["id"], {})
+                stuck = journal.get("stuck", {}).get(identity["id"])
+                if stuck:
+                    record["slot_reservation_state"] = "stuck"
+                    record["slot_stuck_evidence"] = stuck.get("stuck_evidence") or stuck
+                    return record
+                cancelled = journal.get("cancelled", {}).get(identity["id"])
+                if cancelled:
+                    record["slot_reservation_state"] = cancelled.get("state", "cancelled")
+                    record["slot_cancel_evidence"] = cancelled.get("cancel_evidence") or cancelled
+                    return record
                 if outcome is None and identity["id"] in journal.get("not_submitted", {}):
                     _restore_unposted(record)
                     return record

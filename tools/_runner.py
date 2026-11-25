@@ -528,6 +528,29 @@ def _watch_conflict(spec, requests, occupied):
 STALLED_ROUNDS = 3
 
 
+def _archive_target(directory, spec, source):
+    """Return an archive path without ever overwriting different evidence.
+
+    Retrying the same archived spec is a normal idempotent outcome, not an
+    operational failure. Only content-different namesakes receive a suffix.
+    """
+    fingerprint = hashlib.sha256(source).hexdigest()
+    destination = directory / spec.name
+    suffix = f"-{fingerprint[:10]}"
+    attempt = 1
+    while True:
+        try:
+            if not destination.exists():
+                return destination, False
+            if hashlib.sha256(destination.read_bytes()).hexdigest() == fingerprint:
+                return destination, True
+        except FileNotFoundError:
+            return destination, False
+        tail = "" if attempt == 1 else f"-{attempt}"
+        destination = directory / f"{spec.stem}{suffix}{tail}{spec.suffix}"
+        attempt += 1
+
+
 def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
               concurrency=None, consume=None, execute=None, schedule_recovery=False, recover_only=False,
               launch_rank=None):
@@ -550,6 +573,7 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
             guard = schedule_recovery and not recover_only
             full_recovery_turn = set()
             attempts = recent_campaign_attempts(root)
+            retry_deadlines = {}
             occupied = {}
             saved_owners = {}
             if guard:
@@ -562,6 +586,8 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
             while True:
                 scheduled = []
                 specs = sorted(inbox.glob("*.json"))
+                for stale in set(retry_deadlines) - set(specs):
+                    retry_deadlines.pop(stale, None)
                 full_recovery_turn.intersection_update(specs)
                 for owner, (batch, receipt) in list(saved_owners.items()):
                     if owner in specs:
@@ -582,9 +608,11 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                     scheduled.sort(key=lambda item: (item[3].priority,
                         launch_rank(item[0]) if launch_rank and guard and item[3].priority == 2 else 0))
                 now = time.time()
+                def due_at(spec, task):
+                    return retry_deadlines.get(spec, task.poll_at)
                 ready = {spec for spec, _, _, task in scheduled
                          if watch and (not recover_only or task.priority < 2)
-                         and (task.poll_at is None or task.poll_at <= now)}
+                         and (due_at(spec, task) is None or due_at(spec, task) <= now)}
                 next_poll = None
                 saturated = set()
                 skipped_launches = 0
@@ -593,7 +621,7 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                     if schedule.native_admission_scope in saturated:
                         skipped_launches += 1
                         continue
-                    poll_at = schedule.poll_at
+                    poll_at = due_at(spec, schedule)
                     if poll_at is not None and poll_at > time.time():
                         next_poll = poll_at if next_poll is None else min(next_poll, poll_at)
                         continue
@@ -623,20 +651,23 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                             full_recovery_turn.discard(spec)
                             result = execute(root, spec, batch, receipt, max_wait=wait, concurrency=concurrency)
                         if result.state != "deferred":
-                            destination = inbox / result.state / spec.name
-                            if destination.exists():
-                                raise ValueError(f"archive already exists: {destination}")
-                            if consume is not None and result.data.get("rows"):
-                                consume(spec, result.data)
+                            destination, already_archived = _archive_target(
+                                inbox / result.state, spec, source)
                             if spec.read_bytes() != source:
                                 raise ValueError(f"spec changed during processing: {spec.name}")
-                            shutil.move(spec, destination)
+                            if already_archived:
+                                spec.unlink(missing_ok=True)
+                            else:
+                                if consume is not None and result.data.get("rows"):
+                                    consume(spec, result.data)
+                                shutil.move(spec, destination)
                     except Exception as error:
                         # Leave the spec and any saved POST intent for an exact retry.
                         result = ProbeRun("deferred", {"diagnosis": {"state": "blocked", "reason": "runner_error",
                             "next_action": {"action": "status", "argv": ["python", "research_cli.py",
                                 "--research-dir", str(root), "campaign", "status"]}}},
                             f"{type(error).__name__}: {error}")
+                    updated = schedule
                     if watch:
                         updated = _recovery_schedule(root, batch, receipt, guard)
                         _watch_refresh(occupied, spec, updated)
@@ -673,11 +704,22 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                                       else "complete" if result.state == "done" else "terminal_failure"})
                     observed = time.time()
                     timed_wait = type(diagnosis.get("next_poll_at")) in (int, float) and diagnosis["next_poll_at"] > observed
+                    retry_at = observed + interval
+                    for candidate in (updated.poll_at, diagnosis.get("next_poll_at")):
+                        if type(candidate) in (int, float) and candidate > retry_at:
+                            retry_at = candidate
+                    if (result.state == "deferred" and diagnosis.get("reason") in {
+                            "platform_pending", "queued_work", "shared_slots_occupied",
+                            "submission_cooldown", "preflight_backoff"}):
+                        retry_deadlines[spec] = retry_at
+                    else:
+                        retry_deadlines.pop(spec, None)
                     progress = {"changed": changed, "unchanged_rounds": rounds,
                                 "last_progress_at": observed if changed else progress.get("last_progress_at"),
                                 "stalled": result.state == "deferred" and rounds >= STALLED_ROUNDS and not timed_wait}
                     event = {"kind": result.state, "spec": spec.name, "detail": result.detail,
                              "batch": str(batch), "receipt": str(receipt), "observed_at": observed,
+                             **({"retry_at": retry_at} if result.state == "deferred" else {}),
                              "diagnosis": diagnosis, "progress": progress, "source_fingerprint": source_fingerprint,
                              "progress_fingerprint": after}
                     attempts[spec.name] = event
@@ -692,7 +734,20 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                              "detail": "waiting for the next saved simulation poll"})
                         return 3
                     return 0
-                delay = interval if next_poll is None else min(interval, max(0, next_poll - time.time()))
+                # A poll can fall due while the sweep is still executing other
+                # specs. Rebuild the clock from current saved evidence instead
+                # of sleeping on a deadline observed at the start of the sweep.
+                now = time.time()
+                next_poll = None
+                for spec, batch, receipt, _ in scheduled:
+                    if not spec.exists():
+                        continue
+                    at = retry_deadlines.get(spec)
+                    if at is None:
+                        at = _recovery_schedule(root, batch, receipt, guard).poll_at
+                    if at is not None and at > now:
+                        next_poll = at if next_poll is None else min(next_poll, at)
+                delay = interval if next_poll is None else min(interval, max(0, next_poll - now))
                 time.sleep(delay)
     except cache_store.LockTimeout:
         log({"kind": "busy", "detail": f"another runner is active for {inbox}",

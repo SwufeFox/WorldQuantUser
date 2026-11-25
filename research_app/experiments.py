@@ -2535,7 +2535,18 @@ def _save_probe_records(document, target, updates, *, submitting=False):
         index: _probe_checkpoint_record(records[index], arms[index], payload, submitting=submitting)
         for index, payload in updates
     }
-    _commit_checkpoint_records(document, replacements, lambda pending: _save_probe_checkpoint(pending, target))
+    def persist(pending):
+        if not submitting and (pending.get("recording_policy") or {}).get("enabled") and any(
+            _has_finished_result(row) or _terminal_probe_without_alpha(row)
+            for row in replacements.values()
+        ):
+            try:
+                _probe_reconcile(pending)
+            except (OSError, ValueError, cache_store.CacheError) as exc:
+                note("probe seed recording deferred: %s" % exc)
+        _save_probe_checkpoint(pending, target)
+
+    _commit_checkpoint_records(document, replacements, persist)
 
 
 def _save_probe_progress(document, target, indices, kind, payload):

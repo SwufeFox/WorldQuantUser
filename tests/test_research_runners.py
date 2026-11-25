@@ -282,6 +282,48 @@ class ResearchRunnerTests(TestCase):
                                               max_wait=30, interval=1, once=True), 1)
         self.assertTrue((self.inbox / "failed" / self.spec.name).exists())
 
+    def test_rearchiving_identical_spec_is_idempotent_and_does_not_consume_twice(self):
+        failed = self.inbox / "failed"
+        failed.mkdir()
+        destination = failed / self.spec.name
+        destination.write_text("{}", encoding="utf-8")
+        paths = lambda _spec: (self.batch, self.receipt)
+        consume = mock.Mock()
+        execute = mock.Mock(return_value=runner.ProbeRun("failed", {}))
+
+        for _ in range(2):
+            self.spec.write_text("{}", encoding="utf-8")
+            code = runner.run_queue(self.root, self.inbox, paths, mock.Mock(),
+                                    max_wait=30, interval=1, once=True,
+                                    consume=consume, execute=execute)
+            self.assertEqual(code, 1)
+            self.assertFalse(self.spec.exists())
+
+        self.assertEqual(list(failed.glob("*.json")), [destination])
+        consume.assert_not_called()
+        self.assertEqual(execute.call_count, 2)
+
+    def test_archiving_a_different_namesake_preserves_both_and_consumes_once(self):
+        failed = self.inbox / "failed"
+        failed.mkdir()
+        original = failed / self.spec.name
+        original.write_text('{"old": true}\n', encoding="utf-8")
+        paths = lambda _spec: (self.batch, self.receipt)
+        consume = mock.Mock()
+
+        code = runner.run_queue(
+            self.root, self.inbox, paths, mock.Mock(), max_wait=30, interval=1,
+            once=True, consume=consume,
+            execute=mock.Mock(return_value=runner.ProbeRun("failed", {"rows": [{"alpha_id": "x"}]})))
+
+        self.assertEqual(code, 1)
+        self.assertFalse(self.spec.exists())
+        self.assertEqual(original.read_text(encoding="utf-8"), '{"old": true}\n')
+        archived = sorted(failed.glob("*.json"))
+        self.assertEqual(len(archived), 2)
+        self.assertIn(self.spec.name, {path.name for path in archived})
+        consume.assert_called_once()
+
     def test_campaign_recover_only_prioritizes_known_work_in_once_mode(self):
         backlog = self.root / "backlog"
         backlog.mkdir()
@@ -597,6 +639,68 @@ class ResearchRunnerTests(TestCase):
               mock.patch.object(runner.time, "sleep", side_effect=sleep), self.assertRaises(InterruptedError)):
             campaign.run_campaign(self.root, max_wait=55, interval=20, execute=execute, log_event=mock.Mock())
         self.assertEqual(calls, [(fresh, 55), (pending, 300)])
+
+    def test_campaign_watch_recomputes_the_next_poll_after_a_slow_sweep(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        due, later = [backlog / name for name in ("a-due.json", "b-later.json")]
+        for spec in (due, later):
+            spec.write_text("{}", encoding="utf-8")
+        for spec, at in ((due, 100), (later, 105)):
+            batch, _ = campaign.campaign_paths(self.root, spec)
+            self.saved(batch, [arm("PENDING", submission_state="accepted",
+                                   progress_url="https://test.invalid/1", next_poll_at=at)])
+            payload = json.loads(batch.read_text(encoding="utf-8"))
+            payload["execution"] = {"total": 1, "finished": 0}
+            batch.write_text(json.dumps(payload), encoding="utf-8")
+        clock, calls = [100.0], []
+
+        def execute(_root, spec, _batch, _receipt, **_options):
+            calls.append(spec)
+            clock[0] = 110.0
+            return runner.ProbeRun("deferred", {})
+
+        with (mock.patch.object(runner.time, "time", side_effect=lambda: clock[0]),
+              mock.patch.object(runner.time, "sleep", side_effect=InterruptedError) as sleep,
+              self.assertRaises(InterruptedError)):
+            campaign.run_campaign(self.root, interval=30, execute=execute, log_event=mock.Mock())
+        self.assertEqual(calls, [due, later])
+        sleep.assert_called_once_with(30)
+
+    def test_campaign_watch_retry_deadline_blocks_immediate_recover_and_resume_sweeps(self):
+        inbox = self.root / "retry-inbox"
+        inbox.mkdir()
+        recovery, resume = [inbox / name for name in ("a-recover.json", "b-resume.json")]
+        for spec in (recovery, resume):
+            spec.write_text("{}", encoding="utf-8")
+        clock, calls, sleeps = [100.0], [], []
+
+        def execute(_root, spec, _batch, _receipt, **_options):
+            calls.append(spec)
+            reason = "platform_pending" if spec == recovery else "shared_slots_occupied"
+            return runner.ProbeRun("deferred", {
+                "diagnosis": {"state": "waiting", "reason": reason}})
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                clock[0] += 1
+                return
+            raise InterruptedError
+
+        log = mock.Mock()
+        with (mock.patch.object(runner.time, "time", side_effect=lambda: clock[0]),
+              mock.patch.object(runner.time, "sleep", side_effect=sleep),
+              self.assertRaises(InterruptedError)):
+            runner.run_queue(self.root, inbox, lambda _spec: (self.batch, self.receipt),
+                             log, max_wait=30, interval=30, schedule_recovery=True,
+                             execute=execute)
+
+        self.assertEqual(calls, [recovery, resume])
+        deferred = [call.args[0] for call in log.call_args_list
+                    if call.args[0].get("kind") == "deferred"]
+        self.assertEqual([event["retry_at"] for event in deferred], [130, 130])
+        self.assertEqual(sleeps[0], 30)
 
     def test_campaign_once_defers_a_queued_repeat_of_a_cooling_legacy_job(self):
         backlog = self.root / "backlog"
