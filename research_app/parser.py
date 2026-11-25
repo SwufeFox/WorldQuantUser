@@ -230,6 +230,11 @@ def _add_settings_args(parser):
     parser.add_argument("--pasteurization", type=str.upper)
     parser.add_argument("--nan-handling", type=str.upper)
     parser.add_argument("--test-period", type=str.upper, help="e.g. P0Y, P1Y, P2Y.")
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument("--quick", action="store_true", dest="quick_mode",
+                            help="Shortcut for --setting simulationMode=QUICK.")
+    mode_group.add_argument("--full", action="store_true", dest="full_mode",
+                            help="Shortcut for --setting simulationMode=FULL.")
     parser.add_argument("--setting", action="append", type=_setting_assignment, default=None,
                         metavar="NAME=VALUE", help="Additional platform setting; repeatable. "
                         "Values accept JSON or unquoted text. Conflicting explicit flags are rejected.")
@@ -315,8 +320,27 @@ def build_parser():
     auth_check.bind_handler("account.cmd_auth_check")
 
     auth_logout = auth_sub.add_parser(
-        "logout", help="Forget the cached session cookie (local only).")
+        "logout", help="Forget the cached session cookie (and optionally revoke on BRAIN).")
+    auth_logout.add_argument("--remote", action="store_true",
+                             help="Also revoke the session server-side via DELETE /authentication.")
     auth_logout.bind_handler("account.cmd_auth_logout")
+
+    auth_profile = auth_sub.add_parser(
+        "profile", help="Inspect the authenticated user's profile and optional consultant surfaces.")
+    auth_profile.add_argument("--consultant", action="store_true",
+                              help="Also inspect level-gated consultant, pyramid and activity surfaces.")
+    _add_session_args(auth_profile)
+    auth_profile.bind_handler("account.cmd_auth_profile")
+
+    auth_comp = auth_sub.add_parser(
+        "competitions", help="List enrolled competitions, all platform challenges, or one competition.")
+    auth_comp_scope = auth_comp.add_mutually_exclusive_group()
+    auth_comp_scope.add_argument("--all", action="store_true",
+                                 help="List all platform competitions instead of only enrolled ones.")
+    auth_comp_scope.add_argument("--id", dest="competition_id", metavar="COMPETITION_ID",
+                                 help="Fetch details for one specific competition.")
+    _add_session_args(auth_comp)
+    auth_comp.bind_handler("account.cmd_auth_competitions")
 
     pairs_parser = sub.add_parser(
         "pairs", help="Screen cached alphas for a combination worth simulating.",
@@ -463,6 +487,8 @@ def build_parser():
         description="Compare candidates or book members using train metrics, costs and PnL. "
                     "Save a choice with --freeze; --show-test requires --selection and "
                     "cannot change the frozen candidates or their order.")
+    triage_parser.add_argument("targets", nargs="*", metavar="ID_OR_BATCH",
+                               help="Positional alpha ids or a batch .json file (shorthand for --ids / --batch).")
     triage_parser.add_argument("--batch", default=None, metavar="BATCH_JSON",
                                help="Triage every alpha id in this batch file.")
     triage_parser.add_argument("--ids", nargs="+", default=None, metavar="ID")
@@ -658,6 +684,16 @@ def build_parser():
     _add_session_args(cat_ds)
     cat_ds.bind_handler("catalog.cmd_catalog_datasets")
 
+    cat_ds_one = cat.add_parser("dataset", help="Fetch one dataset's metadata directly by id.")
+    cat_ds_one.add_argument("dataset_id", metavar="DATASET_ID", help="Dataset id, e.g. fundamental6.")
+    _add_session_args(cat_ds_one)
+    cat_ds_one.bind_handler("catalog.cmd_catalog_dataset")
+
+    cat_field_one = cat.add_parser("field", help="Fetch one datafield's metadata and FASTEXPR wrapper by id.")
+    cat_field_one.add_argument("field_id", metavar="FIELD_ID", help="Datafield id, e.g. fnd6_newa1v1300_assets.")
+    _add_session_args(cat_field_one)
+    cat_field_one.bind_handler("catalog.cmd_catalog_field")
+
     cat_find = cat.add_parser(
         "find", help="Search every dataset's fields at once (offline once cached).")
     cat_find.add_argument("query", nargs="?", help="Search terms; multi-word queries are ANDed. "
@@ -691,7 +727,10 @@ def build_parser():
     cat_unused.bind_handler("catalog.cmd_catalog_unused")
 
     cat_f = cat.add_parser("fields", help="Datafields of one dataset.")
-    cat_f.add_argument("--dataset", required=True, help="Dataset id, e.g. fundamental6.")
+    cat_f.add_argument("dataset_pos", nargs="?", metavar="DATASET",
+                       help="Dataset id, e.g. fundamental6.")
+    cat_f.add_argument("--dataset", default=None,
+                       help="Dataset id, e.g. fundamental6 (optional when passed positionally).")
     cat_f.add_argument("--region", type=str.upper, default=ml.DEFAULT_SETTINGS["region"])
     cat_f.add_argument("--universe", type=str.upper, default=ml.DEFAULT_SETTINGS["universe"])
     cat_f.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
@@ -849,8 +888,8 @@ def build_parser():
     sim = sub.add_parser(
         "simulate", help="Simulate alphas; preview with --dry-run before using platform capacity.")
     sim.add_argument("file", nargs="?",
-                     help="Research file: JSON, one FASTEXPR expression per line, or one Python Alpha (.py). "
-                          "Omit when using --expr.")
+                     help="Research file (.json/.py/.txt), - for stdin, or a single inline FASTEXPR "
+                          "expression such as 'rank(close)'.")
     sim.add_argument("--expr", action="append", default=[], metavar="EXPRESSION",
                      help="Inline expression; repeat for several.")
     sim.add_argument("--file", dest="files", action="append", default=[],
@@ -1170,6 +1209,9 @@ def build_parser():
                        help="Also read platform merged before/after performance; full includes all native series.")
     a_get.add_argument("--recordsets", nargs="*", metavar="NAME",
                        help="Discover native diagnostic recordsets and optionally read names such as yearly-stats.")
+    a_get.add_argument("--correlations", nargs="*", choices=["self", "prod", "power-pool"],
+                       default=None, metavar="KIND",
+                       help="Also fetch correlation views (self, prod, power-pool; all three if passed without values).")
     a_get_scope = a_get.add_mutually_exclusive_group()
     a_get_scope.add_argument("--team", dest="team_id", help="Team scope for --performance; default is the current user.")
     a_get_scope.add_argument("--competition", dest="competition_id", help="Competition scope for --performance.")
@@ -1186,6 +1228,8 @@ def build_parser():
                     "or by eye (unreliable at 55 alphas). This compares AST skeletons and "
                     "field sets instead: an identical skeleton means 'same construction, "
                     "different grid point'.")
+    a_near.add_argument("target", nargs="?", metavar="ID_OR_EXPR",
+                        help="Stored alpha id or inline FASTEXPR expression (shorthand for --alpha-id / --expression).")
     a_near.add_argument("--alpha-id", default=None, dest="alpha_id")
     a_near.add_argument("--expression", default=None)
     a_near.add_argument("--status", default=None, help="Filter candidates by status, e.g. ACTIVE.")
@@ -1219,20 +1263,84 @@ def build_parser():
     _add_session_args(a_sc)
     a_sc.bind_handler("alphas.cmd_alpha_self_corr")
 
+    a_pc = alpha_sub.add_parser(
+        "prod-corr",
+        help="Production correlation histogram/detail via GET /alphas/{id}/correlations/prod.",
+        description="Fetches the platform's production correlation distribution (when permitted by "
+                    "account tier) and optionally writes a promote-compatible --pc-distribution archive.")
+    a_pc.add_argument("alpha_id")
+    a_pc.add_argument("--limit", type=float, default=0.7,
+                      help="Formal production correlation ceiling (default 0.7).")
+    a_pc.add_argument("--save-archive", default=None, metavar="PATH",
+                      help="Save a promote-compatible --pc-distribution archive JSON.")
+    a_pc.add_argument("--max-wait-seconds", "--max-wait", dest="max_wait",
+                      type=_non_negative_seconds, default=60.0,
+                      help="Wait budget for the production correlation endpoint (default 60).")
+    _add_session_args(a_pc)
+    a_pc.bind_handler("alphas.cmd_alpha_prod_corr")
+
+    a_pp = alpha_sub.add_parser(
+        "pp-corr",
+        help="Power Pool correlation detail via GET /alphas/{id}/correlations/power-pool.",
+        description="Fetches Power Pool correlation records/histogram and checks the strict < 0.5 ceiling.")
+    a_pp.add_argument("alpha_id")
+    a_pp.add_argument("--limit", type=float, default=0.5,
+                      help="Power Pool correlation ceiling (< limit required, default 0.5).")
+    a_pp.add_argument("--max-wait-seconds", "--max-wait", dest="max_wait",
+                      type=_non_negative_seconds, default=60.0,
+                      help="Wait budget for the Power Pool correlation endpoint (default 60).")
+    _add_session_args(a_pp)
+    a_pp.bind_handler("alphas.cmd_alpha_pp_corr")
+
+    a_cancel = alpha_sub.add_parser(
+        "cancel-sim",
+        help="Cancel a running simulation and release its local slot once cancellation is confirmed.")
+    a_cancel.add_argument("reference", metavar="SIM_REFERENCE",
+                          help="Simulation ID or https://api.worldquantbrain.com/simulations/<id> URL.")
+    _add_session_args(a_cancel)
+    a_cancel.bind_handler("alphas.cmd_alpha_cancel_sim")
+
+    a_ready = alpha_sub.add_parser(
+        "readiness",
+        help="One-shot submission readiness check, Power Pool budget and catalog-backed description builder.",
+        description="Runs live platform checks, resolves field/operator catalog metadata, evaluates "
+                    "Regular or Power Pool gates, and optionally composes and applies a verified "
+                    "IDEA / DATA / RATIONALE description.")
+    a_ready.add_argument("alpha_id")
+    a_ready.add_argument("--track", choices=["REGULAR", "POWER_POOL"], type=str.upper, default=None,
+                         help="Target track (auto-detected from live checks when omitted).")
+    a_ready.add_argument("--idea", default=None,
+                         help="Economic hypothesis used to compose a verified IDEA/DATA/RATIONALE description.")
+    a_ready.add_argument("--rationale", default=None,
+                         help="Optional custom rationale paragraph when composing with --idea.")
+    a_ready.add_argument("--apply-description", action="store_true",
+                         help="Write the composed description to the alpha before running live checks.")
+    a_ready.add_argument("--seeds", default=None,
+                         help="Seed store path for duplicate-description check (default: seeds.jsonl).")
+    a_ready.add_argument("--max-wait-seconds", "--max-wait", dest="max_wait",
+                         type=_non_negative_seconds, default=180.0,
+                         help="Wait budget for live platform checks (default 180).")
+    _add_session_args(a_ready)
+    a_ready.bind_handler("alphas.cmd_alpha_readiness")
+
     a_desc = alpha_sub.add_parser(
         "describe",
-        help="Set an alpha's name, category and tags (the only writable metadata).",
-        description="The platform accepts name, category and tags on an alpha. It has "
-                    "no description property: eighteen candidate spellings all return "
-                    "'Unexpected property', so nothing is invented to hold one.")
+        help="Set an alpha's writable metadata (name, category, tags, description, color, hidden).",
+        description="Updates top-level metadata (`name`, `category`, `tags`, `color`, `hidden`) and/or "
+                    "nested `regular.description`, then reads back the alpha to verify every field stuck.")
     a_desc.add_argument("alpha_id")
     a_desc.add_argument("--name", default=None)
-    a_desc.add_argument("--category", default=None, choices=list(ml.ALPHA_CATEGORIES))
-    a_desc.add_argument("--tags", default=None,
-                        help="Comma-separated tags.")
+    a_desc.add_argument("--category", default=None, choices=list(ml.ALPHA_CATEGORIES), type=str.upper)
+    a_desc.add_argument("--tags", nargs="+", default=None,
+                        help="Comma- or space-separated tags.")
     a_desc.add_argument("--description", default=None,
-                        help="Free-text note. Writable, but nested under `regular` in "
-                             "the payload rather than as a top-level property.")
+                        help="Free-text rationale/note, written under `regular.description`.")
+    a_desc.add_argument("--color", default=None, type=str.upper,
+                        choices=[*ml.ALPHA_COLORS, "NONE"],
+                        help="Color tag (RED, YELLOW, GREEN, BLUE, PURPLE, or NONE to clear).")
+    a_desc_vis = a_desc.add_mutually_exclusive_group()
+    a_desc_vis.add_argument("--hide", action="store_true", help="Mark the alpha hidden on the platform.")
+    a_desc_vis.add_argument("--unhide", action="store_true", help="Mark the alpha visible on the platform.")
 
     _add_session_args(a_desc)
     a_desc.bind_handler("alphas.cmd_alpha_describe")
@@ -1278,8 +1386,19 @@ def build_parser():
                         help="UNSUBMITTED, SUBMITTED, or '' for any.")
     a_list.add_argument("--region")
     a_list.add_argument("--universe")
+    a_list.add_argument("--delay", type=_non_negative_integer, default=None,
+                        help="Filter by settings.delay (e.g. 0 or 1).")
+    a_list.add_argument("--instrument-type", type=str.upper, default=None,
+                        help="Filter by settings.instrumentType (e.g. EQUITY).")
+    a_list.add_argument("--category", choices=list(ml.ALPHA_CATEGORIES), type=str.upper, default=None)
+    a_list.add_argument("--color", choices=list(ml.ALPHA_COLORS), type=str.upper, default=None)
+    a_list.add_argument("--tag", default=None, help="Filter by tag.")
     a_list.add_argument("--min-sharpe", type=float)
     a_list.add_argument("--min-fitness", type=float)
+    a_list.add_argument("--max-turnover", type=float, default=None,
+                        help="Upper bound on in-sample turnover (is.turnover<).")
+    a_list.add_argument("--since", default=None,
+                        help="Minimum creation timestamp/date (dateCreated>=).")
     a_list.add_argument("--search")
     a_list.add_argument("--all", action="store_true",
                         help="Merge visible and hidden alphas, including SUPER; "
@@ -1707,13 +1826,15 @@ def build_parser():
 
 
 _COMMAND_EXAMPLES = {
-    "": ["brief", "catalog fields --dataset fundamental6 --expressions --limit 10",
-         'simulate --expr "rank(close)" --dry-run', "ledger list --family quality"],
+    "": ["brief", "catalog fields fundamental6 --expressions --limit 10",
+         'simulate "rank(close)" --quick --dry-run', "ledger list --family quality"],
     "help": ["help catalog fields"],
     "schema": ["schema alpha get"],
-    "auth": ["auth check"],
+    "auth": ["auth check", "auth profile --consultant", "auth competitions"],
     "auth check": ["auth check"],
-    "auth logout": ["auth logout"],
+    "auth logout": ["auth logout", "auth logout --remote"],
+    "auth profile": ["auth profile", "auth profile --consultant"],
+    "auth competitions": ["auth competitions", "auth competitions --all"],
     "docs": ['docs get --query "power pool" --text', "docs list --query python --summary"],
     "docs list": ["docs list --query python --summary"],
     "docs get": ['docs get --query "power pool" --text',
@@ -1729,11 +1850,14 @@ _COMMAND_EXAMPLES = {
     "cache": ["cache info"],
     "cache info": ["cache info"],
     "cache clear": ["cache clear --kind metadata"],
-    "catalog": ["catalog datasets --limit 10", "catalog fields --dataset fundamental6 --limit 10"],
+    "catalog": ["catalog datasets --limit 10", "catalog fields fundamental6 --limit 10",
+                "catalog field fnd6_newa1v1300_assets"],
     "catalog operators": ["catalog operators --search rank --limit 10"],
     "catalog datasets": ["catalog datasets --region USA --limit 10",
                          "catalog datasets --theme true --summary"],
-    "catalog fields": ["catalog fields --dataset fundamental6 --search liability --expressions --limit 10",
+    "catalog dataset": ["catalog dataset fundamental6"],
+    "catalog field": ["catalog field fnd6_newa1v1300_assets"],
+    "catalog fields": ["catalog fields fundamental6 --search liability --expressions --limit 10",
                        "catalog fields --dataset fundamental6 --summary"],
     "catalog find": ["catalog find debt --min-coverage 0.8",
                      "catalog find --region EUR --universe TOP2500 --dataset analyst69,analyst15 "
@@ -1742,7 +1866,7 @@ _COMMAND_EXAMPLES = {
     "catalog verify": ["catalog verify --fields close volume --strict"],
     "catalog categories": ["catalog categories"],
     "catalog field-audit": ["catalog field-audit --fields close,volume"],
-    "lint": ['lint --expr "rank(close)" --offline', "lint --file research.json",
+    "lint": ['lint "rank(close)" --offline', "lint --file research.json",
              "lint --file reversal.py --offline"],
     "paper": ['paper "accruals stock returns" --limit 3',
               'paper --id W2741809807', 'paper --id W2741809807 --related references --limit 5',
@@ -1753,7 +1877,8 @@ _COMMAND_EXAMPLES = {
              'feed --source all --topic "earnings guidance" --max-topics 12 --summary --dry-run',
              'feed --sources-file radar-sources.json --summary --dry-run',
              'feed --market coinbase:BTC-USD --book-depth 10 --summary --dry-run'],
-    "simulate": ['simulate --expr "rank(close)" --dry-run',
+    "simulate": ['simulate "rank(close)" --quick --dry-run',
+                 'simulate --expr "rank(close)" --dry-run',
                  "simulate reversal.py --setting lookback=0 --dry-run",
                  "simulate research.json --sort fitness --save results.json"],
     "resume": ["resume CHECKPOINT.json --save results.json"],
@@ -1761,8 +1886,8 @@ _COMMAND_EXAMPLES = {
     "compare": ["compare results.json --cost-bps 5 10 20 --freeze choice.json --summary",
                 "compare --frozen --selection choice.json --summary",
                 'compare --match "sample-batch*.json" --latest --sort none'],
-    "triage": ["triage --batch BATCH.json --freeze choice.json",
-               "triage --ids ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --freeze choice.json",
+    "triage": ["triage BATCH.json --freeze choice.json",
+               "triage ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --freeze choice.json",
                "triage --show-test --selection choice.json"],
     "promote": ['promote ALPHA_ID --note "candidate validation" --cost-bps 5 10 20',
                 "promote ALPHA_ID --selection choice.json --max-self-correlation 0.7",
@@ -1771,7 +1896,7 @@ _COMMAND_EXAMPLES = {
     "brief": ["brief", "brief --days 7 --top 5"],
     "ask": ["ask --by neutralization --stat n,median:sharpe,floor_share",
             "ask --where status=ACTIVE --list"],
-    "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json --check",
+    "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json --quick --check",
               "probe python.spec.json --batch-path PYTHON_BATCH.json --dry-run",
               "probe batch.spec.json --batch-path BATCH.json --save response.json",
               "probe --recover BATCH.json --max-wait-seconds 60",
@@ -1782,17 +1907,23 @@ _COMMAND_EXAMPLES = {
                  "campaign run --recover-only", "campaign run --watch --defer-quick-pnl --stream",
                  "campaign recover-pnl --watch --stream"],
     "views": ["views --limit 10"],
-    "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],
+    "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID", "alpha readiness ALPHA_ID"],
     "alpha get": ["alpha get ALPHA_ID", "alpha get ALPHA_ID --performance",
-                  "alpha get ALPHA_ID --performance full --competition COMPETITION_ID",
+                  "alpha get ALPHA_ID --correlations",
                   "alpha get ALPHA_ID --recordsets yearly-stats"],
+    "alpha near": ['alpha near "rank(close)"', "alpha near ALPHA_ID"],
     "alpha check": ["alpha check ALPHA_ID", "alpha check ALPHA_A ALPHA_B --workers 2"],
     "alpha self-corr": ["alpha self-corr ALPHA_ID"],
-    "alpha describe": ['alpha describe ALPHA_ID --name "quality signal" --category FUNDAMENTAL'],
+    "alpha prod-corr": ["alpha prod-corr ALPHA_ID", "alpha prod-corr ALPHA_ID --save-archive pc.json"],
+    "alpha pp-corr": ["alpha pp-corr ALPHA_ID"],
+    "alpha cancel-sim": ["alpha cancel-sim SIMULATION_ID"],
+    "alpha readiness": ["alpha readiness ALPHA_ID",
+                        'alpha readiness ALPHA_ID --track POWER_POOL --idea "Hypothesis..." --apply-description'],
+    "alpha describe": ['alpha describe ALPHA_ID --name "quality signal" --category FUNDAMENTAL --color GREEN'],
     "alpha submit": ["alpha submit ALPHA_ID", "alpha submit ALPHA_ID --yes --selection choice.json"],
     "buffer submit": ["buffer submit ALPHA_ID --yes --selection choice.json"],
     "alpha explain": ["alpha explain ALPHA_ID --no-corr"],
-    "alpha list": ["alpha list --limit 10 --min-fitness 1"],
+    "alpha list": ["alpha list --limit 10 --min-fitness 1", "alpha list --delay 1 --color GREEN"],
     "alpha self-check": ["alpha self-check ALPHA_ID"],
     "alpha corr": ["alpha corr ALPHA_A ALPHA_B --vs-book"],
     "alpha book": ["alpha book --limit 10", "alpha book --income"],

@@ -18,7 +18,7 @@ import correlation
 import machine_lib as ml
 import research_paths
 
-from .runtime import CliError, METRIC_KEYS, note, with_session
+from .runtime import CliError, METRIC_KEYS, note, parse_tags, protect_output, with_session
 from . import incentives, stats
 
 
@@ -58,6 +58,9 @@ def cmd_alpha_get(args, _sink):
     """Read the Alpha snapshot and any explicitly requested platform evidence."""
     detail = getattr(args, "performance", None)
     recordset_names = getattr(args, "recordsets", None)
+    corr_kinds = getattr(args, "correlations", None)
+    if corr_kinds is not None and len(corr_kinds) == 0:
+        corr_kinds = ["self", "prod", "power-pool"]
     max_wait = getattr(args, "max_wait", 180.0)
     team_id, competition_id = getattr(args, "team_id", None), getattr(args, "competition_id", None)
     if detail is None and (team_id is not None or competition_id is not None):
@@ -75,22 +78,46 @@ def cmd_alpha_get(args, _sink):
         except ValueError as exc:
             raise CliError("INVALID_INPUT", str(exc)) from exc
 
+    def _read_correlations(session):
+        fetchers = {
+            "self": lambda: ml.fetch_self_correlation(session, args.alpha_id, max_wait_seconds=max_wait),
+            "prod": lambda: ml.fetch_prod_correlation(session, args.alpha_id, max_wait_seconds=max_wait),
+            "power-pool": lambda: ml.fetch_power_pool_correlation(session, args.alpha_id, max_wait_seconds=max_wait),
+        }
+        collected = {}
+        for kind in dict.fromkeys(corr_kinds or []):
+            try:
+                data = fetchers[kind]()
+                collected[kind] = {
+                    k: v for k, v in data.items() if k != "raw_json_response"
+                }
+                collected[kind]["state"] = "available"
+            except ml.PermissionDenied as exc:
+                collected[kind] = {"state": "level_gated", "error": _check_error(exc)}
+            except (ml.BrainError, requests.RequestException) as exc:
+                if isinstance(exc, ml.AuthError):
+                    raise
+                collected[kind] = {"state": "unavailable", "error": _check_error(exc)}
+        return collected
+
     def read(session):
         alpha = ml.fetch_alpha_metrics(session, args.alpha_id)
-        comparison = recordsets = None
+        comparison = recordsets = correlations = None
         if detail is not None:
             comparison = ml.fetch_merged_performance(session, args.alpha_id,
                 team_id=team_id, competition_id=competition_id, max_wait_seconds=max_wait, on_event=_sink)
         if recordset_names is not None:
             recordsets = ml.fetch_alpha_recordsets(session, args.alpha_id, recordset_names,
                 max_wait_seconds=max_wait)
-        return alpha, comparison, recordsets
+        if corr_kinds is not None:
+            correlations = _read_correlations(session)
+        return alpha, comparison, recordsets, correlations
 
-    if detail is None and recordset_names is None:
+    if detail is None and recordset_names is None and corr_kinds is None:
         payload = with_session(args, lambda s: ml.fetch_alpha_metrics(s, args.alpha_id))
-        comparison = recordsets = None
+        comparison = recordsets = correlations = None
     else:
-        payload, comparison, recordsets = with_session(args, read)
+        payload, comparison, recordsets, correlations = with_session(args, read)
     in_sample = payload.get("is") or {}
     code, description, operator_count = ml.regular_expression(payload)
     document = {
@@ -98,6 +125,8 @@ def cmd_alpha_get(args, _sink):
         # Keep the metadata needed to diagnose submission readiness.
         "name": payload.get("name"),
         "category": payload.get("category"),
+        "color": payload.get("color"),
+        "hidden": payload.get("hidden"),
         "tags": payload.get("tags") or [],
         "expression": code,
         "expression_description": description,
@@ -136,6 +165,12 @@ def cmd_alpha_get(args, _sink):
         if viewed:
             research_paths.log_view("alpha get --recordsets", "validation", [args.alpha_id],
                                     note=", ".join(viewed))
+    if correlations is not None:
+        document["correlations"] = correlations
+        viewed_corrs = [name for name, entry in correlations.items() if entry.get("state") == "available"]
+        if viewed_corrs:
+            research_paths.log_view("alpha get --correlations", "validation", [args.alpha_id],
+                                    note=", ".join(viewed_corrs))
 
     return document
 
@@ -154,8 +189,11 @@ def cmd_alpha_near(args, _sink):
     """
     import fastexpr_ast
 
-    if args.alpha_id and args.expression:
-        raise CliError("USAGE", "pass either --alpha-id or --expression, not both")
+    target = getattr(args, "target", None)
+    alpha_id_arg = args.alpha_id
+    expression_arg = args.expression
+    if sum(bool(x) for x in (target, alpha_id_arg, expression_arg)) > 1:
+        raise CliError("USAGE", "pass one target (positional, --alpha-id, or --expression), not multiple")
     registry = args.registry or alpha_registry.default_registry_path()
     entries = alpha_registry.load_entries(registry)
     latest = {}
@@ -164,16 +202,26 @@ def cmd_alpha_near(args, _sink):
         if alpha_id:
             latest[alpha_id] = entry
 
-    if args.alpha_id:
-        entry = latest.get(args.alpha_id)
+    if target:
+        if target in latest:
+            alpha_id_arg = target
+        elif "(" not in target and ml.valid_simulation_id(target):
+            raise CliError("INVALID_INPUT", "%s is not in the ledger" % target,
+                           "pass a stored Alpha ID, or wrap an expression such as 'rank(close)'")
+        else:
+            expression_arg = target
+
+    if alpha_id_arg:
+        entry = latest.get(alpha_id_arg)
         if entry is None:
-            raise CliError("INVALID_INPUT", "%s is not in the ledger" % args.alpha_id)
+            raise CliError("INVALID_INPUT", "%s is not in the ledger" % alpha_id_arg)
         if ml.is_python_language(alpha_registry.entry_language(entry)):
             raise CliError("INVALID_INPUT", "alpha near compares FastExpr structure",
                            "use alpha get to inspect the stored Python source")
         expression = entry.get("expression") or ""
     else:
-        expression = args.expression or ""
+        expression = expression_arg or ""
+    args.alpha_id = alpha_id_arg
     expression = " ".join(expression.split())
     if not expression:
         raise CliError("INVALID_INPUT", "empty expression")
@@ -706,10 +754,19 @@ def _alpha_list_page(session, args):
     limit, offset = min(args.limit, 100), args.offset
     if limit < 1 or offset < 0:
         raise CliError("USAGE", "--limit must be positive and --offset non-negative")
-    filters = dict(order=args.order, status=args.status, region=args.region,
-                   universe=args.universe, min_sharpe=args.min_sharpe,
-                   min_fitness=args.min_fitness, search=args.search,
-                   alpha_type_not="" if args.all else "SUPER")
+    filters = dict(
+        order=args.order, status=args.status, region=args.region,
+        universe=args.universe, min_sharpe=args.min_sharpe,
+        min_fitness=args.min_fitness, search=args.search,
+        delay=getattr(args, "delay", None),
+        instrument_type=getattr(args, "instrument_type", None),
+        category=getattr(args, "category", None),
+        color=getattr(args, "color", None),
+        tag=getattr(args, "tag", None),
+        max_turnover=getattr(args, "max_turnover", None),
+        date_created_from=getattr(args, "since", None),
+        alpha_type_not="" if args.all else "SUPER",
+    )
     scope = {"hidden": [False, True] if args.all else [False],
              "alpha_type_not": None if args.all else "SUPER",
              "status": args.status, "order": args.order,
@@ -781,7 +838,10 @@ def cmd_alpha_list(args, _sink):
             "turnover": in_sample.get("turnover"),
             "region": settings.get("region"),
             "universe": settings.get("universe"),
+            "delay": settings.get("delay"),
             "neutralization": settings.get("neutralization"),
+            "category": alpha.get("category"),
+            "color": alpha.get("color"),
             "status": alpha.get("status"),
             "grade": alpha.get("grade"),
             "date_created": alpha.get("dateCreated"),
@@ -966,18 +1026,304 @@ def cmd_alpha_self_corr(args, _sink):
     return data
 
 
+def cmd_alpha_prod_corr(args, _sink):
+    """Fetch production correlation detail and optionally save a promote-compatible archive."""
+    protect_output(args)
+    max_wait = getattr(args, "max_wait", 60.0)
+    if max_wait is not None and (not math.isfinite(max_wait) or max_wait < 0):
+        raise CliError("USAGE", "--max-wait must be finite and non-negative")
+    capture = with_session(
+        args,
+        lambda s: ml.fetch_prod_correlation(
+            s, args.alpha_id, max_wait_seconds=max_wait, on_event=_sink
+        ),
+    )
+    bins = []
+    for row in capture.get("records") or []:
+        if (isinstance(row, (list, tuple)) and len(row) == 3
+                and _correlation_number(row[0]) and _correlation_number(row[1])
+                and type(row[2]) is int and row[2] >= 0):
+            bins.append({"lower": row[0], "upper": row[1], "count": row[2]})
+    count_above = (
+        sum(item["count"] for item in bins if item["lower"] >= args.limit)
+        if bins and _correlation_number(args.limit)
+        else None
+    )
+    archive_path = None
+    if getattr(args, "save_archive", None):
+        target = Path(args.save_archive).expanduser().resolve()
+        archive = ml.build_prod_correlation_archive(args.alpha_id, capture)
+        cache_store.write_json_atomic(target, archive)
+        archive_path = str(target)
+    research_paths.log_view("alpha prod-corr", "validation", [args.alpha_id])
+    return {
+        "alpha_id": args.alpha_id,
+        "source": capture["source"],
+        "captured_at": capture["captured_at"],
+        "max_correlation": capture.get("max"),
+        "min_correlation": capture.get("min"),
+        "limit": args.limit,
+        "bins": bins,
+        "records": capture.get("records") or [],
+        "count_in_bins_at_or_above_limit": count_above,
+        "archive_path": archive_path,
+    }
+
+
+def cmd_alpha_pp_corr(args, _sink):
+    """Fetch Power Pool correlation detail and evaluate the strict < 0.5 ceiling."""
+    max_wait = getattr(args, "max_wait", 60.0)
+    if max_wait is not None and (not math.isfinite(max_wait) or max_wait < 0):
+        raise CliError("USAGE", "--max-wait must be finite and non-negative")
+    capture = with_session(
+        args,
+        lambda s: ml.fetch_power_pool_correlation(
+            s, args.alpha_id, max_wait_seconds=max_wait, on_event=_sink
+        ),
+    )
+    verdict = ml.power_pool_correlation_verdict(capture, limit=args.limit)
+    research_paths.log_view("alpha pp-corr", "validation", [args.alpha_id])
+    return {
+        "alpha_id": args.alpha_id,
+        "source": capture["source"],
+        "captured_at": capture["captured_at"],
+        "max_correlation": capture.get("max"),
+        "min_correlation": capture.get("min"),
+        "limit": args.limit,
+        "verdict": "blocked" if verdict["blocked"] else ("clear" if verdict["known"] else "unknown"),
+        "blocked": verdict["blocked"],
+        "known": verdict["known"],
+        "reason": verdict["reason"],
+        "counterparts": verdict["counterparts"],
+        "bins_at_or_above_limit": verdict["bins_at_or_above_limit"],
+    }
+
+
+def cmd_alpha_cancel_sim(args, _sink):
+    """Cancel a running simulation via DELETE /simulations/{id} and free its local slot."""
+    try:
+        ml.simulation_reference_id(args.reference)
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc),
+                       "pass a simulation id or an exact https://api.worldquantbrain.com/simulations/<id> URL") from exc
+    return with_session(args, lambda s: ml.cancel_simulation(s, args.reference))
+
+
+def cmd_alpha_readiness(args, _sink):
+    """One-shot submission readiness check, Power Pool gate evaluation and description builder."""
+    import fastexpr_ast
+    from . import capabilities, description, pp_budget, rules_snapshot
+
+    if not ml.valid_simulation_id(args.alpha_id):
+        raise CliError("INVALID_INPUT", "invalid Alpha ID")
+    max_wait = getattr(args, "max_wait", 180.0)
+    if max_wait is not None and (not math.isfinite(max_wait) or max_wait < 0):
+        raise CliError("USAGE", "--max-wait must be finite and non-negative")
+    if getattr(args, "apply_description", False) and not getattr(args, "idea", None):
+        raise CliError("USAGE", "--apply-description requires --idea")
+
+    def work(session):
+        payload = ml.fetch_alpha_metrics(session, args.alpha_id)
+        code, current_desc, operator_count = ml.regular_expression(payload)
+        language = ml.alpha_language(payload)
+        settings = payload.get("settings") or {}
+        scoped = capabilities.cached_field_scope(settings)
+        field_datasets = pp_budget.field_datasets_from_records(scoped.get("records"))
+        field_notes = {
+            row["id"]: row.get("description", "")
+            for row in (scoped.get("records") or ())
+            if isinstance(row, dict) and isinstance(row.get("id"), str) and row.get("description")
+        }
+        ast_fields, ast_operators = [], []
+        if code and not ml.is_python_language(language):
+            try:
+                program = fastexpr_ast.parse(code)
+                ast_fields = pp_budget.data_fields(program)
+                ast_operators = fastexpr_ast.operator_names(program)
+            except (fastexpr_ast.ParseError, RecursionError):
+                pass
+        need_notes = bool(getattr(args, "idea", None))
+        for field_id in ast_fields:
+            if field_id not in field_datasets or (need_notes and not field_notes.get(field_id)):
+                try:
+                    record = ml.get_datafield(session, field_id)
+                except ml.BrainError:
+                    continue
+                if isinstance(record, dict):
+                    ds = record.get("dataset")
+                    ds_id = ds.get("id") if isinstance(ds, dict) else ds
+                    if isinstance(ds_id, str) and ds_id:
+                        field_datasets[field_id] = ds_id
+                    if isinstance(record.get("description"), str) and record["description"].strip():
+                        field_notes[field_id] = record["description"]
+        operator_notes = {}
+        if need_notes and ast_operators:
+            try:
+                op_catalog = ml.fetch_operators(session)
+                by_name = {
+                    row["name"]: row.get("description", "")
+                    for row in (op_catalog or ())
+                    if isinstance(row, dict) and isinstance(row.get("name"), str)
+                }
+                for op in ast_operators:
+                    if by_name.get(op):
+                        operator_notes[op] = by_name[op]
+            except ml.BrainError:
+                pass
+        draft = None
+        applied = False
+        if need_notes:
+            draft = description.compose(
+                args.idea,
+                ast_fields,
+                ast_operators,
+                field_notes=field_notes,
+                operator_notes=operator_notes,
+                rationale=getattr(args, "rationale", None),
+            )
+            if getattr(args, "apply_description", False):
+                if not draft["ok"]:
+                    raise CliError(
+                        "INVALID_INPUT",
+                        "cannot apply incomplete description: "
+                        + (draft.get("reason") or ", ".join((draft.get("check") or {}).get("errors") or [])),
+                        details={"draft_description": draft},
+                    )
+                payload = ml.set_alpha_metadata(session, args.alpha_id, description=draft["text"])
+                applied = True
+        live = ml.fetch_alpha_checks(session, args.alpha_id, max_wait_seconds=max_wait, on_event=_sink)
+        return payload, live, field_datasets, draft, applied
+
+    payload, live, field_datasets, draft, applied = with_session(args, work)
+    code, current_desc, operator_count = ml.regular_expression(payload)
+    language = ml.alpha_language(payload)
+    settings = payload.get("settings") or {}
+    checked = _check_result(args.alpha_id, live)
+    checks = checked["checks"] or {}
+
+    if checked["complete"]:
+        try:
+            rules_snapshot.record_observed_checks(
+                checks, scope=capabilities.scope_settings(settings)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    research_paths.log_view("alpha readiness", "validation", [args.alpha_id])
+
+    from . import buffer_cmd
+    try:
+        seeds_file = buffer_cmd.seeds_path(args)
+        existing_seeds = buffer_cmd.read_seeds(seeds_file) if seeds_file.exists() else {}
+    except (OSError, ValueError):
+        existing_seeds = {}
+    other_descriptions = [
+        item.get("description", "")
+        for aid, item in existing_seeds.items()
+        if aid != args.alpha_id and isinstance(item.get("description"), str)
+    ]
+    effective_desc = (draft["text"] if draft and draft.get("ok") and not current_desc else current_desc)
+    desc_review = description.check(effective_desc, others=other_descriptions)
+
+    pp_summary = None
+    if code and not ml.is_python_language(language):
+        pp_summary = pp_budget.alpha_budget(
+            code, settings, checks=checks,
+            platform_operator_count=operator_count,
+            field_datasets=field_datasets,
+        )
+
+    track = (getattr(args, "track", None) or (
+        "POWER_POOL" if "POWER_POOL_CORRELATION" in checks else "REGULAR"
+    )).upper()
+
+    blocking = []
+    unknown = []
+    if ml.is_quick_simulation(payload):
+        blocking.append("quick_simulation_mode")
+    summary = summarize_checks(checks)
+    failed_checks = sorted(set(summary["failed"]) - set(summary["errored"]))
+    blocking.extend(f"check:{name}" for name in failed_checks)
+    if not checked["complete"] or not summary["resolved"]:
+        unknown.append("platform_checks_unresolved")
+    missing_meta = [field for field in ("name", "category") if not payload.get(field)]
+    if missing_meta:
+        blocking.extend(f"missing_{field}" for field in missing_meta)
+
+    if track == "POWER_POOL":
+        if pp_summary is None:
+            unknown.append("power_pool_budget_unavailable")
+        else:
+            gates = pp_summary["gates"]
+            for gate_name in gates["blocking"]:
+                tag = f"pp:{gate_name}"
+                if tag not in blocking:
+                    blocking.append(tag)
+            for gate_name in gates["unknown"]:
+                tag = f"pp:{gate_name}"
+                if tag not in unknown:
+                    unknown.append(tag)
+        if not desc_review["ok"]:
+            blocking.append("description_invalid")
+
+    ready = not blocking and not unknown
+    if "quick_simulation_mode" in blocking:
+        next_action = "Rerun the expression in FULL simulation mode before candidate validation."
+    elif draft and draft.get("ok") and not applied and not current_desc:
+        next_action = f"Apply the verified description with `alpha readiness {args.alpha_id} --idea ... --apply-description`."
+    elif missing_meta:
+        next_action = f"Set {', '.join(missing_meta)} with `alpha describe {args.alpha_id}`."
+    elif blocking:
+        next_action = "Resolve blocking checks/gates before promotion or submission."
+    elif unknown:
+        next_action = "Re-run once pending platform checks or unresolved metadata finish."
+    else:
+        next_action = f"Candidate clears live {track} readiness checks; proceed via `promote {args.alpha_id} --selection SELECTION.json`."
+
+    in_sample = payload.get("is") or {}
+    return {
+        "alpha_id": args.alpha_id,
+        "track": track,
+        "ready": ready,
+        "blocking": blocking,
+        "unknown": unknown,
+        "status": payload.get("status"),
+        "name": payload.get("name"),
+        "category": payload.get("category"),
+        "tags": payload.get("tags") or [],
+        "expression": code,
+        "expression_description": current_desc,
+        "metrics": {k: in_sample.get(k) for k in METRIC_KEYS if k in in_sample},
+        "checks_complete": checked["complete"],
+        "checks": checks,
+        "self_correlation": checked["self_correlation"],
+        "production_correlation_evidence": checked["production_correlation_evidence"],
+        "incentives": checked["incentives"],
+        "power_pool_budget": pp_summary,
+        "description_review": desc_review,
+        "draft_description": draft,
+        "description_applied": applied,
+        "next_action": next_action,
+    }
+
+
 def cmd_alpha_describe(args, _sink):
     """Write an alpha's metadata and verify it stuck."""
-    tags = [t.strip() for t in (args.tags or "").split(",") if t.strip()]
-    if not any((args.name, args.category, tags, args.description)):
+    tags = parse_tags(args.tags)
+    color_arg = getattr(args, "color", None)
+    color = ml._UNSET if color_arg is None else (None if color_arg.upper() == "NONE" else color_arg.upper())
+    hidden = True if getattr(args, "hide", False) else (False if getattr(args, "unhide", False) else None)
+    if (args.name is None and args.category is None and not tags
+            and args.description is None and color is ml._UNSET and hidden is None):
         raise CliError("USAGE", "nothing to set",
-                       "pass --name, --category, --tags and/or --description")
+                       "pass --name, --category, --tags, --description, --color, --hide or --unhide")
 
     def work(session):
         return ml.set_alpha_metadata(session, args.alpha_id, name=args.name,
                                      category=args.category,
-                                     tags=tags or None,
-                                     description=args.description)
+                                     tags=tags if tags else None,
+                                     description=args.description,
+                                     color=color,
+                                     hidden=hidden)
 
     current = with_session(args, work)
     data = {
@@ -985,10 +1331,11 @@ def cmd_alpha_describe(args, _sink):
         "name": current.get("name"),
         "category": current.get("category"),
         "tags": current.get("tags"),
+        "color": current.get("color"),
+        "hidden": current.get("hidden"),
         "verified": True,
         "description": (current.get("regular") or {}).get("description"),
-        "note": "name, category and tags are top-level; description is nested under "
-                "`regular`",
+        "note": "name, category, tags, color and hidden are top-level; description is nested under `regular`",
     }
 
     return data

@@ -637,10 +637,27 @@ def cmd_triage(args, _sink):
 
 
 def _cmd_triage(args):
-    ids = list(getattr(args, "ids", None) or [])
+    ids = []
+    for chunk in getattr(args, "ids", None) or []:
+        for part in str(chunk).replace(",", " ").split():
+            if part:
+                ids.append(part)
+    batch_path = getattr(args, "batch", None)
+    for item in getattr(args, "targets", None) or []:
+        if not isinstance(item, str) or not item.strip():
+            continue
+        token = item.strip()
+        if token.lower().endswith(".json") or os.path.isfile(os.path.expanduser(token)):
+            if batch_path and os.path.abspath(os.path.expanduser(batch_path)) != os.path.abspath(os.path.expanduser(token)):
+                raise ValueError("at most one batch file may be triaged at a time")
+            batch_path = token
+        else:
+            for part in token.replace(",", " ").split():
+                if part:
+                    ids.append(part)
     roles = {}
-    if getattr(args, "batch", None):
-        path = os.path.expanduser(args.batch)
+    if batch_path:
+        path = os.path.expanduser(batch_path)
         try:
             with open(path, encoding="utf-8") as handle:
                 document = json.load(handle)
@@ -687,5 +704,5 @@ def _cmd_triage(args):
                     against_shelf=getattr(args, "against_shelf", False),
                     shelf_path=getattr(args, "buffer", None),
                     max_shelf_correlation=getattr(args, "max_shelf_correlation", None),
-                    source_files=[os.path.abspath(path)] if getattr(args, "batch", None) else None)
+                    source_files=[os.path.abspath(path)] if batch_path else None)
     return result

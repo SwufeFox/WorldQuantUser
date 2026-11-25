@@ -17,7 +17,7 @@ import alpha_registry
 
 from . import alphas, buffer_cmd, capabilities, description, pp_budget, rules_snapshot, selection, triage
 from .experiments import _selection_call
-from .runtime import CliError, note, protect_output, with_session
+from .runtime import CliError, note, parse_tags, protect_output, with_session
 
 
 def _finite(value):
@@ -338,8 +338,9 @@ def cmd_promote(args, sink):
         if reasons:
             data["steps"]["buffer"] = {"status": "skipped"}
             return data
+        normalized_tags = parse_tags(getattr(args, "tags", None))
         metadata_required = buffer_cmd.validate_seed(getattr(args, "name", None),
-            getattr(args, "category", None), getattr(args, "tags", None), getattr(args, "description", None))
+            getattr(args, "category", None), normalized_tags, getattr(args, "description", None))
         if metadata_required:
             data.update(outcome="metadata_required", metadata_required=metadata_required)
             data["steps"]["buffer"] = {"status": "blocked", "reason": "seed_metadata_required"}
@@ -378,7 +379,7 @@ def cmd_promote(args, sink):
         buffer_args.buffer, buffer_args.note = args.buffer, args.note
         buffer_args.name = getattr(args, "name", None)
         buffer_args.category = getattr(args, "category", None)
-        buffer_args.tags = getattr(args, "tags", None)
+        buffer_args.tags = normalized_tags
         buffer_args.description = getattr(args, "description", None)
         buffer_args.seeds = getattr(args, "seeds", None)
         buffer_args.cost_bps = cost_bps

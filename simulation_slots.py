@@ -144,8 +144,8 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
     """Release only observed terminal acceptances, retaining their receipts.
 
     ``poll(url)`` supplies an authenticated observation for that exact URL.
-    Age is diagnostic: time passing, a failed read or HTTP 404 cannot prove a
-    live job finished or an ambiguous POST never happened. Network reads run
+    Age and missing receipts are diagnostic. A confirmed HTTP 404 on a verified
+    ordinary acceptance records that the task is gone. Network reads run
     outside the journal lock, and changed reservations are not overwritten.
 
     ``max_age_min`` and ``hard_max_age_min`` retain their compatibility names
@@ -199,7 +199,8 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
             status, alpha = answer, None
             progress = children = None
         status = status.upper() if isinstance(status, str) else None
-        if status == "NOT_FOUND" and not entry.get("quick_job_key"):
+        if (status == "NOT_FOUND" and isinstance(answer, dict)
+                and answer.get("http_status") == 404 and not entry.get("quick_job_key")):
             decisions.append({**item, "kind": "already_gone", "reason": "already_gone",
                               "state": "already_gone",
                               "status": status, "status_code": 404,
@@ -310,6 +311,39 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                 cache_store.write_json_atomic(path, journal)
     return {"released": released, "cancelled": cancelled, "kept": kept,
             "age_diagnostics": age_diagnostics}
+
+
+def cancel_reservation_by_url(account, progress_url, *, state="cancelled", status_code=204):
+    """Release accepted local slot reservations matching a cancelled simulation URL."""
+    fingerprint = _fingerprint(account)
+    if not fingerprint or not isinstance(progress_url, str) or not progress_url:
+        return []
+    path, lock = _paths(fingerprint)
+    stamp = time.time()
+    released_ids = []
+    with cache_store.file_lock(lock):
+        journal = _load(path, fingerprint)
+        reservations = journal.get("reservations") or {}
+        matching = [
+            key for key, entry in reservations.items()
+            if entry.get("progress_url") == progress_url and entry.get("state") == "accepted"
+        ]
+        for key in matching:
+            entry = reservations.pop(key)
+            evidence = {
+                "reason": "explicit_cancel" if state == "cancelled" else state,
+                "progress_url": progress_url,
+                "progress": entry.get("progress"),
+                "last_progress_at": entry.get("last_progress_at"),
+                "status_code": status_code,
+                "cancelled_at": stamp,
+            }
+            entry.update(evidence, state=state, quick_owner=None, cancel_evidence=evidence)
+            journal.setdefault("cancelled", {})[key] = entry
+            released_ids.append(key)
+        if released_ids:
+            cache_store.write_json_atomic(path, journal)
+    return released_ids
 
 
 def _active_limit(journal, limit):

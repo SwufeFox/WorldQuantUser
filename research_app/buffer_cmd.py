@@ -31,7 +31,7 @@ from check_evidence import normalize_checks, summarize_checks
 import machine_lib as ml
 import research_paths
 
-from .runtime import CliError, protect_output, with_session
+from .runtime import CliError, parse_tags, protect_output, with_session
 
 BUFFER_FILENAME = "submit-buffer.jsonl"
 SEEDS_FILENAME = "seeds.jsonl"
@@ -305,8 +305,10 @@ def cmd_buffer_add(args, _sink, *, checked=None):
     if not ml.valid_simulation_id(args.alpha_id):
         raise CliError("INVALID_INPUT", "invalid Alpha ID")
     role = _candidate_role(args)
+    tags = parse_tags(getattr(args, "tags", None))
+    args.tags = tags
     problems = validate_seed(getattr(args, "name", None), getattr(args, "category", None),
-                             getattr(args, "tags", None), getattr(args, "description", None))
+                             tags, getattr(args, "description", None))
     if problems:
         raise CliError("INVALID_INPUT", "seed missing or invalid: " + ", ".join(problems),
                        "supply name, category, at least one tag, and a >=100 character description")

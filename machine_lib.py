@@ -447,6 +447,93 @@ def invalidate_session(cache_path=None):
     return cache_store.remove(Path(cache_path or session_cache_path()))
 
 
+def logout_session(s=None, *, cache_path=None, remote=False):
+    """Forget the local session cache and optionally revoke it via ``DELETE /authentication``."""
+    from requests.exceptions import RequestException
+
+    target = Path(cache_path or session_cache_path())
+    remote_session = s
+    if remote and remote_session is None:
+        entry = cache_store.read_entry(target)
+        payload = entry.get("payload")
+        if (entry.get("present") and entry.get("kind") == "brain-session"
+                and isinstance(payload, dict) and isinstance(payload.get("cookies"), dict)
+                and payload["cookies"]):
+            remote_session = _session_from_entry(payload, None)
+    remote_attempted = False
+    remote_revoked = False
+    status_code = None
+    remote_error = None
+    if remote and remote_session is not None:
+        remote_attempted = True
+        try:
+            response = remote_session.delete(BRAIN_API_URL + "/authentication", timeout=10.0)
+            status_code = response.status_code
+            remote_revoked = status_code in (200, 202, 204, 401)
+        except RequestException as exc:
+            remote_error = type(exc).__name__
+    removed = invalidate_session(target)
+    result = {
+        "logged_out": removed,
+        "remote_attempted": remote_attempted,
+        "remote_revoked": remote_revoked,
+        "http_status": status_code,
+        "session_path": str(target),
+    }
+    if remote_error:
+        result["remote_error"] = remote_error
+    return result
+
+
+def fetch_user_profile(s, *, deadline=None):
+    """Fetch the authenticated user's BRAIN profile (``GET /users/self``)."""
+    limits = {} if deadline is None else {"deadline": deadline}
+    payload = request_json(s, "GET", "/users/self", **limits)
+    if not isinstance(payload, dict):
+        raise ServiceError("user profile returned a non-object payload")
+    return payload
+
+
+def fetch_competitions(s, *, mine=True, competition_id=None, deadline=None):
+    """Fetch enrolled competitions, all platform challenges, or one competition's details."""
+    limits = {} if deadline is None else {"deadline": deadline}
+    if competition_id is not None:
+        if not isinstance(competition_id, str) or not competition_id.strip():
+            raise ValueError("competition_id must be a nonempty string")
+        payload = request_json(
+            s, "GET", "/competitions/" + quote(competition_id.strip(), safe=""), **limits
+        )
+        if not isinstance(payload, dict):
+            raise ServiceError("competition detail returned a non-object payload")
+        return payload
+    path = "/users/self/competitions" if mine else "/competitions"
+    payload = request_json(s, "GET", path, **limits)
+    return _as_results(payload, "competitions")
+
+
+def fetch_user_surface(s, path, *, deadline=None):
+    """Read an account surface while distinguishing ``available``, ``level_gated`` and ``absent``."""
+    if not isinstance(path, str) or not path.startswith("/"):
+        raise ValueError("path must start with '/'")
+    limits = {} if deadline is None else {"deadline": deadline}
+    try:
+        payload = request_json(s, "GET", path, **limits)
+    except PermissionDenied:
+        return {"path": path, "state": "level_gated", "http_status": 403, "data": None}
+    except NotFound:
+        return {"path": path, "state": "absent", "http_status": 404, "data": None}
+    return {"path": path, "state": "available", "http_status": 200, "data": payload}
+
+
+def fetch_consultant_summary(s, *, deadline=None):
+    """Inspect level-gated consultant, pyramid and activity surfaces without failing on HTTP 403/404."""
+    return {
+        "consultant": fetch_user_surface(s, "/users/self/consultant", deadline=deadline),
+        "pyramids": fetch_user_surface(s, "/users/self/pyramids", deadline=deadline),
+        "activities": fetch_user_surface(s, "/users/self/activities", deadline=deadline),
+    }
+
+
 def login_lock_timeout():
     """Seconds a caller waits for another process to finish authentication."""
     try:
@@ -804,7 +891,7 @@ def _as_results(payload, *keys):
             value = payload.get(key)
             if isinstance(value, list):
                 return value
-        for key in ("results", "operators", "categories", "data-sets", "datafields"):
+        for key in ("results", "operators", "categories", "data-sets", "datafields", "competitions"):
             value = payload.get(key)
             if isinstance(value, list):
                 return value
@@ -1020,6 +1107,36 @@ def search_datafield(s, field, scope, *, deadline):
     return {"matches": [row for row in rows if row.get("id") == field],
             "returned_count": len(rows), "reported_count": count,
             "complete": count == len(rows) and not bool(payload.get("next"))}
+
+
+def get_dataset(s, dataset_id, *, refresh=None, report=None, deadline=None):
+    """Fetch one dataset's metadata directly via ``GET /data-sets/{id}`` (cached per account)."""
+    if not isinstance(dataset_id, str) or not dataset_id.strip():
+        raise ValueError("dataset_id must be a nonempty string")
+    clean_id = dataset_id.strip()
+    limits = {} if deadline is None else {"deadline": deadline}
+    return _cached_account_catalog(
+        s, "dataset", {"id": clean_id},
+        lambda session: request_json(
+            session, "GET", "/data-sets/" + quote(clean_id, safe=""), **limits
+        ),
+        refresh, report,
+    )
+
+
+def get_datafield(s, field_id, *, refresh=None, report=None, deadline=None):
+    """Fetch one datafield's metadata directly via ``GET /data-fields/{id}`` (cached per account)."""
+    if not isinstance(field_id, str) or not field_id.strip():
+        raise ValueError("field_id must be a nonempty string")
+    clean_id = field_id.strip()
+    limits = {} if deadline is None else {"deadline": deadline}
+    return _cached_account_catalog(
+        s, "datafield", {"id": clean_id},
+        lambda session: request_json(
+            session, "GET", "/data-fields/" + quote(clean_id, safe=""), **limits
+        ),
+        refresh, report,
+    )
 
 
 def field_ids(fields, field_type=None, search=""):
@@ -1350,6 +1467,53 @@ def _read_simulation_snapshot(s, url, simulation_id, *, deadline):
     return payload, retry_after
 
 
+def cancel_simulation(s, reference, *, deadline=None):
+    """Cancel a running BRAIN simulation via ``DELETE /simulations/{id}`` and release its local slot."""
+    from requests.exceptions import RequestException
+    import simulation_capabilities
+    import simulation_slots
+
+    simulation_id = simulation_reference_id(reference)
+    url = f"{BRAIN_API_URL}/simulations/{simulation_id}"
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ServiceError("simulation cancellation wait budget expired")
+    try:
+        response = s.delete(url, timeout=_request_timeout(deadline), allow_redirects=False)
+    except RequestException as exc:
+        raise ServiceError("simulation cancellation request failed") from exc
+    status = response.status_code
+    if status in (401, 403):
+        raise AuthError("BRAIN denied simulation cancellation (HTTP %s)" % status)
+    if status in (200, 204):
+        state = "cancelled"
+    elif status == 202:
+        state = "cancellation_pending"
+    elif status == 404:
+        state = "already_gone"
+    elif status == 429:
+        retry_after = _retry_after_seconds(response, cap_error_wait=False)
+        raise RateLimited(
+            "simulation cancellation rate limited",
+            retry_after=retry_after if math.isfinite(retry_after) and retry_after > 0 else None,
+        )
+    else:
+        raise ServiceError("simulation cancellation returned HTTP %s" % status)
+
+    released_slots = []
+    if state != "cancellation_pending":
+        released_slots = simulation_slots.cancel_reservation_by_url(
+            simulation_capabilities.account_provenance(s), url, state=state, status_code=status
+        )
+    return {
+        "simulation_id": simulation_id,
+        "url": url,
+        "state": state,
+        "cancelled": state == "cancelled",
+        "http_status": status,
+        "released_reservations": released_slots,
+    }
+
+
 def simulation_progress_receipt(response, body, simulation_id):
     """Return a terminal snapshot that belongs to the requested simulation."""
     import simulation_slots
@@ -1407,7 +1571,7 @@ def recover_accepted_slots(s, account, *, deadline=None):
         except AuthError:
             raise
         except NotFound:
-            answer = "NOT_FOUND"
+            answer = {"status": "NOT_FOUND", "http_status": 404}
         except Exception:
             answer = None
         else:
@@ -3302,7 +3466,10 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
 
 def list_alphas(s, limit=100, offset=0, order="-is.sharpe", status="UNSUBMITTED",
                 region=None, universe=None, min_sharpe=None, min_fitness=None,
-                alpha_type_not="SUPER", hidden=False, search=None, *, deadline=None):
+                alpha_type_not="SUPER", hidden=False, search=None, *,
+                delay=None, instrument_type=None, category=None, color=None,
+                tag=None, max_turnover=None, date_created_from=None,
+                date_created_to=None, date_submitted_from=None, deadline=None):
     """List the account's own alphas (``GET /users/self/alphas``) as ``list[dict]``.
 
     Metadata only: this never re-simulates anything and consumes no quota.
@@ -3329,10 +3496,28 @@ def list_alphas(s, limit=100, offset=0, order="-is.sharpe", status="UNSUBMITTED"
         params["settings.region"] = region
     if universe:
         params["settings.universe"] = universe
+    if delay is not None:
+        params["settings.delay"] = int(delay)
+    if instrument_type:
+        params["settings.instrumentType"] = instrument_type
+    if category:
+        params["category"] = category
+    if color:
+        params["color"] = color
+    if tag:
+        params["tag"] = tag
     if min_sharpe is not None:
         params["is.sharpe>"] = min_sharpe
     if min_fitness is not None:
         params["is.fitness>"] = min_fitness
+    if max_turnover is not None:
+        params["is.turnover<"] = max_turnover
+    if date_created_from:
+        params["dateCreated>="] = date_created_from
+    if date_created_to:
+        params["dateCreated<"] = date_created_to
+    if date_submitted_from:
+        params["dateSubmitted>="] = date_submitted_from
     if search:
         params["search"] = search
     limits = {} if deadline is None else {"deadline": deadline}
@@ -3389,21 +3574,17 @@ def extract_split(payload):
 #: API: an invalid value returns 400 without listing the choices, so the set is
 #: assembled from what is accepted.
 ALPHA_CATEGORIES = ("ANALYST", "FUNDAMENTAL", "PRICE_VOLUME", "SENTIMENT", "VOLUME")
+ALPHA_COLORS = ("RED", "YELLOW", "GREEN", "BLUE", "PURPLE")
+_UNSET = object()
 
 
 def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None,
-                       description=None):
+                       description=None, *, color=_UNSET, hidden=None):
     """Set an alpha's writable metadata and return the updated payload.
 
-    ``name``, ``category`` and ``tags`` are top-level properties; ``tags`` must be a
-    list, not a string.
-
-    ``description`` is writable too, but **nested under ``regular``** - the payload is
-    ``{"regular": {"description": ...}}``. This was missed for a long time on the
-    strength of eighteen *top-level* spellings all answering "Unexpected property", and
-    the wrong conclusion ("description does not exist") was written down here. Reading
-    another project's client showed the nested shape; a PATCH with it returns 200 and the
-    text reads back. The lesson is about the shape of a payload, not about the field.
+    ``name``, ``category``, ``tags``, ``color`` and ``hidden`` are top-level properties;
+    ``tags`` must be a list, not a string. ``description`` is nested under ``regular``
+    (``{"regular": {"description": ...}}``).
 
     The update is verified by re-reading rather than trusting the PATCH status, for
     the same reason a submission is verified by ``dateSubmitted``: this API answers
@@ -3421,6 +3602,19 @@ def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None,
         payload["tags"] = list(tags)
     if description is not None:
         payload["regular"] = {"description": str(description)}
+    if color is not _UNSET:
+        if color is None or (isinstance(color, str) and color.strip().upper() == "NONE"):
+            payload["color"] = None
+        else:
+            normalized_color = str(color).strip().upper()
+            if normalized_color not in ALPHA_COLORS:
+                raise ValueError("color must be one of %s or None, got %r"
+                                 % (", ".join(ALPHA_COLORS), color))
+            payload["color"] = normalized_color
+    if hidden is not None:
+        if not isinstance(hidden, bool):
+            raise ValueError("hidden must be a boolean")
+        payload["hidden"] = hidden
     if not payload:
         raise ValueError("nothing to update")
 
@@ -3445,7 +3639,128 @@ def set_alpha_metadata(s, alpha_id, name=None, category=None, tags=None,
         raise ServiceError("metadata did not stick: %s" % ", ".join(mismatched))
     return current
 
-def fetch_self_correlation(s, alpha_id, tries=6, max_wait=5.0):
+
+_CORRELATION_KINDS = ("self", "prod", "power-pool")
+
+
+def _fetch_alpha_correlation_endpoint(
+    s, alpha_id, kind, *, max_wait_seconds=60.0, max_step_wait=None,
+    max_attempts=None, on_event=None
+):
+    """Poll ``GET /alphas/{id}/correlations/{kind}`` until ready or budget expires."""
+    from requests.exceptions import RequestException
+
+    if not valid_simulation_id(alpha_id):
+        raise ValueError("invalid Alpha ID")
+    if kind not in _CORRELATION_KINDS:
+        raise ValueError("correlation kind must be one of %s" % (", ".join(_CORRELATION_KINDS),))
+    if (isinstance(max_wait_seconds, bool) or not isinstance(max_wait_seconds, (int, float))
+            or not math.isfinite(max_wait_seconds) or max_wait_seconds < 0):
+        raise ValueError("max_wait_seconds must be a finite, non-negative number")
+
+    url = f"{BRAIN_API_URL}/alphas/{alpha_id}/correlations/{kind}"
+    deadline = time.monotonic() + max_wait_seconds
+    attempt = 0
+    last_status = None
+    last_retry_after = None
+
+    while True:
+        attempt += 1
+        try:
+            response = s.get(
+                url,
+                timeout=_request_timeout(deadline if max_wait_seconds > 0 else None),
+            )
+        except RequestException as exc:
+            raise ReadInterrupted(
+                f"{kind} correlation read failed ({type(exc).__name__})"
+            ) from exc
+
+        status = getattr(response, "status_code", 200)
+        last_status = status
+        if status == 401:
+            raise AuthError(f"BRAIN rejected the session (HTTP 401) for {kind} correlation")
+        if status == 403:
+            raise PermissionDenied(
+                f"BRAIN denied access (HTTP 403) to {kind} correlation for {alpha_id}"
+            )
+        if status == 404:
+            raise NotFound(f"alpha {alpha_id} or {kind} correlation not found")
+
+        headers = getattr(response, "headers", None) or {}
+        raw_retry = headers.get("Retry-After")
+        if raw_retry is None:
+            retry_after = 0.0
+        else:
+            retry_after = _retry_after_seconds(response, cap_error_wait=False)
+            if not math.isfinite(retry_after):
+                raise ServiceError(f"{kind} correlation returned an invalid Retry-After")
+        last_retry_after = retry_after
+
+        if status == 429 and retry_after <= 0:
+            raise RateLimited(f"{kind} correlation for {alpha_id} is rate limited")
+        if not 200 <= status < 300 and status not in (429, 503):
+            raise ServiceError(f"HTTP {status} fetching {kind} correlation for {alpha_id}")
+
+        body_text = getattr(response, "text", "") or ""
+        if 200 <= status < 300 and retry_after <= 0 and body_text.strip():
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                raise ServiceError(f"{kind} correlation returned non-JSON") from exc
+            if not isinstance(payload, dict):
+                raise ServiceError(f"{kind} correlation returned a non-object payload")
+            raw_bytes = getattr(response, "content", None)
+            if not isinstance(raw_bytes, (bytes, bytearray)):
+                raw_bytes = body_text.encode("utf-8")
+            return {
+                "alpha_id": alpha_id,
+                "kind": kind,
+                "source": f"GET /alphas/{alpha_id}/correlations/{kind}",
+                "captured_at": datetime.now(timezone.utc).isoformat(),
+                "http_status": status,
+                "response_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                "schema": payload.get("schema"),
+                "max": payload.get("max"),
+                "min": payload.get("min"),
+                "records": payload.get("records") or [],
+                "raw_json_response": payload,
+            }
+
+        if max_attempts is not None and attempt >= max_attempts:
+            break
+        if max_wait_seconds <= 0 or time.monotonic() >= deadline:
+            break
+        wait = retry_after if retry_after > 0 else 2.0
+        if max_step_wait is not None:
+            wait = min(wait, max_step_wait)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        wait = min(wait, remaining) if max_step_wait is not None else wait
+        if wait > remaining:
+            break
+        if on_event:
+            on_event({
+                "event": "correlation_pending",
+                "alpha_id": alpha_id,
+                "kind": kind,
+                "retry_after_seconds": wait,
+            })
+        time.sleep(wait)
+
+    if last_status == 429:
+        raise RateLimited(
+            f"{kind} correlation for {alpha_id} exceeded its wait budget",
+            retry_after=last_retry_after if last_retry_after and last_retry_after > 0 else None,
+        )
+    if max_attempts is not None:
+        raise ServiceError(f"{kind}-correlation stayed empty after {max_attempts} attempts")
+    raise ServiceError(f"{kind}-correlation stayed pending or empty for {alpha_id}")
+
+
+def fetch_self_correlation(s, alpha_id, tries=6, max_wait=5.0, *,
+                           max_wait_seconds=None, on_event=None):
     """Return the platform's own self-correlation view for one alpha.
 
     The counterpart's Sharpe determines whether the substitute route clears its
@@ -3455,26 +3770,113 @@ def fetch_self_correlation(s, alpha_id, tries=6, max_wait=5.0):
     header. That means "not now", not "no data": reading it as absence silently
     reports an alpha as uncorrelated. The response is retried while the body is blank.
     """
-    deadline = time.monotonic() + max_wait * tries
-    for _ in range(tries):
-        response = s.get(BRAIN_API_URL + "/alphas/" + alpha_id + "/correlations/self",
-                         timeout=_request_timeout(None))
-        if response.text.strip():
-            payload = response.json()
-            return {
-                "alpha_id": alpha_id,
-                "max": payload.get("max"),
-                "min": payload.get("min"),
-                "records": payload.get("records") or [],
-            }
-        if time.monotonic() > deadline:
-            break
-        try:
-            wait = float(response.headers.get("Retry-After", 2) or 2)
-        except (TypeError, ValueError):
-            wait = 2.0
-        time.sleep(min(wait, max_wait))
-    raise ServiceError("self-correlation stayed empty after %d attempts" % tries)
+    if max_wait_seconds is None:
+        capture = _fetch_alpha_correlation_endpoint(
+            s, alpha_id, "self",
+            max_wait_seconds=max(0.0, float(max_wait) * int(tries)),
+            max_step_wait=float(max_wait),
+            max_attempts=int(tries),
+            on_event=on_event,
+        )
+    else:
+        capture = _fetch_alpha_correlation_endpoint(
+            s, alpha_id, "self",
+            max_wait_seconds=max_wait_seconds,
+            on_event=on_event,
+        )
+    return {
+        "alpha_id": alpha_id,
+        "max": capture["max"],
+        "min": capture["min"],
+        "records": capture["records"],
+        "schema": capture["schema"],
+        "captured_at": capture["captured_at"],
+    }
+
+
+def fetch_prod_correlation(s, alpha_id, *, max_wait_seconds=60.0, on_event=None):
+    """Fetch production correlation histogram/records via ``GET /alphas/{id}/correlations/prod``."""
+    return _fetch_alpha_correlation_endpoint(
+        s, alpha_id, "prod", max_wait_seconds=max_wait_seconds, on_event=on_event
+    )
+
+
+def build_prod_correlation_archive(alpha_id, capture):
+    """Package a ``fetch_prod_correlation`` capture into the ``--pc-distribution`` archive contract."""
+    if not valid_simulation_id(alpha_id):
+        raise ValueError("invalid Alpha ID")
+    if not isinstance(capture, dict) or not isinstance(capture.get("raw_json_response"), dict):
+        raise ValueError("capture must contain raw_json_response from fetch_prod_correlation")
+    return {
+        "source": "GET /alphas/{id}/correlations/prod",
+        "requested_ids": [alpha_id],
+        "results": {
+            alpha_id: [{
+                "captured_at": capture["captured_at"],
+                "http_status": capture.get("http_status", 200),
+                "retry_after": capture.get("retry_after"),
+                "response_sha256": capture.get("response_sha256"),
+                "raw_json_response": capture["raw_json_response"],
+            }],
+        },
+    }
+
+
+def fetch_power_pool_correlation(s, alpha_id, *, max_wait_seconds=60.0, on_event=None):
+    """Fetch Power Pool correlation detail via ``GET /alphas/{id}/correlations/power-pool``."""
+    return _fetch_alpha_correlation_endpoint(
+        s, alpha_id, "power-pool", max_wait_seconds=max_wait_seconds, on_event=on_event
+    )
+
+
+def power_pool_correlation_verdict(payload, limit=0.5):
+    """Evaluate Power Pool correlation against its strict ``< limit`` ceiling (default 0.5)."""
+    records = payload.get("records") or []
+    max_corr = payload.get("max")
+    max_valid = type(max_corr) in (int, float) and math.isfinite(max_corr)
+    counterparts = []
+    bins_at_or_above = 0
+    is_histogram = bool(
+        records and all(
+            isinstance(row, (list, tuple)) and len(row) == 3
+            and type(row[0]) in (int, float) and type(row[1]) in (int, float)
+            and type(row[2]) is int
+            for row in records
+        )
+    )
+    if is_histogram:
+        bins_at_or_above = sum(
+            row[2] for row in records if row[0] >= limit or (row[1] > limit and row[2] > 0 and max_valid and max_corr >= limit)
+        )
+    else:
+        for row in records:
+            if (isinstance(row, (list, tuple)) and len(row) > 5
+                    and type(row[5]) in (int, float) and math.isfinite(row[5])
+                    and abs(row[5]) >= limit):
+                counterparts.append({
+                    "alpha_id": row[0],
+                    "name": row[1] if len(row) > 1 else None,
+                    "correlation": row[5],
+                    "sharpe": row[6] if len(row) > 6 else None,
+                })
+    known = bool(records) or max_valid
+    blocked = bool(counterparts) or bins_at_or_above > 0 or (max_valid and abs(max_corr) >= limit)
+    if not known:
+        reason = "no Power Pool correlation records: not scored yet"
+    elif blocked:
+        reason = "Power Pool correlation at or above limit (< %g required)" % limit
+    else:
+        reason = "Power Pool correlation strictly below limit"
+    return {
+        "blocked": blocked,
+        "known": known,
+        "limit": limit,
+        "max_correlation": max_corr if max_valid else None,
+        "records": len(records),
+        "counterparts": counterparts,
+        "bins_at_or_above_limit": bins_at_or_above if is_histogram else None,
+        "reason": reason,
+    }
 
 
 def self_correlation_verdict(payload, limit=0.7, sharpe_margin=1.10):
@@ -3517,3 +3919,155 @@ def self_correlation_verdict(payload, limit=0.7, sharpe_margin=1.10):
         ],
         "sharpe_needed": round(needed, 4) if needed else None,
     }
+
+
+class BrainClient:
+    """Ergonomic, session-managed Python facade for WorldQuant BRAIN.
+
+    Lazily loads the account-bound session cache on first network access and
+    automatically refreshes once if BRAIN rejects an expired session cookie.
+    Offline calls such as ``simulate(..., dry_run=True)`` never touch the network.
+    """
+
+    def __init__(self, session=None, *, cache_path=None, use_cache=True, refresh=False):
+        self._session = session
+        self._external_session = session is not None
+        self._cache_path = cache_path
+        self._use_cache = use_cache
+        self._refresh = refresh
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        self.close()
+        return False
+
+    def close(self):
+        if self._session is not None and not self._external_session:
+            close_fn = getattr(self._session, "close", None)
+            if callable(close_fn):
+                close_fn()
+            self._session = None
+
+    @property
+    def session(self):
+        if self._session is None:
+            self._session = load_session(
+                cache_path=self._cache_path,
+                use_cache=self._use_cache,
+                refresh=self._refresh,
+            )
+            self._refresh = False
+        return self._session
+
+    def _call(self, fn, *args, **kwargs):
+        retried = False
+        while True:
+            try:
+                return fn(self.session, *args, **kwargs)
+            except AuthError as exc:
+                if retried or self._external_session or exc.code != "AUTH_FAILED":
+                    raise
+                retried = True
+                self._session = load_session(
+                    cache_path=self._cache_path, use_cache=False, refresh=True
+                )
+
+    def _catalog_access(self):
+        if self._external_session:
+            return self._session
+        return CatalogAccess(configured_username(), lambda work: self._call(work))
+
+    # --- Account & session ---
+    def profile(self, *, deadline=None):
+        return self._call(fetch_user_profile, deadline=deadline)
+
+    def competitions(self, *, mine=True, competition_id=None, deadline=None):
+        return self._call(
+            fetch_competitions, mine=mine, competition_id=competition_id, deadline=deadline
+        )
+
+    def consultant(self, *, deadline=None):
+        return self._call(fetch_consultant_summary, deadline=deadline)
+
+    def logout(self, *, remote=False):
+        result = logout_session(
+            self._session, cache_path=self._cache_path, remote=remote
+        )
+        self.close()
+        return result
+
+    # --- Catalog ---
+    def datasets(self, **kwargs):
+        return get_datasets(self._catalog_access(), **kwargs)
+
+    def dataset(self, dataset_id, **kwargs):
+        return get_dataset(self._catalog_access(), dataset_id, **kwargs)
+
+    def fields(self, dataset_id="", **kwargs):
+        return get_datafields(self._catalog_access(), dataset_id=dataset_id, **kwargs)
+
+    def field(self, field_id, **kwargs):
+        return get_datafield(self._catalog_access(), field_id, **kwargs)
+
+    def operators(self, search="", group="", **kwargs):
+        return self._call(fetch_operators, search=search, group=group, **kwargs)
+
+    def operator_doc(self, name, **kwargs):
+        return self._call(fetch_operator_doc, name, **kwargs)
+
+    def categories(self, **kwargs):
+        return fetch_data_categories(self._catalog_access(), **kwargs)
+
+    # --- Simulation ---
+    def simulate(self, expressions, settings=None, *, mode=None, dry_run=False, **kwargs):
+        items = [expressions] if isinstance(expressions, (str, dict)) else list(expressions)
+        merged = dict(settings or {})
+        if mode is not None:
+            merged["simulationMode"] = str(mode).upper()
+        resolved = resolve_settings(merged)
+        if dry_run:
+            return simulate_alphas(None, items, resolved, dry_run=True, **kwargs)
+        return self._call(simulate_alphas, items, resolved, dry_run=False, **kwargs)
+
+    def simulate_one(self, expression, settings=None, *, mode=None, dry_run=False, **kwargs):
+        rows = self.simulate([expression], settings=settings, mode=mode, dry_run=dry_run, **kwargs)
+        return rows[0] if rows else None
+
+    def cancel_simulation(self, reference, *, deadline=None):
+        return self._call(cancel_simulation, reference, deadline=deadline)
+
+    # --- Alphas & correlations ---
+    def alphas(self, **kwargs):
+        return self._call(list_alphas, **kwargs)
+
+    def alpha(self, alpha_id, **kwargs):
+        return self._call(fetch_alpha_metrics, alpha_id, **kwargs)
+
+    def pnl(self, alpha_id, **kwargs):
+        return self._call(fetch_daily_pnl, alpha_id, **kwargs)
+
+    def recordsets(self, alpha_id, names=(), **kwargs):
+        return self._call(fetch_alpha_recordsets, alpha_id, names=names, **kwargs)
+
+    def performance(self, alpha_id, **kwargs):
+        return self._call(fetch_merged_performance, alpha_id, **kwargs)
+
+    def check(self, alpha_id, **kwargs):
+        return self._call(fetch_alpha_checks, alpha_id, **kwargs)
+
+    def self_corr(self, alpha_id, **kwargs):
+        return self._call(fetch_self_correlation, alpha_id, **kwargs)
+
+    def prod_corr(self, alpha_id, **kwargs):
+        return self._call(fetch_prod_correlation, alpha_id, **kwargs)
+
+    def pp_corr(self, alpha_id, **kwargs):
+        return self._call(fetch_power_pool_correlation, alpha_id, **kwargs)
+
+    def describe(self, alpha_id, **kwargs):
+        return self._call(set_alpha_metadata, alpha_id, **kwargs)
+
+    def submit(self, alpha_id, confirm=False, **kwargs):
+        return self._call(submit_alpha, alpha_id, confirm=confirm, **kwargs)

@@ -55,7 +55,23 @@ ERROR_CODES = {
 METRIC_KEYS = ("sharpe", "fitness", "turnover", "returns", "drawdown", "margin",
                "longCount", "shortCount", "pnl")
 _PROTECTED_OUTPUT_ARGS = ("freeze", "selection", "batch_path", "checkpoint", "resume", "recover", "emit",
-                          "review_receipt", "pc_distribution", "seeds")
+                          "review_receipt", "pc_distribution", "seeds", "save_archive")
+
+
+def parse_tags(raw):
+    """Normalize comma- or space-separated tag arguments into a deduplicated list."""
+    if raw is None:
+        return None
+    items = [raw] if isinstance(raw, str) else raw
+    if not isinstance(items, (list, tuple)) or any(not isinstance(tag, str) for tag in items):
+        raise CliError("INVALID_INPUT", "tags must be text")
+    tags = []
+    for chunk in items:
+        for part in chunk.replace(",", " ").split():
+            cleaned = part.strip()
+            if cleaned and cleaned not in tags:
+                tags.append(cleaned)
+    return tags
 
 
 class CliError(Exception):
@@ -176,10 +192,28 @@ def with_session(args, work, *, deadline=None):
     return session_reader(args, deadline=deadline)(work)
 
 
+def _looks_like_inline_expression(value):
+    """True when a positional argument is an inline FASTEXPR snippet rather than a file path."""
+    if not isinstance(value, str) or not value or value == "-":
+        return False
+    if "/" in value.partition("(")[0] or "\\" in value:
+        return False
+    if value.lower().endswith((".json", ".jsonl", ".py", ".txt", ".spec")):
+        return False
+    if "(" not in value or ")" not in value:
+        return False
+    try:
+        return not Path(value).exists()
+    except OSError:
+        return True
+
+
 def collect_alphas(args, metadata=None):
     """Merge inputs in order, optionally collecting research-file side metadata."""
     file_settings, alphas = {}, []
-    paths = ([args.file] if getattr(args, "file", None) else [])
+    raw_file = getattr(args, "file", None)
+    inline_file_expr = raw_file if _looks_like_inline_expression(raw_file) else None
+    paths = ([raw_file] if raw_file and inline_file_expr is None else [])
     paths.extend(getattr(args, "files", None) or [])
     if sum(str(path) == "-" for path in paths) > 1:
         raise CliError("INVALID_INPUT", "stdin (-) may be read only once")
@@ -196,6 +230,8 @@ def collect_alphas(args, metadata=None):
                     metadata[key] = payload[key]
         file_settings.update(settings)
         alphas.extend(entries)
+    if inline_file_expr is not None:
+        alphas.append(inline_file_expr)
     if getattr(args, "expression", None) is not None:
         alphas.append(args.expression)
     expressions = getattr(args, "expr", None)
@@ -203,7 +239,7 @@ def collect_alphas(args, metadata=None):
         alphas.extend([expressions] if isinstance(expressions, str) else expressions)
     if not alphas:
         raise CliError("USAGE", "no expressions supplied",
-                       "pass a research file, --file, or at least one --expr")
+                       "pass an inline expression, a research file, --file, or --expr")
     return file_settings, alphas
 
 
@@ -225,6 +261,10 @@ def merge_settings(file_settings, args):
         "nanHandling": getattr(args, "nan_handling", None),
         "testPeriod": getattr(args, "test_period", None),
     }
+    if getattr(args, "quick_mode", False):
+        named["simulationMode"] = "QUICK"
+    elif getattr(args, "full_mode", False):
+        named["simulationMode"] = "FULL"
     explicit = {key: value for key, value in named.items() if value is not None}
     for key, value in getattr(args, "setting", None) or ():
         try:

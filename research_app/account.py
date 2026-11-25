@@ -147,13 +147,66 @@ def cmd_auth_check(args, _sink):
 
 
 def cmd_auth_logout(args, _sink):
-    """Forget the cached session. Does not revoke it server-side."""
+    """Forget the cached session, and optionally revoke it on BRAIN."""
+    if getattr(args, "remote", False):
+        result = ml.logout_session(remote=True)
+        result["note"] = (
+            "Revoked the BRAIN session server-side and cleared the local cache."
+            if result.get("remote_revoked")
+            else "Cleared the local session cache; no active remote session was revoked."
+        )
+        return result
     removed = ml.invalidate_session()
     return {
         "logged_out": removed,
         "session_path": str(ml.session_cache_path()),
-        "note": ("Removed only the local cookie cache; the BRAIN session itself "
-                 "stays valid until it expires server-side."),
+        "note": ("Removed only the local cookie cache; pass --remote to also "
+                 "revoke the session server-side via DELETE /authentication."),
+    }
+
+
+def cmd_auth_profile(args, _sink):
+    """Read the authenticated user's profile and optional consultant/pyramid surfaces."""
+    from .runtime import with_session
+
+    deadline = time.monotonic() + DIAGNOSTIC_SECONDS
+
+    def work(session):
+        profile = ml.fetch_user_profile(session, deadline=deadline)
+        surfaces = (
+            ml.fetch_consultant_summary(session, deadline=deadline)
+            if getattr(args, "consultant", False)
+            else None
+        )
+        return profile, surfaces
+
+    profile, surfaces = with_session(args, work, deadline=deadline)
+    result = {"profile": profile}
+    if surfaces is not None:
+        result["surfaces"] = surfaces
+    return result
+
+
+def cmd_auth_competitions(args, _sink):
+    """List enrolled competitions, all platform challenges, or one competition's details."""
+    from .runtime import with_session
+
+    deadline = time.monotonic() + DIAGNOSTIC_SECONDS
+    competition_id = getattr(args, "competition_id", None)
+    mine = not getattr(args, "all", False)
+    payload = with_session(
+        args,
+        lambda session: ml.fetch_competitions(
+            session, mine=mine, competition_id=competition_id, deadline=deadline
+        ),
+        deadline=deadline,
+    )
+    if competition_id is not None:
+        return {"competition_id": competition_id, "competition": payload}
+    return {
+        "scope": "enrolled" if mine else "all",
+        "count": len(payload),
+        "competitions": payload,
     }
 
 
@@ -167,8 +220,10 @@ PROBE_PATHS = (
     ("/leaderboards", "leaderboard (expected 404)"),
     ("/users/self/competitions", "own competitions, where your rank lives"),
     ("/alphas/{alpha}/correlations/prod", "production correlation detail (level-gated)"),
+    ("/alphas/{alpha}/correlations/power-pool", "Power Pool correlation detail"),
     ("/alphas/{alpha}/recordsets/daily-pnl", "daily PnL recordset"),
     ("/users/self/consultant", "consultant surface (level-gated)"),
+    ("/users/self", "authenticated user profile"),
 )
 
 

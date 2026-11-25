@@ -17,6 +17,14 @@ python3 research_cli.py help catalog fields   # 具体任务的参数和例子
 python3 research_cli.py schema alpha get      # 单个命令的机器契约
 ```
 
+常用简写直接减少样板参数：
+- **账户与竞赛**：`auth profile --consultant`（读取 `/users/self` 与顾问/Pyramid 端面）、`auth competitions [--all | --id ID]`、`auth logout --remote`（同时发送 `DELETE /authentication` 吊销服务端会话）。
+- **目录直查**：`catalog fields fundamental6`（位置参数直传数据集）、`catalog dataset DATASET_ID`、`catalog field FIELD_ID`（单次请求返回字段元数据与可直接粘贴的 FASTEXPR 包装）。
+- **模拟与取消**：`simulate "rank(close)" --quick --dry-run`（位置参数直传单条表达式，`--quick` / `--full` 快捷切换 `simulationMode`，`probe` 同样支持）、`alpha cancel-sim SIM_ID`（调用 `DELETE /simulations/{id}`，收到终态回执后释放本地共享槽位）。
+- **筛选与相关性**：`triage BATCH.json` 或 `triage A1 A2`、`alpha near "rank(close)"`、`alpha get ID --correlations`、`alpha prod-corr ID --save-archive pc.json`、`alpha pp-corr ID`。
+- **一站式就绪检查与描述生成**：`alpha readiness ID [--track POWER_POOL] [--idea "..." --apply-description]` 自动拉取实时检查、字段/算子目录释义、核验 Power Pool 预算并合成符合规范的 `IDEA / DATA / RATIONALE` 描述。
+- **Python 调用门面**：脚本或 Notebook 直接使用 `with machine_lib.BrainClient() as brain:`，按需加载缓存会话并在遇到过期 401 时自动重登一次。
+
 常用路径是 `catalog` 找数据、`lint` 检查表达式、`simulate` / `probe`
 先 `--dry-run` 再运行、`compare` 看结果。平台 alpha 读写在 `alpha`；本地台账
 统一在 `ledger`：`list`、`record`、`label`、`coverage`、`impact`、`lineage`。

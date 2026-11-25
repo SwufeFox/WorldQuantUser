@@ -1670,6 +1670,8 @@ def _recover_probe_batch(args, path):
             raise CliError("INVALID_INPUT", "--pnl-alpha-id requires QUICK Alpha IDs in this batch",
                            details={"unknown_quick_alpha_ids": sorted(unknown_ids)})
     native_indices = list(_native_probe_groups(document))
+    if document.get("recording"):
+        document["recording"]["appended"] = 0
 
     def pnl_records():
         return (record for record in document["records"]
@@ -2467,9 +2469,12 @@ def _probe_reconcile(document):
             "provenance": {"run_id": document.get("run_id"),
                 "request_fingerprint": document.get("request_fingerprint"),
                 "source_spec": document.get("spec"), "arm_label": arm["label"]}})
-    document["recording"] = {"state": "reconciled", **alpha_registry.record_simulation(
+    summary = alpha_registry.record_simulation(
         records, {}, idea=document.get("idea"), mechanism=document.get("mechanism"),
-        note=document.get("note"), registry_path=policy["registry"], source="simulate", batch=document.get("name"))}
+        note=document.get("note"), registry_path=policy["registry"], source="simulate", batch=document.get("name"))
+    # Checkpoint callbacks may have already written rows during this invocation.
+    summary["appended"] += (document.get("recording") or {}).get("appended", 0)
+    document["recording"] = {"state": "reconciled", **summary}
 
 
 def _probe_needs_train_pnl(record):
@@ -2592,6 +2597,8 @@ def _execute_probe(args, document, target, groups):
     deferred_preflights = document.get("preflight_deferred") or {}
     records = document["records"]
     state_lock = threading.Lock()
+    if document.get("recording"):
+        document["recording"]["appended"] = 0
     multi = _multi_options(args, document)
     if multi and getattr(args, "native_poll_once", False):
         multi["native_poll_once"] = True
@@ -2787,7 +2794,8 @@ def _run_probe(args, spec, name, groups, design, gate, target):
 def _reject_saved_overrides(args, mode="resume/recover"):
     changing = ("setting", "region", "universe", "instrument_type", "neutralization",
                 "decay", "delay", "truncation", "pasteurization", "nan_handling", "test_period", "multi_size")
-    if any(getattr(args, key, None) is not None for key in changing):
+    if (any(getattr(args, key, None) is not None for key in changing)
+            or getattr(args, "quick_mode", False) or getattr(args, "full_mode", False)):
         raise CliError("USAGE", f"{mode} uses saved settings; explicit overrides are not allowed")
 
 

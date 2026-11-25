@@ -408,10 +408,38 @@ needs remain inferred reading leads. Explicit field requirements can be availabl
 missing from a verified scope, or unknown; none of those states establishes a signal's validity.
 
 
-### Check the account
+### Python SDK (`BrainClient`)
+
+For notebooks and Python scripts, `machine_lib.BrainClient` manages the private
+account-bound session lazily and refreshes once automatically if an expired
+cookie is rejected:
+
+```python
+import machine_lib as ml
+
+with ml.BrainClient() as brain:
+    # Offline payload preview (needs no credentials or network)
+    preview = brain.simulate_one("rank(close)", mode="QUICK", dry_run=True)
+
+    # Account, competitions & catalog point lookups
+    me = brain.profile()
+    challenges = brain.competitions()
+    field = brain.field("fnd6_newa1v1300_assets")
+
+    # Live simulation, checks & correlation endpoints
+    run = brain.simulate_one("rank(close)", mode="QUICK")
+    checks = brain.check(run["alpha_id"])
+    self_corr = brain.self_corr(run["alpha_id"])
+    pp_corr = brain.pp_corr(run["alpha_id"])
+```
+
+### Check the account, profile and competitions
 
 ```bash
 python research_cli.py auth check
+python research_cli.py auth profile --consultant
+python research_cli.py auth competitions
+python research_cli.py auth logout --remote
 ```
 
 Returns `user_id`, `permissions` and `data_regions` verified by live catalog probes.
@@ -440,8 +468,9 @@ with `--allow-lint-errors`.
 python research_cli.py catalog operators --search ts_ --group "Time Series"
 python research_cli.py catalog categories                 # field/alpha counts = crowding
 python research_cli.py catalog datasets --region USA
-python research_cli.py catalog datasets --region USA --theme true --summary
-python research_cli.py catalog fields --dataset fundamental6 --type MATRIX \
+python research_cli.py catalog dataset fundamental6       # point lookup by dataset id
+python research_cli.py catalog field fnd6_newa1v1300_assets # point lookup + FASTEXPR wrapper
+python research_cli.py catalog fields fundamental6 --type MATRIX \
     --search liability --limit 20 --expressions
 python research_cli.py catalog find "short term debt"
 ```
@@ -502,10 +531,12 @@ hard-coded, so the tool cannot rot into mis-grouping after a family is renamed.
 
 ### Simulate
 
-Always validate before spending quota:
+Always validate before spending quota. `simulate` accepts an inline expression
+directly as its positional argument, and `--quick` / `--full` set `simulationMode`:
 
 ```bash
-python research_cli.py simulate --expr "rank(liabilities/assets)-0.5" --decay 4 --dry-run
+python research_cli.py simulate "rank(liabilities/assets)-0.5" --quick --decay 4 --dry-run
+python research_cli.py alpha cancel-sim SIMULATION_ID     # cancel a runaway task and release its slot
 ```
 
 `--dry-run` prints the exact `POST /simulations` payloads without contacting
@@ -959,6 +990,12 @@ computation and replies with `Retry-After` until the job finishes.
 ```bash
 python research_cli.py alpha check ALPHA_ID          # compute and print live checks
 python research_cli.py alpha check ALPHA_A ALPHA_B --workers 2 --max-wait 300
+python research_cli.py alpha readiness ALPHA_ID      # one-shot checks + Power Pool budget + description review
+python research_cli.py alpha readiness ALPHA_ID --track POWER_POOL \
+    --idea "High cash-flow-to-assets firms earn higher subsequent returns." --apply-description
+python research_cli.py alpha prod-corr ALPHA_ID --save-archive pc.json
+python research_cli.py alpha pp-corr ALPHA_ID
+python research_cli.py alpha get ALPHA_ID --correlations
 ```
 
 One or several IDs use the same response shape: `count`, `results`, `complete` and
@@ -1076,7 +1113,8 @@ remain available without creating a new seed record.
 
 ```bash
 python research_cli.py alpha describe ALPHA_ID \
-    --name "Sample research candidate" --category FUNDAMENTAL
+    --name "Sample research candidate" --category FUNDAMENTAL \
+    --tags quality,cashflow --color GREEN
 ```
 
 Categories are an enum discovered by probing, because an invalid value returns 400 without

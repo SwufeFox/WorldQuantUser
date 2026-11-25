@@ -106,6 +106,30 @@ def field_opportunity(field):
     return coverage * (multiplier if multiplier is not None else 1.0) / math.log(2 + alpha_count)
 
 
+def cmd_catalog_dataset(args, _sink):
+    """Fetch one dataset's metadata directly by dataset id."""
+    cache_report = {}
+    dataset = ml.get_dataset(_catalog_access(args), args.dataset_id, report=cache_report)
+    return {
+        "dataset_id": args.dataset_id,
+        "dataset": dataset,
+        "cache": cache_report,
+    }
+
+
+def cmd_catalog_field(args, _sink):
+    """Fetch one datafield's metadata and FASTEXPR wrapper directly by field id."""
+    cache_report = {}
+    field = ml.get_datafield(_catalog_access(args), args.field_id, report=cache_report)
+    snippets = ml.process_datafields([field]) if isinstance(field, dict) else []
+    return {
+        "field_id": args.field_id,
+        "field": field,
+        "expression": snippets[0] if snippets else None,
+        "cache": cache_report,
+    }
+
+
 def cmd_catalog_fields(args, _sink):
     """List a dataset's fields, with ranked local search.
 
@@ -115,10 +139,21 @@ def cmd_catalog_fields(args, _sink):
     locally supports AND terms, exclusions, prefixes and typos, and reports why
     each hit matched.
     """
+    dataset_pos = getattr(args, "dataset_pos", None)
+    dataset_flag = getattr(args, "dataset", None)
+    if dataset_pos and dataset_flag and dataset_pos != dataset_flag:
+        raise CliError("USAGE", "conflicting dataset arguments",
+                       "pass either `catalog fields DATASET` or `--dataset DATASET`, not two different ids")
+    dataset = dataset_flag or dataset_pos
+    if not dataset:
+        raise CliError("USAGE", "dataset id is required",
+                       "pass `catalog fields DATASET` or `catalog fields --dataset DATASET`")
+    args.dataset = dataset
+
     cache_report = {}
     everything = ml.get_datafields(
         _catalog_access(args), instrument_type=args.instrument_type, region=args.region,
-        delay=args.delay, universe=args.universe, dataset_id=args.dataset,
+        delay=args.delay, universe=args.universe, dataset_id=dataset,
         search="", field_type=args.field_type, limit=None,
         report=cache_report,
     )
@@ -531,9 +566,8 @@ def _fetch_raw_fields(session, args, dataset=None, search=""):
 def _resolve_fields_by_id(session, args, field_ids):
     """Locate raw catalog records for specific field ids.
 
-    Tries ``--dataset`` first, then walks the region's datasets until every id
-    is found. Dataset listing and field listing are both quota-free, so a miss
-    costs a request rather than simulation quota.
+    Tries ``--dataset`` first, then point-lookups via ``GET /data-fields/{id}``,
+    and finally walks the region's datasets if any id remains unresolved.
     """
     wanted = list(field_ids)
     found = []
@@ -545,6 +579,26 @@ def _resolve_fields_by_id(session, args, field_ids):
         if not remaining:
             return found, []
         wanted = remaining
+
+    still_wanted = []
+    for field_id in wanted:
+        try:
+            record = ml.get_datafield(session, field_id)
+        except ml.NotFound:
+            still_wanted.append(field_id)
+            continue
+        except ml.BrainError:
+            still_wanted.append(field_id)
+            continue
+        if isinstance(record, dict) and record.get("id") == field_id:
+            found.append(record)
+        else:
+            still_wanted.append(field_id)
+    if not still_wanted:
+        order = {field_id: index for index, field_id in enumerate(field_ids)}
+        found.sort(key=lambda record: order.get(record.get("id"), len(order)))
+        return found, []
+    wanted = still_wanted
 
     datasets = ml.get_datasets(
         session,

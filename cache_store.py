@@ -136,7 +136,15 @@ def write_text_atomic(path, data, mode=0o600):
             os.chmod(tmp_path, mode)
         except OSError:  # pragma: no cover - exotic filesystems
             pass
-        os.replace(tmp_path, path)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, path)
+                break
+            except PermissionError as exc:
+                # On Windows a short-lived reader can prevent replacement.
+                if getattr(exc, "winerror", None) not in (5, 32) or attempt == 4:
+                    raise
+                time.sleep(0.02 * (attempt + 1))
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
