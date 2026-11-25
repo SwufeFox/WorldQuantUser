@@ -170,29 +170,40 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, now=None):
     """
     fingerprint = _fingerprint(account)
     path, lock = _paths(fingerprint)
-    released, kept = [], []
     stamp = time.time() if now is None else now
+
+    # Snapshot under the lock, then poll outside it. Holding the lock across
+    # network reads made every other writer time out at 60s.
     with cache_store.file_lock(lock):
-        journal = _load(path, fingerprint)
-        reservations = journal.get("reservations") or {}
-        for key, entry in list(reservations.items()):
-            url = entry.get("progress_url")
-            age_min = (stamp - float(entry.get("created_at") or stamp)) / 60.0
-            answer = poll(url) if url else None
-            if isinstance(answer, dict):
-                status, alpha = answer.get("status"), answer.get("alpha")
-            else:
-                status, alpha = answer, None
-            reclaim = (status in ORPHAN_RELEASE_STATUSES
-                       or (status is None and age_min > max_age_min))
-            if reclaim:
-                reservations.pop(key, None)
-                released.append({"id": key, "status": status, "alpha": alpha,
-                                 "age_min": round(age_min, 1)})
-            else:
-                kept.append({"id": key, "status": status, "age_min": round(age_min, 1)})
-        if released:
-            cache_store.write_json_atomic(path, journal)
+        snapshot = dict((_load(path, fingerprint).get("reservations") or {}))
+
+    decisions, kept = [], []
+    for key, entry in snapshot.items():
+        url = entry.get("progress_url")
+        age_min = (stamp - float(entry.get("created_at") or stamp)) / 60.0
+        answer = poll(url) if url else None
+        if isinstance(answer, dict):
+            status, alpha = answer.get("status"), answer.get("alpha")
+        else:
+            status, alpha = answer, None
+        reclaim = (status in ORPHAN_RELEASE_STATUSES
+                   or (status is None and age_min > max_age_min))
+        if reclaim:
+            decisions.append({"id": key, "status": status, "alpha": alpha,
+                              "age_min": round(age_min, 1)})
+        else:
+            kept.append({"id": key, "status": status, "age_min": round(age_min, 1)})
+
+    released = []
+    if decisions:
+        with cache_store.file_lock(lock):
+            journal = _load(path, fingerprint)
+            reservations = journal.get("reservations") or {}
+            for item in decisions:
+                if reservations.pop(item["id"], None) is not None:
+                    released.append(item)
+            if released:
+                cache_store.write_json_atomic(path, journal)
     return {"released": released, "kept": kept}
 
 
