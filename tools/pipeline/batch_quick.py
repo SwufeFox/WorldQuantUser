@@ -201,9 +201,11 @@ def _load_arms(path):
     else:
         arms = value if isinstance(value, list) else [value]
     if not all(isinstance(arm, dict) and isinstance(arm.get("label"), str)
-               and isinstance(arm.get("expr"), str) and isinstance(arm.get("settings"), dict)
+               and isinstance(arm.get("expr", arm.get("expression")), str) and isinstance(arm.get("settings"), dict)
                for arm in arms):
-        raise ValueError("arms must contain label, expr and settings per row")
+        raise ValueError("arms must contain label, expr (or expression) and settings per row")
+    for arm in arms:
+        arm.setdefault("expr", arm.get("expression"))
     return arms
 
 

@@ -319,7 +319,7 @@ class ResearchRunnerTests(TestCase):
               mock.patch.object(runner.time, "sleep", side_effect=InterruptedError) as sleep,
               self.assertRaises(InterruptedError)):
             campaign.run_campaign(self.root, max_wait=600, interval=30, execute=execute, log_event=mock.Mock())
-        self.assertEqual(calls, [(pending.name, 30, 3), (fresh.name, 600, 3)])
+        self.assertEqual(calls, [(pending.name, 600, 3), (fresh.name, 600, 3)])
         sleep.assert_called_once_with(7)
         self.assertTrue(pending.is_file())
         self.assertTrue((backlog / "done" / fresh.name).is_file())
@@ -337,7 +337,7 @@ class ResearchRunnerTests(TestCase):
               self.assertRaises(InterruptedError)):
             campaign.run_campaign(self.root, max_wait=600, interval=30, execute=execute, log_event=mock.Mock())
         self.assertEqual([(call.args[1], call.kwargs["max_wait"]) for call in execute.call_args_list],
-                         [(old, 30), (fresh, 600), (old, 600), (fresh, 600)])
+                         [(old, 600), (fresh, 600), (old, 600), (fresh, 600)])
 
     def test_campaign_watch_reuses_only_fresh_saturation_for_matching_unstarted_batches(self):
         backlog = self.root / "backlog"

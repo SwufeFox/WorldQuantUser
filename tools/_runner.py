@@ -459,8 +459,9 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                             result = ProbeRun("deferred", {}, f"waiting for matching request in {owner.name}")
                         else:
                             conflict_rounds.pop(spec.name, None)
-                            if ready and recovery and schedule.priority == 0 and spec not in full_recovery_turn:
-                                wait = min(max_wait, interval)
+                            # Recovery must use the full wait budget: capping it at
+                            # the watch interval made every slow QUICK batch defer
+                            # 5-6 times per arm, which was the recover churn.
                             full_recovery_turn.discard(spec)
                             result = execute(root, spec, batch, receipt, max_wait=wait, concurrency=concurrency)
                         if result.state != "deferred":

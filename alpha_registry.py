@@ -327,6 +327,21 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
         "batch": batch,
         "recorded_at": _now(),
     }
+    # Operator count has two incompatible meanings: the platform's operatorCount
+    # counts call sites (duplicates included), while a deduplicated set count
+    # makes PP eligibility look far better than it is. Record the basis so a
+    # filter can tell them apart.
+    operator_count = alpha.get("operator_count")
+    if isinstance(operator_count, int) and not isinstance(operator_count, bool) and operator_count >= 0:
+        entry["operator_count"] = operator_count
+        entry["operator_count_basis"] = "platform"
+    elif expression:
+        # Imported lazily: the help/schema path must not pull the parser in.
+        from expression_lint import estimate_operator_count
+        estimate = estimate_operator_count(expression)
+        if isinstance(estimate, int) and estimate >= 0:
+            entry["operator_count"] = estimate
+            entry["operator_count_basis"] = "estimate_total"
     if extra:
         entry["extra"] = extra
     # Lineage is recorded, never inferred: an ablation variant knows which

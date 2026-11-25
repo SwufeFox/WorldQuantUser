@@ -44,6 +44,7 @@ def cmd_ledger_record(args, sink):
             "settings": payload.get("settings") or {},
             "language": ml.alpha_language(payload),
             "metrics": in_sample,
+            "operator_count": ml.regular_expression(payload)[2],
             "checks": in_sample.get("checks") or {},
             "status": payload.get("status") or "UNSUBMITTED",
             "out_of_sample": ml.extract_split(payload),

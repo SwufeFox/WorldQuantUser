@@ -508,6 +508,20 @@ def submit_workflow(session, args, shelf_entry=None):
             result["confirmation_evidence"] = "durable_journal"
             current = {**current, "dateSubmitted": (prior.get("platform") or {}).get("dateSubmitted")}
         pending_attempt = prior.get("state") in {"INTENT", "ACCEPTED", "UNCERTAIN", "UNKNOWN"}
+        if not confirmed and pending_attempt:
+            # A definitive UNSUBMITTED read with no submission date proves the
+            # earlier POST never landed; keeping UNCERTAIN would deadlock every
+            # later attempt ("previous attempt is unresolved").
+            if (str(current.get("status") or "").upper() == "UNSUBMITTED"
+                    and not current.get("dateSubmitted")):
+                result["reconciled_from"] = prior.get("state")
+                result["reconciled"] = True
+                journal = {"alpha_id": args.alpha_id, "state": "NOT_SENT",
+                           "reconciled_from": prior.get("state"),
+                           "reconciled_at": datetime.now(timezone.utc).isoformat()}
+                cache_store.write_json_atomic(path, journal)
+                prior = journal
+                pending_attempt = False
         if not confirmed and not pending_attempt:
             _reject_quick_simulation(args, current)
         selection_id = prior.get("selection_id")
@@ -515,6 +529,12 @@ def submit_workflow(session, args, shelf_entry=None):
             selection_id = _selection_id(args, required=False) or selection_id
         elif getattr(args, "selection", None):
             selection_id = _selection_id(args)
+        if not confirmed:
+            _candidate_role(args, shelf_entry)
+            missing_meta = [field for field in ("name", "category") if not current.get(field)]
+            if missing_meta:
+                raise CliError("INVALID_INPUT", "%s has no %s" % (args.alpha_id, ", ".join(missing_meta)),
+                               "set the missing metadata with alpha describe")
         if not yes:
             if confirmed:
                 result.update(submitted=True, submission="CONFIRMED",
@@ -525,7 +545,7 @@ def submit_workflow(session, args, shelf_entry=None):
             else:
                 result.update(ml.submit_alpha(session, args.alpha_id, confirm=False,
                                                max_wait_seconds=max_wait))
-            result.update(dry_run=True, reconciled=False)
+            result.update(dry_run=True, reconciled=bool(result.get("reconciled")))
             return result
         if not confirmed and pending_attempt:
             result.update(submitted=False, submission=prior["state"],

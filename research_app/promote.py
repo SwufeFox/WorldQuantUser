@@ -12,6 +12,8 @@ import machine_lib as ml
 import requests
 import research_paths
 
+import alpha_registry
+
 from . import alphas, buffer_cmd, selection, triage
 from .experiments import _selection_call
 from .runtime import CliError, note, protect_output, with_session
@@ -179,6 +181,28 @@ def _review_receipt(args):
     }
 
 
+def _record_current_evidence(payload, alpha_id):
+    """Write the platform's current metrics/splits into the ledger first.
+
+    Validation joins evidence by alpha id. A fresh FULL alpha is absent from the
+    ledger, which used to report test_sharpe_missing even though the platform
+    carried both train and test splits.
+    """
+    expression, _, operator_count = ml.regular_expression(payload)
+    entry = alpha_registry.build_entry(
+        {"alpha_id": payload.get("id") or alpha_id,
+         "expression": expression,
+         "settings": payload.get("settings") or {},
+         "language": ml.alpha_language(payload),
+         "metrics": payload.get("is") or {},
+         "checks": (payload.get("is") or {}).get("checks") or {},
+         "operator_count": operator_count,
+         "status": payload.get("status") or "UNSUBMITTED",
+         "out_of_sample": ml.extract_split(payload)},
+        source="promote")
+    return alpha_registry.record_entry(entry, alpha_registry.default_registry_path())
+
+
 def cmd_promote(args, sink):
     """Compose existing commands; operational failures carry the completed evidence."""
     if getattr(args, "review_receipt", None):
@@ -237,6 +261,10 @@ def cmd_promote(args, sink):
             raise CliError("INVALID_INPUT", "retention floor must be finite")
         payload = with_session(args, lambda session: ml.fetch_alpha_metrics(session, alpha_id))
         alphas._reject_quick_simulation(args, payload)
+        # Validation joins current evidence by alpha id; a fresh FULL alpha is not
+        # in the ledger yet, which used to report "test_sharpe_missing" even though
+        # the platform already carried train and test splits.
+        _record_current_evidence(payload, alpha_id)
         if not saved_choice:
             freeze_args = parser.parse_args(["triage", "--ids", alpha_id, "--freeze", str(freeze)])
             freeze_args.retention_floor = retention_floor

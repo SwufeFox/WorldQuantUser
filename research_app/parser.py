@@ -201,8 +201,8 @@ def _setting_assignment(value):
     return key.strip(), parsed
 
 
-def _add_concurrency_args(parser):
-    parser.add_argument("--batch-size", dest="concurrency", type=_positive_count, default=None,
+def _add_concurrency_args(parser, default=None):
+    parser.add_argument("--batch-size", dest="concurrency", type=_positive_count, default=default,
                         help="Requested simulation concurrency. Published account limits take precedence; "
                              "unpublished capacity uses a reported local policy, not a claimed platform allowance.")
 
@@ -1137,7 +1137,7 @@ def build_parser():
     campaign_run.add_argument("--validate", action="store_true",
                               help="Validate eligible Regular FULL candidates after freezing training evidence.")
     campaign_run.add_argument("--stream", action="store_true", help="Emit campaign events on stderr.")
-    _add_concurrency_args(campaign_run)
+    _add_concurrency_args(campaign_run, default=7)
     _add_multi_size_arg(campaign_run)
     campaign_run.bind_handler("campaign.cmd_campaign_run")
 
