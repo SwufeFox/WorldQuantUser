@@ -159,7 +159,7 @@ def release_url(url):
 ORPHAN_RELEASE_STATUSES = TERMINAL_STATUSES | {"NOT_FOUND"}
 
 
-def reconcile_orphans(account, poll, *, max_age_min=45.0, now=None):
+def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0, now=None):
     """Release reservations that can no longer be recovered.
 
     ``poll(url)`` returns the platform status, the sentinel ``"NOT_FOUND"`` when
@@ -187,7 +187,8 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, now=None):
         else:
             status, alpha = answer, None
         reclaim = (status in ORPHAN_RELEASE_STATUSES
-                   or (status is None and age_min > max_age_min))
+                   or (status is None and age_min > max_age_min)
+                   or age_min > hard_max_age_min)
         if reclaim:
             decisions.append({"id": key, "status": status, "alpha": alpha,
                               "age_min": round(age_min, 1)})

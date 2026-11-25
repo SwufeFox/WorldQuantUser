@@ -184,3 +184,12 @@ def test_reconcile_releases_unreadable_only_past_max_age(tmp_path, monkeypatch):
     assert young["released"] == []
     aged = slots.reconcile_orphans(ACCOUNT, lambda url: None, max_age_min=0, now=10**12)
     assert [item["id"] for item in aged["released"]] == [old["id"]]
+
+
+def test_reconcile_releases_ancient_reservation_even_if_running(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    old = slots.quick_acquire(ACCOUNT, 1, "ancient")
+    slots.quick_update(ACCOUNT, old["id"], "accepted", progress_url="https://api.worldquantbrain.com/simulations/ancient")
+    result = slots.reconcile_orphans(ACCOUNT, lambda url: "RUNNING",
+                                     hard_max_age_min=360, now=10**12)
+    assert [item["id"] for item in result["released"]] == [old["id"]]
