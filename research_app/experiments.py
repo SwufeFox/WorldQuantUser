@@ -751,8 +751,13 @@ def _probe_summary(response):
     quota = next((report["quota"] for report in reversed(response.get("scheduling") or [])
                   if report.get("quota") is not None), None)
     incentive_rows = [row for row in rows if (row.get("incentives") or {}).get("state") == "reported"]
+    checkpoint_path = response.get("path")
+    saved = (not response.get("dry_run") and not response.get("check")
+             and isinstance(checkpoint_path, str) and Path(checkpoint_path).is_file())
     return {"path": response.get("path"), "run_id": response.get("run_id"),
             "request_fingerprint": response.get("request_fingerprint"), "view": "train",
+            "full_evidence": {"available": saved, "source": "checkpoint" if saved else None,
+                              "path": checkpoint_path if saved else None},
             "total_count": (response.get("execution") or {}).get("total", response.get("arms", len(rows))),
             "displayed_count": min(20, len(rows)), "rows_omitted": max(0, len(rows) - 20),
             "execution": response.get("execution"), "recording": response.get("recording"),
@@ -784,38 +789,57 @@ def _compact_preflight(report):
             result[key + "_omitted"] = len(items) - len(visible)
             if visible:
                 result[key] = visible
+    result["truncated"] = (any(result.get(key + "_omitted", 0)
+                               for key in ("errors", "warnings", "results", "checked_requests"))
+                           or bool(set(report) - set(result)
+                                   - {"errors", "warnings", "results", "checked_requests"}))
     return result
 
 
 def _summarize_probe_response(response):
     response["summary"] = _probe_summary(response)
+    truncated = bool(response["summary"]["rows_omitted"] or response["summary"]["incentives_omitted"])
     deferred_preflights = response.get("preflight_deferred")
     if deferred_preflights:
         response["preflight_deferred_total"] = len(deferred_preflights)
+        response["preflight_deferred_omitted"] = max(0, len(deferred_preflights) - 20)
+        response["preflight_deferred_truncated"] = len(deferred_preflights) > 20
+        visible_keys = ("code", "message", "hint", "scope", "retry_at")
         response["preflight_deferred"] = {
-            label: {key: group[key] for key in ("code", "message", "hint", "scope", "retry_at")}
+            label: {key: group[key] for key in visible_keys}
             for label, group in list(deferred_preflights.items())[:20]
         }
+        truncated |= (response["preflight_deferred_truncated"]
+                      or any(set(group) - set(visible_keys) for group in deferred_preflights.values()))
     quick_pnl = response.get("quick_pnl")
     if quick_pnl:
         labels = quick_pnl["pending_labels"]
         response["quick_pnl"] = {**quick_pnl, "pending_labels": labels[:20],
                                  "pending_labels_total": len(labels),
-                                 "pending_labels_omitted": max(0, len(labels) - 20)}
+                                 "pending_labels_omitted": max(0, len(labels) - 20),
+                                 "pending_labels_truncated": len(labels) > 20}
+        truncated |= len(labels) > 20
     for key in ("rows", "results", "incomplete", "comparisons", "arm_order", "preflight", "multi_requests"):
         items = response.get(key)
         if isinstance(items, list):
             response[key + "_total"] = len(items)
             response[key + "_omitted"] = max(0, len(items) - 20)
+            response[key + "_truncated"] = len(items) > 20
             response[key] = [_compact_preflight(item) for item in items[:20]] if key == "preflight" else items[:20]
+            truncated |= len(items) > 20
+            if key == "preflight":
+                truncated |= any(item.get("truncated", False) for item in response[key])
     if isinstance(response.get("lint"), dict):
         lint = response["lint"]
         response["lint"] = _compact_preflight(lint)
         response["lint"]["groups_count"] = len(lint.get("groups") or [])
+        truncated |= response["lint"]["truncated"]
     snapshot = response.get("capability_snapshot")
     if isinstance(snapshot, dict):
         response["capability_snapshot"] = {key: snapshot[key] for key in (
             "state", "account", "source", "as_of", "age_seconds", "capability_id", "concurrency") if key in snapshot}
+        truncated |= bool(set(snapshot) - set(response["capability_snapshot"]))
+    response["truncated"] = response["summary"]["truncated"] = bool(truncated)
     return response
 
 
@@ -2344,7 +2368,8 @@ def _probe_document_update(document, target):
         actions.append({"action": "recover", "batch_path": str(target), "reason": "reconcile_recording"})
     document["next_actions"] = actions
     for action in actions:
-        action["argv"] = ["python", "research_cli.py", "probe", "--" + action["action"], str(target)]
+        action["argv"] = ["python", "research_cli.py", "--research-dir", research_paths.research_dir(),
+                          "probe", "--" + action["action"], str(target)]
 
 
 def _probe_response(document, path, show_test=False, manifest=None, summary=False):

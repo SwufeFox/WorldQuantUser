@@ -213,8 +213,9 @@ def validate_seed(name, category, tags, description):
     if (not isinstance(tags, (list, tuple)) or not all(isinstance(t, str) for t in tags)
             or not any(t.strip() for t in tags)):
         problems.append("tags (at least one)")
-    if not isinstance(description, str) or len(description.strip()) < 100:
-        problems.append("description (>=100 characters)")
+    description_length = len(description.strip()) if isinstance(description, str) else 0
+    if description_length < 100:
+        problems.append("description (actual=%d characters; minimum=100)" % description_length)
     return problems
 
 

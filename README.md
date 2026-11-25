@@ -32,7 +32,9 @@ whether it still matches the saved batch. Repeating a command or starting a
 second writer is not evidence of progress.
 
 [Batch execution and recovery](docs/ledger-workflow.md) is the operating guide,
-including the state-to-next-action table. [Tooling](docs/tooling.md) is a reference
+including the state-to-next-action table. [Fast backtesting](docs/fast-backtest.md)
+is the Chinese guide to throughput, wait budgets and concurrency measurements.
+[Tooling](docs/tooling.md) is a reference
 for a specific question; `help COMMAND` and `schema COMMAND` expose that command's
 options and machine contract. `simulate`, direct `probe` and older runners remain
 available for their specific uses.
@@ -156,6 +158,7 @@ pattern-matching the string.
 | --- | --- |
 | [Tool map](docs/tooling.md) | Choose a CLI command, check its evidence, or recover a runner batch. |
 | [Batch research and ledger review](docs/ledger-workflow.md) | Queue QUICK probes, read the indexed report, and prepare a FULL follow-up. |
+| [Fast backtesting (中文)](docs/fast-backtest.md) | Diagnose slow or stalled work and measure accepted jobs, finished results and complete evidence separately. |
 | [Expression pipeline](docs/ast-pipeline.md) | Understand FASTEXPR parsing, source identity, and structural analysis. |
 | [Unit compression](docs/unit-compression.md) | Inspect FASTEXPR construction coverage and reproduce the report. |
 | [Backup and replay](docs/backup-replay.md) | Archive research state, restore a workspace, or check historical results. |

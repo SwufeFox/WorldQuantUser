@@ -43,6 +43,14 @@ python research_cli.py campaign run --watch --defer-quick-pnl --stream
 已有批次优先读 `diagnosis.state`、`diagnosis.reason` 和 `diagnosis.next_action.argv`。
 这些从当前保存的批次推导；尚无批次的新规格显示 `state: queued`。
 具体命令由回执给出，仍由当前执行者推进。
+Probe 的 `next_actions[].argv` 同样带实际 `--research-dir`；执行时保留整个参数数组，
+不要手工重建批次路径或改用当前 shell 的默认目录。CLI 子命令是单数 `alpha`。
+等待参数统一接受 `--max-wait-seconds` 和兼容别名 `--max-wait`；默认值、是否允许 0
+及按整次调用／逐任务计算的预算含义，以对应 `help COMMAND` 为准。
+
+缩略回执的 `truncated: true` 表示有证据被省略，逐列表的 `*_total` / `*_omitted`
+给出数量。`summary.full_evidence.available=true` 时，`path` 指向已保存的完整检查点；
+dry-run/check 不会把计划路径冒充本次已保存的证据。
 
 | 看到的状态或现象 | 下一步 | 保留什么 |
 | --- | --- | --- |

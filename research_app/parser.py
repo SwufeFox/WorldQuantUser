@@ -859,7 +859,7 @@ def build_parser():
     _add_settings_args(sim)
     _add_concurrency_args(sim)
     _add_multi_size_arg(sim)
-    sim.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
+    sim.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=300.0,
                      help="Shared wait budget for login, preflight and simulation. Longer Retry-After "
                           "waits are saved for resume (default: 300).")
     sim.add_argument("--checkpoint", default=None,
@@ -899,7 +899,7 @@ def build_parser():
         "resume", help="Resume pending/queued simulations from a checkpoint.")
     resume.add_argument("checkpoint", help="Checkpoint JSON produced by simulate/resume.")
     _add_concurrency_args(resume)
-    resume.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
+    resume.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=300.0,
                         help="Shared wait budget for login and resumed simulations (default: 300).")
     resume.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
                         help="Sort results by this metric, best first.")
@@ -1072,7 +1072,7 @@ def build_parser():
                        help="For live probe runs, read each due native Multi parent once and save its next poll time.")
     probe.add_argument("--pnl-alpha-id", action="append", metavar="ID",
                        help="With --recover, fetch daily PnL only for these saved QUICK Alpha IDs. Repeatable.")
-    probe.add_argument("--max-wait-seconds", type=_positive_seconds, default=300.0,
+    probe.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=300.0,
                        help="Shared wait budget for login, preflight, simulation and recovery reads; "
                             "accepted jobs remain recoverable (default: 300).")
     probe.add_argument("--show-test", action="store_true",
@@ -1126,7 +1126,7 @@ def build_parser():
     campaign_pnl.add_argument("--watch", action="store_true", help="Revisit pending evidence in successive passes.")
     campaign_pnl.add_argument("--interval", type=_positive_seconds, default=30,
                               help="Seconds between passes in watch mode.")
-    campaign_pnl.add_argument("--max-wait-seconds", type=_positive_seconds, default=60,
+    campaign_pnl.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=60,
                               help="Maximum wait budget for each Probe recovery.")
     campaign_pnl.add_argument("--stream", action="store_true", help="Emit recovery events on stderr.")
     campaign_pnl.bind_handler("campaign.cmd_campaign_recover_pnl")
@@ -1136,7 +1136,7 @@ def build_parser():
     campaign_run.add_argument("--watch", action="store_true", help="Keep consuming the research inbox.")
     campaign_run.add_argument("--interval", type=_positive_seconds, default=30,
                               help="Seconds between passes in watch mode.")
-    campaign_run.add_argument("--max-wait-seconds", type=_positive_seconds, default=600,
+    campaign_run.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=600,
                               help="Maximum wait budget for each Probe invocation.")
     campaign_run.add_argument("--recover-only", action="store_true",
                               help="Recover existing simulation tasks without posting unstarted arms.")
@@ -1173,7 +1173,8 @@ def build_parser():
     a_get_scope = a_get.add_mutually_exclusive_group()
     a_get_scope.add_argument("--team", dest="team_id", help="Team scope for --performance; default is the current user.")
     a_get_scope.add_argument("--competition", dest="competition_id", help="Competition scope for --performance.")
-    a_get.add_argument("--max-wait", type=_non_negative_seconds, default=180.0,
+    a_get.add_argument("--max-wait-seconds", "--max-wait", dest="max_wait",
+                       type=_non_negative_seconds, default=180.0,
                        help="Wait budget for each requested evidence view (performance or recordsets).")
     _add_session_args(a_get)
 
@@ -1198,7 +1199,8 @@ def build_parser():
     a_chk.add_argument("alpha_ids", nargs="+", metavar="ALPHA_ID")
     a_chk.add_argument("--workers", type=int, choices=[1, 2, 3], default=1,
                        help="Concurrent alpha checks; each worker uses isolated authenticated session state.")
-    a_chk.add_argument("--max-wait", type=_non_negative_seconds, default=180.0,
+    a_chk.add_argument("--max-wait-seconds", "--max-wait", dest="max_wait",
+                       type=_non_negative_seconds, default=180.0,
                        help="Seconds to wait for each alpha's async check job (default 180).")
     _add_session_args(a_chk)
 
@@ -1242,7 +1244,7 @@ def build_parser():
     a_sub.add_argument("--yes", action="store_true",
                        help="Execute the saved workflow: submit a new eligible attempt or reconcile "
                             "an unresolved one. Without it, preview and read-only checks only.")
-    a_sub.add_argument("--max-wait", type=float, default=180.0,
+    a_sub.add_argument("--max-wait-seconds", "--max-wait", dest="max_wait", type=float, default=180.0,
                        help="Local submission/reconciliation wait budget in seconds; expiry does not "
                             "prove that an earlier POST failed.")
     a_sub.add_argument("--registry", default=None)
@@ -1427,7 +1429,7 @@ def build_parser():
     l_sync.add_argument("--pages", type=int, default=10)
     l_sync.add_argument("--order", default="-dateCreated")
     l_sync.add_argument("--limit-record", type=int, default=25, dest="limit_record")
-    l_sync.add_argument("--max-wait-seconds", type=float, default=300.0,
+    l_sync.add_argument("--max-wait-seconds", "--max-wait", type=float, default=300.0,
                         help="Network wait budget shared by login, listing, metrics and PnL (default 300s).")
     l_sync.add_argument("--dry-run", action="store_true", dest="dry_run")
     l_sync.add_argument("--registry", default=None)
@@ -1554,7 +1556,7 @@ def build_parser():
     b_add.add_argument("--description", default=None,
                        help="Seed rationale, at least 100 characters.")
     b_add.add_argument("--seeds", default=None, help="Seed store path (default: seeds.jsonl).")
-    b_add.add_argument("--max-wait", type=int, default=None, dest="max_wait")
+    b_add.add_argument("--max-wait-seconds", "--max-wait", type=int, default=None, dest="max_wait")
     b_add.add_argument("--buffer", default=None, help="Shelf file (default: in research dir).")
     b_add.add_argument("--registry", default=None)
     _add_selection_args(b_add, freeze=False)
@@ -1579,7 +1581,7 @@ def build_parser():
     b_sub.add_argument("--yes", action="store_true")
     b_sub.add_argument("--force", action="store_true",
                        help="Submit even if the fresh self-correlation is above the gate.")
-    b_sub.add_argument("--max-wait", type=int, default=None, dest="max_wait")
+    b_sub.add_argument("--max-wait-seconds", "--max-wait", type=int, default=None, dest="max_wait")
     b_sub.add_argument("--buffer", default=None)
     b_sub.add_argument("--seeds", default=None,
                        help="Validated seed metadata store used when shelving this alpha.")

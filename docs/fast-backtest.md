@@ -46,7 +46,7 @@ python research_cli.py campaign run --watch --defer-quick-pnl --stream
 | --- | --- |
 | `--batch-size N` | 本次调用的本地并发预算；native Multi 下按父任务计 |
 | `--multi-size N` | 每个原生批次带几条子回测；支持范围由 `help campaign run` 给出 |
-| `--max-wait-seconds N` | 每次 Probe 调用的共享等待预算，含预检与恢复；不是远端仿真的最长寿命 |
+| `--max-wait-seconds N`（兼容 `--max-wait N`） | 每次 Probe 调用的共享等待预算，含预检与恢复；不是远端仿真的最长寿命 |
 | `--watch --interval N` | 持续推进；轮次之间按间隔和已保存的重试／轮询时间安排 |
 | `--defer-quick-pnl` | QUICK 先出分，晋级时按 Alpha ID 补 PnL |
 | `--prefer` / `--stream` | 指定优先 spec / 输出逐条调度事件 |

@@ -80,6 +80,63 @@ class SchemaContractTests(unittest.TestCase):
         payload = parse(run_cli("schema", "simulate"))["data"]
         self.assertEqual(payload["command"]["command"], "simulate")
 
+    def test_singular_alpha_metadata_and_submission_commands_roundtrip(self):
+        parser = cli_parser.build_parser()
+        for argv in (("alpha", "describe", "SYNTHETIC", "--name", "Research seed"),
+                     ("alpha", "submit", "SYNTHETIC", "--yes")):
+            with self.subTest(argv=argv):
+                command = parse(run_cli("schema", *argv[:2]))["data"]["command"]
+                parsed = parser.parse_args(argv)
+                self.assertEqual(command["command"], " ".join(argv[:2]))
+                self.assertEqual(parsed.command, "alpha")
+                self.assertEqual(parsed.subcommand, argv[1])
+                self.assertEqual(parsed.alpha_id, "SYNTHETIC")
+
+    def test_wait_budget_aliases_preserve_destinations_defaults_and_numeric_types(self):
+        parser = cli_parser.build_parser()
+        cases = (
+            (("simulate",), "max_wait_seconds", 300.0, "1.5", 1.5),
+            (("resume", "batch.json"), "max_wait_seconds", 300.0, "1.5", 1.5),
+            (("probe",), "max_wait_seconds", 300.0, "1.5", 1.5),
+            (("campaign", "recover-pnl"), "max_wait_seconds", 60, "1.5", 1.5),
+            (("campaign", "run"), "max_wait_seconds", 600, "1.5", 1.5),
+            (("alpha", "get", "SYNTHETIC"), "max_wait", 180.0, "1.5", 1.5),
+            (("alpha", "check", "SYNTHETIC"), "max_wait", 180.0, "1.5", 1.5),
+            (("alpha", "submit", "SYNTHETIC"), "max_wait", 180.0, "1.5", 1.5),
+            (("ledger", "sync"), "max_wait_seconds", 300.0, "1.5", 1.5),
+            (("buffer", "add", "SYNTHETIC"), "max_wait", None, "2", 2),
+            (("buffer", "submit", "SYNTHETIC"), "max_wait", None, "2", 2),
+        )
+        for argv, dest, default, value, expected in cases:
+            with self.subTest(argv=argv):
+                parsed = parser.parse_args(argv)
+                self.assertEqual(getattr(parsed, dest), default)
+                action = parsed._parser._option_string_actions["--max-wait-seconds"]
+                self.assertEqual(action.option_strings, ["--max-wait-seconds", "--max-wait"])
+                for flag in action.option_strings:
+                    parsed = parser.parse_args((*argv, flag, value))
+                    self.assertEqual(getattr(parsed, dest), expected)
+                    self.assertIs(type(getattr(parsed, dest)), type(expected))
+                    if dest == "max_wait":
+                        self.assertFalse(hasattr(parsed, "max_wait_seconds"))
+
+    def test_wait_aliases_keep_existing_zero_budget_boundaries(self):
+        parser = cli_parser.build_parser()
+        for flag in ("--max-wait-seconds", "--max-wait"):
+            for argv in (("simulate",), ("resume", "batch.json"), ("probe",),
+                         ("campaign", "run"), ("campaign", "recover-pnl")):
+                with self.subTest(argv=argv, flag=flag), self.assertRaises(cli_runtime.CliError):
+                    parser.parse_args((*argv, flag, "0"))
+            for argv in (("alpha", "get", "SYNTHETIC"), ("alpha", "check", "SYNTHETIC"),
+                         ("alpha", "submit", "SYNTHETIC"), ("buffer", "add", "SYNTHETIC"),
+                         ("buffer", "submit", "SYNTHETIC")):
+                with self.subTest(argv=argv, flag=flag):
+                    self.assertEqual(parser.parse_args((*argv, flag, "0")).max_wait, 0)
+            # Ledger validates its float budget in the handler, before authentication.
+            result = run_cli("ledger", "sync", flag, "0")
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(parse(result)["error"]["code"], "USAGE")
+
     def test_catalog_find_advertises_queryless_field_filters(self):
         options = parse(run_cli("schema", "catalog", "find"))["data"]["command"]["options"]
         by_flag = {flag: option for option in options for flag in option["flags"]}
