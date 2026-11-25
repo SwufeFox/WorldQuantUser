@@ -259,7 +259,7 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
 
 
 def probe_poll_at(document):
-    """Earliest useful poll when remaining saved work is accepted and timed."""
+    """Earliest useful accepted-job poll or queued group's preflight retry."""
     rows = document.get("rows") or []
     execution = document.get("execution") or {}
     if (not isinstance(rows, list) or not rows or not isinstance(execution, dict)
@@ -277,12 +277,27 @@ def probe_poll_at(document):
         and not record.get("multi_parent_terminal")
         and isinstance(record.get("multi_request_id"), str) and isinstance(record.get("multi_parent_url"), str)
     } if isinstance(records, list) else {}
+    from research_app.experiments import _matching_preflight_deferrals
+
+    snapshot = document.get("capability_snapshot")
+    account = snapshot.get("account") if isinstance(snapshot, dict) else None
+    deferred = (_matching_preflight_deferrals(document, account.get("fingerprint"))
+                if isinstance(account, dict) else {})
+    account_retry_at = max((entry["retry_at"] for entry in deferred.values()
+                           if entry.get("code") == "RATE_LIMITED"), default=0)
+    queued_times = {label: entry["retry_at"] for entry in deferred.values() for label in entry["labels"]}
     times, finished = [], 0
     for row in rows:
         if not isinstance(row, dict):
             return None
         state = row.get("submission_state")
         if state == "terminal":
+            continue
+        if state == "not_submitted":
+            retry_at = max(account_retry_at, queued_times.get(row.get("label"), 0))
+            if not retry_at:
+                return None
+            times.append(retry_at)
             continue
         if state != "accepted":
             return None

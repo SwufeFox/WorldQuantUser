@@ -2404,6 +2404,34 @@ def _save_probe_progress(document, target, indices, kind, payload):
     _save_probe_records(document, target, updates, submitting=kind in {"submitting", "multi_submitting"})
 
 
+def _matching_preflight_deferrals(document, account_fingerprint):
+    """Reuse retry state only for the same account and exact saved requests."""
+    entries, saved_arms = document.get("preflight_deferred"), document.get("arms")
+    if not isinstance(entries, dict) or not isinstance(saved_arms, list):
+        return {}
+    arms = {arm["label"]: arm for arm in saved_arms
+            if isinstance(arm, dict) and isinstance(arm.get("label"), str)}
+    matched = {}
+    for label, entry in entries.items():
+        if not isinstance(entry, dict) or entry.get("account_fingerprint") != account_fingerprint:
+            continue
+        retry_at, labels = entry.get("retry_at"), entry.get("labels")
+        if (type(retry_at) not in (int, float) or not math.isfinite(retry_at) or retry_at <= 0
+                or not isinstance(labels, list) or not labels
+                or any(not isinstance(name, str) or name not in arms for name in labels)):
+            continue
+        try:
+            fingerprint = _request_fingerprint([arms[name] for name in labels])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (entry.get("request_fingerprint") == fingerprint
+                or (entry.get("request_fingerprint") is None and entry.get("code") == "RATE_LIMITED")):
+            # Older checkpoints lack group digests, but an observed account
+            # rate limit still applies to that endpoint's new requests.
+            matched[label] = entry
+    return matched
+
+
 def _execute_probe(args, document, target, groups):
     deadline = _simulation_deadline(args)
     proof_cache = {}
@@ -2427,7 +2455,7 @@ def _execute_probe(args, document, target, groups):
         scheduling = {}
         document.setdefault("scheduling", []).append(scheduling)
         options = dict(labels=[arm["label"] for arm in group["arms"]],
-            concurrency=document["concurrency"], capability_snapshot=document["capability_snapshot"],
+            concurrency=document["concurrency"], capability_snapshot=document.get("capability_snapshot"),
             scheduling_report=scheduling, initial_records=[records[index] for index in indices],
             deadline=deadline, fetch_metrics=fetch_metrics,
             on_event=lambda kind, payload: progress(indices, kind, payload), **multi)
@@ -2442,10 +2470,18 @@ def _execute_probe(args, document, target, groups):
             _save_probe_records(document, target, zip(indices, produced))
         return produced
 
+    def recover_group(session, group):
+        if time.monotonic() < deadline and any(
+                _probe_needs_recovery(document["rows"][arm["arm_index"]]) for arm in group["arms"]):
+            run_group(session, group)
+
     def work(session):
         _validate_saved_native_owner(session, document)
-        document["capability_snapshot"] = _invocation_capabilities(session, args, deadline=deadline)
         account = simulation_capabilities.account_provenance(session)
+        fingerprint = account.get("fingerprint")
+        matched = _matching_preflight_deferrals(document, fingerprint)
+        deferred_preflights.clear()
+        deferred_preflights.update(matched)
         document.setdefault("preflight", [])
         save()
         def launches(group):
@@ -2455,24 +2491,25 @@ def _execute_probe(args, document, target, groups):
         ordered = sorted(((launches(group), group) for group in groups.values()),
                          key=lambda item: (item[0], deferred_preflights.get(
                              item[1]["arms"][0]["label"], {}).get("observed_at", 0)))
-        fingerprint = account.get("fingerprint")
         field_retry_at = max((item.get("retry_at", 0) for item in deferred_preflights.values()
-                              if item.get("account_fingerprint") == fingerprint), default=0)
-        last_launch = len(ordered) - 1 if ordered[-1][0] else -1
+                              if item.get("code") == "RATE_LIMITED"), default=0)
+        def group_retry_at(group):
+            prior = deferred_preflights.get(group["arms"][0]["label"], {})
+            return max(field_retry_at, prior.get("retry_at", 0))
+
+        last_launch = max((index for index, (launching, group) in enumerate(ordered)
+                           if launching and group_retry_at(group) <= time.time()), default=-1)
         launch_limit = None
-        if last_launch >= 0:
-            plan = ml.concurrency_plan(session, document["concurrency"], document["capability_snapshot"])
-            launch_limit = plan["effective"]
-            if multi:
-                launch_limit = min(launch_limit, simulation_multi.CONSULTANT_PARENT_LIMIT)
+        capabilities_ready = False
         deferred_metrics = []
         for position, (launching, group) in enumerate(ordered):
             if time.monotonic() >= deadline:
                 break
             preflight = None
             if launching:
-                if field_retry_at > time.time():
-                    break
+                if group_retry_at(group) > time.time():
+                    recover_group(session, group)
+                    continue
                 retry_at = simulation_slots.submission_retry_at(account)
                 deferred = None
                 if retry_at is not None:
@@ -2480,7 +2517,16 @@ def _execute_probe(args, document, target, groups):
                         "state": "deferred", "reason": "submission_cooldown",
                         "submission_retry_at": retry_at,
                     }
-                elif launch_limit:
+                else:
+                    if not capabilities_ready:
+                        # Recovery and cooled launches need no fresh OPTIONS or catalogs.
+                        document["capability_snapshot"] = _invocation_capabilities(session, args, deadline=deadline)
+                        plan = ml.concurrency_plan(session, document["concurrency"], document["capability_snapshot"])
+                        launch_limit = plan["effective"]
+                        if multi:
+                            launch_limit = min(launch_limit, simulation_multi.CONSULTANT_PARENT_LIMIT)
+                        capabilities_ready = True
+                if deferred is None and launch_limit:
                     accepted = simulation_slots.confirmed_accepted_count(account)
                     if accepted is not None and accepted >= launch_limit:
                         deferred = {
@@ -2489,9 +2535,7 @@ def _execute_probe(args, document, target, groups):
                         }
                 if deferred is not None:
                     document.setdefault("scheduling", []).append(deferred)
-                    if any(_probe_needs_recovery(document["rows"][arm["arm_index"]])
-                           for arm in group["arms"]):
-                        run_group(session, group)
+                    recover_group(session, group)
                     continue
                 label = group["arms"][0]["label"]
                 try:
@@ -2500,18 +2544,26 @@ def _execute_probe(args, document, target, groups):
                 except FieldEvidenceRefreshError as exc:
                     evidence = exc.details["field_catalog"]
                     catalogs = evidence.get("catalogs") or []
-                    field_retry_at = max((row.get("retry_at", 0) for row in catalogs), default=0)
+                    observed_at = time.time()
+                    attempts = deferred_preflights.get(label, {}).get("attempts", 0)
+                    attempts = (attempts if type(attempts) is int and attempts >= 0 else 0) + 1
+                    server_retry_at = max((row["retry_at"] for row in catalogs
+                        if type(row.get("retry_at")) in (int, float) and math.isfinite(row["retry_at"])), default=0)
+                    retry_at = max(server_retry_at, observed_at + min(300, 15 * 2 ** min(attempts - 1, 5)))
                     deferred_preflights[label] = {
                         "labels": [arm["label"] for arm in group["arms"]],
                         "code": exc.code, "message": exc.message, "hint": exc.hint,
-                        "observed_at": time.time(), "retry_at": field_retry_at,
+                        "observed_at": observed_at, "retry_at": retry_at, "attempts": attempts,
                         "account_fingerprint": fingerprint,
+                        "request_fingerprint": _request_fingerprint(group["arms"]),
                         "scope": evidence.get("scope"), "required_fields": evidence.get("required_fields"),
                         "catalogs": [row for row in catalogs if row.get("state") != "verified"],
                     }
                     document["preflight_deferred"] = deferred_preflights
                     save()
+                    recover_group(session, group)
                     if exc.code == "RATE_LIMITED":
+                        field_retry_at = retry_at
                         break
                     continue
                 deferred_preflights.pop(label, None)

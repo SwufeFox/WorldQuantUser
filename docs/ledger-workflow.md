@@ -32,6 +32,7 @@ python research_cli.py campaign run --watch --defer-quick-pnl --stream
 | 首次推进 | `campaign status` 的 `data.jobs` 显示规格、批次和已保存的执行状态。首次启动使用配置的等待预算。 |
 | 回合结束时仍在等平台 | `--watch` 每轮只读一次新受理或已到期的 native Multi 父任务，将平台的 `Retry-After` 保存到检查点后推进队列。直接运行 `probe` 时默认按指定预算等待。 |
 | 有 `next_poll_at` | 这是检查点记录的下次轮询时间。监视器按时间推进，原生 Multi 的时间来自父任务。 |
+| 全部仍排队，字段预检暂缓 | 看 `preflight_deferred` 中的 `retry_at`、失败次数和未核验字段。已成功的精确字段证据按账户、作用域和原有效期保存；下一轮只补缺项。提前恢复不会重查仍在退避的组。 |
 | 进程或连接中断 | 先读原批次。用 `campaign run --recover-only` 补回已受理的结果。需要继续未启动的臂时，再让普通队列推进。 |
 | QUICK 训练已记录，日 PnL 尚欠 | `data.archived_quick_pnl` 有待补批次、臂数和不可读批次数。用其中的 `jobs[].batch` 定位原批次。 |
 

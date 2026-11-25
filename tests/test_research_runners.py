@@ -487,6 +487,65 @@ class ResearchRunnerTests(TestCase):
         complete["metrics_pending"] = True
         self.assertIsNone(runner.probe_poll_at(document))
 
+    def test_preflight_retry_schedule_preserves_ready_work_and_account_scope(self):
+        requests = [{"label": label, "expression": "rank(close)", "settings": {"decay": 5}}
+                    for label in ("cooled", "other")]
+        queued = arm("QUEUED", label="cooled", submission_state="not_submitted")
+        deferred = {"labels": ["cooled"], "account_fingerprint": "account", "code": "SERVICE_ERROR",
+                    "request_fingerprint": experiments._request_fingerprint(requests[:1]), "retry_at": 160}
+        document = {"execution": {"total": 1, "finished": 0}, "rows": [queued], "arms": requests,
+                    "capability_snapshot": {"account": {"fingerprint": "account"}},
+                    "preflight_deferred": {"cooled": deferred}}
+        self.assertEqual(runner.probe_poll_at(document), 160)
+        document["execution"]["total"] = 2
+        other = arm("PENDING", label="other", submission_state="accepted",
+                    progress_url="https://test.invalid/accepted", next_poll_at=100)
+        document["rows"] = [queued, other]
+        self.assertEqual(runner.probe_poll_at(document), 100)
+        other["next_poll_at"] = 180
+        self.assertEqual(runner.probe_poll_at(document), 160)
+        other.pop("next_poll_at")
+        self.assertIsNone(runner.probe_poll_at(document))
+        document["rows"][1] = arm("QUEUED", label="other", submission_state="not_submitted")
+        self.assertIsNone(runner.probe_poll_at(document))
+        deferred["code"] = "RATE_LIMITED"
+        self.assertEqual(runner.probe_poll_at(document), 160)
+        digest = deferred.pop("request_fingerprint")
+        self.assertEqual(runner.probe_poll_at(document), 160)
+        deferred["request_fingerprint"] = digest
+        document["capability_snapshot"]["account"]["fingerprint"] = "other-account"
+        self.assertIsNone(runner.probe_poll_at(document))
+        for snapshot in ("malformed", {"account": "malformed"}, None):
+            with self.subTest(snapshot=snapshot):
+                document["capability_snapshot"] = snapshot
+                self.assertIsNone(runner.probe_poll_at(document))
+        document["capability_snapshot"] = {"account": {"fingerprint": "account"}}
+        requests[0]["expression"] = "rank(volume)"
+        self.assertIsNone(runner.probe_poll_at(document))
+
+    def test_campaign_advances_fresh_spec_while_queued_preflight_is_cooling(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        waiting, fresh = [backlog / name for name in ("a-waiting.json", "b-fresh.json")]
+        for spec in (waiting, fresh):
+            spec.write_text("{}", encoding="utf-8")
+        batch, _ = campaign.campaign_paths(self.root, waiting)
+        request = {"label": "cooled", "expression": "rank(close)", "settings": {"decay": 5}}
+        self.saved(batch, [arm("QUEUED", label="cooled", submission_state="not_submitted")])
+        document = json.loads(batch.read_text(encoding="utf-8"))
+        document.update(arms=[request], execution={"total": 1, "finished": 0},
+                        capability_snapshot={"account": {"fingerprint": "account"}},
+                        preflight_deferred={"cooled": {
+                            "labels": ["cooled"], "account_fingerprint": "account", "code": "SERVICE_ERROR",
+                            "request_fingerprint": experiments._request_fingerprint([request]), "retry_at": 160}})
+        batch.write_text(json.dumps(document), encoding="utf-8")
+        execute = mock.Mock(return_value=runner.ProbeRun("done", {}))
+        with mock.patch.object(runner.time, "time", return_value=100):
+            self.assertEqual(campaign.run_campaign(self.root, once=True, execute=execute,
+                                                   log_event=mock.Mock()), 0)
+        self.assertEqual(execute.call_args.args[1], fresh)
+        self.assertTrue(waiting.is_file())
+
     def campaign_reply(self, *, freeze=True, **updates):
         training = {"alpha_id": "candidate", "delta": 0.01, "evidence": {"state": "measured"},
                     "training_gate": {"state": "pass", "reason": None},

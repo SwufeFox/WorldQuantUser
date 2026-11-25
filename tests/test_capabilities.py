@@ -1,5 +1,6 @@
 """Offline synthetic checks for scoped metadata, type order and economic evidence."""
 
+import copy
 import os
 import tempfile
 import unittest
@@ -288,7 +289,7 @@ class ScopedCacheTests(unittest.TestCase):
             result = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix", "sample_vector"})
 
         sleep.assert_called_once_with(0.75)
-        self.assertEqual([item.kwargs["deadline"] for item in search.call_args_list], [8.0, 9.0])
+        self.assertEqual([item.kwargs["deadline"] for item in search.call_args_list], [30.0, 30.0])
         self.assertEqual(result["evidence"]["state"], "verified")
 
     def test_explicit_complete_empty_capture_replaces_removed_field_snapshot(self):
@@ -312,6 +313,311 @@ class ScopedCacheTests(unittest.TestCase):
         payload["account"]["sources"] = ["other-confirmation-of-same-principal"]
         cache_store.write_json_atomic(path, cache_store.build_entry("scoped-capabilities", payload, ttl=3600))
         self.assertEqual(validation.cached_field_scope(SETTINGS)["evidence"]["state"], "verified")
+
+
+class RequiredFieldProofTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.session = SimpleNamespace(auth=("synthetic-account", "unused"))
+        self.policy = {"enabled": True, "max_age": 3600, "refresh": False}
+        for patch in (
+            mock.patch.object(ml.research_paths, "metadata_root", return_value=str(self.root / "metadata")),
+            mock.patch.object(ml, "session_cache_path", return_value=self.root / "session.json"),
+            mock.patch.object(ml, "metadata_cache_policy", return_value=self.policy),
+            mock.patch.object(ml, "request_json", side_effect=AssertionError("unexpected network")),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def lookup(self, _session, field, _scope, *, deadline):
+        # A positive exact match does not require a complete fuzzy search page.
+        return {"matches": [{"id": field, "type": "MATRIX", "dataset": "sample_dataset"}],
+                "returned_count": 1, "reported_count": 1000, "complete": False}
+
+    def proof_path(self, field="sample_matrix"):
+        account = simulation_capabilities.account_provenance(self.session)
+        return capabilities._field_proof_path(account, SETTINGS, field)
+
+    def prove(self, fields=("sample_matrix",), **kwargs):
+        return capabilities.required_field_scope(self.session, SETTINGS, fields, proof_cache={}, **kwargs)
+
+    def test_saved_exact_proof_survives_fresh_invocation_without_retiming(self):
+        observed = cache_store.utc_now()
+        with mock.patch.object(cache_store, "utc_now", return_value=observed), \
+                mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            first = self.prove()
+        before = self.proof_path().read_bytes()
+        with mock.patch.object(cache_store, "utc_now", return_value=observed + timedelta(minutes=20)), \
+                mock.patch.object(ml, "search_datafield", side_effect=AssertionError("cached exact proof")):
+            second = self.prove()
+        self.assertEqual(second["known_fields"], {"sample_matrix"})
+        self.assertEqual(second["evidence"]["as_of"], first["evidence"]["as_of"])
+        self.assertEqual(second["evidence"]["age_seconds"], 1200)
+        self.assertEqual(second["evidence"]["source"], "private_field_proof")
+        self.assertTrue(second["evidence"]["catalogs"][0]["reused_from_cache"])
+        self.assertFalse(second["evidence"]["coverage"]["complete"])
+        self.assertFalse(second["evidence"]["coverage"]["full_scope"])
+        self.assertEqual(self.proof_path().read_bytes(), before)
+
+    def test_shared_memory_cache_cannot_extend_expiry_or_override_refresh(self):
+        observed = cache_store.utc_now()
+        cache = {}
+        self.policy["max_age"] = 1
+        with mock.patch.object(cache_store, "utc_now", return_value=observed), \
+                mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"}, proof_cache=cache)
+        with mock.patch.object(cache_store, "utc_now", return_value=observed + timedelta(seconds=2)), \
+                mock.patch.object(ml, "search_datafield", side_effect=ml.ServiceError("unavailable")) as expired:
+            result = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"}, proof_cache=cache)
+        expired.assert_called_once()
+        self.assertEqual(result["evidence"]["state"], "unknown")
+        self.policy["max_age"] = 3600
+        with mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"}, proof_cache=cache)
+        self.policy["refresh"] = True
+        with mock.patch.object(ml, "search_datafield", side_effect=ml.ServiceError("unavailable")) as refreshed:
+            result = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"}, proof_cache=cache)
+        refreshed.assert_called_once()
+        self.assertEqual(result["evidence"]["state"], "unknown")
+        self.assertFalse(self.proof_path().exists())
+
+    def test_live_refresh_proof_is_reusable_across_groups_in_same_invocation(self):
+        cache = {}
+        self.policy["refresh"] = True
+        with mock.patch.object(ml, "search_datafield", side_effect=self.lookup) as search:
+            first = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"}, proof_cache=cache)
+            second = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"}, proof_cache=cache)
+        search.assert_called_once()
+        self.assertTrue(second["evidence"]["catalogs"][0]["reused_in_invocation"])
+        self.assertEqual(first["evidence"]["as_of"], second["evidence"]["as_of"])
+
+    def test_proof_expiring_during_later_lookup_defers_preflight_without_retry_loop(self):
+        elapsed = [0.0]
+        started = cache_store.utc_now()
+        self.policy["max_age"] = 60
+
+        def operators(_session, **kwargs):
+            kwargs["report"].update(complete=True)
+            return [{"name": "rank"}]
+
+        def slow_lookup(session, field, scope, *, deadline):
+            self.assertEqual(field, "sample_vector")
+            elapsed[0] += 27.4
+            return self.lookup(session, field, scope, deadline=deadline)
+
+        with mock.patch.object(capabilities.time, "monotonic", side_effect=lambda: elapsed[0]), \
+                mock.patch.object(cache_store, "utc_now", side_effect=lambda: started + timedelta(seconds=elapsed[0])):
+            with mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+                first = self.prove()
+            elapsed[0] = 50.0
+            with mock.patch.object(ml, "search_datafield", side_effect=slow_lookup) as search, \
+                    mock.patch.object(ml, "fetch_operators", side_effect=operators), \
+                    self.assertRaises(validation.FieldEvidenceRefreshError) as caught:
+                validation._preflight_lint(
+                    self.session, [("rank(sample_matrix + sample_vector)", 0)], SETTINGS,
+                    SimpleNamespace(allow_lint_errors=False), deadline=90, proof_cache={})
+        search.assert_called_once()
+        self.assertEqual(caught.exception.code, "SERVICE_ERROR")
+        evidence = caught.exception.details["field_catalog"]
+        self.assertEqual(evidence["state"], "unknown")
+        self.assertEqual(evidence["required_fields"]["verified_ids"], ["sample_vector"])
+        self.assertEqual(evidence["required_fields"]["expired_ids"], ["sample_matrix"])
+        expired = evidence["catalogs"][0]
+        self.assertEqual(expired["state"], "unknown")
+        self.assertEqual(expired["reason"], "proof_expired_during_preflight")
+        self.assertEqual(expired["as_of"], first["evidence"]["as_of"])
+        self.assertAlmostEqual(expired["age_seconds"], 77.4)
+
+    def test_increasing_maximum_age_cannot_extend_original_memory_proof_expiry(self):
+        observed = cache_store.utc_now()
+        cache = {}
+        self.policy["max_age"] = 10
+        with mock.patch.object(cache_store, "utc_now", return_value=observed), \
+                mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"}, proof_cache=cache)
+        self.policy["max_age"] = 3600
+        with mock.patch.object(cache_store, "utc_now", return_value=observed + timedelta(seconds=11)), \
+                mock.patch.object(ml, "search_datafield", side_effect=ml.ServiceError("unavailable")) as search:
+            result = capabilities.required_field_scope(self.session, SETTINGS, {"sample_matrix"}, proof_cache=cache)
+        search.assert_called_once()
+        self.assertEqual(result["evidence"]["state"], "unknown")
+        self.assertIsNone(result["known_fields"])
+
+    def test_slow_search_uses_caller_budget_and_saves_partial_progress(self):
+        elapsed = [0.0]
+        started = cache_store.utc_now()
+
+        def lookup(session, field, scope, *, deadline):
+            remaining = deadline - elapsed[0]
+            if remaining < 27.4:
+                elapsed[0] = deadline
+                raise ml.ServiceError("response exceeded remaining wait budget")
+            elapsed[0] += 27.4
+            return self.lookup(session, field, scope, deadline=deadline)
+
+        with mock.patch.object(capabilities.time, "monotonic", side_effect=lambda: elapsed[0]), \
+                mock.patch.object(cache_store, "utc_now", side_effect=lambda: started + timedelta(seconds=elapsed[0])), \
+                mock.patch.object(ml, "search_datafield", side_effect=lookup) as search:
+            first = self.prove(("sample_matrix", "sample_vector"))
+            before = self.proof_path().read_bytes()
+            second = self.prove(("sample_matrix", "sample_vector"), deadline=90)
+        self.assertEqual(first["evidence"]["state"], "unknown")
+        self.assertEqual(first["evidence"]["required_fields"]["verified_ids"], ["sample_matrix"])
+        self.assertEqual([call.args[1] for call in search.call_args_list],
+                         ["sample_matrix", "sample_vector", "sample_vector"])
+        self.assertEqual([call.kwargs["deadline"] for call in search.call_args_list], [30, 30, 90])
+        self.assertEqual(second["known_fields"], {"sample_matrix", "sample_vector"})
+        self.assertEqual(second["evidence"]["as_of"], first["evidence"]["as_of"])
+        self.assertAlmostEqual(second["evidence"]["age_seconds"], 30.0)
+        self.assertEqual(self.proof_path().read_bytes(), before)
+
+    def test_account_and_every_scope_component_prevent_cross_scope_reuse(self):
+        with mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            self.prove()
+        cases = [(SimpleNamespace(auth=("other-account", "unused")), SETTINGS),
+                 (SimpleNamespace(), SETTINGS)]
+        cases.extend((self.session, {**SETTINGS, key: value}) for key, value in (
+            ("region", "EUR"), ("universe", "TOP1000"), ("delay", 0), ("instrumentType", "OTHER")))
+        for session, settings in cases:
+            with self.subTest(settings=settings, account=getattr(session, "auth", None)), \
+                    mock.patch.object(ml, "search_datafield", side_effect=self.lookup) as search:
+                result = capabilities.required_field_scope(session, settings, {"sample_matrix"}, proof_cache={})
+            search.assert_called_once()
+            self.assertNotIn("reused_from_cache", result["evidence"]["catalogs"][0])
+
+    def test_expiry_and_stricter_maximum_age_reject_saved_proofs(self):
+        observed = cache_store.utc_now()
+        with mock.patch.object(cache_store, "utc_now", return_value=observed), \
+                mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            self.prove()
+        for age, maximum in ((3601, 7200), (120, 60)):
+            self.policy["max_age"] = maximum
+            with self.subTest(age=age, maximum=maximum), \
+                    mock.patch.object(cache_store, "utc_now", return_value=observed + timedelta(seconds=age)), \
+                    mock.patch.object(ml, "search_datafield", side_effect=ml.ServiceError("unavailable")) as search:
+                result = self.prove()
+            search.assert_called_once()
+            self.assertEqual(result["evidence"]["state"], "unknown")
+
+    def test_disabled_or_zero_age_cache_neither_reuses_nor_renews_proofs(self):
+        with mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            self.prove()
+        before = self.proof_path().read_bytes()
+        for enabled, maximum in ((False, 3600), (True, 0)):
+            self.policy.update(enabled=enabled, max_age=maximum)
+            with self.subTest(enabled=enabled, maximum=maximum), \
+                    mock.patch.object(ml, "search_datafield", side_effect=self.lookup) as search, \
+                    mock.patch.object(cache_store, "write_json_atomic", side_effect=AssertionError("disabled cache")):
+                result = self.prove()
+            search.assert_called_once()
+            self.assertEqual(result["evidence"]["state"], "verified")
+            self.assertEqual(self.proof_path().read_bytes(), before)
+
+    def test_refresh_failure_cannot_resurrect_an_earlier_positive_proof(self):
+        failures = [ml.ServiceError("unavailable"),
+                    {"matches": [], "returned_count": 0, "reported_count": 0, "complete": True},
+                    {"matches": [FIELDS[0], FIELDS[0]], "returned_count": 2, "reported_count": 2, "complete": True},
+                    {"matches": [{**FIELDS[0], "region": "EUR"}], "returned_count": 1,
+                     "reported_count": 1, "complete": True}]
+        for failure in failures:
+            self.policy["refresh"] = False
+            with mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+                self.prove()
+            self.policy["refresh"] = True
+            with self.subTest(failure=failure), \
+                    mock.patch.object(ml, "search_datafield", side_effect=[failure]) as refresh:
+                result = self.prove()
+            refresh.assert_called_once()
+            self.assertEqual(result["evidence"]["state"], "unknown")
+            self.assertFalse(self.proof_path().exists())
+            self.policy["refresh"] = False
+            with mock.patch.object(ml, "search_datafield", side_effect=ml.ServiceError("still unavailable")) as search:
+                self.assertEqual(self.prove()["evidence"]["state"], "unknown")
+            search.assert_called_once()
+
+    def test_deferred_refresh_does_not_destroy_unattempted_proof(self):
+        with mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            self.prove()
+        before = self.proof_path().read_bytes()
+        self.policy["refresh"] = True
+        with mock.patch.object(capabilities.time, "monotonic", return_value=10), \
+                mock.patch.object(ml, "search_datafield", side_effect=AssertionError("past deadline")):
+            result = self.prove(deadline=10)
+        self.assertEqual(result["evidence"]["required_fields"]["budget_deferred_ids"], ["sample_matrix"])
+        self.assertEqual(self.proof_path().read_bytes(), before)
+
+    def test_malformed_or_degraded_proofs_do_not_authorize_fields(self):
+        with mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            self.prove()
+        original, error = cache_store.load_json(self.proof_path())
+        self.assertIsNone(error)
+        changes = [(("_cache", "source"), "untrusted"),
+                   (("payload", "version"), 999),
+                   (("payload", "account", "fingerprint"), "other-account"),
+                   (("payload", "scope", "delay"), 0),
+                   (("payload", "field"), "other_field"),
+                   (("payload", "row", "id"), "other_field"),
+                   (("payload", "row", "universe"), "TOP500"),
+                   (("payload", "search", "state"), "unknown"),
+                   (("payload", "search", "exact_count"), 2),
+                   (("payload", "search", "degraded"), True),
+                   (("payload", "search", "stale"), True),
+                   (("payload", "search", "as_of"), "invalid")]
+        for keys, value in changes:
+            mutated = copy.deepcopy(original)
+            target = mutated
+            for key in keys[:-1]:
+                target = target[key]
+            target[keys[-1]] = value
+            cache_store.write_json_atomic(self.proof_path(), mutated)
+            with self.subTest(keys=keys), \
+                    mock.patch.object(ml, "search_datafield", side_effect=ml.ServiceError("unavailable")) as search:
+                result = self.prove()
+            search.assert_called_once()
+            self.assertEqual(result["evidence"]["state"], "unknown")
+            self.assertIsNone(result["known_fields"])
+
+    def test_cache_write_failure_keeps_live_proof_but_creates_no_durable_success(self):
+        with mock.patch.object(cache_store, "write_json_atomic", side_effect=OSError("read-only cache")), \
+                mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            live = self.prove()
+        self.assertEqual(live["evidence"]["state"], "verified")
+        self.assertEqual(live["evidence"]["catalogs"][0]["cache_error"], "OSError")
+        self.assertFalse(self.proof_path().exists())
+        with mock.patch.object(ml, "search_datafield", side_effect=ml.ServiceError("unavailable")) as search:
+            self.assertEqual(self.prove()["evidence"]["state"], "unknown")
+        search.assert_called_once()
+
+    def test_cache_read_failure_cannot_supply_a_proof(self):
+        with mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            self.prove()
+        path = self.proof_path()
+        read = cache_store.read_entry
+
+        def unreadable(candidate, **kwargs):
+            if Path(candidate) == path:
+                raise OSError("unreadable field proof")
+            return read(candidate, **kwargs)
+
+        with mock.patch.object(cache_store, "read_entry", side_effect=unreadable), \
+                mock.patch.object(ml, "search_datafield", side_effect=ml.ServiceError("unavailable")) as search:
+            self.assertEqual(self.prove()["evidence"]["state"], "unknown")
+        search.assert_called_once()
+
+    def test_failed_invalidation_blocks_refresh_before_an_old_proof_can_be_contradicted(self):
+        with mock.patch.object(ml, "search_datafield", side_effect=self.lookup):
+            self.prove()
+        before = self.proof_path().read_bytes()
+        self.policy["refresh"] = True
+        with mock.patch.object(cache_store, "remove", side_effect=OSError("read-only cache")), \
+                mock.patch.object(ml, "search_datafield", side_effect=AssertionError("invalidation failed")):
+            result = self.prove()
+        self.assertEqual(result["evidence"]["state"], "unknown")
+        self.assertEqual(result["evidence"]["catalogs"][0]["error"], "SERVICE_ERROR")
+        self.assertEqual(result["evidence"]["catalogs"][0]["cache_operation"], "invalidate")
+        self.assertEqual(self.proof_path().read_bytes(), before)
 
 
 class PreflightEvidenceTests(unittest.TestCase):

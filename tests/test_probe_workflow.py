@@ -189,7 +189,8 @@ class ProbeWorkflowTests(unittest.TestCase):
                                                     details={"field_catalog": evidence})
             return {"ok": True}
 
-        with mock.patch.object(app, "_preflight_lint", side_effect=preflight), \
+        with mock.patch.object(app.time, "time", return_value=100) as clock, \
+                mock.patch.object(app, "_preflight_lint", side_effect=preflight), \
                 mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator) as launch:
             first = self.run_probe(multi_size=2)
             self.assertEqual(first["execution"]["not_submitted"], 2)
@@ -199,11 +200,19 @@ class ProbeWorkflowTests(unittest.TestCase):
             deferred = saved["preflight_deferred"]["first"]
             self.assertEqual(deferred["labels"], ["first", "third"])
             self.assertEqual(deferred["catalogs"], evidence["catalogs"])
+            self.assertEqual((deferred["attempts"], deferred["retry_at"]), (1, 115))
             self.assertFalse(saved["records"][0]["submission_attempted"])
             summary = app._summarize_probe_response(dict(first))
             self.assertEqual(summary["preflight_deferred_total"], 1)
             self.assertEqual(summary["preflight_deferred"]["first"]["code"], "SERVICE_ERROR")
 
+            with mock.patch.object(app, "_preflight_lint", return_value={"ok": True}) as retry, \
+                    mock.patch.object(app, "_invocation_capabilities", side_effect=AssertionError("cooled catalog refresh")):
+                immediate = app.cmd_probe(arguments(resume=str(self.batch)), None)
+            retry.assert_not_called()
+            self.assertEqual(immediate["preflight_deferred"]["first"], deferred)
+            self.assertEqual(launch.call_count, 1)
+            clock.return_value = deferred["retry_at"]
             with mock.patch.object(app, "_preflight_lint", return_value={"ok": True}):
                 resumed = app.cmd_probe(arguments(resume=str(self.batch)), None)
 
@@ -214,18 +223,100 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual([call.kwargs["labels"] for call in launch.call_args_list],
                          [["second"], ["first", "third"]])
 
+    def test_field_service_backoff_is_bounded_and_old_identity_does_not_accumulate_attempts(self):
+        failure = app.FieldEvidenceRefreshError("SERVICE_ERROR", "field wait budget expired", details={
+            "field_catalog": {"required_fields": {"budget_deferred_ids": ["close"]}, "catalogs": []}})
+        account = {"fingerprint": "first-account"}
+        with mock.patch.object(app.time, "time", return_value=100) as clock, \
+                mock.patch.object(app.simulation_capabilities, "account_provenance", return_value=account), \
+                mock.patch.object(app, "_preflight_lint", side_effect=failure), \
+                mock.patch.object(app.guarded_sim, "simulate") as launch:
+            for attempt, delay in enumerate((15, 30, 60, 120, 240, 300, 300), 1):
+                result = (self.run_probe(no_record=True) if attempt == 1 else
+                          app.cmd_probe(arguments(resume=str(self.batch)), None))
+                deferred = result["preflight_deferred"]["first"]
+                self.assertEqual(deferred["attempts"], attempt)
+                self.assertEqual(deferred["retry_at"], clock.return_value + delay)
+                clock.return_value = deferred["retry_at"]
+
+            account["fingerprint"] = "second-account"
+            clock.return_value -= 1
+            result = app.cmd_probe(arguments(resume=str(self.batch)), None)
+            self.assertEqual(result["preflight_deferred"]["first"]["attempts"], 1)
+            saved = json.loads(self.batch.read_text(encoding="utf-8"))
+            saved["preflight_deferred"]["first"]["request_fingerprint"] = "another-request"
+            self.batch.write_text(json.dumps(saved), encoding="utf-8")
+            result = app.cmd_probe(arguments(resume=str(self.batch)), None)
+            self.assertEqual(result["preflight_deferred"]["first"]["attempts"], 1)
+            self.assertEqual(result["preflight_deferred"]["first"]["retry_at"], clock.return_value + 15)
+        launch.assert_not_called()
+
+    def test_cooling_field_preflight_does_not_delay_accepted_recovery(self):
+        def preflight(_session, pairs, *_args, **_kwargs):
+            if pairs[0][0] == "rank(close)":
+                raise app.FieldEvidenceRefreshError("SERVICE_ERROR", "catalog unavailable", details={
+                    "field_catalog": {"catalogs": [{"error": "SERVICE_ERROR"}]}})
+            return {"ok": True}
+
+        accepted = {"status": "PENDING", "submission_attempted": True,
+                    "progress_url": "https://api.worldquantbrain.com/simulations/accepted"}
+        with mock.patch.object(app.time, "time", return_value=100), \
+                mock.patch.object(app, "_preflight_lint", side_effect=preflight) as check, \
+                mock.patch.object(app.guarded_sim, "simulate", return_value=[accepted]) as launch:
+            first = self.run_probe(no_record=True)
+            self.assertEqual(first["execution"]["accepted"], 1)
+            with mock.patch.object(app, "_invocation_capabilities", side_effect=AssertionError("recovery needs no OPTIONS")), \
+                    mock.patch.object(ml, "simulate_alphas", return_value=[finished("SYNTHETIC_second")]) as recover:
+                result = app.cmd_probe(arguments(resume=str(self.batch)), None)
+            self.assertTrue(recover.call_args.kwargs["recover_only"])
+            self.assertEqual(check.call_count, 2)
+            launch.assert_called_once()
+            self.assertEqual(result["execution"]["finished"], 1)
+            self.assertEqual(result["execution"]["not_submitted"], 2)
+            self.assertEqual(result["preflight_deferred"]["first"]["attempts"], 1)
+
+    def test_mixed_group_recovers_accepted_rows_during_cooldown_or_new_preflight_failure(self):
+        failure = app.FieldEvidenceRefreshError("SERVICE_ERROR", "catalog unavailable", details={
+            "field_catalog": {"catalogs": [{"error": "SERVICE_ERROR"}]}})
+        with mock.patch.object(app.time, "time", return_value=100) as clock, \
+                mock.patch.object(app, "_preflight_lint", side_effect=failure) as check, \
+                mock.patch.object(app.guarded_sim, "simulate") as launch:
+            self.run_probe(no_record=True)
+            original = self.batch.read_text(encoding="utf-8")
+            for cooling in (True, False):
+                with self.subTest(cooling=cooling):
+                    document = json.loads(original)
+                    document["records"][0].update(status="PENDING", submission_attempted=True,
+                        progress_url="https://api.worldquantbrain.com/simulations/accepted")
+                    app._probe_document_update(document, self.batch)
+                    arms = [document["arms"][index] for index in (0, 2)]
+                    group = {"arms": arms, "settings": arms[0]["settings"],
+                             "pairs": [(arm["expression"], arm["settings"]["decay"]) for arm in arms]}
+                    clock.return_value = 100 if cooling else 115
+                    check.reset_mock()
+                    recovered = [finished("SYNTHETIC_first"), document["records"][2]]
+                    with mock.patch.object(ml, "simulate_alphas", return_value=recovered) as recover:
+                        result = app._execute_probe(arguments(), document, self.batch, {"mixed": group})
+                    recover.assert_called_once()
+                    self.assertTrue(recover.call_args.kwargs["recover_only"])
+                    self.assertEqual(check.call_count, 0 if cooling else 1)
+                    self.assertEqual(result["rows"][0]["alpha_id"], "SYNTHETIC_first")
+                    self.assertEqual(result["rows"][2]["submission_state"], "not_submitted")
+            launch.assert_not_called()
+
     def test_field_rate_limit_defers_new_preflight_until_saved_retry_time(self):
         failure = app.FieldEvidenceRefreshError("RATE_LIMITED", "catalog rate limit", details={
-            "field_catalog": {"catalogs": [{"field": "close", "error": "RATE_LIMITED", "retry_at": 160}]}})
+            "field_catalog": {"catalogs": [{"field": "close", "error": "RATE_LIMITED", "retry_at": 1000}]}})
         with (mock.patch.object(app.time, "time", return_value=100) as clock,
               mock.patch.object(app, "_preflight_lint", side_effect=failure) as preflight,
               mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator) as launch):
-            self.run_probe(multi_size=2, no_record=True)
+            first = self.run_probe(multi_size=2, no_record=True)
+            self.assertEqual(first["preflight_deferred"]["first"]["retry_at"], 1000)
             app.cmd_probe(arguments(resume=str(self.batch)), None)
             preflight.assert_called_once()
             launch.assert_not_called()
 
-            clock.return_value = 160
+            clock.return_value = 1000
             preflight.side_effect = None
             preflight.return_value = {"ok": True}
             result = app.cmd_probe(arguments(resume=str(self.batch)), None)

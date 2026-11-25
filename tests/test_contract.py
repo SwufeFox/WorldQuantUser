@@ -1205,6 +1205,53 @@ class CliWorkflowContractTests(unittest.TestCase):
             self.assertEqual(response.read_text(encoding="utf-8"), stdout)
             self.assertFalse(batch.exists())
 
+    def test_probe_retry_receipt_survives_a_fresh_cli_invocation_without_rechecking(self):
+        session = requests.Session()
+        self.addCleanup(session.close)
+        session._brain_account_id = "offline-preflight-cli"
+        account = cli_experiments.simulation_capabilities.account_provenance(session)
+        snapshot = {"state": "unknown", "account": account,
+                    "concurrency": {"state": "unknown", "limit": None}}
+        failure = cli_experiments.FieldEvidenceRefreshError(
+            "SERVICE_ERROR", "synthetic slow field endpoint", details={"field_catalog": {
+                "scope": {"region": "USA"},
+                "required_fields": {"verified_ids": [], "unverified_ids": ["close"]},
+                "catalogs": [{"field": "close", "error": "SERVICE_ERROR"}],
+            }})
+        with tempfile.TemporaryDirectory() as directory:
+            spec, batch = Path(directory) / "slow.spec.json", Path(directory) / "batch.json"
+            spec.write_text(json.dumps({"name": "slow-catalog", "design": "explore", "arms": [
+                {"label": "candidate", "expression": "rank(close)"}]}), encoding="utf-8")
+            with mock.patch.object(ml, "load_session", return_value=session), \
+                    mock.patch.object(cli_experiments.time, "time", return_value=100), \
+                    mock.patch.object(cli_experiments, "_novelty_gate", return_value=[{}]), \
+                    mock.patch.object(cli_experiments.simulation_capabilities, "fetch",
+                                      return_value=snapshot) as capability_fetch, \
+                    mock.patch.object(cli_experiments, "_preflight_lint", side_effect=failure) as preflight, \
+                    mock.patch.object(cli_experiments.guarded_sim, "simulate") as launch:
+                code, stdout, _ = self.invoke("probe", str(spec), "--batch-path", str(batch),
+                    "--no-record", "--research-dir", directory, "--quiet")
+                receipt = json.loads(stdout)
+                self.assertEqual(code, 0, receipt)
+                self.assertTrue(receipt["ok"])
+                first = receipt["data"]
+                retry = first["preflight_deferred"]["candidate"]
+                self.assertEqual((retry["attempts"], retry["retry_at"]), (1, 115))
+                self.assertEqual(first["execution"]["not_submitted"], 1)
+
+                code, stdout, _ = self.invoke("probe", "--resume", str(batch),
+                    "--research-dir", directory, "--quiet")
+                resumed = json.loads(stdout)
+                self.assertEqual(code, 0, resumed)
+                self.assertTrue(resumed["ok"])
+                self.assertEqual(resumed["data"]["preflight_deferred"], first["preflight_deferred"])
+                saved = json.loads(batch.read_text(encoding="utf-8"))
+                self.assertEqual(saved["preflight_deferred"], first["preflight_deferred"])
+                self.assertFalse(saved["records"][0]["submission_attempted"])
+                preflight.assert_called_once()
+                capability_fetch.assert_called_once()
+                launch.assert_not_called()
+
     def test_workspace_override_is_local_to_each_invocation(self):
         with tempfile.TemporaryDirectory() as directory, \
                 mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(ROOT / "unused-research")}):

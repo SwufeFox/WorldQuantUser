@@ -1185,15 +1185,26 @@ error envelope carries every finding under `error.details`.
 Online `lint` and simulation preflight derive names and types from one exact field scope.
 Both reject a raw VECTOR passed to `rank`; use `rank(vec_avg(vector_field))` when the
 catalog confirms VECTOR input. Complete captures save private account-bound snapshots.
-Simulation preflight extracts used fields from the AST and uses matching private
-snapshots only to locate their datasets. It refreshes those catalogs live; unrelated
-dataset failures cannot invalidate freshly verified used fields. Receipts distinguish
-`required_fields_only` verification from full catalog completeness, and partial proofs
-never overwrite complete offline snapshots. Unknown or moved fields trigger full
-discovery; stale, cached, degraded or incomplete evidence for used fields still blocks.
+Simulation preflight extracts used fields from the AST and verifies exact IDs in
+the authenticated account and field scope. Successful positive proofs are saved
+incrementally and can be reused by a later resume under the same metadata TTL and
+maximum-age policy. Reuse preserves the original observation time; forced refresh
+and disabled caching do not reuse persisted proofs. Unverified fields use the
+remaining caller deadline rather than an additional eight-second request cap.
+Receipts distinguish `required_fields_only` verification from full catalog completeness;
+partial proofs never overwrite complete offline snapshots. A raw catalog cache hit
+does not establish an exact preflight proof. Missing, ambiguous, stale, damaged or
+mismatched evidence remains unknown.
 Offline lint uses only a matching fresh, complete snapshot and performs no authentication
 or network access; stale, partial, legacy or mismatched metadata stays unknown.
 `tools.guarded_sim` uses the same core field enumerator.
+
+Probe checkpoints retain per-group retry times for temporary field-service failures
+and exhausted preflight budgets. Immediate resume calls skip cooled groups; successful
+field proofs survive so later attempts can advance. Campaign respects these times
+while continuing due accepted-job recovery. A rate-limit cooldown blocks new
+preflight requests in that saved batch for the same account; ordinary service
+failures defer only the affected group.
 
 Rejections the simulator reports are written back to
 `<research_dir>/operator-denylist.json` with a severity: `block` when the operator
@@ -1587,6 +1598,7 @@ accuracy without that experiment's data and configuration.
 | CLI schema, error envelopes and file inputs | [`test_contract.py`](tests/test_contract.py), [`test_contract_v2.py`](tests/test_contract_v2.py) |
 | Check states, missing refreshes and ledger provenance | [`test_check_evidence.py`](tests/test_check_evidence.py), [`test_ledger_evidence.py`](tests/test_ledger_evidence.py), [`test_registry_index.py`](tests/test_registry_index.py) |
 | Account budgets, worker limits and accepted-job recovery | [`test_concurrency_policy.py`](tests/test_concurrency_policy.py), [`test_quick_slots.py`](tests/test_quick_slots.py), [`test_native_multi.py`](tests/test_native_multi.py) |
+| Slow field catalog, durable proofs and preflight retry scheduling | [`test_preflight_recovery.py`](tests/test_preflight_recovery.py), [`test_capabilities.py`](tests/test_capabilities.py), [`test_probe_workflow.py`](tests/test_probe_workflow.py) |
 | Python source, account preflight and payload | [`test_python_preflight.py`](tests/test_python_preflight.py), [`test_regular_settings_payload.py`](tests/test_regular_settings_payload.py), [`test_expression_identity.py`](tests/test_expression_identity.py) |
 | Probe reuse, queue recovery and Campaign | [`test_probe.py`](tests/test_probe.py), [`test_research_runners.py`](tests/test_research_runners.py) |
 | Training freeze and candidate validation | [`test_triage_modes.py`](tests/test_triage_modes.py), [`test_promote.py`](tests/test_promote.py) |
