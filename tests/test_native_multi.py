@@ -414,6 +414,21 @@ def test_native_parent_and_child_retry_after_survive_resume(simulator):
     assert [row["alpha_id"] for row in records] == ["Alpha1", "Alpha2"]
 
 
+def test_native_pending_parent_without_retry_after_saves_a_fallback_poll(simulator):
+    pending = {"id": "NativeParent", "status": "PENDING"}
+    with mock.patch.object(simulation_multi.time, "time", return_value=100), \
+            mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
+            mock.patch.object(ml, "read_simulation_snapshot", return_value=(pending, None)):
+        records = simulator(fetch_metrics=False)
+    assert records[0]["multi_next_parent_poll_at"] == (
+        100 + simulation_multi.PARENT_POLL_FALLBACK_SECONDS)
+
+    with mock.patch.object(simulation_multi.time, "time", return_value=129), \
+            mock.patch.object(ml, "read_simulation_snapshot") as read:
+        simulator(initial_records=records, fetch_metrics=False, recover_only=True)
+    read.assert_not_called()
+
+
 @pytest.mark.parametrize("status", [200, 429])
 def test_native_watch_parent_reads_once_and_retains_retry_before_terminal(simulator, status):
     pending = {"id": "NativeParent", "status": "SIMULATING"}

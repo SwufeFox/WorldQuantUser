@@ -717,7 +717,18 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                              "detail": "waiting for the next saved simulation poll"})
                         return 3
                     return 0
-                delay = interval if next_poll is None else min(interval, max(0, next_poll - time.time()))
+                # A poll can fall due while the sweep is still executing other
+                # specs. Rebuild the clock from current saved evidence instead
+                # of sleeping on a deadline observed at the start of the sweep.
+                now = time.time()
+                next_poll = None
+                for spec, batch, receipt, _ in scheduled:
+                    if not spec.exists():
+                        continue
+                    at = _recovery_schedule(root, batch, receipt, guard).poll_at
+                    if at is not None and at > now:
+                        next_poll = at if next_poll is None else min(next_poll, at)
+                delay = interval if next_poll is None else min(interval, max(0, next_poll - now))
                 time.sleep(delay)
     except cache_store.LockTimeout:
         log({"kind": "busy", "detail": f"another runner is active for {inbox}",

@@ -640,6 +640,33 @@ class ResearchRunnerTests(TestCase):
             campaign.run_campaign(self.root, max_wait=55, interval=20, execute=execute, log_event=mock.Mock())
         self.assertEqual(calls, [(fresh, 55), (pending, 300)])
 
+    def test_campaign_watch_recomputes_the_next_poll_after_a_slow_sweep(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        due, later = [backlog / name for name in ("a-due.json", "b-later.json")]
+        for spec in (due, later):
+            spec.write_text("{}", encoding="utf-8")
+        for spec, at in ((due, 100), (later, 105)):
+            batch, _ = campaign.campaign_paths(self.root, spec)
+            self.saved(batch, [arm("PENDING", submission_state="accepted",
+                                   progress_url="https://test.invalid/1", next_poll_at=at)])
+            payload = json.loads(batch.read_text(encoding="utf-8"))
+            payload["execution"] = {"total": 1, "finished": 0}
+            batch.write_text(json.dumps(payload), encoding="utf-8")
+        clock, calls = [100.0], []
+
+        def execute(_root, spec, _batch, _receipt, **_options):
+            calls.append(spec)
+            clock[0] = 110.0
+            return runner.ProbeRun("deferred", {})
+
+        with (mock.patch.object(runner.time, "time", side_effect=lambda: clock[0]),
+              mock.patch.object(runner.time, "sleep", side_effect=InterruptedError) as sleep,
+              self.assertRaises(InterruptedError)):
+            campaign.run_campaign(self.root, interval=30, execute=execute, log_event=mock.Mock())
+        self.assertEqual(calls, [due, later])
+        sleep.assert_called_once_with(30)
+
     def test_campaign_once_defers_a_queued_repeat_of_a_cooling_legacy_job(self):
         backlog = self.root / "backlog"
         backlog.mkdir()

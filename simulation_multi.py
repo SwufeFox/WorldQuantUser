@@ -12,6 +12,7 @@ import simulation_slots
 
 MAX_CHILDREN = 10
 CONSULTANT_PARENT_LIMIT = 8
+PARENT_POLL_FALLBACK_SECONDS = 30
 PARENT_TIMING_FIELDS = (
     "multi_parent_accepted_at", "multi_last_pending_observed_at", "multi_parent_terminal_observed_at",
 )
@@ -306,7 +307,9 @@ class MultiRuns:
             if pending:
                 anchor["multi_last_pending_observed_at"] = observed_at
             if not retry_after:
-                anchor["multi_next_parent_poll_at"] = None
+                terminal = isinstance(status, str) and status in simulation_slots.TERMINAL_STATUSES
+                anchor["multi_next_parent_poll_at"] = (
+                    None if terminal else observed_at + PARENT_POLL_FALLBACK_SECONDS)
                 break
             if self.poll_once or retry_after >= self.deadline - time.monotonic():
                 anchor["multi_next_parent_poll_at"] = observed_at + retry_after
