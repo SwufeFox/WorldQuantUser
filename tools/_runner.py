@@ -573,6 +573,7 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
             guard = schedule_recovery and not recover_only
             full_recovery_turn = set()
             attempts = recent_campaign_attempts(root)
+            retry_deadlines = {}
             occupied = {}
             saved_owners = {}
             if guard:
@@ -585,6 +586,8 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
             while True:
                 scheduled = []
                 specs = sorted(inbox.glob("*.json"))
+                for stale in set(retry_deadlines) - set(specs):
+                    retry_deadlines.pop(stale, None)
                 full_recovery_turn.intersection_update(specs)
                 for owner, (batch, receipt) in list(saved_owners.items()):
                     if owner in specs:
@@ -605,9 +608,11 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                     scheduled.sort(key=lambda item: (item[3].priority,
                         launch_rank(item[0]) if launch_rank and guard and item[3].priority == 2 else 0))
                 now = time.time()
+                def due_at(spec, task):
+                    return retry_deadlines.get(spec, task.poll_at)
                 ready = {spec for spec, _, _, task in scheduled
                          if watch and (not recover_only or task.priority < 2)
-                         and (task.poll_at is None or task.poll_at <= now)}
+                         and (due_at(spec, task) is None or due_at(spec, task) <= now)}
                 next_poll = None
                 saturated = set()
                 skipped_launches = 0
@@ -616,7 +621,7 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                     if schedule.native_admission_scope in saturated:
                         skipped_launches += 1
                         continue
-                    poll_at = schedule.poll_at
+                    poll_at = due_at(spec, schedule)
                     if poll_at is not None and poll_at > time.time():
                         next_poll = poll_at if next_poll is None else min(next_poll, poll_at)
                         continue
@@ -662,6 +667,7 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                             "next_action": {"action": "status", "argv": ["python", "research_cli.py",
                                 "--research-dir", str(root), "campaign", "status"]}}},
                             f"{type(error).__name__}: {error}")
+                    updated = schedule
                     if watch:
                         updated = _recovery_schedule(root, batch, receipt, guard)
                         _watch_refresh(occupied, spec, updated)
@@ -698,11 +704,22 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                                       else "complete" if result.state == "done" else "terminal_failure"})
                     observed = time.time()
                     timed_wait = type(diagnosis.get("next_poll_at")) in (int, float) and diagnosis["next_poll_at"] > observed
+                    retry_at = observed + interval
+                    for candidate in (updated.poll_at, diagnosis.get("next_poll_at")):
+                        if type(candidate) in (int, float) and candidate > observed:
+                            retry_at = min(retry_at, candidate)
+                    if (result.state == "deferred" and diagnosis.get("reason") in {
+                            "platform_pending", "queued_work", "shared_slots_occupied",
+                            "submission_cooldown", "preflight_backoff"}):
+                        retry_deadlines[spec] = retry_at
+                    else:
+                        retry_deadlines.pop(spec, None)
                     progress = {"changed": changed, "unchanged_rounds": rounds,
                                 "last_progress_at": observed if changed else progress.get("last_progress_at"),
                                 "stalled": result.state == "deferred" and rounds >= STALLED_ROUNDS and not timed_wait}
                     event = {"kind": result.state, "spec": spec.name, "detail": result.detail,
                              "batch": str(batch), "receipt": str(receipt), "observed_at": observed,
+                             **({"retry_at": retry_at} if result.state == "deferred" else {}),
                              "diagnosis": diagnosis, "progress": progress, "source_fingerprint": source_fingerprint,
                              "progress_fingerprint": after}
                     attempts[spec.name] = event
@@ -725,7 +742,9 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                 for spec, batch, receipt, _ in scheduled:
                     if not spec.exists():
                         continue
-                    at = _recovery_schedule(root, batch, receipt, guard).poll_at
+                    at = retry_deadlines.get(spec)
+                    if at is None:
+                        at = _recovery_schedule(root, batch, receipt, guard).poll_at
                     if at is not None and at > now:
                         next_poll = at if next_poll is None else min(next_poll, at)
                 delay = interval if next_poll is None else min(interval, max(0, next_poll - now))

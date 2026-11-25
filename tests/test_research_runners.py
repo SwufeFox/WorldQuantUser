@@ -667,6 +667,41 @@ class ResearchRunnerTests(TestCase):
         self.assertEqual(calls, [due, later])
         sleep.assert_called_once_with(30)
 
+    def test_campaign_watch_retry_deadline_blocks_immediate_recover_and_resume_sweeps(self):
+        inbox = self.root / "retry-inbox"
+        inbox.mkdir()
+        recovery, resume = [inbox / name for name in ("a-recover.json", "b-resume.json")]
+        for spec in (recovery, resume):
+            spec.write_text("{}", encoding="utf-8")
+        clock, calls, sleeps = [100.0], [], []
+
+        def execute(_root, spec, _batch, _receipt, **_options):
+            calls.append(spec)
+            reason = "platform_pending" if spec == recovery else "shared_slots_occupied"
+            return runner.ProbeRun("deferred", {
+                "diagnosis": {"state": "waiting", "reason": reason}})
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 1:
+                clock[0] += 1
+                return
+            raise InterruptedError
+
+        log = mock.Mock()
+        with (mock.patch.object(runner.time, "time", side_effect=lambda: clock[0]),
+              mock.patch.object(runner.time, "sleep", side_effect=sleep),
+              self.assertRaises(InterruptedError)):
+            runner.run_queue(self.root, inbox, lambda _spec: (self.batch, self.receipt),
+                             log, max_wait=30, interval=30, schedule_recovery=True,
+                             execute=execute)
+
+        self.assertEqual(calls, [recovery, resume])
+        deferred = [call.args[0] for call in log.call_args_list
+                    if call.args[0].get("kind") == "deferred"]
+        self.assertEqual([event["retry_at"] for event in deferred], [130, 130])
+        self.assertEqual(sleeps[0], 30)
+
     def test_campaign_once_defers_a_queued_repeat_of_a_cooling_legacy_job(self):
         backlog = self.root / "backlog"
         backlog.mkdir()
