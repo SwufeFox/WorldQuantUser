@@ -156,6 +156,46 @@ def release_url(url):
     return released
 
 
+ORPHAN_RELEASE_STATUSES = TERMINAL_STATUSES | {"NOT_FOUND"}
+
+
+def reconcile_orphans(account, poll, *, max_age_min=45.0, now=None):
+    """Release reservations that can no longer be recovered.
+
+    ``poll(url)`` returns the platform status, the sentinel ``"NOT_FOUND"`` when
+    the job is unknown, or ``None`` when the read failed. Terminal, missing and
+    (past ``max_age_min``) unreadable reservations are released; healthy
+    in-flight jobs keep their slot. Leaked reservations otherwise make every
+    later sweep report ``shared_slots_occupied`` and stop all submissions.
+    """
+    fingerprint = _fingerprint(account)
+    path, lock = _paths(fingerprint)
+    released, kept = [], []
+    stamp = time.time() if now is None else now
+    with cache_store.file_lock(lock):
+        journal = _load(path, fingerprint)
+        reservations = journal.get("reservations") or {}
+        for key, entry in list(reservations.items()):
+            url = entry.get("progress_url")
+            age_min = (stamp - float(entry.get("created_at") or stamp)) / 60.0
+            answer = poll(url) if url else None
+            if isinstance(answer, dict):
+                status, alpha = answer.get("status"), answer.get("alpha")
+            else:
+                status, alpha = answer, None
+            reclaim = (status in ORPHAN_RELEASE_STATUSES
+                       or (status is None and age_min > max_age_min))
+            if reclaim:
+                reservations.pop(key, None)
+                released.append({"id": key, "status": status, "alpha": alpha,
+                                 "age_min": round(age_min, 1)})
+            else:
+                kept.append({"id": key, "status": status, "age_min": round(age_min, 1)})
+        if released:
+            cache_store.write_json_atomic(path, journal)
+    return {"released": released, "kept": kept}
+
+
 def _active_limit(journal, limit):
     for entry in journal["reservations"].values():
         shared_limit = entry.get("quick_limit")

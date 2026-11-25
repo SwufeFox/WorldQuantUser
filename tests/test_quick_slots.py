@@ -153,3 +153,34 @@ def test_dead_quick_owner_does_not_cap_the_workspace(tmp_path, monkeypatch):
     identity, state = slots.reserve(account, 4)
     assert identity is not None
     assert state["active"] == 2
+
+
+def test_reconcile_releases_terminal_missing_and_old_orphans(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    first = slots.quick_acquire(ACCOUNT, 4, "done")
+    slots.quick_update(ACCOUNT, first["id"], "accepted", progress_url="https://api.worldquantbrain.com/simulations/done")
+    second = slots.quick_acquire(ACCOUNT, 4, "gone")
+    slots.quick_update(ACCOUNT, second["id"], "accepted", progress_url="https://api.worldquantbrain.com/simulations/gone")
+    third = slots.quick_acquire(ACCOUNT, 4, "healthy")
+    slots.quick_update(ACCOUNT, third["id"], "accepted", progress_url="https://api.worldquantbrain.com/simulations/live")
+
+    statuses = {"https://api.worldquantbrain.com/simulations/done":
+                    {"status": "COMPLETE", "alpha": "ALPHA1"},
+                "https://api.worldquantbrain.com/simulations/gone": "NOT_FOUND",
+                "https://api.worldquantbrain.com/simulations/live": "RUNNING"}
+    result = slots.reconcile_orphans(ACCOUNT, statuses.get)
+    released = {item["id"] for item in result["released"]}
+    assert {item["alpha"] for item in result["released"] if item["alpha"]} == {"ALPHA1"}
+    assert released == {first["id"], second["id"]}
+    assert [item["id"] for item in result["kept"]] == [third["id"]]
+    assert slots.snapshot(ACCOUNT, 10)["active"] == 1
+
+
+def test_reconcile_releases_unreadable_only_past_max_age(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    old = slots.quick_acquire(ACCOUNT, 1, "old")
+    slots.quick_update(ACCOUNT, old["id"], "accepted", progress_url="https://api.worldquantbrain.com/simulations/old")
+    young = slots.reconcile_orphans(ACCOUNT, lambda url: None, max_age_min=45)
+    assert young["released"] == []
+    aged = slots.reconcile_orphans(ACCOUNT, lambda url: None, max_age_min=0, now=10**12)
+    assert [item["id"] for item in aged["released"]] == [old["id"]]
