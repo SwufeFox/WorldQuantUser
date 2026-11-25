@@ -78,7 +78,7 @@ def test_native_parent_completion_releases_one_slot_without_inventing_child_resu
 
 
 @pytest.mark.parametrize("code,body,headers", [
-    (404, {}, {}), (503, {}, {}),
+    (503, {}, {}),
     (200, {"id": "Accepted", "status": "RUNNING"}, {}),
     (200, {"id": "Other", "status": "COMPLETE", "alpha": "FinishedAlpha"}, {}),
     (200, {"id": "Accepted", "status": "COMPLETE", "alpha": "FinishedAlpha"}, {"Retry-After": "300"}),
@@ -161,7 +161,10 @@ def test_unknown_or_other_account_cannot_poll_or_release(context, monkeypatch):
     assert slots.snapshot(account, 1)["active"] == 1
 
 
-def test_unchanged_progress_past_threshold_releases_local_slot_with_evidence(context, monkeypatch):
+@pytest.mark.parametrize("delete_status,state", [(200, "cancelled"), (204, "cancelled"),
+                                                  (404, "already_gone")])
+def test_unchanged_progress_past_threshold_cancels_with_evidence(
+        context, monkeypatch, delete_status, state):
     session, account = context
     clock = [1000.0]
     monkeypatch.setattr(slots.time, "time", lambda: clock[0])
@@ -173,25 +176,69 @@ def test_unchanged_progress_past_threshold_releases_local_slot_with_evidence(con
     assert first["released"] == []
     assert slots.snapshot(account, 1)["active"] == 1
 
+    monkeypatch.setattr(session, "delete", lambda *_a, **_k: response(delete_status, {}))
     clock[0] += 46 * 60
     second = ml.recover_accepted_slots(session, account)
-    assert len(second["stuck"]) == 1
-    assert second["released"][0]["reason"] == "progress_unchanged"
+    assert len(second["cancelled"]) == 1
+    assert second["released"][0]["state"] == state
+    assert second["released"][0]["status_code"] == delete_status
     assert slots.snapshot(account, 1)["active"] == 0
 
     path, _ = slots._paths(account["fingerprint"])
     journal = slots._load(path, account["fingerprint"])
-    evidence = journal["stuck"][record["slot_reservation"]["id"]]
-    assert evidence["state"] == "stuck"
+    evidence = journal["cancelled"][record["slot_reservation"]["id"]]
+    assert evidence["state"] == state
     assert evidence["progress_url"] == record["progress_url"]
     assert evidence["progress"] == 0.10
     assert evidence["last_progress_at"] == 1000.0
-    assert evidence["stuck_evidence"]["minutes_unchanged"] == 46.0
+    assert evidence["cancel_evidence"]["minutes_unchanged"] == 46.0
+    assert evidence["cancel_evidence"]["status_code"] == delete_status
+    assert evidence["cancel_evidence"]["cancelled_at"] == 1000.0 + 46 * 60
 
     slots.reconcile_record(record, account)
-    assert record["slot_reservation_state"] == "stuck"
-    assert record["slot_stuck_evidence"]["progress_url"] == record["progress_url"]
+    assert record["slot_reservation_state"] == state
+    assert record["slot_cancel_evidence"]["progress_url"] == record["progress_url"]
     assert slots.snapshot(account, 1)["active"] == 0
+
+
+def test_progress_that_advances_is_never_cancelled(context, monkeypatch):
+    session, account = context
+    clock, progress = [1000.0], [0.10]
+    monkeypatch.setattr(slots.time, "time", lambda: clock[0])
+    accept(account)
+    monkeypatch.setattr(session, "get", lambda *_a, **_k: response(
+        200, {"id": "Accepted", "status": "RUNNING", "progress": progress[0]}))
+    monkeypatch.setattr(session, "delete", lambda *_a, **_k: pytest.fail(
+        "a progressing simulation must never be cancelled"))
+
+    ml.recover_accepted_slots(session, account)
+    clock[0] += 46 * 60
+    progress[0] = 0.20
+    report = ml.recover_accepted_slots(session, account)
+    assert report["cancelled"] == []
+    assert slots.snapshot(account, 1)["active"] == 1
+    path, _ = slots._paths(account["fingerprint"])
+    entry = next(iter(slots._load(path, account["fingerprint"])["reservations"].values()))
+    assert entry["progress"] == 0.20
+    assert entry["last_progress_at"] == clock[0]
+
+
+def test_get_404_records_already_gone_and_releases_local_slot(context, monkeypatch):
+    session, account = context
+    record = accept(account)
+    monkeypatch.setattr(session, "get", lambda *_a, **_k: response(404, {}))
+    monkeypatch.setattr(session, "delete", lambda *_a, **_k: pytest.fail(
+        "an already cancelled simulation must not be deleted again"))
+
+    report = ml.recover_accepted_slots(session, account)
+    assert report["released"][0]["state"] == "already_gone"
+    assert report["released"][0]["status_code"] == 404
+    assert slots.snapshot(account, 1)["active"] == 0
+    path, _ = slots._paths(account["fingerprint"])
+    evidence = slots._load(path, account["fingerprint"])["cancelled"][
+        record["slot_reservation"]["id"]]
+    assert evidence["state"] == "already_gone"
+    assert evidence["progress_url"] == record["progress_url"]
 
 
 def test_single_simulation_admission_recovers_completed_external_reservation(context, monkeypatch):

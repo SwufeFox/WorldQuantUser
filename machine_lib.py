@@ -1428,9 +1428,20 @@ def recover_accepted_slots(s, account, *, deadline=None):
         observed[simulation_id] = answer
         return answer
 
+    def cancel(url):
+        from requests.exceptions import RequestException
+        try:
+            response = s.delete(url, timeout=_request_timeout(end), allow_redirects=False)
+        except RequestException:
+            return None
+        if response.status_code in (401, 403):
+            raise AuthError("BRAIN denied simulation cancellation")
+        return response.status_code
+
     try:
         report = simulation_slots.reconcile_orphans(
-            account, poll, deadline=end, ordinary_only=True, stuck_after_min=45.0)
+            account, poll, deadline=end, ordinary_only=True, stuck_after_min=45.0,
+            cancel=cancel)
     except cache_store.LockTimeout:
         report = {"state": "journal_busy", "released": [], "kept": []}
     report.setdefault("state", "observed")

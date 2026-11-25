@@ -55,6 +55,8 @@ def _load(path, fingerprint):
         or any(not isinstance(value, dict) for value in journal.get("resolved", {}).values())
         or not isinstance(journal.get("stuck", {}), dict)
         or any(not isinstance(value, dict) for value in journal.get("stuck", {}).values())
+        or not isinstance(journal.get("cancelled", {}), dict)
+        or any(not isinstance(value, dict) for value in journal.get("cancelled", {}).values())
     ):
         raise cache_store.CacheError("simulation slot journal cannot be read safely: %s" % (error or path))
     return journal
@@ -164,7 +166,8 @@ ORPHAN_RELEASE_STATUSES = TERMINAL_STATUSES
 
 
 def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0,
-                      now=None, deadline=None, ordinary_only=False, stuck_after_min=None):
+                      now=None, deadline=None, ordinary_only=False, stuck_after_min=None,
+                      cancel=None):
     """Release only observed terminal acceptances, retaining their receipts.
 
     ``poll(url)`` supplies an authenticated observation for that exact URL.
@@ -213,6 +216,14 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
             status, alpha = answer, None
             progress = children = None
         status = status.upper() if isinstance(status, str) else None
+        if status == "NOT_FOUND" and not entry.get("quick_job_key"):
+            decisions.append({**item, "kind": "already_gone", "reason": "already_gone",
+                              "state": "already_gone",
+                              "status": status, "status_code": 404,
+                              "progress_url": url, "progress": entry.get("progress"),
+                              "last_progress_at": entry.get("last_progress_at"),
+                              "cancelled_at": stamp})
+            continue
         if status in ORPHAN_RELEASE_STATUSES:
             decisions.append({**item, "kind": "terminal", "status": status, "alpha": alpha})
             continue
@@ -222,10 +233,14 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
             child_count = len(children) if isinstance(children, list) else 0
             progress_fingerprint = f"{status}:{progress_value:.12g}:{child_count}"
             previous = _quota_number(entry.get("last_progress_at"))
-            last_progress_at = previous if entry.get("progress_fingerprint") == progress_fingerprint else None
-            if last_progress_at is None:
+            prior_fingerprint = entry.get("progress_fingerprint")
+            if prior_fingerprint == progress_fingerprint:
+                last_progress_at = previous if previous is not None else stamp
+            elif prior_fingerprint is None:
                 last_progress_at = created if created is not None else stamp
                 last_progress_at = min(last_progress_at, stamp)
+            else:
+                last_progress_at = stamp
             unchanged_min = max(0, stamp - last_progress_at) / 60.0
             observed = {
                 "progress": progress_value,
@@ -244,13 +259,30 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                 "stuck_at": stamp,
                 **observed,
             }
-            if unchanged_min >= stuck_after_min:
-                decisions.append({**item, "kind": "stuck", "status": status,
-                                  "reason": "progress_unchanged",
-                                  "progress": progress_value,
-                                  "last_progress_at": last_progress_at,
-                                  "minutes_unchanged": round(unchanged_min, 1),
-                                  "evidence": evidence})
+            if unchanged_min >= stuck_after_min and cancel is not None:
+                status_code = cancel(url)
+                evidence.update(status_code=status_code, cancelled_at=stamp)
+                if status_code in {200, 204}:
+                    decisions.append({**item, "kind": "cancelled", "reason": "cancelled",
+                                      "state": "cancelled",
+                                      "status": status, "status_code": status_code,
+                                      "progress": progress_value,
+                                      "last_progress_at": last_progress_at,
+                                      "minutes_unchanged": round(unchanged_min, 1),
+                                      "cancelled_at": stamp, "evidence": evidence})
+                    continue
+                if status_code == 404:
+                    decisions.append({**item, "kind": "already_gone", "reason": "already_gone",
+                                      "state": "already_gone",
+                                      "status": status, "status_code": 404,
+                                      "progress": progress_value,
+                                      "last_progress_at": last_progress_at,
+                                      "minutes_unchanged": round(unchanged_min, 1),
+                                      "cancelled_at": stamp, "evidence": evidence})
+                    continue
+                kept.append({**item, "status": status, "reason": "cancel_failed",
+                             "status_code": status_code, "progress": progress_value,
+                             "minutes_unchanged": round(unchanged_min, 1)})
                 continue
             kept.append({**item, "status": status, "reason": "progress_unchanged",
                          "progress": progress_value, "minutes_unchanged": round(unchanged_min, 1)})
@@ -259,7 +291,7 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                      "reason": "platform_pending" if status not in {None, "NOT_FOUND"} else "outcome_unknown"})
 
     released = []
-    stuck = []
+    cancelled = []
     if decisions or observations:
         with cache_store.file_lock(lock, **lock_options()):
             journal = _load(path, fingerprint)
@@ -269,11 +301,16 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                 if reservations.get(key) != snapshot[key]:
                     kept.append({**item, "reason": "reservation_changed"})
                     continue
-                if item["kind"] == "stuck":
+                if item["kind"] in {"cancelled", "already_gone"}:
                     entry = reservations.pop(key)
-                    entry.update(item["evidence"], state="stuck", stuck_evidence=item["evidence"])
-                    journal.setdefault("stuck", {})[key] = entry
-                    stuck.append({key: value for key, value in item.items() if key not in {"evidence"}})
+                    evidence = item.get("evidence") or {
+                        "reason": item["reason"], "progress_url": item.get("progress_url"),
+                        "progress": item.get("progress"), "last_progress_at": item.get("last_progress_at"),
+                        "status_code": item.get("status_code"), "cancelled_at": item.get("cancelled_at"),
+                    }
+                    entry.update(evidence, state=item["kind"], cancel_evidence=evidence)
+                    journal.setdefault("cancelled", {})[key] = entry
+                    cancelled.append({key: value for key, value in item.items() if key not in {"evidence"}})
                     released.append({key: value for key, value in item.items() if key != "evidence"})
                     continue
                 entry = reservations.pop(key)
@@ -288,7 +325,7 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                     reservations[key].update(observed)
             if decisions or observations:
                 cache_store.write_json_atomic(path, journal)
-    return {"released": released, "stuck": stuck, "kept": kept}
+    return {"released": released, "cancelled": cancelled, "kept": kept}
 
 
 def _active_limit(journal, limit):
@@ -718,6 +755,11 @@ def restore_record(record, account=None):
         record["slot_reservation_state"] = "stuck"
         record["slot_stuck_evidence"] = stuck.get("stuck_evidence") or stuck
         return True
+    cancelled = journal.get("cancelled", {}).get(attempt)
+    if cancelled:
+        record["slot_reservation_state"] = cancelled.get("state", "cancelled")
+        record["slot_cancel_evidence"] = cancelled.get("cancel_evidence") or cancelled
+        return True
     if record.get("progress_url"):
         return False
     entry = journal["reservations"].get(attempt, {})
@@ -774,6 +816,11 @@ def reconcile_record(record, account=None, *, outcome=None, progress_url=None, a
                 if stuck:
                     record["slot_reservation_state"] = "stuck"
                     record["slot_stuck_evidence"] = stuck.get("stuck_evidence") or stuck
+                    return record
+                cancelled = journal.get("cancelled", {}).get(identity["id"])
+                if cancelled:
+                    record["slot_reservation_state"] = cancelled.get("state", "cancelled")
+                    record["slot_cancel_evidence"] = cancelled.get("cancel_evidence") or cancelled
                     return record
                 if outcome is None and identity["id"] in journal.get("not_submitted", {}):
                     _restore_unposted(record)
