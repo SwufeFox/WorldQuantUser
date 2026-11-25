@@ -1167,6 +1167,18 @@ def _has_finished_result(record):
     return any(_finite_metric(metrics.get(key)) for key in ("sharpe", "fitness", "returns", "turnover"))
 
 
+def _batch_incomplete_labels(rows, records):
+    """Rows still missing train evidence, excluding terminal guard refusals.
+
+    A duplicate arm rejected by the submission guard ends as UNSUBMITTED and
+    never gains metrics; counting it as incomplete keeps the whole batch open
+    forever, which is what made campaign retry the same spec every minute.
+    """
+    return [row["label"] for row, record in zip(rows, records)
+            if row.get("train_fitness") is None
+            and str(record.get("status") or "").upper() != "UNSUBMITTED"]
+
+
 def _probe_comparisons(rows, design):
     """Describe intervention minus control using only explicit train evidence."""
     result = {"scope": "train", "rows": []}
@@ -1274,6 +1286,11 @@ def _terminal_probe_without_alpha(record):
 
 
 def _probe_needs_recovery(row):
+    # UNSUBMITTED is the platform's terminal label for an arm that was accepted
+    # but refused by a submission guard (e.g. a duplicate). It never gains
+    # metrics, so waiting on it makes the whole batch look unfinished forever.
+    if str(row.get("status") or "").upper() == "UNSUBMITTED":
+        return False
     if _native_parent_pending(row):
         return True
     return (row.get("submission_attempted") is not False
@@ -2252,7 +2269,7 @@ def _probe_document_update(document, target):
         row["arm_index"] = index
         row["submission_state"] = _submission_state(records[index])
         row["cost_evidence"] = costs.evidence(_train_metrics(records[index]), "train", document.get("cost_bps"))
-    incomplete = [row["label"] for row in rows if row.get("train_fitness") is None]
+    incomplete = _batch_incomplete_labels(rows, records)
     document.update({"rows": rows, "complete": not incomplete, "incomplete": incomplete,
                      "all_empty": bool(rows) and len(incomplete) == len(rows),
                      "comparisons": _probe_comparisons(rows, document.get("design"))})

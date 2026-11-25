@@ -992,3 +992,19 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual([row["alpha_id"] for row in validated["rows"]],
                          [row["alpha_id"] for row in result["rows"]])
         self.assertFalse(any(row.get("missing") for row in validated["rows"]))
+
+
+class UnsubmittedTerminalTests(unittest.TestCase):
+    def test_unsubmitted_row_needs_no_recovery(self):
+        from research_app.experiments import _probe_needs_recovery
+
+        row = {"status": "UNSUBMITTED", "alpha_id": "abc", "train_fitness": None}
+        self.assertFalse(_probe_needs_recovery(row))
+
+    def test_guard_refusal_does_not_keep_batch_incomplete(self):
+        from research_app.experiments import _batch_incomplete_labels
+
+        rows = [{"label": "refused", "train_fitness": None},
+                {"label": "done", "train_fitness": 1.2}]
+        records = [{"status": "UNSUBMITTED"}, {"status": "COMPLETE"}]
+        self.assertEqual(_batch_incomplete_labels(rows, records), [])
