@@ -1423,12 +1423,14 @@ def recover_accepted_slots(s, account, *, deadline=None):
             elif delay:
                 answer = "PENDING"
             else:
-                answer = {"status": status, "alpha": alpha}
+                answer = {"status": status, "alpha": alpha, "progress": payload.get("progress"),
+                          "children": payload.get("children")}
         observed[simulation_id] = answer
         return answer
 
     try:
-        report = simulation_slots.reconcile_orphans(account, poll, deadline=end, ordinary_only=True)
+        report = simulation_slots.reconcile_orphans(
+            account, poll, deadline=end, ordinary_only=True, stuck_after_min=45.0)
     except cache_store.LockTimeout:
         report = {"state": "journal_busy", "released": [], "kept": []}
     report.setdefault("state", "observed")

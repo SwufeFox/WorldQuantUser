@@ -161,6 +161,39 @@ def test_unknown_or_other_account_cannot_poll_or_release(context, monkeypatch):
     assert slots.snapshot(account, 1)["active"] == 1
 
 
+def test_unchanged_progress_past_threshold_releases_local_slot_with_evidence(context, monkeypatch):
+    session, account = context
+    clock = [1000.0]
+    monkeypatch.setattr(slots.time, "time", lambda: clock[0])
+    record = accept(account)
+    monkeypatch.setattr(session, "get", lambda *_a, **_k: response(
+        200, {"id": "Accepted", "status": "RUNNING", "progress": 0.10}))
+
+    first = ml.recover_accepted_slots(session, account)
+    assert first["released"] == []
+    assert slots.snapshot(account, 1)["active"] == 1
+
+    clock[0] += 46 * 60
+    second = ml.recover_accepted_slots(session, account)
+    assert len(second["stuck"]) == 1
+    assert second["released"][0]["reason"] == "progress_unchanged"
+    assert slots.snapshot(account, 1)["active"] == 0
+
+    path, _ = slots._paths(account["fingerprint"])
+    journal = slots._load(path, account["fingerprint"])
+    evidence = journal["stuck"][record["slot_reservation"]["id"]]
+    assert evidence["state"] == "stuck"
+    assert evidence["progress_url"] == record["progress_url"]
+    assert evidence["progress"] == 0.10
+    assert evidence["last_progress_at"] == 1000.0
+    assert evidence["stuck_evidence"]["minutes_unchanged"] == 46.0
+
+    slots.reconcile_record(record, account)
+    assert record["slot_reservation_state"] == "stuck"
+    assert record["slot_stuck_evidence"]["progress_url"] == record["progress_url"]
+    assert slots.snapshot(account, 1)["active"] == 0
+
+
 def test_single_simulation_admission_recovers_completed_external_reservation(context, monkeypatch):
     session, account = context
     accept(account, "External", limit=1)
