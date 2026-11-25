@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import sys
 import hashlib
 import json
 import math
@@ -2313,6 +2314,24 @@ def _probe_document_update(document, target):
         row["arm_index"] = index
         row["submission_state"] = _submission_state(records[index])
         row["cost_evidence"] = costs.evidence(_train_metrics(records[index]), "train", document.get("cost_bps"))
+    # Seed ledger: record every arm, including ERROR/FAIL, keyed by arm identity.
+    for index, (row, record, arm) in enumerate(zip(rows, records, arms)):
+        try:
+            entry = alpha_registry.build_entry(
+                {"alpha_id": record.get("alpha_id"),
+                 "expression": record.get("expression") or arm.get("expression") or row.get("expression"),
+                 "settings": record.get("settings") or (document.get("settings") or {}),
+                 "metrics": {"sharpe": row.get("train_sharpe"), "fitness": row.get("train_fitness"),
+                             "turnover": row.get("train_turnover")},
+                 "checks": {k: v for k, v in row.items() if isinstance(v, dict) and v.get("result")},
+                 "failing_checks": row.get("fails") or [],
+                 "status": record.get("status"),
+                 "operator_count": record.get("operator_count")},
+                idea=arm.get("idea"), mechanism=arm.get("mechanism") or arm.get("label"),
+                source="probe", batch=str(target))
+            alpha_registry.record_arm(entry)
+        except ValueError as exc:
+            print("seed not recorded for %s: %s" % (arm.get("label"), exc), file=sys.stderr)
     incomplete = _batch_incomplete_labels(rows, records)
     document.update({"rows": rows, "complete": not incomplete, "incomplete": incomplete,
                      "all_empty": bool(rows) and len(incomplete) == len(rows),
