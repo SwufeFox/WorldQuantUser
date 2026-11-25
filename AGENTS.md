@@ -34,6 +34,8 @@ The step-by-step guide and state table live in
 [docs/ledger-workflow.md](docs/ledger-workflow.md). Use `help COMMAND` for the
 next command's options and examples; use `schema COMMAND` for its machine
 contract. The full schema and source files are not startup reading.
+For throughput, shared budgets and concurrency measurements, read the Chinese
+[docs/fast-backtest.md](docs/fast-backtest.md) guide.
 
 ## Read progress literally
 
@@ -60,6 +62,13 @@ contract. The full schema and source files are not startup reading.
   error evidence; they are not automatic scientific rejections. Check
   `recording.recorded_failures` and `recording.missing_idea_count`. An idea comes
   from the arm or spec, never from a guessed explanation of its filename.
+- The compatibility Quick exploration runner checks the whole input before new
+  POSTs: a nonempty `idea` on every arm, at most eight arms per AST skeleton, and
+  at least three datasets supported by account/scoped field evidence. Read its
+  `.admission.json` receipt when blocked; `family` labels and field prefixes are
+  not catalog evidence. Existing accepted/unknown tasks and historical recording
+  remain recoverable. These exploration rules do not redefine a controlled
+  two-arm Probe or FULL validation. See the Quick section in `docs/tooling.md`.
 - Research seeds are the ledger's experiment records, including failed attempts.
   Submission-candidate metadata belongs to the existing buffer/seed store and is
   written by promotion. Supply a nonempty name, an allowed category, at least one

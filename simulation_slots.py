@@ -130,34 +130,6 @@ def reserve(account, limit):
         return identity, state
 
 
-def release_url(url):
-    """Drop reservations that point at a simulation URL the platform no longer knows.
-
-    A 404 means the job was cancelled outside this workspace; keeping its
-    reservation would hold a slot forever and block new submissions.
-    """
-    if not isinstance(url, str) or not url.startswith("https://"):
-        return []
-    root = Path(research_paths.resolve("simulation-slots"))
-    released = []
-    for path in sorted(root.glob("*.json")):
-        journal, error = cache_store.load_json(str(path))
-        if error or not isinstance(journal, dict) or not isinstance(journal.get("reservations"), dict):
-            continue
-        reservations = journal["reservations"]
-        dropped = [key for key, entry in reservations.items()
-                   if isinstance(entry, dict) and entry.get("progress_url") == url]
-        if not dropped:
-            continue
-        for key in dropped:
-            reservations.pop(key, None)
-        journal.setdefault("quick_resolved", {})[url.rstrip("/").split("/")[-1]] = {
-            "state": "released", "progress_url": url}
-        cache_store.write_json_atomic(str(path), journal)
-        released.extend(dropped)
-    return released
-
-
 ORPHAN_RELEASE_STATUSES = TERMINAL_STATUSES
 
 
@@ -169,10 +141,19 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
     Age is diagnostic: time passing, a failed read or HTTP 404 cannot prove a
     live job finished or an ambiguous POST never happened. Network reads run
     outside the journal lock, and changed reservations are not overwritten.
+
+    ``max_age_min`` and ``hard_max_age_min`` retain their compatibility names
+    and defaults (45 and 360 minutes). They describe the reported age only:
+    ``overdue`` uses the earlier threshold and ``past_hard_age`` uses the
+    second one. Neither threshold permits releasing a reservation.
     """
+    age_diagnostics = {"diagnostic_only": True, "max_age_min": max_age_min,
+                       "hard_max_age_min": hard_max_age_min,
+                       "overdue_after_min": min(max_age_min, hard_max_age_min)}
     fingerprint = _fingerprint(account)
     if not fingerprint:
-        return {"released": [], "kept": [], "state": "account_unknown"}
+        return {"released": [], "kept": [], "state": "account_unknown",
+                "age_diagnostics": age_diagnostics}
     path, lock = _paths(fingerprint)
     stamp = time.time() if now is None else now
 
@@ -192,7 +173,8 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
         created = _quota_number(entry.get("created_at"))
         age_min = max(0, stamp - created) / 60.0 if created is not None else None
         item = {"id": key, "age_min": round(age_min, 1) if age_min is not None else None,
-                "overdue": age_min is not None and age_min > min(max_age_min, hard_max_age_min)}
+                "overdue": age_min is not None and age_min > age_diagnostics["overdue_after_min"],
+                "past_hard_age": age_min is not None and age_min > hard_max_age_min}
         unavailable = (entry.get("state") != "accepted" or not url
                        or entry.get("manual_location") or entry.get("identity_unverified")
                        or (entry.get("quick_job_key") and _quick_owner_is_live(entry.get("quick_owner"))))
@@ -233,7 +215,7 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                 released.append(item)
             if released:
                 cache_store.write_json_atomic(path, journal)
-    return {"released": released, "kept": kept}
+    return {"released": released, "kept": kept, "age_diagnostics": age_diagnostics}
 
 
 def _active_limit(journal, limit):
@@ -345,6 +327,8 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False,
                 raise ValueError("saved progress URL differs from the shared quick reservation")
             if stored_url:
                 entry.update(state="accepted", quick_owner=owner)
+                if identity_unverified:
+                    entry["identity_unverified"] = True
             elif entry.get("state") == "quick_preparing" and not existing_url and limit == 0:
                 # No POST has begun. A later zero budget revokes this owner's
                 # preparation instead of allowing its old limit to authorize work.
@@ -407,6 +391,7 @@ def quick_update(account, identity, outcome, *, progress_url=None, retain=False,
                 return True
             return False
         if retain and (entry.get("state") != "accepted" or entry.get("manual_location")
+                       or entry.get("identity_unverified")
                        or _quick_owner_is_live(entry.get("quick_owner"))):
             return False
         if outcome == "submitting":
@@ -453,7 +438,7 @@ def quick_orphans(account, *, exclude_job=None):
         for key, entry in reservations.items()
         if entry.get("quick_job_key") and entry["quick_job_key"] != exclude_job
         and entry.get("state") == "accepted" and entry.get("progress_url")
-        and not entry.get("manual_location")
+        and not entry.get("manual_location") and not entry.get("identity_unverified")
         and (_quota_number(entry.get("next_poll_at")) or 0) <= now
         and not _quick_owner_is_live(entry.get("quick_owner"))
     ]
@@ -493,9 +478,10 @@ def quick_attach_location(account, job_key, progress_url, *, terminal_failure=No
             raise ValueError("no unresolved Quick reservation matches this job key")
         key, entry = match
         new_location = entry.get("state") in {"unknown", "submitting"} and not entry.get("progress_url")
-        parked_manual = (terminal_failure and entry.get("state") == "accepted"
-                         and entry.get("manual_location") and entry.get("progress_url") == progress_url)
-        if not (new_location or parked_manual) or _quick_owner_is_live(entry.get("quick_owner")):
+        parked_unverified = (terminal_failure and entry.get("state") == "accepted"
+                             and (entry.get("manual_location") or entry.get("identity_unverified"))
+                             and entry.get("progress_url") == progress_url)
+        if not (new_location or parked_unverified) or _quick_owner_is_live(entry.get("quick_owner")):
             raise ValueError("Quick reservation already has a Location or may still be posting")
         for collection in (reservations, resolved):
             if any(other != key and isinstance(row.get("progress_url"), str)
@@ -518,15 +504,24 @@ def quick_attach_location(account, job_key, progress_url, *, terminal_failure=No
         return {"id": key, **entry}
 
 
-def quick_known_jobs(account):
-    """Return durable Quick job keys without changing the shared journal."""
+def quick_job_snapshot(account):
+    """Read durable Quick identities and POST evidence without changing the journal.
+
+    This snapshot is a scheduling hint. ``quick_acquire`` rechecks current
+    ownership and state under its lock before authorizing any work.
+    """
     with _locked_quick_journal(account) as (journal, _):
         return {
-            entry["quick_job_key"]
+            entry["quick_job_key"]: {"id": identity, **entry}
             for collection in (journal["reservations"], journal.get("quick_resolved", {}))
-            for entry in collection.values()
+            for identity, entry in collection.items()
             if entry.get("quick_job_key")
         }
+
+
+def quick_known_jobs(account):
+    """Return durable Quick job keys without changing the shared journal."""
+    return set(quick_job_snapshot(account))
 
 
 def _record_unposted(journal, identity):

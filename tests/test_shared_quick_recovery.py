@@ -224,17 +224,20 @@ def test_manually_recovered_location_is_held_until_payload_is_verified(tmp_path,
     session.post.assert_not_called()
 
 
-def test_legacy_import_can_free_slot_but_keeps_unverified_result_identity(tmp_path, monkeypatch):
+def test_unverified_import_needs_identity_confirmation_before_orphan_release(tmp_path, monkeypatch):
     monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
     lease = slots.quick_acquire(ACCOUNT, 1, "legacy-job", existing_url=ORPHAN_URL,
                                 identity_unverified=True)
     assert slots.quick_update(ACCOUNT, lease["id"], "parked")
     session = Mock()
     session.get.return_value = response(200, {"status": "COMPLETE", "alpha": "OldAlpha"})
-    assert ml.recover_quick_orphans(session, ACCOUNT) == 1
+    assert ml.recover_quick_orphans(session, ACCOUNT) == 0
+    session.get.assert_not_called()
+    assert not slots.quick_update(ACCOUNT, lease["id"], "terminal", retain=True,
+                                  terminal_result={"status": "COMPLETE", "alpha_id": "OldAlpha"})
     receipt = slots.quick_acquire(ACCOUNT, 1, "legacy-job")
-    assert receipt["resolved"] and receipt["identity_unverified"]
-    assert receipt["terminal_result"]["alpha_id"] == "OldAlpha"
+    assert not receipt.get("resolved") and receipt["identity_unverified"]
+    assert slots.snapshot(ACCOUNT, 1)["active"] == 1
 
 
 def test_recovery_rejects_wrong_account_active_post_wrong_receipt_and_existing_address(tmp_path, monkeypatch):

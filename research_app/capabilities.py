@@ -173,7 +173,12 @@ def _cached_field_proof(path, account, scope, field, maximum):
 
 
 def required_field_scope(session, settings, required_fields, *, deadline=None, proof_cache=None):
-    """Verify required IDs with fresh exact proofs and bounded live searches."""
+    """Verify required IDs with fresh exact proofs and bounded live searches.
+
+    ``verified_records`` exposes individually verified, still-fresh records even
+    when some required IDs remain unknown. The original fields retain their
+    all-required-IDs-verified contract and never imply a complete catalog.
+    """
     from requests.exceptions import RequestException
 
     scope, account = scope_settings(settings), simulation_capabilities.account_provenance(session)
@@ -321,12 +326,19 @@ def required_field_scope(session, settings, required_fields, *, deadline=None, p
         evidence["required_fields"]["budget_deferred_ids"] = budget_deferred
     if expired:
         evidence["required_fields"]["expired_ids"] = sorted(expired)
-    return field_scope(records, evidence)
+    return {**field_scope(records, evidence), "verified_records": records}
 
 
-def cached_field_scope(settings, max_age_seconds=None):
-    """Read exactly one scope/account snapshot; unknown metadata is never verified."""
-    scope, account = scope_settings(settings), simulation_capabilities.account_provenance()
+def cached_field_scope(settings, max_age_seconds=None, *, account=None):
+    """Read exactly one scope/account snapshot; unknown metadata is never verified.
+
+    Callers with an authenticated session can supply its account provenance.
+    Without it, retain the configured offline account lookup.
+    """
+    scope = scope_settings(settings)
+    account = simulation_capabilities.account_provenance() if account is None else account
+    if not isinstance(account, dict):
+        account = {"state": "unknown", "fingerprint": None}
     maximum = ml.metadata_cache_policy()["max_age"] if max_age_seconds is None else float(max_age_seconds)
     entry = cache_store.read_entry(snapshot_path(scope, account))
     payload = entry.get("payload")
@@ -338,7 +350,8 @@ def cached_field_scope(settings, max_age_seconds=None):
         isinstance(row, dict) and isinstance(row.get("id"), str) and row["id"] for row in records)
     coverage = payload.get("coverage") or {}
     reasons = []
-    if account["state"] != "known":
+    if (account.get("state") != "known" or not isinstance(account.get("fingerprint"), str)
+            or not account["fingerprint"]):
         reasons.append("account_unknown")
     if not entry.get("present"):
         reasons.append("snapshot_missing_or_invalid")

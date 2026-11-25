@@ -1168,21 +1168,32 @@ class UnsubmittedEvidenceTests(unittest.TestCase):
 
     def test_missing_receipt_does_not_release_or_authorize_repost(self):
         url = "https://api.worldquantbrain.com/simulations/original"
-        row = {"label": "missing", "status": "PENDING", "progress_url": url,
-               "submission_attempted": True, "train_fitness": None,
-               "expression": "rank(close)", "settings": ml.resolve_settings()}
-        with mock.patch.object(ml, "poll_simulation", side_effect=ml.NotFound("not found")), \
-                mock.patch.object(ml, "list_alphas", return_value=[{
-                    "id": "OldAlpha", "regular": {"code": "rank(close)"},
-                    "settings": row["settings"], "dateCreated": "2020-01-01T00:00:00Z"}]) as listing, \
-                mock.patch.object(app.simulation_slots, "release_url") as release, \
-                mock.patch.object(ml, "submit_single_simulation") as post:
-            result = app._recover_probe_rows(object(), [row])
+        account = {"fingerprint": "probe-missing-receipt"}
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": directory}):
+            identity, _ = app.simulation_slots.reserve(account, 1)
+            row = {"label": "missing", "status": "PENDING", "progress_url": url,
+                   "submission_attempted": True, "train_fitness": None,
+                   "expression": "rank(close)", "settings": ml.resolve_settings(),
+                   "slot_reservation": identity}
+            app.simulation_slots.reconcile_record(row, account, outcome="accepted")
+            journal = Path(app.simulation_slots._paths(account["fingerprint"])[0])
+            before = journal.read_bytes()
+            with mock.patch.object(ml, "poll_simulation", side_effect=ml.NotFound("not found")), \
+                    mock.patch.object(ml, "list_alphas", return_value=[{
+                        "id": "OldAlpha", "regular": {"code": "rank(close)"},
+                        "settings": row["settings"], "dateCreated": "2020-01-01T00:00:00Z"}]) as listing, \
+                    mock.patch.object(ml, "submit_single_simulation") as post:
+                result = app._recover_probe_rows(
+                    object(), [row], on_progress=lambda changed:
+                    app.simulation_slots.reconcile_record(changed, account))
+            self.assertEqual(app.simulation_slots.snapshot(account, 1)["active"], 1)
+            self.assertEqual(journal.read_bytes(), before)
         self.assertEqual(result["still_missing"], ["missing"])
         self.assertEqual(result["not_submitted"], [])
         self.assertTrue(row["submission_attempted"])
         self.assertEqual(row["progress_url"], url)
+        self.assertEqual(row["slot_reservation"], identity)
         self.assertEqual(app._submission_state(row), "accepted")
-        release.assert_not_called()
         post.assert_not_called()
         listing.assert_not_called()

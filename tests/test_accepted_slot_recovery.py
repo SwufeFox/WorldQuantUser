@@ -149,7 +149,41 @@ def test_unknown_post_without_location_is_not_released_by_age(context):
                                      now=10**12, max_age_min=0, hard_max_age_min=0)
     assert report["released"] == []
     assert report["kept"][0]["overdue"] is True
+    assert report["kept"][0]["past_hard_age"] is True
+    assert report["age_diagnostics"] == {
+        "diagnostic_only": True, "max_age_min": 0, "hard_max_age_min": 0,
+        "overdue_after_min": 0,
+    }
     assert slots.snapshot(account, 1)["active"] == 1
+
+
+def test_default_age_thresholds_are_reported_without_releasing_live_jobs(context):
+    _session, account = context
+    stamp = 2_000_000_000
+    ages = {accept(account, "Age%d" % age)["slot_reservation"]["id"]: age
+            for age in (45, 46, 360, 361)}
+    path = Path(slots._paths(account["fingerprint"])[0])
+    journal, _ = cache_store.load_json(path)
+    for identity, age in ages.items():
+        journal["reservations"][identity]["created_at"] = stamp - age * 60
+    cache_store.write_json_atomic(path, journal)
+    before = path.read_bytes()
+
+    report = slots.reconcile_orphans(account, lambda _url: "RUNNING", now=stamp)
+
+    assert report["released"] == []
+    assert report["age_diagnostics"] == {
+        "diagnostic_only": True, "max_age_min": 45.0, "hard_max_age_min": 360.0,
+        "overdue_after_min": 45.0,
+    }
+    assert len(report["kept"]) == len(ages)
+    for item in report["kept"]:
+        age = ages[item["id"]]
+        assert item["age_min"] == age
+        assert item["overdue"] is (age > 45)
+        assert item["past_hard_age"] is (age > 360)
+    assert slots.snapshot(account, 4)["active"] == 4
+    assert path.read_bytes() == before
 
 
 def test_unknown_or_other_account_cannot_poll_or_release(context, monkeypatch):

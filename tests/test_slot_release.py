@@ -1,38 +1,63 @@
-"""Offline contract for releasing a reservation whose simulation no longer exists."""
+"""A missing receipt cannot free a slot; terminal evidence stays account-scoped."""
 
-import json
 from pathlib import Path
 
+import cache_store
 import simulation_slots as slots
 
-ACCOUNT = {"fingerprint": "release-url-test"}
+ACCOUNT = {"fingerprint": "slot-release-test"}
+OTHER_ACCOUNT = {"fingerprint": "other-slot-release-test"}
 URL = "https://api.worldquantbrain.com/simulations/gone"
 
 
-def _journal(tmp_path, monkeypatch, reservations):
+def _accepted(account, url):
+    identity, _ = slots.reserve(account, 2)
+    row = {"status": "PENDING", "submission_attempted": True,
+           "slot_reservation": identity, "progress_url": url}
+    slots.reconcile_record(row, account, outcome="accepted")
+    return identity
+
+
+def test_missing_receipt_keeps_actual_reservations_in_both_accounts(tmp_path, monkeypatch):
     monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
-    path, _lock = slots._paths(slots._fingerprint(ACCOUNT))
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    Path(path).write_text(json.dumps({
-        "version": 1, "account_fingerprint": slots._fingerprint(ACCOUNT),
-        "reservations": reservations,
-    }))
-    return Path(path)
+    missing = _accepted(ACCOUNT, URL)
+    live = _accepted(ACCOUNT, URL + "-alive")
+    _accepted(OTHER_ACCOUNT, URL)
+    paths = [Path(slots._paths(account["fingerprint"])[0])
+             for account in (ACCOUNT, OTHER_ACCOUNT)]
+    before = [path.read_bytes() for path in paths]
+    reads = []
+
+    def poll(url):
+        reads.append(url)
+        return "NOT_FOUND" if url == URL else "RUNNING"
+
+    report = slots.reconcile_orphans(ACCOUNT, poll)
+
+    assert report["released"] == []
+    assert {item["id"] for item in report["kept"]} == {missing["id"], live["id"]}
+    assert sorted(reads) == [URL, URL + "-alive"]
+    assert [path.read_bytes() for path in paths] == before
+    assert slots.snapshot(ACCOUNT, 2)["active"] == 2
+    assert slots.snapshot(OTHER_ACCOUNT, 2)["active"] == 1
 
 
-def test_release_url_drops_only_the_matching_reservation(tmp_path, monkeypatch):
-    path = _journal(tmp_path, monkeypatch, {
-        "gone": {"state": "accepted", "progress_url": URL},
-        "alive": {"state": "accepted", "progress_url": URL + "-alive"},
-    })
-    assert slots.release_url(URL) == ["gone"]
-    journal = json.loads(path.read_text())
-    assert list(journal["reservations"]) == ["alive"]
-    assert journal["quick_resolved"]["gone"]["state"] == "released"
-    assert slots.release_url(URL) == []
+def test_terminal_release_reads_outside_lock_and_changes_only_the_observed_account(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    accepted = _accepted(ACCOUNT, URL)
+    _accepted(OTHER_ACCOUNT, URL)
+    _path, lock = slots._paths(ACCOUNT["fingerprint"])
+    other_path = Path(slots._paths(OTHER_ACCOUNT["fingerprint"])[0])
+    other_before = other_path.read_bytes()
 
+    def poll(url):
+        assert url == URL
+        with cache_store.file_lock(lock, timeout=0, poll=0):
+            return {"status": "COMPLETE", "alpha": "FinishedAlpha"}
 
-def test_release_url_ignores_non_http_values(tmp_path, monkeypatch):
-    _journal(tmp_path, monkeypatch, {})
-    assert slots.release_url(None) == []
-    assert slots.release_url("simulations/4") == []
+    report = slots.reconcile_orphans(ACCOUNT, poll)
+
+    assert [item["id"] for item in report["released"]] == [accepted["id"]]
+    assert slots.snapshot(ACCOUNT, 2)["active"] == 0
+    assert slots.snapshot(OTHER_ACCOUNT, 2)["active"] == 1
+    assert other_path.read_bytes() == other_before

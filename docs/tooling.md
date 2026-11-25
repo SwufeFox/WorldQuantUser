@@ -900,6 +900,10 @@ python3 research_cli.py resume checkpoint.json --batch-size 6 --max-wait-seconds
 
 `probe --summary` 返回训练期表格：label、role、执行状态、S/F、换手、margin_bps、
 两段训练 Sharpe 和 alpha_id。展示和预检明细最多 20 条，并给出总数、略去数量与完整批次路径。
+`truncated` 标明缩略，`preflight_deferred_total` / `preflight_deferred_omitted` 给出延后项计数。
+`summary.full_evidence` 仅在真实保存的检查点存在时给出 `available: true` 和完整路径；
+dry-run/check 保留 `available: false`。`next_actions[].argv` 带实际 `--research-dir`，
+供调用方直接按参数数组执行，不另猜恢复命令或工作目录。
 缺失显示 `-`，真实的零保留为零；完整批次不截断。读取旧结果可用
 `compare sample-batch.json --summary --format markdown`，表格仍装在单个 JSON 回执里。
 
@@ -920,7 +924,9 @@ checkpoint。收到取消或记账写入失败时，错误回执给出已保留�
 能读到时附带 `owner.pid` 和 `owner.acquired_at`，只表示锁文件中观察到的内容。
 先检查已有执行者，不删锁、不另起一个执行者抢同一批次。
 
-`--max-wait-seconds` 默认 300 秒。登录、预检、模拟、恢复查询和 PnL 补读共用一次等待预算。
+Probe 的 `--max-wait-seconds` 默认 300 秒，兼容 `--max-wait`。
+CLI 中这两个写法指向同一个预算参数；不同命令仍保留各自的默认值、类型和预算范围。
+登录、预检、模拟、恢复查询和 PnL 补读共用一次 Probe 等待预算。
 预算耗尽时，未发出的工作保持排队。任务进入终态后立即释放槽位，空位可在同一组接下一条任务。
 前组若只剩指标待取，`probe` 会先启动后续设置组，再在剩余预算内补读。指标尚未生成时，
 回执保留 Alpha ID、等待状态和建议重试时间。`--recover` 接受批次或保存的回执，只读现有任务并幂等补账。
@@ -1012,9 +1018,39 @@ FASTEXPR 从 AST 提取用到的字段与类型，Python 则使用 `@alpha` 的�
 python3 tools/pipeline/batch_quick.py arms.json --out ledgers/quick.jsonl --concurrency 4 --account-slots 5
 ```
 
-输入可用 JSON 数组或 JSONL，每条包含 `label`、`expr` 和 `settings`。默认使用 `QUICK`，
+输入可用 JSON 数组或 JSONL，每条包含 `label`、`expr`、`settings` 和非空字符串 `idea`。
+默认使用 `QUICK`，
 显式 `settings.simulationMode` 优先。回测结束后由独立 worker 读取指标，回测 worker 可以接下一条。
 兼容入口 `tools/pipeline/async_batch.py` 使用同一执行器，默认输出 `ledgers/async.jsonl`，默认 worker 数为 6。
+
+#### 新探索批次的准入
+
+新 POST 前对完整输入做一次检查；`--limit`、worker 数和设置分组都不缩小检查范围：
+
+| 规则 | 证据与处理 |
+| --- | --- |
+| 每条 arm 有非空字符串 `idea` | 不接受空白、数字或由文件名猜出的说明 |
+| 同一 AST skeleton 最多 8 条 | 展开 local，只看最终 signal；更换字段、窗口、local 名称或增加无用赋值不会增加 skeleton 数 |
+| 至少 3 个已核实的 dataset ID | 使用实际账号、scope 和有效期匹配的字段记录；只计 MATRIX/VECTOR 信号字段，GROUP/UNIVERSE 不计数 |
+
+第三条采用可验证的数据集口径；arm 自报的 `family` / `dataset` 和字段名前缀不充当证据。
+至少 3 个已核实数据集只证明覆盖下界，不证明三个信号独立、有效或符合平台全部预检。
+不足 3 个且映射完整时是 `dataset_diversity_insufficient`；映射未知、过期或有矛盾时是
+`dataset_diversity_unverified`。已知至少 3 个时，其余未知字段仍会列入诊断。
+
+优先复用现有完整 scope 快照，否则复用既有的精确字段 proof 缓存和查询器。
+一批所有 scope 共用 30 秒字段查询预算；限流后本轮其余 scope 只读缓存，不自动连打重试。
+`next_retry_at` 存在时按该时间等待；成功字段证据沿原有效期保存，下一次原样调用可以复用。
+该预算独立于仿真 `--poll-timeout`。只恢复已接受或未知提交时不再查目录。
+
+完整回执写在输出旁的 `quick.jsonl.admission.json`，stderr 事件给出其实际路径和 blocker。
+被拦的新工作写 `status: BLOCKED` 并返回退出码 2；没有发生平台试验，因此不冒充科学失败种子。
+修正尚未发出的输入或补足字段证据后，沿原输出继续。已受理/未知提交仍按原身份恢复，
+终态历史结果即使缺 `idea` 也能补账；缺失说明可在原 arm 中补齐后重放，不能改表达式或设置。
+
+此准入用于 `batch_quick.py` / `async_batch.py` 的批量探索，支持 FASTEXPR。
+Python 或无法可靠展开的程序会明确报 `unsupported_expression`，不会按字符串粗算。
+受控的两臂 Probe、Campaign 的既有实验设计和 FULL 验证继续使用各自的验证规则。
 
 | 参数 | 控制范围 |
 | --- | --- |
@@ -1034,12 +1070,21 @@ python3 tools/pipeline/batch_quick.py arms.json --out ledgers/quick.jsonl --conc
 | 台账 `status` | 续跑处理 |
 | --- | --- |
 | `QUEUED` | 尚待发单，检查槽位、配额及已有的 `next_retry_at` 后再启动 |
+| `BLOCKED` | 读取 `admission_path` 的 `blocking` / `diversity`；修正准入问题，不连打发单 |
 | `PENDING` | 使用保存的任务地址轮询，或用已取得的 Alpha ID 补读指标，遵守已记录的 `Retry-After` |
 | `UNKNOWN_SUBMISSION` | 保留待核对的提交，找到原始 POST 的 `Location` 后登记 |
 | `UNVERIFIED_RESULT` | 保留待核实的结果，核对原始任务和表达式及设置 |
 
 退出后，平台仍可能继续执行已受理的回测。查对应候选的最新台账行及 `.state/`，完成情况以逐项状态为准。
 自动回收只查看可轮询且无人接管的任务，读到该任务的终态回执后才释放共享槽位。
+即使 `.state/` 和共享预约丢失，同账号、同请求的 `UNKNOWN_SUBMISSION` / `UNVERIFIED_RESULT`
+结果行仍会阻止重投。保留原始线索并核实原任务；缺文件不表示从未发出。
+只有重试时间的旧 checkpoint 也不能覆盖台账中更新的未知提交证据。
+从旧台账或 `.loc` 导入的未核验 URL，需核对 Alpha 的表达式和完整设置后才释放预约；
+身份不匹配或指标读取尚未完成时仍保留。原任务明确失败且没有 Alpha ID 时，使用下述
+`--confirm-original-failure` 路径完成核对与失败记录。
+槽位恢复的 `age_diagnostics`、`age_min`、`overdue` 和 `past_hard_age` 仅用于诊断；
+404 或超过 45/360 分钟都不构成释放证据。
 
 #### 补登记原始 Location
 

@@ -34,6 +34,8 @@ import machine_lib
 import simulation_capabilities
 import simulation_slots
 from check_evidence import normalize_checks, summarize_checks
+from research_app import capabilities
+from tools.pipeline import batch_policy
 
 QUICK = "QUICK"
 DEFAULT_ACCOUNT_SLOTS = 5
@@ -275,18 +277,22 @@ def _record_seed(arm, row, payload, source_spec, out):
 
 
 class Runner:
-    def __init__(self, out: Path, account: dict, slots: int, poll_timeout: float):
+    def __init__(self, out: Path, account: dict, slots: int, poll_timeout: float, *, admission=None):
         if not account.get("fingerprint"):
             raise ValueError("quick runner needs an authenticated account for shared slots")
         self.out = out.resolve()
         self.account = account
         self.slots = slots
         self.poll_timeout = poll_timeout
+        # Bulk-exploration admission belongs to the calling workflow. The same
+        # transport also recovers historical work and serves FULL validation.
+        self.admission = admission
         self.state_path = self.out.with_suffix(self.out.suffix + ".state")
         self.state_lock = threading.Lock()
         self.jobs = {}
         self.saved_labels = set()
-        self.shared_jobs = simulation_slots.quick_known_jobs(self.account)
+        self.shared_job_evidence = simulation_slots.quick_job_snapshot(self.account)
+        self.shared_jobs = set(self.shared_job_evidence)
         for path in self.state_path.glob("*.json"):
             saved, error = cache_store.load_json(path)
             if error or not isinstance(saved, dict) or saved.get("account") != account["fingerprint"]:
@@ -377,6 +383,15 @@ class Runner:
         return {"progress_url": machine_lib._validated_progress_url(self.legacy_locations[label]),
                 "legacy_unverified": True}
 
+    def needs_new_submission(self, arm):
+        """Queued preparations need admission; accepted/ambiguous work does not."""
+        key = self._job_key(arm["label"], _payload(arm))
+        saved = self._existing(key, arm["label"])
+        shared = self.shared_job_evidence.get(key, {})
+        return not (saved.get("progress_url") or saved.get("simulation_status")
+                    or saved.get("status") in RECONCILIATION_STATUSES
+                    or shared.get("progress_url") or shared.get("state") in {"submitting", "unknown"})
+
     def _reap(self, key, deadline):
         if not self.reap_lock.acquire(blocking=False):
             return
@@ -459,12 +474,21 @@ class Runner:
         retry_at = time.monotonic() + max(0, next_retry_at - time.time())
         refresh = False
         while not self.stop_requested.is_set():
-            self._reap(key, deadline)
+            admitted = self.admission is None or self.admission["ok"]
+            if admitted:
+                self._reap(key, deadline)
             if time.monotonic() >= deadline:
                 return None, {**row, "status": "QUEUED", "detail": "simulation POST deferred"}
-            slot = simulation_slots.quick_acquire(self.account, self.slots, key,
+            # A zero reservation budget still claims accepted/unknown jobs, but
+            # never creates a new POST or keeps an unposted preparation alive.
+            slot = simulation_slots.quick_acquire(self.account, self.slots if admitted else 0, key,
                                                   existing_url=existing_url, prepare=True,
                                                   identity_unverified=identity_unverified)
+            if not admitted and slot is None:
+                return None, {**row, "status": "BLOCKED", "new_post_allowed": False,
+                              "detail": "batch admission blocks new simulations; recovery remains available",
+                              "admission_path": self.admission["path"],
+                              "admission_codes": [item["code"] for item in self.admission["blocking"]]}
             if slot is None and self.slots == 0:
                 return None, {**row, "status": "QUEUED", "detail": "account slot budget is zero"}
             if slot is not None:
@@ -473,6 +497,8 @@ class Runner:
                 if slot["state"] == "unknown":
                     return None, {**row, "status": "UNKNOWN_SUBMISSION",
                                   "detail": "previous POST outcome is unknown"}
+                if not admitted:
+                    raise RuntimeError("blocked admission received a new POST reservation")
                 try:
                     quota = simulation_slots.quota_snapshot(self.account)
                     if self.quota_exhausted.is_set() or quota["blocked"]:
@@ -607,10 +633,21 @@ class Runner:
         row = {"label": arm["label"], "expr": arm["expr"], "simulation_job_key": key,
                **{name: settings.get(name) for name in ("region", "delay", "universe")}}
         saved = self._existing(key, arm["label"])
+        if (saved.get("status") in RECONCILIATION_STATUSES
+                and not saved.get("progress_url") and key not in self.shared_jobs):
+            # The append-only result may outlive a damaged/missing checkpoint.
+            # Missing local files cannot prove that the earlier POST was unsent.
+            return {**saved, **row, "status": saved["status"],
+                    "recovery_hint": "find the original Location; no new POST is authorized"}
+        if saved.get("status") in RECONCILIATION_STATUSES and saved.get("legacy_unverified"):
+            # A compact unverified row is not a terminal identity receipt. Read
+            # its original operation and validate the Alpha's executed payload.
+            saved = {name: value for name, value in saved.items()
+                     if name not in {"simulation_status", "alpha_id", "metrics_pending"}}
         legacy_payload = saved.get("legacy_payload")
         if legacy_payload is None and saved.get("legacy_unverified"):
             legacy_payload = payload
-        awaiting_manual_confirmation = saved.get("manual_location") and not saved.get("alpha_id")
+        awaiting_manual_confirmation = (saved.get("manual_location") or legacy_payload is not None) and not saved.get("alpha_id")
         if saved.get("simulation_status") and not awaiting_manual_confirmation:
             terminal = saved if legacy_payload is None else {**saved, "legacy_payload": legacy_payload}
         else:
@@ -663,7 +700,7 @@ class Runner:
                 simulation_slots.quick_update(self.account, slot["id"], "parked")
                 return {name: value for name, value in {**pending, "status": "PENDING"}.items()
                         if name != "legacy_payload"}
-        outcome = "parked" if terminal.get("manual_location") else "terminal"
+        outcome = "parked" if (terminal.get("manual_location") or terminal.get("legacy_payload") is not None) else "terminal"
         simulation_slots.quick_update(self.account, terminal["slot_id"], outcome)
         row.update({name: value for name, value in terminal.items() if name != "account"})
         row["status"] = row["simulation_status"]
@@ -673,11 +710,8 @@ class Runner:
             if fetch_metrics:
                 return self.finish_metrics(row)
         elif row.pop("legacy_payload", None) is not None:
-            detail = "legacy simulation ended without an Alpha ID to verify"
-            if row.get("manual_location"):
-                detail = "verify the original Location and use --confirm-original-failure to release its slot"
             row.update(status="UNVERIFIED_RESULT", observed_alpha_id=None,
-                       detail=detail)
+                       detail="verify the original Location and use --confirm-original-failure to release its slot")
         return row
 
     def finish_metrics(self, row):
@@ -703,7 +737,7 @@ class Runner:
             row.pop("metrics_pending", None)
             return {**row, "status": "UNVERIFIED_RESULT", "alpha_id": None, "observed_alpha_id": alpha_id,
                     "detail": "BRAIN did not confirm the legacy simulation's expression and settings"}
-        if row.pop("manual_location", False):
+        if row.pop("manual_location", False) or legacy_payload is not None:
             simulation_slots.quick_update(self.account, row["slot_id"], "terminal")
         metrics = payload["is"]
         row = dict(row, status=row["simulation_status"])
@@ -765,6 +799,35 @@ def _select_arms(arms, runner, done):
     for arm in arms:
         payload = _payload(arm)
         job_key = runner._job_key(arm["label"], payload)
+        saved = runner._existing(job_key, arm["label"])
+        authoritative = (saved.get("progress_url") or saved.get("simulation_status")
+                         or saved.get("status") in RECONCILIATION_STATUSES)
+        if not authoritative and job_key not in runner.shared_jobs:
+            # Older runners hashed the complete raw payload. A matching hash
+            # still binds all settings, source, label, account and output path.
+            candidates = {job_key, runner._raw_key(arm["label"], payload)}
+
+            def matches_prior(row):
+                if row.get("simulation_job_key") in candidates:
+                    return True
+                source = row.get("expr")
+                if not isinstance(source, str):
+                    return False
+                prior_payload = {**payload, "regular": source}
+                try:
+                    return (row.get("simulation_job_key") == runner._raw_key(arm["label"], prior_payload)
+                            and runner._key(arm["label"], prior_payload) == runner._key(arm["label"], payload))
+                except ValueError:
+                    return False
+
+            prior = next((row for row in reversed(own_rows.get(arm["label"], []))
+                          if row.get("account_fingerprint") == runner.account["fingerprint"]
+                          and row.get("status") in RECONCILIATION_STATUSES and matches_prior(row)), None)
+            if prior is not None:
+                with runner.state_lock:
+                    runner.jobs[prior["simulation_job_key"]] = {**prior, "legacy_unverified": True}
+                    runner.saved_labels.add(arm["label"])
+                job_key = runner._job_key(arm["label"], payload)
         if job_key in prepared:
             continue
         simulation_key = _simulation_key(payload)
@@ -818,6 +881,58 @@ def _account_slot_plan(session, requested):
     return plan
 
 
+def _build_admission(arms, session, account, *, recover_only=False):
+    """Assess the complete exploration batch once, with one catalog budget.
+
+    Only positive, account/scope-bound evidence contributes dataset IDs. Keep
+    catalog uncertainty separate from a proven shortfall and from expression
+    errors; none of these authorizes repeating an accepted or ambiguous POST.
+    """
+    analysis = batch_policy.analyze_arms(arms)
+    evidence = []
+    if analysis["ok"] and not recover_only:
+        groups = {}
+        for arm in analysis["arms"]:
+            key = tuple(sorted(arm["scope"].items()))
+            group = groups.setdefault(key, {"scope": arm["scope"], "fields": set(), "indices": []})
+            group["fields"].update(arm["fields"])
+            group["indices"].append(arm["index"])
+        records_by_arm = [[] for _ in arms]
+        deadline = time.monotonic() + capabilities._REQUIRED_FIELDS_WAIT_SECONDS
+        proof_cache = {}
+        for group in groups.values():
+            try:
+                scope = capabilities.cached_field_scope(group["scope"], account=account)
+                if scope["evidence"]["state"] == "verified":
+                    records = scope["records"]
+                else:
+                    scope = capabilities.required_field_scope(
+                        session, group["scope"], group["fields"], deadline=deadline, proof_cache=proof_cache)
+                    records = scope["verified_records"]
+                observed = scope["evidence"]
+            except (machine_lib.BrainError, RequestException) as exc:
+                records = []
+                observed = {"state": "unknown", "scope": group["scope"],
+                            "error": getattr(exc, "code", type(exc).__name__), "message": str(exc)}
+            evidence.append(observed)
+            for index in group["indices"]:
+                records_by_arm[index] = records
+            # One rate limit also defers live reads for the remaining scopes;
+            # those scopes may still reuse their already verified cache entries.
+            if (observed.get("error") == "RATE_LIMITED" or any(
+                    row.get("error") == "RATE_LIMITED" for row in observed.get("catalogs", []))):
+                deadline = time.monotonic()
+        analysis = batch_policy.assess_datasets(analysis, records_by_arm)
+    elif analysis["ok"]:
+        analysis = {**analysis, "ok": False, "state": "recovery_only",
+                    "blocking": [{"code": "recovery_only",
+                                  "message": "existing tasks need recovery, not admission for a new POST"}]}
+    retry_times = [row["retry_at"] for scope in evidence for row in scope.get("catalogs", [])
+                   if isinstance(row.get("retry_at"), (int, float))]
+    return {**analysis, "new_posts_allowed": analysis["ok"], "recovery_allowed": True,
+            "field_evidence": evidence, "next_retry_at": max(retry_times, default=None)}
+
+
 def _run_batch(args, out):
     arms = _load_arms(Path(args.arms))
     if not arms:
@@ -838,28 +953,39 @@ def _run_batch(args, out):
                        else "recovery Location recorded")
             print(f"{message} for {recover_job}", flush=True)
             return 0
-    done = load_done(out, account)
-    # A crash after the durable result append but before the ledger append must
-    # be repairable without resubmitting the simulation. Bind every replay to
-    # the original account and exact job identity; legacy guesses stay untouched.
-    for arm in arms:
-        payload = _payload(arm)
-        job_key = runner._job_key(arm["label"], payload)
-        previous = next((row for row in reversed(done[1].get(arm["label"], []))
-                         if row.get("simulation_job_key") == job_key
-                         and _ledger_account(out, row) == account["fingerprint"]), None)
-        if previous is not None:
-            _record_seed(arm, previous, payload, args.arms, out)
-    todo = _select_arms(arms, runner, done)
-    if args.limit:
-        todo = todo[:args.limit]
+        done = load_done(out, account)
+        # Repair a durable result whose ledger append was interrupted, even when
+        # its historical input lacks metadata required for new exploration.
+        for arm in arms:
+            payload = _payload(arm)
+            job_key = runner._job_key(arm["label"], payload)
+            previous = next((row for row in reversed(done[1].get(arm["label"], []))
+                             if row.get("simulation_job_key") == job_key
+                             and _ledger_account(out, row) == account["fingerprint"]), None)
+            if previous is not None:
+                _record_seed(arm, previous, payload, args.arms, out)
+        todo = _select_arms(arms, runner, done)
+        if args.limit:
+            todo = todo[:args.limit]
+        if todo:
+            recover_only = not any(runner.needs_new_submission(arm) for arm in todo)
+            admission = _build_admission(arms, session, account, recover_only=recover_only)
+            path = out.with_suffix(out.suffix + ".admission.json")
+            admission.update(path=str(path), input_path=str(Path(args.arms).resolve()),
+                             account_fingerprint=account["fingerprint"])
+            cache_store.write_json_atomic(path, admission)
+            runner.admission = admission
+            print(json.dumps({"event": "batch_admission", "path": str(path),
+                              "new_posts_allowed": admission["ok"], "recovery_allowed": True,
+                              "blocking": admission["blocking"],
+                              "next_retry_at": admission["next_retry_at"]}, ensure_ascii=False), file=sys.stderr)
     print(f"arms={len(arms)} todo={len(todo)} workers={args.concurrency} account_slots={plan['effective']}",
           flush=True)
     if not todo:
         return 0
 
     started = time.monotonic()
-    deferred = 0
+    deferred = blocked = 0
     try:
         with (
             _open_ledger(out) as fh,
@@ -874,7 +1000,9 @@ def _run_batch(args, out):
                     row["simulation_key"] = _simulation_key(payload)
                     row["simulation_job_key"] = runner._job_key(arm["label"], payload)
                     _append(fh, row)
-                    _record_seed(arm, row, payload, args.arms, out)
+                    if row["status"] != "BLOCKED":
+                        _record_seed(arm, row, payload, args.arms, out)
+                    blocked += row["status"] == "BLOCKED"
                     deferred += row["status"] in {"QUEUED", "PENDING", "UNKNOWN_SUBMISSION", "UNVERIFIED_RESULT", "RUNNER_ERROR"}
                     print(f"[{count}/{len(todo)}] {row['label'][:34]:34s} {row['status']} "
                           f"S={row.get('sharpe')} T={row.get('turnover')} fails={row.get('fails')}", flush=True)
@@ -884,8 +1012,8 @@ def _run_batch(args, out):
                 raise
     finally:
         runner.close()
-    print(f"elapsed {time.monotonic() - started:.0f}s, unresolved {deferred}", flush=True)
-    return 0
+    print(f"elapsed {time.monotonic() - started:.0f}s, unresolved {deferred}, admission_blocked {blocked}", flush=True)
+    return 2 if blocked else 0
 
 
 def _batch_parser(description, default_out, default_concurrency):

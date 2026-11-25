@@ -120,7 +120,13 @@ def test_quick_checkpoint_and_result_replay_repair_seed_gap_without_another_post
     monkeypatch.setattr(machine_lib, "concurrency_plan", lambda *_args, **_kwargs: {
         "account": ACCOUNT, "effective": 1})
     arms, out = tmp_path / "arms.json", tmp_path / "quick.jsonl"
-    arms.write_text(json.dumps([ARM]))
+    arm = {**ARM, "expr": "rank(cap) + rank(analyst_signal) + rank(sentiment_signal)",
+           "idea": "Test a specified combination of three input datasets."}
+    arms.write_text(json.dumps([arm]))
+    monkeypatch.setattr(batch_quick.capabilities, "cached_field_scope", lambda *args, **kwargs: {
+        "records": [{"id": field, "type": "MATRIX", "dataset": dataset} for field, dataset in
+                    (("cap", "prices"), ("analyst_signal", "analyst"), ("sentiment_signal", "sentiment"))],
+        "evidence": {"state": "verified", "source": "private_snapshot"}})
     args = Namespace(arms=str(arms), account_slots=1, poll_timeout=5, limit=0, concurrency=1)
     checks = [{"name": "REGIONAL_BREADTH", "result": "FAIL", "value": 0.2, "limit": 1.3,
                "details": {"region": "EMEA"}, "message": "too narrow"},
@@ -152,6 +158,10 @@ def test_quick_checkpoint_and_result_replay_repair_seed_gap_without_another_post
                                                              if key != "name"}
         assert row["checks"] == checkpoint["checks"]
     monkeypatch.setattr(alpha_registry, "record_simulation", original)
+    # Historical evidence may lack today's admission metadata. The missing idea
+    # cannot prevent repair, and changing metadata does not change POST identity.
+    arm.pop("idea")
+    arms.write_text(json.dumps([arm]))
     session.reset_mock()
     assert batch_quick._run_batch(args, out) == 0
     session.post.assert_not_called()
