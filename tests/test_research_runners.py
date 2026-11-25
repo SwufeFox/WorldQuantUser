@@ -1,3 +1,4 @@
+import unittest
 """Background workers depend on saved arm states, not the subprocess exit code."""
 
 from pathlib import Path
@@ -646,3 +647,11 @@ class ResearchRunnerTests(TestCase):
         self.assertEqual(code, 3)
         self.assertTrue(self.spec.exists())
         self.assertIn("training evidence for candidate: connection lost", report.call_args.args[0]["detail"])
+
+
+class ConflictBudgetTests(unittest.TestCase):
+    def test_conflict_wait_is_bounded(self):
+        from tools._runner import _conflict_rounds_exceeded, CONFLICT_DEFER_LIMIT
+
+        self.assertFalse(_conflict_rounds_exceeded(CONFLICT_DEFER_LIMIT - 1))
+        self.assertTrue(_conflict_rounds_exceeded(CONFLICT_DEFER_LIMIT))

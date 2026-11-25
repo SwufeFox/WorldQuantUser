@@ -377,6 +377,19 @@ def _watch_conflict(spec, requests, occupied):
     return min(conflicts, default=None)
 
 
+CONFLICT_DEFER_LIMIT = 5
+
+
+def _conflict_rounds_exceeded(rounds):
+    """A duplicate-wait must end: after this many rounds the spec proceeds.
+
+    `waiting for matching request` exists to avoid posting the same request
+    twice at once. If the other spec never reaches a terminal state the waiter
+    would otherwise hang forever, so the budget forces a decision.
+    """
+    return rounds >= CONFLICT_DEFER_LIMIT
+
+
 def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
               concurrency=None, consume=None, execute=None, schedule_recovery=False, recover_only=False,
               launch_rank=None):
@@ -398,6 +411,7 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
             watch = schedule_recovery and not once
             guard = schedule_recovery and not recover_only
             full_recovery_turn = set()
+            conflict_rounds = {}
             while True:
                 scheduled = []
                 occupied = {}
@@ -434,9 +448,13 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                         source = spec.read_bytes()
                         recovery = schedule.recovery or recover_only
                         owner = _watch_conflict(spec, schedule.queued, occupied) if not recovery and guard else None
+                        if owner is not None and _conflict_rounds_exceeded(conflict_rounds.get(spec.name, 0)):
+                            owner = None  # bounded exit: stop waiting and decide
                         if owner is not None:
+                            conflict_rounds[spec.name] = conflict_rounds.get(spec.name, 0) + 1
                             result = ProbeRun("deferred", {}, f"waiting for matching request in {owner.name}")
                         else:
+                            conflict_rounds.pop(spec.name, None)
                             if ready and recovery and schedule.priority == 0 and spec not in full_recovery_turn:
                                 wait = min(max_wait, interval)
                             full_recovery_turn.discard(spec)
