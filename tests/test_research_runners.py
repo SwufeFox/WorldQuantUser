@@ -655,3 +655,26 @@ class ConflictBudgetTests(unittest.TestCase):
 
         self.assertFalse(_conflict_rounds_exceeded(CONFLICT_DEFER_LIMIT - 1))
         self.assertTrue(_conflict_rounds_exceeded(CONFLICT_DEFER_LIMIT))
+
+
+class ConflictOwnerTests(unittest.TestCase):
+    def test_archived_owner_does_not_block_a_waiter(self):
+        from pathlib import Path
+        from tempfile import TemporaryDirectory
+        from tools._runner import _watch_conflict
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            waiter = root / "waiter.json"
+            waiter.write_text("{}")
+            archived = root / "archived.json"      # never created: already gone
+            live = root / "live.json"
+            live.write_text("{}")
+            occupied = {("key",): {archived, live}}
+            self.assertEqual(_watch_conflict(waiter, [("key",)], occupied), live)
+
+    def test_conflict_budget_is_three_rounds(self):
+        from tools._runner import _conflict_rounds_exceeded
+
+        self.assertFalse(_conflict_rounds_exceeded(2))
+        self.assertTrue(_conflict_rounds_exceeded(3))

@@ -373,11 +373,15 @@ def _watch_conflict(spec, requests, occupied):
         except CliError:
             # The executor reports invalid Probe specs and handles local SPC specs.
             return None
-    conflicts = {owner for key in requests for owner in occupied.get(key, ()) if owner != spec}
+    # An owner whose spec was archived (done/failed) can never release the
+    # request key through its own terminal receipt, so it must not keep another
+    # spec waiting: wait only for owners that are still in the inbox.
+    conflicts = {owner for key in requests for owner in occupied.get(key, ())
+                 if owner != spec and owner.exists()}
     return min(conflicts, default=None)
 
 
-CONFLICT_DEFER_LIMIT = 5
+CONFLICT_DEFER_LIMIT = 3
 
 
 def _conflict_rounds_exceeded(rounds):
