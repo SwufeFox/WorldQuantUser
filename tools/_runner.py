@@ -528,6 +528,29 @@ def _watch_conflict(spec, requests, occupied):
 STALLED_ROUNDS = 3
 
 
+def _archive_target(directory, spec, source):
+    """Return an archive path without ever overwriting different evidence.
+
+    Retrying the same archived spec is a normal idempotent outcome, not an
+    operational failure. Only content-different namesakes receive a suffix.
+    """
+    fingerprint = hashlib.sha256(source).hexdigest()
+    destination = directory / spec.name
+    suffix = f"-{fingerprint[:10]}"
+    attempt = 1
+    while True:
+        try:
+            if not destination.exists():
+                return destination, False
+            if hashlib.sha256(destination.read_bytes()).hexdigest() == fingerprint:
+                return destination, True
+        except FileNotFoundError:
+            return destination, False
+        tail = "" if attempt == 1 else f"-{attempt}"
+        destination = directory / f"{spec.stem}{suffix}{tail}{spec.suffix}"
+        attempt += 1
+
+
 def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
               concurrency=None, consume=None, execute=None, schedule_recovery=False, recover_only=False,
               launch_rank=None):
@@ -623,14 +646,16 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                             full_recovery_turn.discard(spec)
                             result = execute(root, spec, batch, receipt, max_wait=wait, concurrency=concurrency)
                         if result.state != "deferred":
-                            destination = inbox / result.state / spec.name
-                            if destination.exists():
-                                raise ValueError(f"archive already exists: {destination}")
-                            if consume is not None and result.data.get("rows"):
-                                consume(spec, result.data)
+                            destination, already_archived = _archive_target(
+                                inbox / result.state, spec, source)
                             if spec.read_bytes() != source:
                                 raise ValueError(f"spec changed during processing: {spec.name}")
-                            shutil.move(spec, destination)
+                            if already_archived:
+                                spec.unlink(missing_ok=True)
+                            else:
+                                if consume is not None and result.data.get("rows"):
+                                    consume(spec, result.data)
+                                shutil.move(spec, destination)
                     except Exception as error:
                         # Leave the spec and any saved POST intent for an exact retry.
                         result = ProbeRun("deferred", {"diagnosis": {"state": "blocked", "reason": "runner_error",

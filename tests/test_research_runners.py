@@ -282,6 +282,48 @@ class ResearchRunnerTests(TestCase):
                                               max_wait=30, interval=1, once=True), 1)
         self.assertTrue((self.inbox / "failed" / self.spec.name).exists())
 
+    def test_rearchiving_identical_spec_is_idempotent_and_does_not_consume_twice(self):
+        failed = self.inbox / "failed"
+        failed.mkdir()
+        destination = failed / self.spec.name
+        destination.write_text("{}", encoding="utf-8")
+        paths = lambda _spec: (self.batch, self.receipt)
+        consume = mock.Mock()
+        execute = mock.Mock(return_value=runner.ProbeRun("failed", {}))
+
+        for _ in range(2):
+            self.spec.write_text("{}", encoding="utf-8")
+            code = runner.run_queue(self.root, self.inbox, paths, mock.Mock(),
+                                    max_wait=30, interval=1, once=True,
+                                    consume=consume, execute=execute)
+            self.assertEqual(code, 1)
+            self.assertFalse(self.spec.exists())
+
+        self.assertEqual(list(failed.glob("*.json")), [destination])
+        consume.assert_not_called()
+        self.assertEqual(execute.call_count, 2)
+
+    def test_archiving_a_different_namesake_preserves_both_and_consumes_once(self):
+        failed = self.inbox / "failed"
+        failed.mkdir()
+        original = failed / self.spec.name
+        original.write_text('{"old": true}\n', encoding="utf-8")
+        paths = lambda _spec: (self.batch, self.receipt)
+        consume = mock.Mock()
+
+        code = runner.run_queue(
+            self.root, self.inbox, paths, mock.Mock(), max_wait=30, interval=1,
+            once=True, consume=consume,
+            execute=mock.Mock(return_value=runner.ProbeRun("failed", {"rows": [{"alpha_id": "x"}]})))
+
+        self.assertEqual(code, 1)
+        self.assertFalse(self.spec.exists())
+        self.assertEqual(original.read_text(encoding="utf-8"), '{"old": true}\n')
+        archived = sorted(failed.glob("*.json"))
+        self.assertEqual(len(archived), 2)
+        self.assertIn(self.spec.name, {path.name for path in archived})
+        consume.assert_called_once()
+
     def test_campaign_recover_only_prioritizes_known_work_in_once_mode(self):
         backlog = self.root / "backlog"
         backlog.mkdir()
