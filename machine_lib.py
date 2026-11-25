@@ -29,6 +29,7 @@ import sys
 from datetime import datetime, timezone
 
 import cache_store
+from check_evidence import normalize_checks, platform_check_names
 import research_paths
 
 # ---------------------------------------------------------------------------
@@ -162,11 +163,6 @@ class PermissionDenied(ServiceError):
 # ---------------------------------------------------------------------------
 #: Base payload for ``POST /simulations``. Callers override individual keys;
 #: see ``resolve_settings`` for merge + validation rules.
-# Platform simulation slots are a token bucket with a measured burst capacity of
-# about 7 (wqb-concurrency skill, 2026-08). Local workers above this only produce
-# 429 backoff; every runner clamps its concurrency to this value.
-PLATFORM_BURST_LIMIT = 7
-
 DEFAULT_SETTINGS = {
     "instrumentType": "EQUITY",
     "region": "USA",
@@ -2505,11 +2501,9 @@ def note_operator_rejection(expression, message, context=None):
 
 
 # Checks whose limit is a ceiling: PASS when value <= limit. Every other check
-# in the catalog uses a floor (value >= limit). BRAIN sometimes serves a cached
-# ``result`` beside a refreshed ``value``, so a cached PASS can contradict a value
-# above the ceiling.
-# ``reconcile_check`` recomputes the verdict from the number so a decision is
-# never made on a stale label.
+# in the catalog uses a floor (value >= limit). The displayed value and formal
+# verdict can differ, including when platform exceptions apply. Numeric
+# comparison is diagnostic evidence and never replaces the formal result.
 _CEILING_CHECKS = frozenset({
     "SELF_CORRELATION",
     "PROD_CORRELATION",
@@ -2519,7 +2513,7 @@ _CEILING_CHECKS = frozenset({
 
 
 def reconcile_check(name, check):
-    """Recompute a check's verdict from its value and limit.
+    """Compare a check's value and limit without changing its formal verdict.
 
     Returns ``{"expected", "consistent"}``, or None when the check carries no
     value/limit pair to compare (CONCENTRATED_WEIGHT often has neither) or is
@@ -2538,21 +2532,17 @@ def reconcile_check(name, check):
 
 
 def _extract_checks(alpha_payload):
-    """Flatten the platform checks of an alpha payload into a name -> info map."""
-    checks = {}
-    for check in (alpha_payload.get("is") or {}).get("checks") or []:
-        name = check.get("name")
-        if not name:
-            continue
-        info = {key: value for key, value in check.items()
-                if key not in {"name", "expected_result", "value_consistent"}}
+    """Normalize platform checks, preserving ambiguity and numeric diagnostics."""
+    checks = normalize_checks((alpha_payload.get("is") or {}).get("checks"))
+    for name, info in checks.items():
+        info.pop("expected_result", None)
+        info.pop("value_consistent", None)
         for key in ("result", "limit", "value"):
             info.setdefault(key, None)
         verdict = reconcile_check(name, info)
         if verdict is not None:
             info["expected_result"] = verdict["expected"]
             info["value_consistent"] = verdict["consistent"]
-        checks[name] = info
     return checks or None
 
 
@@ -2605,6 +2595,8 @@ def fetch_alpha_checks(s, alpha_id, max_wait_seconds=180.0, on_event=None):
                 except (AttributeError, TypeError) as exc:
                     raise ServiceError("invalid check payload for alpha %s" % alpha_id) from exc
                 if checks:
+                    if not platform_check_names(checks):
+                        raise ServiceError("invalid check payload for alpha %s" % alpha_id)
                     if any(check["result"] is not None and not isinstance(check["result"], str)
                            for check in checks.values()):
                         raise ServiceError("invalid check result for alpha %s" % alpha_id)

@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 import re
 
+from check_evidence import normalize_checks, summarize_checks
 import machine_lib as ml
 import requests
 import research_paths
@@ -125,8 +126,8 @@ def _review_receipt(args):
             raise ValueError("receipt, candidate and frozen selection do not match")
         row = rows[0] if rows else {}
         checked = results[0] if results else {}
-        observed = checked["checks"] if checked.get("payload_received") is True and not checked.get("error") else {}
-        verdicts = {name: check.get("result") for name, check in observed.items()}
+        observed = normalize_checks(checked.get("checks")) if (
+            checked.get("payload_received") is True and not checked.get("error")) else {}
         saved_pc = (checked.get("production_correlation_evidence") or {}).get("formal") or {}
         captured_at = saved_pc.get("captured_at")
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
@@ -138,10 +139,10 @@ def _review_receipt(args):
                       and row.get(key) != manifest["rows"][0].get(key)]
     missing = [reason for reason in reasons if reason.endswith("_missing_or_nonfinite")]
     failures = [reason for reason in reasons if reason not in missing]
-    failed_checks = sorted(name for name, result in verdicts.items() if result == "FAIL")
-    unresolved = sorted(name for name, result in verdicts.items()
-                        if result not in ("PASS", "FAIL", "WARNING"))
-    checks_complete = bool(verdicts) and not unresolved and checked.get("complete") is True
+    summary = summarize_checks(observed)
+    failed_checks = sorted(set(summary["failed"]) - set(summary["errored"]))
+    unresolved = sorted(set(summary["pending"]) | set(summary["errored"]))
+    checks_complete = summary["resolved"] and checked.get("complete") is True
     production = observed.get("PROD_CORRELATION") or {}
     if not checks_complete:
         missing.append("platform_checks_not_resolved")
@@ -273,13 +274,13 @@ def cmd_promote(args, sink):
             error = result["error"]
             raise CliError(error["code"], error["message"], error.get("hint"))
 
-        summary = buffer_cmd._checks_summary(result.get("checks"))
+        summary = summarize_checks(result.get("checks"))
         if (not checked.get("complete") or not result.get("complete")
-                or not result.get("checks_resolved") or not result.get("checks")
-                or summary["pending"]):
+                or not result.get("checks_resolved") or not summary["resolved"]):
             reasons.append("platform_checks_not_resolved")
-        if summary["failed"]:
-            reasons.append("platform_checks_failed: " + ", ".join(summary["failed"]))
+        failed_checks = sorted(set(summary["failed"]) - set(summary["errored"]))
+        if failed_checks:
+            reasons.append("platform_checks_failed: " + ", ".join(failed_checks))
         if max_corr is not None:
             value = (result.get("self_correlation") or {}).get("value")
             if not _finite(value):

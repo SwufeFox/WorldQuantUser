@@ -19,9 +19,10 @@ from functools import lru_cache
 import alpha_registry
 import fastexpr_ast
 import machine_lib as ml
+from check_evidence import platform_check_names, summarize_checks
 from mechanism_identity import mechanism_key
 
-_INDEX_VERSION = 3
+_INDEX_VERSION = 4
 _ANCHOR_BYTES = 4096
 _FINISHED = alpha_registry.FINISHED_STATUSES | {"ACTIVE", "SUBMITTED", "UNSUBMITTED"}
 _PYTHON_SETTINGS = ml.regular_wire_settings({**ml.DEFAULT_SETTINGS, "language": "PYTHON"})
@@ -43,6 +44,13 @@ _SUMMARY_TYPES = {
     "batch": "TEXT",
     "verdict": "TEXT",
     "recorded_at": "TEXT",
+    "first_recorded_at": "TEXT",
+    "first_measurement_observed_at": "TEXT",
+    "measurement_observed_at": "TEXT",
+    "first_checks_observed_at": "TEXT",
+    "checks_observed_at": "TEXT",
+    "checks_state": "TEXT",
+    "evidence_metadata": "TEXT",
     "train_start": "TEXT",
     "test_start": "TEXT",
     "has_train_split": "INTEGER",
@@ -76,7 +84,7 @@ _LOOKUP_ORDER = """
               WHERE peer.lookup_key = row.lookup_key)
 """
 _STRUCTURAL = "row.structural_block = ? AND row.structural_skeleton = ? AND " + _LATEST_LOOKUP
-_PAYLOAD = "row.key, row.line_offset, row.line_size, row.role"
+_PAYLOAD = "row.key, row.line_offset, row.line_size, row.role, row.evidence_metadata"
 
 
 class _UnindexableLedger(ValueError):
@@ -118,22 +126,22 @@ def summary_fields(entry):
     split = _mapping(entry.get("out_of_sample"))
     train = _mapping(split.get("train"))
     test = _mapping(split.get("test"))
-    raw_checks = entry.get("checks")
-    if isinstance(raw_checks, list):
-        raw_checks = [check for check in raw_checks
-                      if isinstance(check, dict) and isinstance(check.get("name"), str)]
-    checks = alpha_registry._normalize_checks(raw_checks)
-    known_results = {"PASS", "WARNING"} | alpha_registry._FAILING_CHECK_RESULTS
+    checks = alpha_registry._normalize_checks(entry.get("checks"))
+    prior = entry.get("last_check_snapshot") or {}
+    required = platform_check_names(prior.get("checks")) if entry.get("checks_state") == "partial" else ()
+    check_summary = summarize_checks(checks, required=required)
     legacy_failures = entry.get("failing_checks")
     failures = set(alpha_registry._failing_checks(checks))
     if isinstance(legacy_failures, list):
         failures.update(name for name in legacy_failures if isinstance(name, str))
-    unresolved = sorted(name for name, record in checks.items()
-                        if _status(record.get("result")) not in known_results)
+    unresolved = sorted(set(check_summary["pending"]) | set(check_summary["errored"]))
 
     return {
         **{name: _text(entry.get(name)) for name in
-           ("alpha_id", "role", "family", "mechanism", "idea", "batch", "verdict", "recorded_at")},
+           ("alpha_id", "role", "family", "mechanism", "idea", "batch", "verdict", "recorded_at",
+            "first_recorded_at", "first_measurement_observed_at", "measurement_observed_at",
+            "first_checks_observed_at", "checks_observed_at", "checks_state")},
+        "evidence_metadata": json.dumps(alpha_registry.evidence_state(entry), sort_keys=True),
         "status": _status(entry.get("status")),
         "region": _status(settings.get("region")),
         "universe": _status(settings.get("universe")),
@@ -151,7 +159,7 @@ def summary_fields(entry):
         "train_margin": _number(train.get("margin")),
         "train_long_count": _number(train.get("longCount")),
         "train_short_count": _number(train.get("shortCount")),
-        "check_count": len(checks),
+        "check_count": len(platform_check_names(checks)),
         "failed_checks": json.dumps(sorted(failures)),
         "unresolved_checks": json.dumps(unresolved),
     }
@@ -336,8 +344,9 @@ class RegistryIndex:
                 or (lookup is not None and not isinstance(lookup, str))):
             raise _UnindexableLedger("nonstandard registry keys require the legacy reader")
         previous = self.connection.execute(
-            "SELECT role FROM registry_entries WHERE key = ?", (key,)
+            "SELECT role, evidence_metadata FROM registry_entries WHERE key = ?", (key,)
         ).fetchone()
+        entry = alpha_registry.fold_evidence(entry, json.loads(previous[1]) if previous else None)
         entry["role"] = alpha_registry.evidence_role({"role": previous[0]} if previous else None, entry)
         identity = known_request_identity(entry)
         request = _request_lookup(identity) if identity else (None, None)
@@ -369,11 +378,12 @@ class RegistryIndex:
             pass
 
     def _read_entry(self, row):
-        key, offset, size, role = row
+        key, offset, size, role, provenance = row
         self._source.seek(offset)
         read_key, entry = alpha_registry._parse_line(self._source.read(size))
         if read_key != key or entry is None:
             raise OSError("registry no longer matches the indexed evidence")
+        entry = alpha_registry.fold_evidence(entry, json.loads(provenance))
         entry["role"] = role
         return entry
 

@@ -239,9 +239,10 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False,
     reservation without a URL is indeterminate, even when its owner has died.
     With ``prepare=True``, a new reservation is reclaimable until submitting.
     An imported URL belongs to an already accepted job and counts until terminal.
+    A zero budget blocks new reservations while allowing accepted jobs to recover.
     """
-    if type(limit) is not int or limit < 1 or not isinstance(job_key, str) or not job_key:
-        raise ValueError("quick simulation slots require a positive limit and job key")
+    if type(limit) is not int or limit < 0 or not isinstance(job_key, str) or not job_key:
+        raise ValueError("quick simulation slots require a non-negative limit and job key")
     owner = _quick_owner()
     with _locked_quick_journal(account) as (journal, path):
         if _prune_quick_preparations(journal):
@@ -264,6 +265,12 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False,
                 raise ValueError("saved progress URL differs from the shared quick reservation")
             if stored_url:
                 entry.update(state="accepted", quick_owner=owner)
+            elif entry.get("state") == "quick_preparing" and not existing_url and limit == 0:
+                # No POST has begun. A later zero budget revokes this owner's
+                # preparation instead of allowing its old limit to authorize work.
+                del reservations[key]
+                cache_store.write_json_atomic(path, journal)
+                return None
             elif entry.get("state") != "quick_preparing" or existing_url:
                 # An existing unknown POST cannot inherit an unverified legacy address.
                 entry.update(state="unknown", quick_owner=None)

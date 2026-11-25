@@ -13,6 +13,7 @@ import requests
 
 import alpha_registry
 import cache_store
+from check_evidence import normalize_checks, summarize_checks
 import correlation
 import machine_lib as ml
 import research_paths
@@ -249,14 +250,14 @@ def production_correlation_evidence(alpha_id, checks, *, basis, captured_at=None
 
 def _check_result(alpha_id, payload=None, error=None):
     payload = payload or {}
-    checks = payload.get("checks") or {}
-    verdicts = [check.get("result") for check in checks.values()]
-    resolved = bool(verdicts) and all(value in {"PASS", "FAIL", "WARNING"}
-                                      for value in verdicts)
+    checks = normalize_checks(payload.get("checks"))
+    summary = summarize_checks(checks)
+    resolved = summary["resolved"]
     complete = error is None and bool(payload.get("complete")) and resolved
     status = "error" if error else "complete" if complete else "pending"
-    outcome = ("error" if error else "failed" if "FAIL" in verdicts else
-               "pending" if not complete else "warning" if "WARNING" in verdicts else "passed")
+    failures = set(summary["failed"]) - set(summary["errored"])
+    outcome = ("error" if error else "failed" if failures else
+               "pending" if not complete else "warning" if summary["warned"] else "passed")
     received = bool(payload.get("payload_received", checks))
     return {"alpha_id": alpha_id, "status": status, "outcome": outcome,
             "complete": complete, "payload_received": received,

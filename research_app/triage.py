@@ -23,6 +23,7 @@ import os
 from datetime import date
 
 import alpha_registry
+from check_evidence import normalize_checks, platform_check_names, summarize_checks
 import machine_lib as ml
 import research_paths
 
@@ -50,10 +51,7 @@ def _book_series(latest, directory):
 
 def _failing(entry):
     failures = set(entry.get("failing_checks") or [])
-    for name, body in (entry.get("checks") or {}).items():
-        result = body.get("result") if isinstance(body, dict) else body
-        if result in ("FAIL", "ERROR"):
-            failures.add(name)
+    failures.update(summarize_checks(entry.get("checks"))["failed"])
     return sorted(failures)
 
 
@@ -65,7 +63,7 @@ def _sub_universe(entry):
     the first may be earning its edge in names whose execution is worse, which is the one
     thing a daily P&L cannot show. Reported as a margin so the reader can judge.
     """
-    body = (entry.get("checks") or {}).get("LOW_SUB_UNIVERSE_SHARPE")
+    body = normalize_checks(entry.get("checks")).get("LOW_SUB_UNIVERSE_SHARPE")
     if not isinstance(body, dict):
         return None
     value, limit = body.get("value"), body.get("limit")
@@ -82,14 +80,12 @@ def _unresolved(entry):
     candidate look clean, which is how a 0.99 self-correlation sat on the shelf looking
     like 0.44.
     """
-    checks = entry.get("checks") or {}
-    names = []
-    for name in sorted(set(checks) | {"SELF_CORRELATION", "MATCHES_COMPETITION"}):
-        body = checks.get(name)
-        result = (body or {}).get("result") if isinstance(body, dict) else body
-        if result not in ("PASS", "FAIL"):
-            names.append(name)
-    return names
+    required = {"SELF_CORRELATION", "MATCHES_COMPETITION"}
+    if entry.get("checks_state") == "partial":
+        prior = entry.get("last_check_snapshot") or {}
+        required.update(platform_check_names(prior.get("checks")))
+    summary = summarize_checks(entry.get("checks"), required=required)
+    return sorted(set(summary["pending"]) | set(summary["errored"]))
 
 
 def _round(value, places=3):

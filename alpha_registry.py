@@ -31,6 +31,7 @@ import datetime
 import errno
 import hashlib
 import json
+import math
 import re
 import os
 from contextlib import ExitStack, contextmanager
@@ -39,6 +40,7 @@ from functools import partial
 import research_paths
 import cache_store
 import machine_lib as ml
+from check_evidence import normalize_checks, platform_check_names, summarize_checks
 
 __all__ = [
     "VERDICTS",
@@ -239,37 +241,149 @@ def _pick_metrics(metrics):
 
 def _normalize_checks(checks):
     """Accept either the platform list or the lib's name->record mapping."""
-    normalized = {}
-    if isinstance(checks, dict):
-        for name, record in checks.items():
-            if isinstance(record, dict):
-                normalized[name] = {
-                    "result": record.get("result"),
-                    "limit": record.get("limit"),
-                    "value": record.get("value"),
-                }
-            else:
-                normalized[name] = {"result": record}
-    elif isinstance(checks, list):
-        for record in checks:
-            if not isinstance(record, dict):
-                continue
-            name = record.get("name")
-            if not name:
-                continue
-            normalized[name] = {
-                "result": record.get("result"),
-                "limit": record.get("limit"),
-                "value": record.get("value"),
-            }
-    return normalized
+    return normalize_checks(checks)
 
 
 def _failing_checks(checks):
-    return sorted(
-        name for name, record in checks.items()
-        if str(record.get("result") or "").upper() in _FAILING_CHECK_RESULTS
-    )
+    return summarize_checks(checks)["failed"]
+
+
+# These times describe when this ledger observed evidence, never the original
+# simulation date. First observations do not date the current target value: a
+# FAIL may precede a later PASS. Use checks_observed_at for the current payload.
+EVIDENCE_FIELDS = (
+    "first_recorded_at", "first_measurement_observed_at", "measurement_observed_at",
+    "first_checks_observed_at", "checks_observed_at", "checks_source", "checks_state",
+    "last_check_snapshot",
+)
+
+
+def _evidence_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _evidence_identities(entry):
+    request = _evidence_digest({"expression": entry.get("expression"),
+                                "settings": entry.get("settings") or {}})
+    split = entry.get("out_of_sample")
+    metrics = {"metrics": _pick_metrics(entry.get("metrics")),
+               "out_of_sample": split if isinstance(split, dict) else {}}
+    return request, _evidence_digest(metrics), _evidence_digest(_normalize_checks(entry.get("checks")))
+
+
+def _observation_time(value):
+    """Retain valid event times, including legacy naive times, without inventing one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value
+
+
+def evidence_state(entry):
+    """Compact replay state; the index need not reread previous ledger payloads."""
+    request, measurement, checks = _evidence_identities(entry)
+    state = {key: entry.get(key) for key in EVIDENCE_FIELDS if key != "last_check_snapshot"}
+    state.update(request_identity=request, measurement_identity=measurement, check_identity=checks)
+    current = _normalize_checks(entry.get("checks"))
+    snapshot = entry.get("last_check_snapshot")
+    if current and entry.get("checks_state") != "partial":
+        snapshot = {"checks": current, "observed_at": entry.get("checks_observed_at"),
+                    "source": entry.get("checks_source"), "request_identity": request,
+                    "simulation_mode": (entry.get("settings") or {}).get("simulationMode")}
+    state["snapshot"] = snapshot
+    return state
+
+
+def fold_evidence(entry, previous=None):
+    """Fold one event at append and replay boundaries, without rewriting history.
+
+    ``previous`` is evidence_state(), not the previous full payload. Metadata
+    events cannot establish a measurement time, even if their copied row has
+    metrics. One prior check snapshot survives a missing/partial refresh but is
+    never inserted into the current ``checks`` or treated as a current pass.
+    """
+    entry = dict(entry)
+    previous = previous or {}
+    request, measurement, check_identity = _evidence_identities(entry)
+    same_request = previous.get("request_identity") == request
+    source = entry.get("source")
+    metadata_only = str(source or "").startswith(("relabel", "dedupe"))
+    stamp = _observation_time(entry.get("recorded_at"))
+    # Explicit provenance survives exporting the newest row into a fresh ledger.
+    saved = entry if entry.get("evidence_version") == 1 else {}
+    entry["evidence_version"] = 1
+    entry["first_recorded_at"] = (previous.get("first_recorded_at")
+                                  or _observation_time(saved.get("first_recorded_at")) or stamp)
+    for field in ("first_measurement_observed_at", "first_checks_observed_at"):
+        entry[field] = previous.get(field) or _observation_time(saved.get(field))
+
+    split = entry.get("out_of_sample") or {}
+    measured = _pick_metrics(entry.get("metrics"))
+    if isinstance(split, dict):
+        for period in ("train", "test"):
+            measured.update({period + ":" + key: value
+                             for key, value in _pick_metrics(split.get(period)).items()})
+    has_measurement = any(isinstance(value, (int, float)) and not isinstance(value, bool)
+                          and math.isfinite(value) for value in measured.values())
+    if has_measurement:
+        if (same_request and previous.get("measurement_identity") == measurement
+                and (previous.get("measurement_observed_at") is not None or metadata_only)):
+            observed = previous.get("measurement_observed_at")
+        elif not previous and saved:
+            observed = _observation_time(saved.get("measurement_observed_at"))
+        else:
+            observed = None if metadata_only else stamp
+    else:
+        observed = None
+    entry["measurement_observed_at"] = observed
+    entry["first_measurement_observed_at"] = entry["first_measurement_observed_at"] or observed
+
+    snapshot = previous.get("snapshot") if same_request else None
+    if not previous and saved:
+        snapshot = saved.get("last_check_snapshot")
+    if not isinstance(snapshot, dict) or snapshot.get("request_identity") != request:
+        snapshot = None
+    checks = _normalize_checks(entry.get("checks"))
+    entry["checks"] = checks
+    if checks:
+        entry["failing_checks"] = _failing_checks(checks)
+        if (same_request and previous.get("check_identity") == check_identity
+                and (previous.get("checks_observed_at") is not None or metadata_only)):
+            observed, origin = previous.get("checks_observed_at"), previous.get("checks_source")
+        elif not previous and saved:
+            observed, origin = _observation_time(saved.get("checks_observed_at")), saved.get("checks_source")
+        else:
+            observed, origin = (None, None) if metadata_only else (stamp, source)
+        partial = bool(snapshot and platform_check_names(snapshot.get("checks"))
+                       - platform_check_names(checks))
+        entry.update(checks_state="partial" if partial else "observed",
+                     checks_observed_at=observed, checks_source=origin)
+        entry["first_checks_observed_at"] = entry["first_checks_observed_at"] or observed
+        if not partial:
+            snapshot = None
+    else:
+        entry.setdefault("failing_checks", [])
+        entry.update(checks_state="stale" if snapshot else "missing",
+                     checks_observed_at=None, checks_source=None)
+    if snapshot:
+        entry["last_check_snapshot"] = snapshot
+    else:
+        entry.pop("last_check_snapshot", None)
+    # ``ledger record`` has always defaulted to watch, so a legacy nondefault
+    # verdict on that path was an explicit CLI judgement even before the flag.
+    if source == "record" and entry.get("verdict") not in (None, "watch"):
+        entry["verdict_manual"] = True
+    # Repair only recognizable automatic defaults in legacy views. A manual
+    # provisional candidate label is separate from resolved platform evidence.
+    if (entry.get("verdict") == "candidate" and not entry.get("verdict_manual")
+            and source in {"simulate", "sync", "submit"}
+            and (entry["checks_state"] != "observed" or not summarize_checks(checks)["resolved"])):
+        entry["verdict"] = "watch"
+    return entry
 
 
 def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
@@ -366,6 +480,8 @@ def load_entries(path=None):
             key, entry = _parse_line(line)
             if entry is None:
                 continue
+            previous = by_key.get(key)
+            entry = fold_evidence(entry, evidence_state(previous) if previous else None)
             entry["role"] = evidence_role(by_key.get(key), entry)
             by_key[key] = entry
     return list(by_key.values())
@@ -499,6 +615,11 @@ def append_batch(path=None):
 
 
 def _append_locked(existing, write_line, entry, *, skip_unchanged=True, allow_metrics_loss=False):
+    entry = dict(entry)
+    entry.setdefault("recorded_at", _now())
+    key = entry.get("key")
+    current = existing.get(key)
+    entry = fold_evidence(entry, evidence_state(current) if current else None)
     # Attach the rejection cause while the observed check and metrics are present.
     if entry.get("verdict") == "rejected" and not entry.get("reason_code"):
         try:
@@ -510,8 +631,6 @@ def _append_locked(existing, write_line, entry, *, skip_unchanged=True, allow_me
         except Exception:  # noqa: BLE001 - recording must never fail on this
             pass
 
-    key = entry.get("key")
-    current = existing.get(key)
     entry["role"] = evidence_role(current, entry)
     if current is not None and not allow_metrics_loss and current.get("metrics") and not entry.get("metrics"):
         raise ValueError(
@@ -545,16 +664,11 @@ def auto_verdict(record):
     # because a non-failing check emitted a warning.
     if (record.get("status") or "").upper() not in FINISHED_STATUSES | {"UNSUBMITTED", "ACTIVE", "SUBMITTED"}:
         return "watch"
-    checks = record.get("checks") or {}
-    if isinstance(checks, dict):
-        results = [str((value or {}).get("result") or "").upper()
-                   if isinstance(value, dict) else str(value).upper()
-                   for value in checks.values()]
-    else:
-        results = [str((value or {}).get("result") or "").upper()
-                   for value in checks if isinstance(value, dict)]
-    if any(result in {"FAIL", "ERROR"} for result in results):
+    summary = summarize_checks(record.get("checks"))
+    if summary["failed"]:
         return "rejected"
+    if not summary["resolved"] or record.get("checks_state") in {"missing", "stale", "partial"}:
+        return "watch"
     metrics = record.get("metrics") or {}
     sharpe = metrics.get("sharpe")
     fitness = metrics.get("fitness")
@@ -677,6 +791,8 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
                             entry["out_of_sample"][period] = {**old_split[period],
                                 **{key: value for key, value in (new_split.get(period) or {}).items()
                                    if value is not None}}
+            if verdict is not None:
+                entry["verdict_manual"] = True
             try:
                 entry, did_write = append(entry)
             except ValueError as exc:

@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 import requests
 
+import simulation_capabilities
 from tools.pipeline import batch_quick, pipeline_pc
 
 
@@ -67,8 +68,9 @@ def configure(tmp_path, monkeypatch, arms, *, jsonl=False):
     login = Mock(return_value=MagicMock())
     monkeypatch.setattr(pipeline_pc, "Runner", runner_factory)
     monkeypatch.setattr(pipeline_pc.ml, "load_session", login)
-    monkeypatch.setattr(pipeline_pc.simulation_capabilities, "account_provenance",
-                        lambda session: {"fingerprint": "test"})
+    monkeypatch.setattr(simulation_capabilities, "account_provenance",
+                        lambda session=None: {"fingerprint": "test"})
+    monkeypatch.setattr(simulation_capabilities, "cached", lambda: {})
     return args, output, runner, login
 
 

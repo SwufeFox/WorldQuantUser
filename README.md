@@ -1570,7 +1570,7 @@ platform's own terms.
 ## Tests
 
 ```bash
-python -m pip install pytest
+python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
@@ -1578,9 +1578,15 @@ The pytest suite uses local fixtures and mocked platform responses. It blocks
 remote Python socket connections and DNS lookups in tests and their Python CLI
 subprocesses. Loopback stays available for local fixtures.
 
+The offline suite verifies the client's response handling and recovery contracts.
+It does not measure a live account's capacity or reproduce a research model's
+accuracy without that experiment's data and configuration.
+
 | What changed | Relevant tests |
 | --- | --- |
 | CLI schema, error envelopes and file inputs | [`test_contract.py`](tests/test_contract.py), [`test_contract_v2.py`](tests/test_contract_v2.py) |
+| Check states, missing refreshes and ledger provenance | [`test_check_evidence.py`](tests/test_check_evidence.py), [`test_ledger_evidence.py`](tests/test_ledger_evidence.py), [`test_registry_index.py`](tests/test_registry_index.py) |
+| Account budgets, worker limits and accepted-job recovery | [`test_concurrency_policy.py`](tests/test_concurrency_policy.py), [`test_quick_slots.py`](tests/test_quick_slots.py), [`test_native_multi.py`](tests/test_native_multi.py) |
 | Python source, account preflight and payload | [`test_python_preflight.py`](tests/test_python_preflight.py), [`test_regular_settings_payload.py`](tests/test_regular_settings_payload.py), [`test_expression_identity.py`](tests/test_expression_identity.py) |
 | Probe reuse, queue recovery and Campaign | [`test_probe.py`](tests/test_probe.py), [`test_research_runners.py`](tests/test_research_runners.py) |
 | Training freeze and candidate validation | [`test_triage_modes.py`](tests/test_triage_modes.py), [`test_promote.py`](tests/test_promote.py) |

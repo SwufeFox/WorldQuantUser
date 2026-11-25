@@ -52,7 +52,8 @@ class WarningStatusTests(unittest.TestCase):
         self.assertEqual(summary["best"]["sharpe"], 2.0)
 
     def test_unfinished_execution_is_not_a_scientific_rejection(self):
-        self.assertEqual(alpha_registry.auto_verdict(record(status="WARNING")), "candidate")
+        finished = {**record(status="WARNING"), "checks": {"UNITS": {"result": "WARNING"}}}
+        self.assertEqual(alpha_registry.auto_verdict(finished), "candidate")
         for status in ("PENDING", "FAILED", "UNKNOWN_SUBMISSION", "QUEUED"):
             self.assertEqual(alpha_registry.auto_verdict(record(status=status)), "watch")
 

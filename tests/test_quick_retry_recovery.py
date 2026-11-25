@@ -42,7 +42,8 @@ def offline(tmp_path, monkeypatch):
         now += seconds
 
     monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
-    monkeypatch.setattr(batch_quick.simulation_capabilities, "account_provenance", lambda session: ACCOUNT)
+    monkeypatch.setattr(batch_quick.simulation_capabilities, "account_provenance", lambda session=None: ACCOUNT)
+    monkeypatch.setattr(batch_quick.simulation_capabilities, "cached", lambda: {})
     monkeypatch.setattr(batch_quick.time, "monotonic", lambda: now)
     monkeypatch.setattr(batch_quick.time, "time", lambda: 1000 + now)
     monkeypatch.setattr(batch_quick.time, "sleep", sleep)

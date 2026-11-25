@@ -9,6 +9,7 @@ import pytest
 import machine_lib as ml
 from research_app import alphas, app, buffer_cmd, promote, selection, triage
 from research_app.runtime import CliError
+from tools import campaign_runner
 
 
 @pytest.fixture
@@ -178,16 +179,22 @@ def test_optional_live_correlation_cap_rejects_before_buffering(flow, capsys, va
     assert flow["calls"] == ["freeze", "validate", "checks"]
 
 
-@pytest.mark.parametrize("verdict", ["FAIL", "ERROR", "PENDING"])
-def test_failed_or_unresolved_checks_reject(flow, capsys, verdict):
-    result = flow["checked"]["results"][0]
-    result["checks"]["LOW_SHARPE"]["result"] = verdict
-    if verdict != "FAIL":
-        result["checks_resolved"] = False
+@pytest.mark.parametrize("verdict,retryable", [
+    ("FAIL", False), ("ERROR", True), ("PENDING", True), ("UNKNOWN", True),
+])
+def test_failed_or_unresolved_checks_preserve_campaign_retry_semantics(flow, capsys, verdict, retryable):
+    checks = deepcopy(flow["checked"]["results"][0]["checks"])
+    checks["LOW_SHARPE"]["result"] = verdict
+    result = alphas._check_result("A1", {"complete": True, "checks": checks})
+    flow["checked"] = {"complete": result["complete"], "results": [result]}
     _, output = invoke(capsys)
     assert output["data"]["outcome"] == "rejected"
     assert output["data"]["checks"] == flow["checked"]
-    assert any("platform_checks_" in reason for reason in output["data"]["reasons"])
+    expected = "platform_checks_not_resolved" if retryable else "platform_checks_failed: LOW_SHARPE"
+    assert output["data"]["reasons"] == [expected]
+    # Campaigns must retry an operational check error instead of caching it as
+    # a terminal rejection of the candidate's signal.
+    assert campaign_runner._promotion_pending(output["data"]) is retryable
     assert "buffer" not in flow["calls"]
 
 

@@ -2,7 +2,9 @@
 """Run Quick simulations with a shared account budget and durable progress.
 
 Use `--concurrency` for this process's workers and `--account-slots` for
-the budget shared with other runners in the research workspace.
+the local budget shared with other runners in the research workspace. Only
+verified capacity for the authenticated account can lower that slot budget;
+submission rate limits are handled separately through Retry-After.
 """
 from __future__ import annotations
 
@@ -33,7 +35,6 @@ import simulation_slots
 
 QUICK = "QUICK"
 DEFAULT_ACCOUNT_SLOTS = 5
-PLATFORM_BURST_LIMIT = machine_lib.PLATFORM_BURST_LIMIT
 SUCCESS_STATUSES = simulation_slots.TERMINAL_SUCCESS_STATUSES
 CHECK_NAMES = ("LOW_SUB_UNIVERSE_SHARPE", "CONCENTRATED_WEIGHT",
                "LOW_2Y_SHARPE", "LOW_SHARPE", "LOW_FITNESS")
@@ -426,6 +427,8 @@ class Runner:
             slot = simulation_slots.quick_acquire(self.account, self.slots, key,
                                                   existing_url=existing_url, prepare=True,
                                                   identity_unverified=identity_unverified)
+            if slot is None and self.slots == 0:
+                return None, {**row, "status": "QUEUED", "detail": "account slot budget is zero"}
             if slot is not None:
                 if slot.get("progress_url"):
                     return slot, None
@@ -768,6 +771,15 @@ def _select_arms(arms, runner, done):
     return resume + reconciliation
 
 
+def _account_slot_plan(session, requested):
+    """Share the native runner's evidence policy without discovering online limits."""
+    plan = machine_lib.concurrency_plan(session, requested=requested)
+    if plan["effective"] < requested:
+        print(f"note: account slot budget reduced from {requested} to {plan['effective']} "
+              "by verified capacity for the authenticated account", file=sys.stderr)
+    return plan
+
+
 def _run_batch(args, out):
     arms = _load_arms(Path(args.arms))
     if not arms:
@@ -775,8 +787,9 @@ def _run_batch(args, out):
     recover_job = getattr(args, "recover_job", None)
     limits = {"deadline": time.monotonic() + args.poll_timeout} if recover_job else {}
     with machine_lib.load_session(**limits) as session:
-        account = simulation_capabilities.account_provenance(session)
-        runner = Runner(out, account, args.account_slots, args.poll_timeout)
+        plan = _account_slot_plan(session, args.account_slots)
+        account = plan["account"]
+        runner = Runner(out, account, plan["effective"], args.poll_timeout)
         if recover_job:
             if not any(runner._job_key(arm["label"], _payload(arm)) == recover_job for arm in arms):
                 raise ValueError("recovery job key does not match an arm in the original batch")
@@ -790,7 +803,7 @@ def _run_batch(args, out):
     todo = _select_arms(arms, runner, load_done(out, account))
     if args.limit:
         todo = todo[:args.limit]
-    print(f"arms={len(arms)} todo={len(todo)} workers={args.concurrency} account_slots={args.account_slots}",
+    print(f"arms={len(arms)} todo={len(todo)} workers={args.concurrency} account_slots={plan['effective']}",
           flush=True)
     if not todo:
         return 0
@@ -831,7 +844,8 @@ def _batch_parser(description, default_out, default_concurrency):
     parser.add_argument("--concurrency", type=int, default=default_concurrency,
                         help="Number of workers in this process (default: %(default)s).")
     parser.add_argument("--account-slots", type=int, default=DEFAULT_ACCOUNT_SLOTS,
-                        help="Shared simulation slots for this account and workspace (default: %(default)s).")
+                        help="Local shared slot budget, bounded by verified account capacity "
+                             "when known (default: %(default)s).")
     parser.add_argument("--limit", type=int, default=0, help="Maximum arms to process (0 means unlimited).")
     return parser
 
@@ -850,12 +864,6 @@ def _batch_args(parser):
     args = parser.parse_args()
     if min(args.concurrency, args.account_slots) <= 0 or args.limit < 0:
         parser.error("workers and account slots must be positive and limit cannot be negative")
-    if args.concurrency > PLATFORM_BURST_LIMIT or args.account_slots > PLATFORM_BURST_LIMIT:
-        print(f"note: clamping concurrency/account slots to the platform burst limit "
-              f"({PLATFORM_BURST_LIMIT}); requested {args.concurrency}/{args.account_slots}",
-              file=sys.stderr)
-        args.concurrency = min(args.concurrency, PLATFORM_BURST_LIMIT)
-        args.account_slots = min(args.account_slots, PLATFORM_BURST_LIMIT)
     return args
 
 

@@ -27,6 +27,7 @@ import tempfile
 from pathlib import Path
 
 import cache_store
+from check_evidence import normalize_checks, summarize_checks
 import machine_lib as ml
 import research_paths
 
@@ -170,29 +171,9 @@ def _retention(entry):
 
 
 def _checks_summary(checks):
-    """Split checks into passed / failed / pending.
-
-    PENDING is not a failure: the alpha body carries a cached snapshot in which
-    SELF_CORRELATION is usually PENDING until `/alphas/{id}/check` runs. Folding it into
-    "failed" made every fresh candidate look unsubmittable.
-    """
-    passed, failed, pending, warned = [], [], [], []
-    for name, body in (checks or {}).items():
-        result = (body or {}).get("result") if isinstance(body, dict) else body
-        if result == "PASS":
-            passed.append(name)
-        elif result in (None, "PENDING"):
-            pending.append(name)
-        elif result == "WARNING":
-            # WARNING is not a failure on the platform: the alpha still submits, and
-            # UNITS in particular is a unit-inference note, not a rejection. Folding it
-            # into "failed" blocked a passing candidate from the shelf.
-            warned.append(name)
-            passed.append(name)
-        else:
-            failed.append(name)
-    return {"passed": sorted(passed), "failed": sorted(failed),
-            "pending": sorted(pending), "warned": sorted(warned)}
+    """Keep the shelf's four-key public shape over the shared check semantics."""
+    summary = summarize_checks(checks)
+    return {key: summary[key] for key in ("passed", "failed", "pending", "warned")}
 
 
 def cmd_buffer_add(args, _sink, *, checked=None):
@@ -212,7 +193,7 @@ def cmd_buffer_add(args, _sink, *, checked=None):
         wait = getattr(args, "max_wait", None)
         computed = checked if checked is not None else ml.fetch_alpha_checks(
             session, args.alpha_id, max_wait_seconds=60 if wait is None else wait)
-        checks = computed.get("checks") or {}
+        checks = normalize_checks(computed.get("checks"))
         split = ml.extract_split(payload) or {}
         train = split.get("train") or {}
         test = split.get("test") or {}
@@ -226,9 +207,10 @@ def cmd_buffer_add(args, _sink, *, checked=None):
         code, _description, _ops = ml.regular_expression(payload)
         from . import costs
         from .alphas import _selection_id
+        evidence = summarize_checks(checks)
         summary = _checks_summary(checks)
-        eligible = bool(computed.get("complete") and checks and not summary["pending"]
-                        and not summary["failed"] and self_corr is not None)
+        eligible = bool(computed.get("complete") and not computed.get("error")
+                        and evidence["resolved"] and not evidence["failed"] and self_corr is not None)
         return {"event": "shelved", "alpha_id": args.alpha_id,
                 "role": role,
                 "expression": code,

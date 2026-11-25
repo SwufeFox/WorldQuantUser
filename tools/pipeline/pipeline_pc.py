@@ -23,10 +23,9 @@ from requests.exceptions import RequestException
 
 import cache_store
 import machine_lib as ml
-import simulation_capabilities
 import simulation_slots
 from tools.pipeline.batch_quick import (
-    SUCCESS_STATUSES, Runner, _append, _batch_args, _batch_parser, _finished,
+    SUCCESS_STATUSES, Runner, _account_slot_plan, _append, _batch_args, _batch_parser, _finished,
     _json_object, _jsonl_rows, _load_arms, _matches_alpha_payload, _open_ledger,
     _payload, _retry_after, _run_locked, _simulation_key,
 )
@@ -325,8 +324,9 @@ def _run_batch(args, out):
     if not arms:
         return 0
     with ml.load_session() as session:
-        account = simulation_capabilities.account_provenance(session)
-    runner = Runner(out, account, args.account_slots, poll_timeout=600)
+        plan = _account_slot_plan(session, args.account_slots)
+        account = plan["account"]
+    runner = Runner(out, account, plan["effective"], poll_timeout=600)
     try:
         ledger = read_ledger(out)
         snapshots = {}

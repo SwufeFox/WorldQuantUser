@@ -70,6 +70,51 @@ python research_cli.py ledger analyze --region ASI --delay 1 --mode QUICK \
 扣成本后仍有正的训练 margin。换手上限为可选参数。待定检查列在 `unresolved_checks`。
 同一 Alpha ID 的诊断标记对它的所有台账键生效。
 
+### 检查缺失、历史证据与研究标签
+
+检查名称、正式 `result`、实际 `value`、阈值 `limit` 和说明随载荷保留。
+`PASS` 和非阻断的 `WARNING` 都是已有结论；`FAIL` 阻断推进；`ERROR` 也阻断，
+但仍是未解决状态；`PENDING`、未知结果及缺失的必需检查不能当成通过。
+数值与阈值的比较是诊断信息，不覆盖平台的正式 `result`。
+端点是否完成、返回的检查是否都有结论、研究或提交门槛是否满足，分别判断。
+
+同名检查重复出现或夹杂无名、格式错误的记录时，解析器保留原始记录并标记
+`source=client_parser`、`client_parse_error` 和空的 `result`，保持待确认。
+无名记录集中在 `__CLIENT_CHECK_PARSE_ERROR__` 下；这是客户端诊断，不是平台检查名称，
+不会变成后续载荷必须提供的检查。正常刷新可以解除该状态。
+
+每条台账的 `checks` 只表示当前载荷，`checks_state` 描述其覆盖情况：
+
+| `checks_state` | 含义 |
+| --- | --- |
+| `observed` | 当前有检查，未发现相对于上一份已保存的同请求快照的缺项；仍须看每项结果，不能直接当作全清。 |
+| `missing` | 当前没有检查，也没有可匹配的历史快照。 |
+| `stale` | 当前没有检查；同表达式、同设置的上一份检查保存在 `last_check_snapshot`，供追溯。 |
+| `partial` | 当前检查比上一份同请求快照少了名称；缺项仍待确认，历史快照单独保留。 |
+
+`last_check_snapshot` 最多保留一份检查及其来源、模式和观察时间，不补进当前
+`checks`，也不跨表达式或设置（包括 QUICK/FULL）复用。完整事件历史仍在 JSONL 中。
+自动 `candidate` 不接受缺失、待定或部分返回的检查；通过 `ledger label --verdict candidate`
+或 `ledger record --verdict candidate` 手动标记的条目带 `verdict_manual=true`，表示研究判断。
+候选标签本身不证明平台通过，更不证明可以提交。
+
+### 时间字段怎么用于复盘
+
+| 字段 | 含义 |
+| --- | --- |
+| `recorded_at` | 这一次台账事件的时间，改标签和去重也会更新。`ledger analyze --since` 仍按它筛选近期事件。 |
+| `first_recorded_at` | 该台账键最早可追溯的事件时间。 |
+| `measurement_observed_at` | 当前指标载荷首次被观察到的时间；指标及切分载荷不变的重复读取及纯改标签不移动它。 |
+| `checks_observed_at` | 当前检查载荷首次被观察到的时间；当前缺失时为空，旧时间留在历史快照中。 |
+| `first_measurement_observed_at` / `first_checks_observed_at` | 该键最早有时间依据的指标／检查观察，不代表当前数值当时已知。 |
+
+这些是本地证据的观察时间，不是平台实际执行时间。旧台账若只有改标签后的行，
+无法补出原始测量时间，相关字段保留为空。做模型时间切分时，应按当时可见的事件
+重建特征与标签；不能把最新标签配到最早时间，也不能把缺失检查编码成“全清”。
+当前代码不替外部实验选择训练集或证明预测能力。
+
+### 训练初筛参数
+
 | 参数或单位 | 取值 |
 | --- | --- |
 | 默认 `--min-train-sharpe` | 1.0 |
@@ -123,6 +168,8 @@ python research_cli.py campaign preview FULL-SPEC.json
 是可重建的 SQLite 投影。首次建索引、源被替换或截断、索引版本变化时会重放台账。
 正常追加只重放新字节。索引同步需要台账锁，实际报告读取固定的 SQLite 快照。
 大库冷建安排在队列可以暂缓写入的时段。全库报告耗时随覆盖行数增长。
+索引版本 4 和直接 JSONL 读取共用证据折叠逻辑，旧记录可在读取时补出有依据的来源与时间；
+原始 JSONL 不会被改写。升级后的首次读取会重建旧版本索引。
 
 | 看到的情况 | 核对方式 |
 | --- | --- |

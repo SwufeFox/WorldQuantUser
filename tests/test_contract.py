@@ -31,6 +31,8 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import machine_lib as ml  # noqa: E402
+import alpha_registry
+from check_evidence import CLIENT_PARSE_ERROR, summarize_checks
 import field_index
 from research_app import app as cli_app
 from research_app import catalog as cli_catalog
@@ -1590,15 +1592,18 @@ class PrivacyTests(unittest.TestCase):
 
 
 class CheckExtractionTests(unittest.TestCase):
-    def test_extract_checks_flattens_platform_checks(self):
+    def test_extract_checks_preserves_named_records_and_reports_unnamed_evidence(self):
         payload = {"is": {"checks": [
             {"name": "LOW_SHARPE", "result": "PASS", "limit": 1.25, "value": 1.46},
             {"name": "SELF_CORRELATION", "result": "PENDING"},
-            {"result": "PASS"},  # no name -> skipped
+            {"result": "PASS"},  # unnamed evidence must not disappear
         ]}}
         checks = ml._extract_checks(payload)
-        self.assertEqual(sorted(checks), ["LOW_SHARPE", "SELF_CORRELATION"])
+        self.assertEqual(set(checks), {"LOW_SHARPE", "SELF_CORRELATION", CLIENT_PARSE_ERROR})
         self.assertEqual(checks["LOW_SHARPE"]["value"], 1.46)
+        self.assertEqual(checks[CLIENT_PARSE_ERROR]["raw_records"], [{"result": "PASS"}])
+        self.assertIsNone(checks[CLIENT_PARSE_ERROR]["result"])
+        self.assertFalse(summarize_checks(checks)["resolved"])
 
     def test_extract_checks_returns_none_when_absent(self):
         self.assertIsNone(ml._extract_checks({}))
@@ -2111,6 +2116,80 @@ if __name__ == "__main__":
 class RegistryLabelContractTests(unittest.TestCase):
     """Results must be persisted by default and keep their mechanism labels."""
 
+    def _invoke(self, directory, *command):
+        with contextlib.redirect_stdout(io.StringIO()) as stdout:
+            code = cli_app.main(["--research-dir", directory, *command])
+        result = json.loads(stdout.getvalue())
+        self.assertEqual(code, 0, result)
+        self.assertTrue(result["ok"], result)
+        return result["data"]
+
+    def test_platform_refresh_keeps_unknown_checks_and_historical_failure_distinct(self):
+        first_time, label_time, refresh_time = (
+            "2025-01-01T12:00:00+00:00", "2025-01-02T12:00:00+00:00",
+            "2025-01-03T12:00:00+00:00")
+        metrics = {"sharpe": 2.5, "fitness": 1.5}
+        payload = {"id": "A123", "status": "UNSUBMITTED", "regular": {"code": "rank(close)"},
+                   "settings": {"region": "USA", "universe": "TOP3000", "delay": 1,
+                                "language": "FASTEXPR", "simulationMode": "FULL"}}
+        session = SimulationResumeTests.Session(get_responses=[
+            SimulationResumeTests.Response(payload={**payload, "is": {**metrics, "checks": [
+                {"name": "LOW_SUB_UNIVERSE_SHARPE", "result": "FAIL", "value": 0.9,
+                 "limit": 1.3, "message": "synthetic regional shortfall"}]}}),
+            SimulationResumeTests.Response(payload={**payload, "is": metrics}),
+        ])
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(ml, "load_session", return_value=session), \
+                    mock.patch.object(alpha_registry, "_now", return_value=first_time):
+                recorded = self._invoke(directory, "ledger", "record", "A123")["entry"]
+            self.assertEqual(recorded["checks_state"], "observed")
+            self.assertEqual(recorded["checks"]["LOW_SUB_UNIVERSE_SHARPE"]["message"],
+                             "synthetic regional shortfall")
+            with mock.patch.object(ml, "load_session", side_effect=AssertionError("offline label")), \
+                    mock.patch.object(alpha_registry, "_now", return_value=label_time):
+                labelled = self._invoke(directory, "ledger", "label", "A123",
+                                        "--mechanism", "regional-test")["entry"]
+            self.assertEqual(labelled["recorded_at"], label_time)
+            self.assertEqual(labelled["measurement_observed_at"], first_time)
+            self.assertEqual(labelled["checks_observed_at"], first_time)
+            with mock.patch.object(ml, "load_session", return_value=session), \
+                    mock.patch.object(alpha_registry, "_now", return_value=refresh_time):
+                refreshed = self._invoke(directory, "ledger", "record", "A123")["entry"]
+            self.assertEqual(refreshed["checks"], {})
+            self.assertEqual(refreshed["checks_state"], "stale")
+            self.assertEqual(refreshed["verdict"], "watch")
+            self.assertEqual(refreshed["first_recorded_at"], first_time)
+            self.assertEqual(refreshed["measurement_observed_at"], first_time)
+            self.assertIsNone(refreshed["checks_observed_at"])
+            prior = refreshed["last_check_snapshot"]
+            self.assertEqual(prior["observed_at"], first_time)
+            self.assertEqual(prior["checks"]["LOW_SUB_UNIVERSE_SHARPE"]["result"], "FAIL")
+            self.assertEqual(prior["simulation_mode"], "FULL")
+            with mock.patch.object(ml, "load_session", side_effect=AssertionError("offline read")):
+                listed = self._invoke(directory, "ledger", "list")["entries"][0]
+                report = self._invoke(directory, "ledger", "analyze")
+            self.assertEqual(listed, refreshed)
+            self.assertEqual(report["funnel"]["checks_missing"], 1)
+            self.assertEqual(report["funnel"]["research_screen"], 0)
+            self.assertEqual(report["representatives"], [])
+            self.assertEqual(len(session.get_calls), 2)
+            self.assertEqual(session.post_calls, [])
+
+    def test_explicit_candidate_label_does_not_manufacture_check_evidence(self):
+        session = SimulationResumeTests.Session(get_responses=[
+            SimulationResumeTests.Response(payload={
+                "id": "A123", "regular": {"code": "rank(close)"},
+                "is": {"sharpe": 2.5, "fitness": 1.5}}),
+        ])
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ml, "load_session", return_value=session):
+            entry = self._invoke(directory, "ledger", "record", "A123",
+                                 "--verdict", "candidate")["entry"]
+        self.assertEqual(entry["verdict"], "candidate")
+        self.assertTrue(entry["verdict_manual"])
+        self.assertEqual(entry["checks_state"], "missing")
+        self.assertEqual(entry["checks"], {})
+        self.assertIsNone(entry["checks_observed_at"])
 
     def test_per_expression_mechanism_survives_dry_run(self):
         with tempfile.TemporaryDirectory() as tmp:

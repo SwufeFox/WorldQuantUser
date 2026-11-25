@@ -55,6 +55,10 @@ def cmd_ledger_record(args, sink):
         family=getattr(args, "family", None),
         source="record",
     )
+    if getattr(args, "verdict", "watch") != "watch":
+        # Nondefault CLI judgements are explicit annotations, not automatic
+        # evidence that the fetched checks passed.
+        entry["verdict_manual"] = True
     registry_path = (getattr(args, "registry", None)
                      or alpha_registry.default_registry_path())
     stored, written = alpha_registry.record_entry(entry, registry_path)

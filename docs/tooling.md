@@ -5,6 +5,11 @@
 
 ## 先从统一 CLI 进入
 
+批量研究沿一条主路径推进：`campaign preview` 检查规格，`campaign run` 调度和恢复，
+`ledger analyze` 复盘证据，`triage --freeze` / `promote --selection` 冻结并验证候选。
+操作步骤集中在 [批量回测与台账复盘](ledger-workflow.md)，吞吐量的测量口径见
+[快速回测方法论](fast-backtest.md)。下文是按需查询的命令参考。
+
 ```bash
 python3 research_cli.py brief                 # 当前状态、证据摘要和来源路径
 python3 research_cli.py help                  # 不熟悉命令时才读导航
@@ -37,6 +42,10 @@ CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、
 `experiments.py`、`alphas.py`、`ledger.py`。账户与缓存、研究摘要与查看记录、
 文献检索分别在 `account.py`、`campaign.py`、`literature.py`。
 这些是内部模块，入口仍是 `research_cli.py`；改命令时直接修改、测试所属模块。
+
+检查状态由 `check_evidence.py` 统一归一和汇总；台账写入、历史回放共用
+`alpha_registry.py` 的证据合并逻辑；账号并发预算由 `machine_lib.concurrency_plan`
+统一解释。各命令保留自己的研究或提交门槛，不再各自定义 PASS、WARNING、缺失及待定的含义。
 
 CLI 统一按需加载处理模块。执行具体命令时才导入它的处理模块，`help`、`--help` 和
 `schema` 直接从参数定义生成输出。这些命令与离线 lint、Probe 预览可以在未安装
