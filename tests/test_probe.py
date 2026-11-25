@@ -522,12 +522,16 @@ class ProbeTests(unittest.TestCase):
         alpha_registry.record_entry(prior, custom)
         data = self._run(dry_run=True, strict_gate=True, registry=custom)
         self.assertTrue(data["would_block"])
-        self.assertEqual(data["gate_blocking"], [
-            {"code": "exact_repeat", "label": "a", "evidence_keys": ["prior"]}])
+        blocker, = data["gate_blocking"]
+        self.assertEqual({key: blocker[key] for key in ("code", "label", "evidence_keys")},
+                         {"code": "exact_repeat", "label": "a", "evidence_keys": ["prior"]})
+        self.assertEqual(blocker["completed_refs"][0]["key"], "prior")
+        self.assertEqual(blocker["inspect_argv"][-2:], ["--registry", custom])
         self.assertEqual(data["results"][0]["gate"]["exact_repeat_keys"], ["prior"])
         self.assertEqual(data["results"][0]["gate"]["history_registry"], custom)
-        with self.assertRaises(cli_runtime.CliError):
+        with self.assertRaises(cli_runtime.CliError) as caught:
             self._run(strict_gate=True, registry=custom)
+        self.assertEqual(caught.exception.details["next_action"], "inspect_existing_evidence")
         self.load_session.assert_not_called()
         self.assertEqual(self.fake.calls, [])
 

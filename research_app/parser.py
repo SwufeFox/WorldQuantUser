@@ -201,8 +201,8 @@ def _setting_assignment(value):
     return key.strip(), parsed
 
 
-def _add_concurrency_args(parser):
-    parser.add_argument("--batch-size", dest="concurrency", type=_positive_count, default=None,
+def _add_concurrency_args(parser, default=None):
+    parser.add_argument("--batch-size", dest="concurrency", type=_positive_count, default=default,
                         help="Requested simulation concurrency. Published account limits take precedence; "
                              "unpublished capacity uses a reported local policy, not a claimed platform allowance.")
 
@@ -499,7 +499,9 @@ def build_parser():
         "promote", help="Freeze, validate, check and shelve one candidate.",
         description="Freeze the candidate or reuse --selection, then validate, check and add to the shelf. "
                     "Keep every completed step's evidence; stop on an operational failure. "
-                    "Dry runs still open the test view and perform platform checks.")
+                    "Dry runs still open the test view and perform platform checks. "
+                    "Shelving needs name, category, tags and description. An eligible result without "
+                    "them returns metadata_required and a concrete next action.")
     promote_parser.add_argument("alpha_id", metavar="ALPHA_ID")
     promote_parser.add_argument("--note", default=None)
     retention_option = promote_parser.add_argument(
@@ -515,6 +517,8 @@ def build_parser():
                                 help="Validate an existing single-candidate training selection.")
     promote_parser.add_argument("--buffer", default=None, metavar="PATH",
                                 help="Shelf file (default: in research dir).")
+    promote_parser.add_argument("--seeds", default=None, metavar="PATH",
+                                help="Validated seed metadata store (default: seeds.jsonl in research dir).")
     promote_parser.add_argument("--dry-run", action="store_true",
                                 help="Run validation and platform checks. Report would_buffer without "
                                      "writing the shelf if eligible.")
@@ -522,6 +526,12 @@ def build_parser():
                                 help="Review a saved Regular promotion receipt offline. Requires --selection.")
     promote_parser.add_argument("--pc-distribution", metavar="PATH",
                                 help="Attach the candidate's saved production histogram to an offline receipt review.")
+    promote_parser.add_argument("--name", default=None, help="Seed name (required to buffer).")
+    promote_parser.add_argument("--category", default=None,
+                                help="Seed category: ANALYST, FUNDAMENTAL, PRICE_VOLUME, SENTIMENT, VOLUME.")
+    promote_parser.add_argument("--tags", nargs="+", default=None, help="At least one seed tag.")
+    promote_parser.add_argument("--description", default=None,
+                                help="Seed rationale, at least 100 characters.")
     _add_cost_args(promote_parser)
     promote_parser.bind_handler("promote.cmd_promote")
 
@@ -1230,11 +1240,16 @@ def build_parser():
         help="Submit one alpha to its competition (dry-run unless --yes).")
     a_sub.add_argument("alpha_id")
     a_sub.add_argument("--yes", action="store_true",
-                       help="Actually submit. Without it nothing is written.")
-    a_sub.add_argument("--max-wait", type=float, default=180.0)
+                       help="Execute the saved workflow: submit a new eligible attempt or reconcile "
+                            "an unresolved one. Without it, preview and read-only checks only.")
+    a_sub.add_argument("--max-wait", type=float, default=180.0,
+                       help="Local submission/reconciliation wait budget in seconds; expiry does not "
+                            "prove that an earlier POST failed.")
     a_sub.add_argument("--registry", default=None)
     a_sub.add_argument("--buffer", default=None,
                        help="Shelf to reconcile after a confirmed submission.")
+    a_sub.add_argument("--seeds", default=None,
+                       help="Validated seed metadata store used when shelving this alpha.")
     _add_selection_args(a_sub, freeze=False)
     _add_cost_args(a_sub)
     _add_session_args(a_sub)
@@ -1532,6 +1547,13 @@ def build_parser():
     b_add = buf_sub.add_parser("add", help="Run the checks and shelve the alpha.")
     b_add.add_argument("alpha_id")
     b_add.add_argument("--note", default=None)
+    b_add.add_argument("--name", default=None, help="Seed name (required).")
+    b_add.add_argument("--category", default=None,
+                       help="Seed category: ANALYST, FUNDAMENTAL, PRICE_VOLUME, SENTIMENT, VOLUME.")
+    b_add.add_argument("--tags", nargs="+", default=None, help="At least one tag.")
+    b_add.add_argument("--description", default=None,
+                       help="Seed rationale, at least 100 characters.")
+    b_add.add_argument("--seeds", default=None, help="Seed store path (default: seeds.jsonl).")
     b_add.add_argument("--max-wait", type=int, default=None, dest="max_wait")
     b_add.add_argument("--buffer", default=None, help="Shelf file (default: in research dir).")
     b_add.add_argument("--registry", default=None)
@@ -1559,6 +1581,8 @@ def build_parser():
                        help="Submit even if the fresh self-correlation is above the gate.")
     b_sub.add_argument("--max-wait", type=int, default=None, dest="max_wait")
     b_sub.add_argument("--buffer", default=None)
+    b_sub.add_argument("--seeds", default=None,
+                       help="Validated seed metadata store used when shelving this alpha.")
     b_sub.add_argument("--registry", default=None)
     _add_selection_args(b_sub, freeze=False)
     _add_cost_args(b_sub)
@@ -1738,7 +1762,7 @@ _COMMAND_EXAMPLES = {
     "triage": ["triage --batch BATCH.json --freeze choice.json",
                "triage --ids ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --freeze choice.json",
                "triage --show-test --selection choice.json"],
-    "promote": ['promote ALPHA_ID --note "frozen validation passed" --cost-bps 5 10 20',
+    "promote": ['promote ALPHA_ID --note "candidate validation" --cost-bps 5 10 20',
                 "promote ALPHA_ID --selection choice.json --max-self-correlation 0.7",
                 "promote ALPHA_ID --selection choice.json --review-receipt receipt.json",
                 "promote ALPHA_ID --dry-run"],
@@ -1753,7 +1777,7 @@ _COMMAND_EXAMPLES = {
     "campaign": ["campaign status", "campaign preview batch.spec.json",
                  "campaign prepare-full quick-batch.json --out full.spec.json --limit 4",
                  "campaign breed batch.json --out offspring.spec.json --seed 17 --limit 4",
-                 "campaign run --recover-only", "campaign run --watch --multi-size 4",
+                 "campaign run --recover-only", "campaign run --watch --defer-quick-pnl --stream",
                  "campaign recover-pnl --watch --stream"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID"],

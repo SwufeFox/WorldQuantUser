@@ -9,6 +9,7 @@ from pathlib import Path
 import alpha_registry
 import cache_store
 import correlation
+import hashlib
 import json
 import machine_lib
 import research_paths
@@ -398,7 +399,8 @@ def _archived_quick_pnl(root, args, *, live_specs=None, archived_specs=None):
 
 def cmd_campaign_status(args, _sink):
     """Read queue progress from canonical saved probe and SPC receipts."""
-    from tools._runner import probe_poll_at, probe_state, research_root
+    from tools._runner import (_progress_fingerprint, probe_diagnosis, probe_poll_at, probe_state,
+                               recent_campaign_attempts, research_root)
     from tools.campaign_runner import campaign_paths
 
     root = research_root(args.research_dir)
@@ -407,10 +409,12 @@ def cmd_campaign_status(args, _sink):
     pending = sorted(inbox.glob("*.json"))
     archives = _archive_specs(inbox)
     counts = {state: len(specs) for state, specs in archives.items()}
+    attempts = recent_campaign_attempts(root)
     jobs = []
     for path in pending[:args.limit]:
         batch, receipt = campaign_paths(root, path)
         job = {"spec": str(path), "state": "queued"}
+        document = None
         try:
             _, route = _campaign_spec(path)
             job["track"] = route["track"]
@@ -418,6 +422,7 @@ def cmd_campaign_status(args, _sink):
                 source, document = experiments._load_probe_batch(batch)
                 state, action = probe_state(document)
                 job.update(state=state, next_action=action, batch=str(source), execution=document["execution"])
+                job["diagnosis"] = probe_diagnosis(document, source, root=root)
                 if "quick_pnl" in document:
                     job["quick_pnl"] = document["quick_pnl"]
                 poll_at = probe_poll_at(document)
@@ -427,6 +432,17 @@ def cmd_campaign_status(args, _sink):
                 job["receipt"] = str(receipt)
         except CliError as exc:
             job.update(state="invalid", error=exc.message)
+        previous = attempts.get(path.name)
+        if previous:
+            try:
+                same_spec = previous.get("source_fingerprint") == hashlib.sha256(path.read_bytes()).hexdigest()
+            except OSError:
+                same_spec = False
+            if same_spec:
+                job["last_attempt"] = {key: previous[key] for key in
+                    ("observed_at", "diagnosis", "progress", "detail") if key in previous}
+                job["last_attempt"]["matches_current_progress"] = (
+                    previous.get("progress_fingerprint") == _progress_fingerprint(document))
         jobs.append(job)
     pnl_jobs, unreadable = _archived_quick_pnl(root, args, live_specs=pending, archived_specs=archives)
     return {"inbox": str(inbox), "pending": len(pending), "archived": counts,
@@ -434,12 +450,13 @@ def cmd_campaign_status(args, _sink):
                 "pending_arms": sum(len(job["quick_pnl"]["pending_labels"]) for job in pnl_jobs),
                 "jobs": pnl_jobs[:args.limit], "omitted": max(0, len(pnl_jobs) - args.limit)},
             "displayed_by_state": dict(Counter(job["state"] for job in jobs)),
+            "last_runner_event": attempts.get(None),
             "jobs": jobs, "omitted": len(pending) - len(jobs)}
 
 
 def cmd_campaign_recover_pnl(args, sink):
     """Process archived PnL independently of the simulation runner lock."""
-    from tools._runner import _RETRYABLE, research_root, run_cli
+    from tools._runner import CLI_TIMEOUT_GRACE_SECONDS, _RETRYABLE, research_root, run_cli
 
     root = research_root(args.research_dir)
     _protect_campaign_output(args, root)
@@ -455,7 +472,7 @@ def cmd_campaign_recover_pnl(args, sink):
                     cursor = job["batch"]
                     result = run_cli(root, "probe", "--recover", Path(cursor), "--summary",
                                      "--max-wait-seconds", args.max_wait_seconds,
-                                     timeout=args.max_wait_seconds + 15)
+                                     timeout=args.max_wait_seconds + CLI_TIMEOUT_GRACE_SECONDS)
                     after = result.data.get("quick_pnl") or {}
                     remaining = after.get("pending_labels_total", len(after.get("pending_labels") or []))
                     if result.ok:
@@ -521,6 +538,8 @@ def cmd_campaign_run(args, sink):
                         log_event=observe, execute=execute, recover_only=args.recover_only,
                         launch_rank=partial(_preferred_launch_rank, ranks) if ranks else None)
     state = {0: "done_or_empty", 1: "failed", 3: "deferred"}[code]
+    if code == 3 and events and events[-1].get("kind") == "busy":
+        state = "busy"
     return {"state": state, "recover_only": args.recover_only, "validation": args.validate,
             "events": list(events)}
 

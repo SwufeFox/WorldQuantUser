@@ -55,7 +55,7 @@ ERROR_CODES = {
 METRIC_KEYS = ("sharpe", "fitness", "turnover", "returns", "drawdown", "margin",
                "longCount", "shortCount", "pnl")
 _PROTECTED_OUTPUT_ARGS = ("freeze", "selection", "batch_path", "checkpoint", "resume", "recover", "emit",
-                          "review_receipt", "pc_distribution")
+                          "review_receipt", "pc_distribution", "seeds")
 
 
 class CliError(Exception):
@@ -89,11 +89,15 @@ def protect_output(args, *paths):
             or (getattr(args, "command", None) == "triage" and getattr(args, "against_shelf", False))):
         from .buffer_cmd import buffer_path
         protected = (*protected, buffer_path(args))
+    if (getattr(args, "command", None) in {"promote", "buffer"}
+            or (getattr(args, "command", None) == "alpha" and getattr(args, "subcommand", None) == "submit")):
+        from .buffer_cmd import buffer_path, seeds_path
+        protected = (*protected, buffer_path(args), seeds_path(args))
     for path in protected:
         if path and destination == Path(path).expanduser().resolve():
             raise OutputConflict(
                 "INVALID_INPUT", "--save would overwrite durable research state",
-                "choose a response path distinct from the batch, checkpoint, frozen selection and draft spec",
+                "choose a response path distinct from the batch, checkpoint, selection, shelf and seed metadata",
                 details={"protected_path": str(destination)})
 
 

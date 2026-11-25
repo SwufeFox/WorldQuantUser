@@ -492,6 +492,8 @@ def submit_workflow(session, args, shelf_entry=None):
                 return {"alpha_id": args.alpha_id, "submission": prior["state"],
                         "submitted": False, "post_attempted": False,
                         "reason": "read-back failed; no repeated POST", "error": str(exc)}
+        if current.get("id") not in (None, args.alpha_id):
+            raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested submission")
         result = {"alpha_id": args.alpha_id, "status": current.get("status"),
                   "post_attempted": False,
                   "costs": costs.evidence((ml.extract_split(current) or {}).get("train") or {},
@@ -509,13 +511,57 @@ def submit_workflow(session, args, shelf_entry=None):
             result["confirmation_evidence"] = "durable_journal"
             current = {**current, "dateSubmitted": (prior.get("platform") or {}).get("dateSubmitted")}
         pending_attempt = prior.get("state") in {"INTENT", "ACCEPTED", "UNCERTAIN", "UNKNOWN"}
+        if not confirmed and pending_attempt:
+            # This invocation owns the submission lock when --yes is present.
+            # Only the new explicit pre-transport marker proves an interrupted
+            # preparation never reached POST; legacy INTENT remains uncertain.
+            if yes and prior.get("state") == "INTENT" and prior.get("post_phase") == "PREPARING":
+                result.update(submission="NOT_SENT", submitted=False, reconciled=True,
+                              reconciled_from=prior["state"],
+                              reason="interrupted preparation ended before the durable POST boundary",
+                              repair_actions=["rerun the read-only submission precheck before a new attempt"])
+                cache_store.write_json_atomic(path, {**prior, "state": "NOT_SENT", "result": result,
+                    "reconciled_at": datetime.now(timezone.utc).isoformat()})
+                return result
+            prior_recovery = prior.get("recovery")
+            retry_at = prior_recovery.get("retry_at") if isinstance(prior_recovery, dict) else None
+            try:
+                if type(retry_at) in (int, float) and math.isfinite(retry_at) and retry_at > datetime.now(timezone.utc).timestamp():
+                    recovery = {"state": "pending", "reason": "platform_retry_after", "retry_at": retry_at}
+                else:
+                    recovery = ml.read_alpha_submission_status(session, args.alpha_id, max_wait_seconds=max_wait)
+            except Exception as exc:
+                recovery = {"state": "unknown", "reason": "submission_status_read_failed",
+                            "error": str(exc)}
+            result["submission_recovery"] = recovery
+            if recovery.get("state") == "rejected":
+                result.update(submission="REJECTED", submitted=False, reconciled=yes,
+                              reconciled_from=prior["state"], checks=recovery.get("checks"),
+                              failed_checks=recovery.get("failed_checks"), dry_run=not yes,
+                              reason="the submission endpoint returned completed failing checks",
+                              repair_actions=["review the failed submission checks before another attempt"])
+                if yes:
+                    cache_store.write_json_atomic(path, {**prior, "state": "REJECTED", "result": result,
+                        "recovery": recovery, "reconciled_at": datetime.now(timezone.utc).isoformat()})
+                return result
+            if yes:
+                cache_store.write_json_atomic(path, {**prior, "recovery": recovery,
+                    "last_reconciled_at": datetime.now(timezone.utc).isoformat()})
         if not confirmed and not pending_attempt:
             _reject_quick_simulation(args, current)
         selection_id = prior.get("selection_id")
-        if not confirmed:
+        if not confirmed and not pending_attempt:
             selection_id = _selection_id(args, required=False) or selection_id
-        elif getattr(args, "selection", None):
+        elif confirmed and getattr(args, "selection", None):
             selection_id = _selection_id(args)
+        if not confirmed and not pending_attempt:
+            from .buffer_cmd import submission_seed
+            submission_seed(args, current)
+            _candidate_role(args, shelf_entry)
+            missing_meta = [field for field in ("name", "category") if not current.get(field)]
+            if missing_meta:
+                raise CliError("INVALID_INPUT", "%s has no %s" % (args.alpha_id, ", ".join(missing_meta)),
+                               "set the missing metadata with alpha describe")
         if not yes:
             if confirmed:
                 result.update(submitted=True, submission="CONFIRMED",
@@ -526,20 +572,17 @@ def submit_workflow(session, args, shelf_entry=None):
             else:
                 result.update(ml.submit_alpha(session, args.alpha_id, confirm=False,
                                                max_wait_seconds=max_wait))
-            result.update(dry_run=True, reconciled=False)
+            result.update(dry_run=True, reconciled=bool(result.get("reconciled")))
             return result
         if not confirmed and pending_attempt:
             result.update(submitted=False, submission=prior["state"],
                           reason="previous attempt is unresolved; no repeated POST",
-                          repair_actions=["read platform status again with this command"])
+                          repair_actions=["retain the original attempt; inspect platform submission status or its response before retrying POST"])
+            if (result.get("submission_recovery") or {}).get("retry_at"):
+                result["retry_at"] = result["submission_recovery"]["retry_at"]
             return result
         if not confirmed:
-            _candidate_role(args, shelf_entry)
             selection_id = _selection_id(args, required=True)
-            missing = [field for field in ("name", "category") if not current.get(field)]
-            if missing:
-                raise CliError("INVALID_INPUT", "%s has no %s" % (args.alpha_id, ", ".join(missing)),
-                               "set the missing metadata with alpha describe")
             if shelf_entry is not None:
                 if shelf_entry.get("state") in {"dropped", "consumed"}:
                     raise CliError("INVALID_INPUT", "candidate is no longer on the shelf",
@@ -565,19 +608,30 @@ def submit_workflow(session, args, shelf_entry=None):
             })
             journal = {"alpha_id": args.alpha_id, "state": "INTENT",
                        "selection_id": selection_id,
+                       "post_phase": "PREPARING",
                        "started_at": datetime.now(timezone.utc).isoformat()}
             cache_store.write_json_atomic(path, journal)
-            result["post_attempted"] = True
+
+            def submission_event(event):
+                if event.get("event") == "submit_posting":
+                    journal.update(post_phase="STARTED", post_started_at=datetime.now(timezone.utc).isoformat())
+                    cache_store.write_json_atomic(path, journal)
+                    result["post_attempted"] = True
+                elif event.get("event") == "submit_sent":
+                    journal["post_response"] = event
+                    cache_store.write_json_atomic(path, journal)
+
             try:
                 response = ml.submit_alpha(session, args.alpha_id, confirm=True,
-                                            max_wait_seconds=max_wait)
+                                            max_wait_seconds=max_wait, on_event=submission_event)
                 result.update(response)
             except ml.SubmissionDisabled:
                 journal["state"] = "NOT_SENT"
                 cache_store.write_json_atomic(path, journal)
                 raise
             except Exception as exc:
-                result.update(submission="UNKNOWN", submitted=False, error=str(exc))
+                result.update(submission="UNKNOWN" if result["post_attempted"] else "NOT_SENT",
+                              submitted=False, error=str(exc))
             try:
                 refreshed = ml.fetch_alpha_metrics(session, args.alpha_id)
                 if _confirmed(refreshed):

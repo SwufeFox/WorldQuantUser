@@ -52,11 +52,18 @@ class SubmissionWorkflowTests(unittest.TestCase):
         self.registry = str(self.root / "ledger.jsonl")
         self.shelf = str(self.root / "shelf.jsonl")
         self.manifest_path = self.root / "selection.json"
+        for aid in ("CANDIDATE", "OTHER"):
+            buffer_cmd._write_seed(buffer_cmd.seeds_path(),
+                                   {"alpha_id": aid, "name": "seed " + aid,
+                                    "category": "FUNDAMENTAL", "tags": ["test"],
+                                    "description": "y" * 120})
         self.manifest = selection.freeze(self.manifest_path, source="triage",
                                          rows=[{"alpha_id": "CANDIDATE"}, {"alpha_id": "OTHER"}])
 
     def args(self, **overrides):
         values = {"alpha_id": "CANDIDATE", "registry": self.registry,
+                  "name": "seed CANDIDATE", "category": "FUNDAMENTAL", "tags": ["test"],
+                  "description": "y" * 120, "seeds": str(buffer_cmd.seeds_path()),
                   "buffer": self.shelf, "selection": str(self.manifest_path),
                   "yes": True, "max_wait": 0, "force": False, "note": None, "cost_bps": [5]}
         values.update(overrides)
@@ -166,8 +173,12 @@ class SubmissionWorkflowTests(unittest.TestCase):
         self.assertEqual(records[0]["extra"]["selection_id"], self.manifest["selection_id"])
 
     def test_ambiguous_transport_is_read_back_and_never_reposted(self):
+        def timeout_after_post_boundary(_session, _alpha_id, **kwargs):
+            kwargs["on_event"]({"event": "submit_posting"})
+            raise requests.Timeout("unknown delivery")
+
         with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()) as reads, \
-                mock.patch.object(ml, "submit_alpha", side_effect=requests.Timeout("unknown delivery")) as post:
+                mock.patch.object(ml, "submit_alpha", side_effect=timeout_after_post_boundary) as post:
             self.stage(alphas.cmd_alpha_submit, self.args(), post)
             first = alphas.cmd_alpha_submit(self.args(), None)
             second = alphas.cmd_alpha_submit(self.args(selection=None), None)
@@ -176,6 +187,177 @@ class SubmissionWorkflowTests(unittest.TestCase):
         self.assertFalse(second["post_attempted"])
         self.assertEqual(post.call_count, 1)
         self.assertEqual(reads.call_count, 4)
+
+    def test_new_attempt_requires_valid_seed_in_read_only_and_write_modes(self):
+        path = buffer_cmd.seeds_path()
+        path.write_text(json.dumps({"alpha_id": "CANDIDATE"}) + "\n", encoding="utf-8")
+        for yes in (False, True):
+            with self.subTest(yes=yes), \
+                    mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()), \
+                    mock.patch.object(ml, "submit_alpha") as post:
+                with self.assertRaises(CliError) as caught:
+                    alphas.cmd_alpha_submit(self.args(yes=yes), None)
+                self.assertIn("stored seed missing", caught.exception.message)
+                post.assert_not_called()
+
+    def test_pending_and_confirmed_attempts_do_not_depend_on_seed_store_health(self):
+        buffer_cmd.seeds_path().write_text("broken seed JSON\n", encoding="utf-8")
+        path = alphas._submission_path("CANDIDATE")
+        cache_store.write_json_atomic(path, {"alpha_id": "CANDIDATE", "state": "UNKNOWN"})
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()), \
+                mock.patch.object(ml, "submit_alpha") as post:
+            unknown = alphas.cmd_alpha_submit(self.args(yes=False, selection=None), None)
+        self.assertEqual(unknown["submission"], "UNKNOWN")
+        post.assert_not_called()
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha(status="ACTIVE")), \
+                mock.patch.object(alphas, "_reconcile_submission", return_value={}), \
+                mock.patch.object(ml, "submit_alpha") as post:
+            confirmed = alphas.cmd_alpha_submit(self.args(selection=None), None)
+        self.assertTrue(confirmed["submitted"])
+        post.assert_not_called()
+
+    def test_custom_seed_store_is_used_and_wrong_request_seed_is_rejected(self):
+        path = self.root / "custom-seeds.jsonl"
+        seed = {"alpha_id": "CANDIDATE", "name": "Seed", "category": "FUNDAMENTAL",
+                "tags": ["quality"], "description": "d" * 120,
+                "expression": "rank(close)", "settings": {"region": "USA"}}
+        buffer_cmd._write_seed(path, seed)
+        current = {**platform_alpha(), "settings": {"region": "USA"}}
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=current), \
+                mock.patch.object(ml, "submit_alpha", return_value={"submission": "NOT_SENT"}) as precheck:
+            result = alphas.cmd_alpha_submit(self.args(yes=False, seeds=str(path)), None)
+        self.assertEqual(result["submission"], "NOT_SENT")
+        precheck.assert_called_once()
+        for changes in ({"expression": "rank(open)"}, {"settings": {"region": "EUR"}}):
+            buffer_cmd._write_seed(path, {**seed, **changes})
+            with self.subTest(changes=changes), \
+                    mock.patch.object(ml, "fetch_alpha_metrics", return_value=current), \
+                    mock.patch.object(ml, "submit_alpha") as post:
+                with self.assertRaises(CliError):
+                    alphas.cmd_alpha_submit(self.args(yes=False, seeds=str(path)), None)
+                post.assert_not_called()
+
+    def test_pre_post_metrics_failure_is_not_sent_and_does_not_poison_the_journal(self):
+        session = mock.Mock()
+        with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
+                mock.patch.object(confirm, "require_double_call"), \
+                mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[
+                    platform_alpha(), ml.ServiceError("pre-POST GET unavailable"), platform_alpha()]):
+            result = alphas.cmd_alpha_submit(self.args(), None)
+        session.post.assert_not_called()
+        self.assertEqual(result["submission"], "NOT_SENT")
+        self.assertFalse(result["post_attempted"])
+        journal, _ = cache_store.load_json(alphas._submission_path("CANDIDATE"))
+        self.assertEqual(journal["state"], "NOT_SENT")
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()), \
+                mock.patch.object(ml, "fetch_alpha_checks", return_value=complete_checks()) as check:
+            precheck = alphas.cmd_alpha_submit(self.args(yes=False, selection=None), None)
+        check.assert_called_once()
+        self.assertEqual(precheck["submission"], "NOT_SENT")
+        self.assertNotIn("submission_recovery", precheck)
+
+    def test_actual_post_boundary_is_durable_before_transport_and_unsubmitted_does_not_clear_it(self):
+        session = mock.Mock()
+
+        def interrupted(*_args, **_kwargs):
+            journal, _ = cache_store.load_json(alphas._submission_path("CANDIDATE"))
+            self.assertEqual(journal["post_phase"], "STARTED")
+            self.assertEqual(journal["state"], "INTENT")
+            raise requests.Timeout("response lost after POST started")
+
+        session.post.side_effect = interrupted
+        unsubmitted = platform_alpha(status="UNSUBMITTED")
+        with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
+                mock.patch.object(confirm, "require_double_call"), \
+                mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=unsubmitted):
+            first = alphas.cmd_alpha_submit(self.args(), None)
+            second = alphas.cmd_alpha_submit(self.args(selection=None), None)
+        self.assertEqual(first["submission"], "UNKNOWN")
+        self.assertTrue(first["post_attempted"])
+        self.assertEqual(second["submission"], "UNKNOWN")
+        self.assertFalse(second["post_attempted"])
+        session.post.assert_called_once()
+
+    def test_interrupted_explicit_preparation_can_be_resolved_without_another_post(self):
+        path = alphas._submission_path("CANDIDATE")
+        cache_store.write_json_atomic(path, {"alpha_id": "CANDIDATE", "state": "INTENT",
+                                            "post_phase": "PREPARING"})
+        before = path.read_bytes()
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()), \
+                mock.patch.object(ml, "submit_alpha") as post:
+            dry = alphas.cmd_alpha_submit(self.args(yes=False, selection=None), None)
+            self.assertEqual(dry["submission"], "INTENT")
+            self.assertEqual(path.read_bytes(), before)
+            result = alphas.cmd_alpha_submit(self.args(selection=None), None)
+        self.assertEqual(result["submission"], "NOT_SENT")
+        self.assertTrue(result["reconciled"])
+        self.assertFalse(result["post_attempted"])
+        post.assert_not_called()
+
+    def test_completed_submission_failure_resolves_uncertainty_without_reposting(self):
+        path = alphas._submission_path("CANDIDATE")
+        cache_store.write_json_atomic(path, {"alpha_id": "CANDIDATE", "state": "UNCERTAIN"})
+        before = path.read_bytes()
+        session = mock.Mock()
+        response = requests.Response()
+        response.status_code = 200
+        response._content = json.dumps({"id": "CANDIDATE", "is": {"checks": [
+            {"name": "LOW_FITNESS", "result": "FAIL", "value": 0.8, "limit": 1.0}]}}).encode()
+        session.get.return_value = response
+        with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha(status="UNSUBMITTED")):
+            dry = alphas.cmd_alpha_submit(self.args(yes=False, selection=None, max_wait=5), None)
+            self.assertEqual(dry["submission"], "REJECTED")
+            self.assertEqual(path.read_bytes(), before)
+            result = alphas.cmd_alpha_submit(self.args(selection=None, max_wait=5), None)
+        self.assertEqual(result["submission"], "REJECTED")
+        self.assertTrue(result["reconciled"])
+        self.assertFalse(result["post_attempted"])
+        self.assertEqual(result["failed_checks"], ["LOW_FITNESS"])
+        session.post.assert_not_called()
+        self.assertEqual(session.get.call_count, 2)
+        journal, _ = cache_store.load_json(path)
+        self.assertEqual(journal["state"], "REJECTED")
+
+    def test_submission_recovery_requires_ready_identified_failure_evidence(self):
+        failed = {"id": "CANDIDATE", "is": {"checks": [{"name": "LOW_FITNESS", "result": "FAIL"}]}}
+        cases = [(404, {}, {}, "unknown"), (200, {}, {}, "unknown"),
+                 (200, {**failed, "id": "OTHER"}, {}, "unknown"),
+                 (200, {**failed, "status": "PENDING"}, {}, "pending"),
+                 (200, failed, {"Retry-After": "300"}, "pending"),
+                 (200, {"is": {"checks": [{"name": "FITNESS", "result": "ERROR"}]}}, {}, "unknown"),
+                 (200, {"is": "invalid"}, {}, "unknown")]
+        for code, body, headers, state in cases:
+            with self.subTest(code=code, body=body, headers=headers):
+                session = mock.Mock()
+                response = requests.Response()
+                response.status_code, response._content = code, json.dumps(body).encode()
+                response.headers.update(headers)
+                session.get.return_value = response
+                result = ml.read_alpha_submission_status(session, "CANDIDATE", max_wait_seconds=5)
+                self.assertEqual(result["state"], state)
+                session.post.assert_not_called()
+
+    def test_failed_post_boundary_checkpoint_prevents_transport(self):
+        session = mock.Mock()
+        write = cache_store.write_json_atomic
+
+        def fail_boundary(path, document, **kwargs):
+            if document.get("state") == "INTENT" and document.get("post_phase") == "STARTED":
+                raise OSError("submission journal write failed")
+            return write(path, document, **kwargs)
+
+        with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
+                mock.patch.object(confirm, "require_double_call"), \
+                mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
+                mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()), \
+                mock.patch.object(cache_store, "write_json_atomic", side_effect=fail_boundary):
+            result = alphas.cmd_alpha_submit(self.args(), None)
+        session.post.assert_not_called()
+        self.assertEqual(result["submission"], "NOT_SENT")
+        self.assertFalse(result["post_attempted"])
 
     def test_gateway_timeout_response_keeps_the_journal_unresolved(self):
         session = mock.Mock()

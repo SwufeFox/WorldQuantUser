@@ -308,7 +308,8 @@ python research_cli.py alpha get ALPHA_ID --recordsets pnl-by-sector --max-wait 
 ### 候选冻结、验证、检查与入库一次完成
 
 ```bash
-python3 research_cli.py promote ALPHA_ID --note "冻结后验证通过" --cost-bps 5 10 20
+# 验证链；入库说明未齐时返回 metadata_required 和补填动作。
+python3 research_cli.py promote ALPHA_ID --note "候选验证" --cost-bps 5 10 20
 python3 research_cli.py promote ALPHA_ID --retention-floor 0.2 --dry-run
 python3 research_cli.py triage --ids ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --min-delta 0 --freeze choice.json
 python3 research_cli.py promote ALPHA_ID --selection choice.json --max-self-correlation 0.7
@@ -319,6 +320,12 @@ python3 research_cli.py promote ALPHA_ID --selection choice.json --max-self-corr
 先 `triage --ids --freeze`，再 `triage --selection --show-test`。测试 Sharpe 与留存通过后
 运行 `alpha check`，最后满足条件时调用 `buffer add`。冻结时就保存本次 retention floor 和 cost scenarios，
 验证沿用同一标准；入库复用第三步的实时检查结果，避免重复等待检查接口。
+
+真正入库时在同一 `promote` 命令补充 `--name`、`--category`、`--tags` 和 `--description`。
+这是候选的明确研究说明；description 至少 100 个字符，category 按 `help promote` 所列值填写。
+完整示例见 [台账工作流](ledger-workflow.md)。`buffer add` 使用同一校验并维护 seed 元数据，
+无需另开一个种子维护循环。自定义存储路径使用 `--seeds PATH`，后续 `alpha submit` / `buffer submit`
+沿用相同路径。研究失败记录仍保存在台账，不受这组入库元数据要求影响。
 
 仅当检查全部 resolved、没有 FAIL/ERROR（WARNING 允许）、`test_sharpe > 0` 且
 `retention >= retention_floor` 才入库；floor 默认 0.2，缺失指标不算通过。
@@ -348,10 +355,15 @@ rho_book、max_member_rho，以及 `checks`、`buffered`、`outcome`、`reasons`
 测试期门未通过时，`steps.checks` 为 `skipped`。
 `steps` 保存各步状态和已完成的冻结、验证及入库证据。任何执行异常立即停止，
 返回 `ok: false`、现有类型的 `error` 和退出码，同时在 `data` 保留已完成证据及 `failed_step`；
-`--save PATH` 保存完全相同的回执，且不能覆盖冻结文件或候选架。
+`--save PATH` 保存完全相同的回执，且不能覆盖冻结文件、候选架或 seed 元数据。
+
+验证通过但元数据缺失时，返回 `ok: true`、`outcome: metadata_required`、`buffered: false`，
+保留验证证据、缺失项与 `next_action`。补齐说明后沿原冻结选择继续；Campaign 保留这个结果，
+不会自动反复请求平台来等待本地说明被补全。
 
 `promote --dry-run` 同样读取冻结后的测试期，测试期门通过后执行实时检查。未提供 `--selection` 时也会写冻结文件。
-通过时返回 `outcome: would_buffer`，候选架不写入。平台提交另见下文。
+通过且入库元数据齐全时返回 `outcome: would_buffer`；说明未齐仍返回 `metadata_required`。
+候选架和 seed 元数据均不写入。平台提交另见下文。
 
 ```bash
 python3 research_cli.py promote ALPHA_ID --selection choice.json --review-receipt receipt.json
@@ -821,7 +833,7 @@ REGULAR 请求统一省略 `selectionHandling` 和 `selectionLimit`，Python 还
 
 | 问题 | 命令 |
 | --- | --- |
-| 我要跑一批臂（常态） | 写一个 sample-batch.spec.json，然后 `python3 research_cli.py probe sample-batch.spec.json`——lint、模拟、train-only 表格、对照差值、JSON、台账一次做完 |
+| 我要持续推进一组实验（常态） | 沿用 `brief → campaign status → campaign preview → campaign run → ledger analyze`；由一个执行者推进队列，具体命令见 [台账工作流](ledger-workflow.md) |
 | 不登录、不花额度，先查看整批请求 | `python3 research_cli.py probe sample-batch.spec.json --dry-run`；输出完整 payload、设计上下文和精确重复证据，正式模拟前再做实时目录检查 |
 | 按当前账户核验这份 spec，但不模拟 | `python3 research_cli.py probe sample-batch.spec.json --check`；使用与正式运行相同的臂和生效设置 |
 | 已经在网页或其他客户端跑过模拟 | `python3 research_cli.py probe --from-simulation SIMULATION_ID`，读取任务状态和已有 Alpha ID |
@@ -836,7 +848,9 @@ REGULAR 请求统一省略 `selectionHandling` 和 `selectionLimit`，Python 还
 池内每条候选还受自身测试起点约束。最低重叠天数与 `triage` 相同，可用 `--min-overlap` 提高。
 `--pool` 对有缓存的成员计算日频相关性，报告与通过计数使用同一次测量，返回每条候选的截止日期和重叠天数。
 
-日常实验维护一份 spec：先 `--dry-run` 离线预览，再用 `--check` 在线核验，最后正式运行。
+日常实验维护一份 spec，并由 campaign 统一推进；下面的 probe 命令用于单个批次或排查。
+`--dry-run` 离线预览，正式运行包含在线预检。仅在单独诊断字段或权限时使用 `--check`，
+不必每轮恢复前额外再查一次目录。
 `idea` / `mechanism` / `note` 会随输出和批次文件保存；`--strict-gate` 只拒绝表达式与完整设置
 都相同的已完成结果。所有组先通过本地校验，等效设置合并，整批复用会话。输入支持 UTF-8 BOM。
 
@@ -855,6 +869,8 @@ REGULAR 字段为准。
 须有唯一匹配的源码和完整设置。Python 源码仍按保留缩进的规则匹配。台账中旧的部分
 `settings_fingerprint` 用于占位记录，不能拿来替代完整请求判重。
 任务进入终态且没有 Alpha ID 时，回执计入 `execution.terminal`，结束该任务的回读。
+`UNSUBMITTED` 是 Alpha 的提交状态，不能证明模拟失败，也不能替代缺失的训练期数据。
+`complete` 和 `execution.train_evidence` 继续描述训练证据；执行已经终止不等于研究结果齐全。
 
 ```bash
 python3 research_cli.py probe sample-batch.spec.json --batch-size 6 --summary --batch-path sample-batch.json --save sample-response.json
@@ -900,6 +916,9 @@ diagnostic 保留用于归因，但不能进入候选冻结、候选架、晋级
 `simulate` 和 `resume` 对同一份 checkpoint 互斥。结果写入台账后才清理已完成的自动
 checkpoint。收到取消或记账写入失败时，错误回执给出已保留的 `error.details.checkpoint`。
 修复写入问题后，可用 `resume PATH` 向原台账补记已完成的结果。
+争用同一批次时，回执的 `error.details.reason=batch_locked` 给出批次和锁路径；
+能读到时附带 `owner.pid` 和 `owner.acquired_at`，只表示锁文件中观察到的内容。
+先检查已有执行者，不删锁、不另起一个执行者抢同一批次。
 
 `--max-wait-seconds` 默认 300 秒。登录、预检、模拟、恢复查询和 PnL 补读共用一次等待预算。
 预算耗尽时，未发出的工作保持排队。任务进入终态后立即释放槽位，空位可在同一组接下一条任务。
@@ -913,13 +932,21 @@ checkpoint。收到取消或记账写入失败时，错误回执给出已保留�
 最多 300 秒；明确的目录限流推迟同批次、同账户的新预检，并尊重平台给出的更长等待时间。
 提前再次 `--resume` 不重查仍在退避的组，也不增加其失败次数。可核验的其他设置组继续推进，
 已受理任务照常回收。Campaign 根据最早可推进的排队组或已受理任务安排下一轮。
-执行失败、未完成和证据缺失列为 deferred。旧批次的记账策略不明确时，保持未补账。
+明确终止的执行失败进入原台账，以 `failure:` 开头的稳定键保存表达式、设置、错误和来源。
+这类记录的 `execution_outcome=failed`、`alpha_id=null`，不会覆盖已有 Alpha 的有效指标，
+也不会生成零 fitness 或把执行错误判成经济假设被证伪。未完成的请求、失败的状态读取和缺失指标仍为 deferred。
+`recording.recorded_failures` 给出失败种子数；idea 优先取 `arm.idea`，其次取 spec 的 `idea`，
+缺失时在 `missing_idea_count` / `missing_idea_labels` 明示，不从表达式或名称编造。
+`provenance` 保留 run、请求指纹、源 spec 和臂标签。整批失败仍返回 `SIMULATION_FAILED`，
+但先完成记账，错误详情保留 `recording` 和 `summary`。旧批次的记账策略不明确时，保持未补账。
 
 模拟并发统一使用 `--batch-size N`，不再硬编码上限 3。已验证的账户上限会约束请求；
 平台没有公布上限时，默认 3 只是有来源标记的保守本地策略，可显式提高请求预算，
 但工具不会把配置当成已获授权的并发。`scheduling` 保留 requested/effective/platform_limit。
 `simulation_slots.py` 在同账户、同研究目录内共享持久占位；接受或结果不明的提交不按时间过期，
 只有确认完成或拒绝才释放。不同研究目录及工具外启动的任务不共享这份占位。
+满位时先进行一次短预算、只读的受理任务核对，确认平台终态后回收占位，并保留终态回执；
+旧 checkpoint 不能再次把已回收的同一预约占满。一次 404、读取失败或经过很久都不能证明任务结束。
 恢复可调整并发而不改变研究请求指纹；权限收缩时先取回已接受任务，再核验新启动的请求。
 
 批量初筛可以用 `--setting simulationMode=QUICK --setting visualization=false`。
@@ -1353,9 +1380,12 @@ python3 research_cli.py probe offspring.spec.json --dry-run --strict-gate
 `campaign recover-pnl` 从原检查点补读，每轮用 `--limit` 控制批次数。
 大规模初筛时，分析报告先用汇总指标筛出 Alpha ID，再用
 `probe --recover BATCH.json --pnl-alpha-id ID` 补读候选的日收益。
-加 `--watch` 后可与模拟队列并行运行。补读复用 `probe --recover`，并把证据写回原批次。
+加 `--watch` 后持续补读。补读复用 `probe --recover`，会写回原批次；先交接该批次的写入权，
+不要与另一个 runner 同时推进同一检查点。
 
-先用 `--recover-only` 回收已有检查点。需要验证 FULL Regular 候选时启用 `--validate`，或对保存的训练冻结选择单独运行 `promote --selection`。已冻结的选择和终态验证回执可以复用。QUICK、Power Pool 与 ATOM 保留各自研究证据，SPC 结果在本地完成。Alpha 和 SPC 的平台提交仍走各自授权入口。
+先用 `--recover-only` 回收已有检查点。需要验证 FULL Regular 候选时启用 `--validate`，或对保存的训练冻结选择单独运行 `promote --selection`。
+`--validate` 没有候选入库说明时停在 `metadata_required`，保留冻结选择、验证回执和补填动作；补齐四项元数据后使用同一 `promote --selection` 完成入库。
+已冻结的选择和终态验证回执可以复用。QUICK、Power Pool 与 ATOM 保留各自研究证据，SPC 结果在本地完成。Alpha 和 SPC 的平台提交仍走各自授权入口。
 
 ### 兼容入口
 

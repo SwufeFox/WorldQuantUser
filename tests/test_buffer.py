@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -23,9 +24,10 @@ from research_app import buffer_cmd, selection
 from research_app.runtime import CliError
 
 
-def _payload(name="cand", checks=None, self_corr=0.45):
+def _payload(name="A1", checks=None, self_corr=0.45):
     return {"id": name, "status": "COMPLETE", "name": "x", "category": "QUALITY",
             "regular": {"code": "rank(close)"},
+            "settings": {"region": "USA", "universe": "TOP3000", "simulationMode": "FULL"},
             "is": {"sharpe": 2.4, "fitness": 1.7, "turnover": 0.2},
             "oos": {"train": {"sharpe": 2.6, "fitness": 2.0, "turnover": 0.22,
                               "returns": 0.12}},
@@ -59,6 +61,8 @@ class BufferTests(unittest.TestCase):
 
     def _args(self, **overrides):
         base = dict(alpha_id="A1", buffer=self.shelf, note=None,
+                    name="seed A1", category="FUNDAMENTAL", tags=["quality"],
+                    description="x" * 120, seeds=str(Path(self.shelf).with_name("seeds.jsonl")),
                     registry=os.path.join(self.tmp, "ledger.jsonl"),
                     selection=self.selection_path, max_wait=None, yes=False, force=False)
         base.update(overrides)
@@ -76,6 +80,71 @@ class BufferTests(unittest.TestCase):
         self.assertEqual(entry["self_correlation"], 0.45)
         self.assertEqual(entry["book_size"], 53)
         self.assertEqual(entry["train"]["fitness"], 2.0)
+        self.assertEqual(data["seed"]["settings"], _payload()["settings"])
+        self.assertEqual(data["seed"]["name"], "seed A1")
+        self.assertEqual(data["seed"]["category"], "FUNDAMENTAL")
+        self.assertEqual(buffer_cmd.read_seeds(data["seeds"])["A1"], data["seed"])
+
+    def test_seed_write_failure_does_not_leave_a_shelved_entry(self):
+        with mock.patch.object(buffer_cmd, "_write_seed", side_effect=OSError("disk full")), \
+                mock.patch.object(buffer_cmd, "_append") as append:
+            with self.assertRaises(CliError) as caught:
+                self._shelve()
+        append.assert_not_called()
+        self.assertFalse(caught.exception.details["partial"])
+        self.assertFalse(caught.exception.details["seed"]["complete"])
+        self.assertFalse(Path(self.shelf).exists())
+
+    def test_shelf_write_failure_reports_seed_progress_and_retry_is_idempotent(self):
+        with mock.patch.object(buffer_cmd, "_append", side_effect=OSError("shelf unavailable")):
+            with self.assertRaises(CliError) as caught:
+                self._shelve()
+        details = caught.exception.details
+        self.assertTrue(details["partial"] and details["seed"]["complete"])
+        self.assertFalse(details["shelf"]["complete"])
+        self.assertIn("A1", buffer_cmd.read_seeds(self._args().seeds))
+        self.assertFalse(Path(self.shelf).exists())
+        result = self._shelve()
+        self.assertTrue(result["written"])
+        self.assertFalse(result["seed_written"])
+        self.assertFalse(self._shelve()["written"])
+        self.assertEqual(len(buffer_cmd.read_events(self.shelf)), 1)
+
+    def test_damaged_seed_store_is_preserved_and_does_not_create_a_shelf(self):
+        seed_path = Path(self._args().seeds)
+        original = '{"alpha_id":"existing"}\n{"incomplete":\n'
+        seed_path.write_text(original, encoding="utf-8")
+        with self.assertRaises(CliError):
+            self._shelve()
+        self.assertEqual(seed_path.read_text(encoding="utf-8"), original)
+        self.assertFalse(Path(self.shelf).exists())
+
+    def test_seed_targets_cannot_overwrite_shelf_selection_or_registry(self):
+        for target in (self.shelf, self.selection_path, self._args().registry):
+            with self.subTest(target=target), mock.patch.object(ml, "fetch_alpha_metrics") as read:
+                with self.assertRaises(CliError):
+                    buffer_cmd.cmd_buffer_add(self._args(seeds=target), None)
+                read.assert_not_called()
+        selection.load(self.selection_path)
+
+    def test_non_text_tags_are_rejected_before_any_read(self):
+        for tags in ([None], ["quality", 4], [{"tag": "quality"}]):
+            with self.subTest(tags=tags), mock.patch.object(ml, "fetch_alpha_metrics") as read:
+                with self.assertRaises(CliError) as caught:
+                    buffer_cmd.cmd_buffer_add(self._args(tags=tags), None)
+                self.assertIn("tags", caught.exception.message)
+                read.assert_not_called()
+
+    def test_mismatched_platform_or_check_identity_never_writes_seed_or_shelf(self):
+        for payload, checks in ((_payload(name="OTHER"), _checks()),
+                                (_payload(), {**_checks(), "alpha_id": "OTHER"})):
+            with self.subTest(payload=payload["id"], checks=checks["alpha_id"]), \
+                    mock.patch.object(ml, "fetch_alpha_metrics", return_value=payload), \
+                    mock.patch.object(ml, "fetch_alpha_checks", return_value=checks):
+                with self.assertRaises(CliError):
+                    buffer_cmd.cmd_buffer_add(self._args(), None)
+        self.assertFalse(Path(self.shelf).exists())
+        self.assertFalse(Path(self._args().seeds).exists())
 
     def test_a_failing_check_is_refused(self):
         failing = {"alpha_id": "A1", "complete": True,

@@ -1,6 +1,7 @@
 """Exercise campaign routing and recovery through the public CLI."""
 
 import json
+import hashlib
 from pathlib import Path
 from unittest import mock
 
@@ -97,6 +98,27 @@ def test_recover_only_does_not_create_a_batch_for_an_unstarted_spec(tmp_path, ca
     assert code == 0
     assert result["data"]["state"] == "deferred"
     assert source.exists()
+    assert not list((tmp_path / "backlog-results").glob("*.json"))
+
+
+def test_campaign_reports_existing_writer_as_busy_without_starting_another(tmp_path, capsys):
+    import cache_store
+
+    inbox = tmp_path / "backlog"
+    inbox.mkdir()
+    source = inbox / "queued.json"
+    source.write_text(json.dumps({"design": "explore", "arms": [{"expression": "rank(close)"}]}))
+    with cache_store.file_lock(inbox / ".runner.lock", timeout=0), \
+            mock.patch.object(campaign, "_execute_campaign", side_effect=AssertionError("second writer started")):
+        code, envelope = invoke(capsys, tmp_path, "campaign", "run")
+    assert code == 0
+    assert envelope["data"]["state"] == "busy"
+    event = envelope["data"]["events"][-1]
+    assert event["diagnosis"]["reason"] == "runner_locked"
+    assert event["diagnosis"]["next_action"]["action"] == "status"
+    _, status = invoke(capsys, tmp_path, "campaign", "status")
+    assert status["data"]["last_runner_event"]["kind"] == "busy"
+    assert source.is_file()
     assert not list((tmp_path / "backlog-results").glob("*.json"))
 
 
@@ -315,6 +337,47 @@ def test_campaign_status_discovers_pending_pnl_from_canonical_archive_batches(tm
     assert pending["pending_batches"] == 2
     assert len(pending["jobs"]) == pending["omitted"] == 1
     assert loaded == [tmp_path / "backlog-results" / "still-live-batch.json"]
+
+
+def test_campaign_status_distinguishes_current_wait_from_last_blocked_attempt(tmp_path, capsys):
+    from research_app import experiments
+
+    source, batch, _ = campaign_pnl_fixture(tmp_path, "waiting", "")
+    saved = json.loads(batch.read_text())
+    saved["records"][0].update(status="PENDING", alpha_id=None, submission_attempted=True,
+                               progress_url="https://api.worldquantbrain.com/simulations/slow",
+                               next_poll_at=9_999_999_999)
+    batch.write_text(json.dumps(saved))
+    _, normalized = experiments._load_probe_batch(batch)
+    event = {"kind": "deferred", "spec": source.name, "observed_at": 100,
+             "source_fingerprint": hashlib.sha256(source.read_bytes()).hexdigest(),
+             "progress_fingerprint": _runner._progress_fingerprint(normalized),
+             "diagnosis": {"state": "blocked", "reason": "batch_locked", "owner": {"pid": 321}},
+             "progress": {"changed": False, "unchanged_rounds": 4, "last_progress_at": 80, "stalled": True}}
+    log = tmp_path / "campaign-log.jsonl"
+    # Status reads only a bounded tail, tolerating an incomplete older log line.
+    log.write_text("x" * 300_000 + "\n" + json.dumps(event) + "\n")
+    code, envelope = invoke(capsys, tmp_path, "campaign", "status")
+    assert code == 0
+    job = envelope["data"]["jobs"][0]
+    assert job["diagnosis"]["reason"] == "platform_pending"
+    assert job["diagnosis"]["next_poll_at"] == 9_999_999_999
+    assert job["last_attempt"]["diagnosis"]["reason"] == "batch_locked"
+    assert job["last_attempt"]["progress"]["stalled"] is True
+    assert job["last_attempt"]["matches_current_progress"] is True
+
+    saved["records"][0].update(status="COMPLETE", alpha_id="A1")
+    saved["records"][0].pop("progress_url")
+    saved["records"][0].pop("next_poll_at")
+    batch.write_text(json.dumps(saved))
+    _, envelope = invoke(capsys, tmp_path, "campaign", "status")
+    job = envelope["data"]["jobs"][0]
+    assert job["diagnosis"]["reason"] == "complete"
+    assert job["last_attempt"]["matches_current_progress"] is False
+
+    source.write_text(json.dumps({**json.loads(source.read_text()), "idea": "a different input"}))
+    _, envelope = invoke(capsys, tmp_path, "campaign", "status")
+    assert "last_attempt" not in envelope["data"]["jobs"][0]
 
 
 def test_campaign_archive_cache_follows_receipt_alias_and_protects_cached_inputs(tmp_path, capsys, monkeypatch):

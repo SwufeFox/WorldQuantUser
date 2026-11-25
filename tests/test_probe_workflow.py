@@ -155,6 +155,8 @@ class ProbeWorkflowTests(unittest.TestCase):
         with mock.patch.object(app.simulation_capabilities, "account_provenance", return_value=account), \
                 mock.patch.object(app.simulation_slots, "submission_retry_at", return_value=None), \
                 mock.patch.object(app.simulation_slots, "confirmed_accepted_count", return_value=limit) as occupied, \
+                mock.patch.object(ml, "recover_accepted_slots", return_value={
+                    "state": "observed", "released": [], "kept": ["still-running"], "checked": 1}) as sweep, \
                 mock.patch.object(app, "_preflight_lint", return_value={"ok": True}) as preflight, \
                 mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator) as launch:
             deferred = self.run_probe(multi_size=2, concurrency=limit + 2, no_record=True)
@@ -163,10 +165,12 @@ class ProbeWorkflowTests(unittest.TestCase):
             occupied.assert_called_with(account)
             self.assertEqual(deferred["execution"]["not_submitted"], 3)
             self.assertEqual(deferred["execution"]["unknown_submission"], 0)
+            sweep.assert_called_once()
+            self.assertEqual(deferred["scheduling"][0]["reason"], "accepted_slot_reconciliation")
             self.assertTrue(all(item == {
                 "state": "deferred", "reason": "shared_slots_occupied",
                 "confirmed_accepted_slots": limit, "effective_limit": limit,
-            } for item in deferred["scheduling"]))
+            } for item in deferred["scheduling"][1:]))
 
             checked = self.run_probe(multi_size=2, concurrency=limit + 2, check=True, no_record=True)
             self.assertTrue(checked["preflight_complete"])
@@ -1005,6 +1009,55 @@ class ProbeWorkflowTests(unittest.TestCase):
         record = {"status": "FAILED", "submission_attempted": False}
         self.assertEqual(app._submission_state(record), "not_submitted")
 
+    def test_terminal_errors_keep_ideas_and_provenance_without_reposting(self):
+        spec = json.loads(self.spec.read_text())
+        spec["idea"] = "batch hypothesis"
+        spec["arms"][0]["idea"] = "arm-specific hypothesis"
+        self.spec.write_text(json.dumps(spec), encoding="utf-8")
+
+        def failed(expressions, settings, **kwargs):
+            records = []
+            for index, label in enumerate(kwargs["labels"]):
+                refused = label == "second"
+                item = {"index": index, "status": "FAILED" if refused else "ERROR",
+                        "submission_attempted": not refused,
+                        "submission_refused": refused, "error": "synthetic failure"}
+                kwargs["on_event"]("failed", item)
+                records.append(item)
+            return records
+
+        with mock.patch.object(app.guarded_sim, "simulate", side_effect=failed):
+            result = self.run_probe()
+        self.assertFalse(result["complete"])
+        self.assertEqual(result["execution"]["terminal"], 3)
+        self.assertEqual(result["execution"]["train_evidence"], 0)
+        self.assertEqual(result["next_actions"], [])
+        self.assertEqual(result["recording"]["recorded_failures"], 3)
+        self.assertEqual(result["recording"]["missing_idea_count"], 0)
+        entries = {row["mechanism"]: row for row in app.alpha_registry.load_entries(str(self.registry))}
+        self.assertEqual(entries["first"]["idea"], "arm-specific hypothesis")
+        self.assertEqual(entries["second"]["idea"], "batch hypothesis")
+        self.assertEqual(entries["first"]["provenance"]["run_id"], result["run_id"])
+        self.assertEqual(entries["first"]["provenance"]["source_spec"], str(self.spec))
+        with mock.patch.object(app, "with_session", side_effect=AssertionError("terminal batch went online")):
+            resumed = app.cmd_probe(arguments(resume=str(self.batch)), None)
+        self.assertEqual(resumed["recording"]["appended"], 0)
+        self.assertEqual(resumed["next_actions"], [])
+
+    def test_full_slots_are_reconciled_once_before_new_launch(self):
+        account = {"fingerprint": "synthetic-slot-admission"}
+        with mock.patch.object(app.simulation_capabilities, "account_provenance", return_value=account), \
+                mock.patch.object(app.simulation_slots, "submission_retry_at", return_value=None), \
+                mock.patch.object(app.simulation_slots, "confirmed_accepted_count", side_effect=[1, 0, 0]), \
+                mock.patch.object(ml, "recover_accepted_slots", return_value={
+                    "state": "observed", "released": ["old-slot"], "kept": [], "checked": 1}) as sweep, \
+                mock.patch.object(app.guarded_sim, "simulate", side_effect=self.simulator) as launch:
+            result = self.run_probe(concurrency=1)
+        sweep.assert_called_once()
+        self.assertEqual(launch.call_count, 2)
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["scheduling"][0]["released"], ["old-slot"])
+
     def test_probe_restores_progress_saved_only_in_slot_journal(self):
         self.spec.write_text(json.dumps({"name": "synthetic", "design": "explore",
             "arms": [{"label": "first", "expression": "rank(close)"}]}), encoding="utf-8")
@@ -1083,3 +1136,53 @@ class ProbeWorkflowTests(unittest.TestCase):
         self.assertEqual([row["alpha_id"] for row in validated["rows"]],
                          [row["alpha_id"] for row in result["rows"]])
         self.assertFalse(any(row.get("missing") for row in validated["rows"]))
+
+
+class UnsubmittedEvidenceTests(unittest.TestCase):
+    def test_unsubmitted_alpha_still_needs_missing_metrics(self):
+        from research_app.experiments import _probe_needs_recovery
+
+        row = {"status": "UNSUBMITTED", "alpha_id": "abc", "train_fitness": None}
+        self.assertTrue(_probe_needs_recovery(row))
+
+    def test_unsubmitted_status_cannot_supply_missing_train_evidence(self):
+        from research_app.experiments import _batch_incomplete_labels
+
+        rows = [{"label": "refused", "train_fitness": None},
+                {"label": "done", "train_fitness": 1.2}]
+        records = [{"status": "UNSUBMITTED"}, {"status": "COMPLETE"}]
+        self.assertEqual(_batch_incomplete_labels(rows, records), ["refused"])
+
+    def test_unsubmitted_alpha_recovers_train_metrics_without_posting(self):
+        row = {"label": "existing", "status": "UNSUBMITTED", "alpha_id": "abc",
+               "expression": "rank(close)", "train_fitness": None, "settings": ml.resolve_settings()}
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value={
+                "status": "UNSUBMITTED", "is": {"fitness": 1.2}, "train": {"fitness": 1.1}}), \
+                mock.patch.object(ml, "submit_single_simulation") as post, \
+                mock.patch.object(ml, "list_alphas") as listing:
+            result = app._recover_probe_rows(object(), [row])
+        self.assertEqual(result["recovered"], 1)
+        self.assertEqual(row["train_fitness"], 1.1)
+        post.assert_not_called()
+        listing.assert_not_called()
+
+    def test_missing_receipt_does_not_release_or_authorize_repost(self):
+        url = "https://api.worldquantbrain.com/simulations/original"
+        row = {"label": "missing", "status": "PENDING", "progress_url": url,
+               "submission_attempted": True, "train_fitness": None,
+               "expression": "rank(close)", "settings": ml.resolve_settings()}
+        with mock.patch.object(ml, "poll_simulation", side_effect=ml.NotFound("not found")), \
+                mock.patch.object(ml, "list_alphas", return_value=[{
+                    "id": "OldAlpha", "regular": {"code": "rank(close)"},
+                    "settings": row["settings"], "dateCreated": "2020-01-01T00:00:00Z"}]) as listing, \
+                mock.patch.object(app.simulation_slots, "release_url") as release, \
+                mock.patch.object(ml, "submit_single_simulation") as post:
+            result = app._recover_probe_rows(object(), [row])
+        self.assertEqual(result["still_missing"], ["missing"])
+        self.assertEqual(result["not_submitted"], [])
+        self.assertTrue(row["submission_attempted"])
+        self.assertEqual(row["progress_url"], url)
+        self.assertEqual(app._submission_state(row), "accepted")
+        release.assert_not_called()
+        post.assert_not_called()
+        listing.assert_not_called()

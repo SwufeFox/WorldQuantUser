@@ -29,15 +29,18 @@ if __package__ in (None, ""):
 
 import cache_store
 import fastexpr_ast
+import alpha_registry
 import machine_lib
 import simulation_capabilities
 import simulation_slots
+from check_evidence import normalize_checks, summarize_checks
 
 QUICK = "QUICK"
 DEFAULT_ACCOUNT_SLOTS = 5
 SUCCESS_STATUSES = simulation_slots.TERMINAL_SUCCESS_STATUSES
 CHECK_NAMES = ("LOW_SUB_UNIVERSE_SHARPE", "CONCENTRATED_WEIGHT",
                "LOW_2Y_SHARPE", "LOW_SHARPE", "LOW_FITNESS")
+METRIC_NAMES = ("sharpe", "fitness", "turnover", "returns", "drawdown", "longCount", "shortCount", "margin")
 LEGACY_SCOPE = ("region", "universe")
 RECONCILIATION_STATUSES = {"UNKNOWN_SUBMISSION", "UNVERIFIED_RESULT"}
 TRANSIENT_AUTH_ERRORS = (RequestException, machine_lib.AuthenticationUnavailable, machine_lib.SessionBusy)
@@ -202,9 +205,11 @@ def _load_arms(path):
     else:
         arms = value if isinstance(value, list) else [value]
     if not all(isinstance(arm, dict) and isinstance(arm.get("label"), str)
-               and isinstance(arm.get("expr"), str) and isinstance(arm.get("settings"), dict)
+               and isinstance(arm.get("expr", arm.get("expression")), str) and isinstance(arm.get("settings"), dict)
                for arm in arms):
-        raise ValueError("arms must contain label, expr and settings per row")
+        raise ValueError("arms must contain label, expr (or expression) and settings per row")
+    for arm in arms:
+        arm.setdefault("expr", arm.get("expression"))
     return arms
 
 
@@ -234,6 +239,39 @@ def _payload(arm):
     settings.setdefault("simulationMode", QUICK)
     settings.setdefault("visualization", False)
     return {"type": "REGULAR", "settings": settings, "regular": arm["expr"]}
+
+
+def _record_seed(arm, row, payload, source_spec, out):
+    """Reconcile a Quick observation through the shared simulation ledger."""
+    source_spec = str(Path(source_spec).resolve())
+    record = {"alpha_id": row.get("alpha_id"), "expression": payload["regular"],
+        "settings": payload["settings"], "status": row.get("status"),
+        "metrics": {name: row[name] for name in METRIC_NAMES if row.get(name) is not None},
+        # Old compact columns never established that the full checks payload was
+        # observed. Keep that absence explicit instead of manufacturing a pass.
+        "checks": row.get("checks"), "error": row.get("error") or row.get("detail"),
+        "idea": arm.get("idea"), "mechanism": arm.get("mechanism") or arm["label"],
+        "family": arm.get("family"), "role": arm.get("role"), "note": arm.get("note"),
+        "provenance": {"run_id": row.get("simulation_job_key"),
+            "request_fingerprint": row.get("simulation_key") or _simulation_key(payload),
+            "source_spec": source_spec, "arm_label": arm["label"], "result_ledger": str(out),
+            "account_fingerprint": row.get("account_fingerprint"),
+            "progress_url": row.get("progress_url"), "checks_payload_present": "checks" in row},
+        **{name: row[name] for name in ("submission_state", "metrics_pending", "progress_url",
+                                       "multi_parent_url", "multi_parent_terminal") if name in row}}
+    try:
+        summary = alpha_registry.record_simulation([record], payload["settings"],
+            source="quick-batch", batch=source_spec)
+    except ValueError as exc:
+        print(f"seed not recorded for {arm['label']}: {exc}; Quick result remains in {out}", file=sys.stderr)
+        return None
+    if summary["missing_idea_count"]:
+        print(f"seed recorded without idea for {arm['label']}; add idea to its original arm "
+              "and replay this batch to label it", file=sys.stderr)
+    for skipped in summary["skipped"]:
+        print(f"seed not recorded for {arm['label']}: {skipped['reason']}; "
+              f"Quick result remains in {out}", file=sys.stderr)
+    return summary
 
 
 class Runner:
@@ -673,13 +711,13 @@ class Runner:
             row["identity_verified"] = True
         row.pop("metrics_pending", None)
         row.pop("next_metrics_at", None)
-        row.update({name: metrics.get(name) for name in ("sharpe", "fitness", "turnover",
-                                                        "returns", "drawdown", "longCount", "shortCount",
-                                                        "margin")})
-        checks = {item.get("name"): item for item in metrics.get("checks") or []}
-        row["fails"] = [name for name, item in checks.items() if item.get("result") == "FAIL"]
+        row.update({name: metrics.get(name) for name in METRIC_NAMES})
+        checks = normalize_checks(metrics.get("checks"))
+        row["checks"] = checks
+        row["fails"] = summarize_checks(checks)["failed"]
         for name in CHECK_NAMES:
             row[name] = {key: checks.get(name, {}).get(key) for key in ("result", "value")}
+        self._checkpoint(row["simulation_job_key"], row)
         return row
 
 
@@ -800,7 +838,19 @@ def _run_batch(args, out):
                        else "recovery Location recorded")
             print(f"{message} for {recover_job}", flush=True)
             return 0
-    todo = _select_arms(arms, runner, load_done(out, account))
+    done = load_done(out, account)
+    # A crash after the durable result append but before the ledger append must
+    # be repairable without resubmitting the simulation. Bind every replay to
+    # the original account and exact job identity; legacy guesses stay untouched.
+    for arm in arms:
+        payload = _payload(arm)
+        job_key = runner._job_key(arm["label"], payload)
+        previous = next((row for row in reversed(done[1].get(arm["label"], []))
+                         if row.get("simulation_job_key") == job_key
+                         and _ledger_account(out, row) == account["fingerprint"]), None)
+        if previous is not None:
+            _record_seed(arm, previous, payload, args.arms, out)
+    todo = _select_arms(arms, runner, done)
     if args.limit:
         todo = todo[:args.limit]
     print(f"arms={len(arms)} todo={len(todo)} workers={args.concurrency} account_slots={plan['effective']}",
@@ -824,6 +874,7 @@ def _run_batch(args, out):
                     row["simulation_key"] = _simulation_key(payload)
                     row["simulation_job_key"] = runner._job_key(arm["label"], payload)
                     _append(fh, row)
+                    _record_seed(arm, row, payload, args.arms, out)
                     deferred += row["status"] in {"QUEUED", "PENDING", "UNKNOWN_SUBMISSION", "UNVERIFIED_RESULT", "RUNNER_ERROR"}
                     print(f"[{count}/{len(todo)}] {row['label'][:34]:34s} {row['status']} "
                           f"S={row.get('sharpe')} T={row.get('turnover')} fails={row.get('fails')}", flush=True)

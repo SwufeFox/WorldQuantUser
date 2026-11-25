@@ -68,17 +68,22 @@ def flow(monkeypatch, tmp_path):
     return state
 
 
-def invoke(capsys, *extra):
-    code = app.main(["promote", "A1", *map(str, extra)])
+def invoke(capsys, *extra, metadata=True):
+    seed = (["--name", "Seed A1", "--category", "FUNDAMENTAL", "--tags", "quality",
+             "--description", "d" * 120] if metadata else [])
+    code = app.main(["promote", "A1", *seed, *map(str, extra)])
     output = capsys.readouterr()
     return code, json.loads(output.out)
 
 
 def test_all_pass_buffers_with_forwarded_options(flow, capsys, tmp_path):
     freeze, shelf, saved = (tmp_path / name for name in ("choice.json", "shelf.jsonl", "saved.json"))
-    code, output = invoke(capsys, "--freeze", freeze, "--buffer", shelf, "--save", saved,
+    seeds = tmp_path / "custom-seeds.jsonl"
+    code, output = invoke(capsys, "--freeze", freeze, "--buffer", shelf, "--save", saved, "--seeds", seeds,
                           "--note", "chosen candidate", "--cost-bps", 5, 10, 20,
-                          "--retention-floor", 0.4, "--compact", "--quiet")
+                          "--retention-floor", 0.4, "--compact", "--quiet",
+                          "--name", "seed A1", "--category", "FUNDAMENTAL",
+                          "--tags", "quality", "--description", "d" * 120)
     assert code == 0 and output["ok"] and output["command"] == "promote"
     data = output["data"]
     assert data["outcome"] == "buffered" and data["buffered"] is True
@@ -91,8 +96,27 @@ def test_all_pass_buffers_with_forwarded_options(flow, capsys, tmp_path):
     assert flow["args"]["freeze"].retention_floor == flow["args"]["validate"].retention_floor == 0.4
     assert flow["args"]["buffer"].note == "chosen candidate"
     assert flow["args"]["buffer"].buffer == str(shelf)
+    assert flow["args"]["buffer"].seeds == str(seeds)
     assert data["freeze_path"] == str(freeze) and freeze.exists()
     assert json.loads(saved.read_text()) == output
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_eligible_promotion_without_metadata_returns_a_stable_action(flow, capsys, tmp_path, dry_run):
+    extra = ["--max-self-correlation", "0.6"] + (["--dry-run"] if dry_run else [])
+    code, output = invoke(capsys, *extra, metadata=False)
+    data = output["data"]
+    assert code == 0 and output["ok"]
+    assert data["outcome"] == "metadata_required" and data["buffered"] is False
+    assert len(data["metadata_required"]) == 4
+    assert data["steps"]["buffer"] == {"status": "blocked", "reason": "seed_metadata_required"}
+    assert flow["calls"] == ["freeze", "validate", "checks"]
+    action = data["next_action"]
+    assert action["action"] == "complete_seed_metadata"
+    assert action["required_options"] == ["--name", "--category", "--tags", "--description"]
+    assert data["freeze_path"] in action["argv"] and "--max-self-correlation" in action["argv"]
+    assert ("--dry-run" in action["argv"]) is dry_run
+    assert not buffer_cmd.buffer_path().exists() and not buffer_cmd.seeds_path().exists()
 
 
 @pytest.mark.parametrize("saved_choice", [False, True])
@@ -284,7 +308,9 @@ def test_real_buffer_add_reuses_checks_without_second_request(flow, capsys, monk
     monkeypatch.setattr(ml, "fetch_alpha_metrics", lambda *args: {
         "id": "A1", "status": "COMPLETE", "regular": {"code": "rank(close)"},
         "is": {}, "oos": {"train": {"sharpe": 2.0}, "test": {"sharpe": 1.0}}})
-    code, output = invoke(capsys, "--note", "keep", "--cost-bps", 5, 10, 20)
+    code, output = invoke(capsys, "--note", "keep", "--cost-bps", 5, 10, 20,
+                          "--name", "seed A1", "--category", "FUNDAMENTAL", "--tags", "quality",
+                          "--description", "d" * 120)
     assert code == 0 and output["data"]["buffered"] is True
     entries = buffer_cmd.read_events(buffer_cmd.buffer_path())
     assert len(entries) == 1 and entries[0]["note"] == "keep"

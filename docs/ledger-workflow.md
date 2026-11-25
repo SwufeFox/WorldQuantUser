@@ -7,44 +7,97 @@
 和 `QUICK_ALPHA_ID` 是占位符。若有多个研究目录，每条命令使用同一个 `--research-dir PATH`。
 先用 `brief` 核对 `data.research_dir`、`data.ledger.path` 和 `data.ledger.exists`。
 
-## 预览、入队和恢复
+## 固定工作链：看状态、预览、单队列执行、复盘
 
 ```bash
-python research_cli.py campaign preview SPEC.json
+python research_cli.py brief
 python research_cli.py campaign status --limit 10
+python research_cli.py campaign preview SPEC.json
 ```
 
-规格的模拟设置写为 `"simulationMode": "QUICK"`。预览返回解析后的请求，并检查精确历史重复。
+先确认是否已有相同问题的结果、排队规格或受理任务。新的规格写清 `idea`、机制、
+每条臂的稳定标签和实际设置。QUICK 初筛的模拟设置写为 `"simulationMode": "QUICK"`。
+预览是离线检查，返回解析后的请求，并检查精确历史重复。
 查看 `data.would_block`、`data.blocking` 和 `data.gate_blocking`。若已有同表达式、同设置
-的结果或可恢复任务，沿 `data.results[].gate` 和 `data.recovery_actions` 回查证据。
+的结果或可恢复任务，沿 `data.results[].gate` 和 `data.recovery_actions` 回查原证据；
+改标签、改输出路径和更换运行器都不能把旧请求变成新实验。
 
-把通过预览的规格放入研究目录的 `backlog/` 后启动队列。
+把通过预览的规格放入研究目录的 `backlog/` 后，由一个执行者启动队列。
 
 ```bash
 python research_cli.py campaign run --watch --defer-quick-pnl --stream
 ```
 
+启动后保留原规格、臂标签、设置和批次路径。子代理可以准备不同的草稿、读取状态、
+分析结果；同一队列和批次的发单、恢复由当前执行者负责。另一个终端可以运行
+`campaign status`，不应同时对这个批次运行另一个 Campaign、Probe 恢复循环或兼容运行器。
+需要交接时，先确认原写入者已经退出，再用它保存的检查点继续。仅看到锁文件不能判断谁仍在运行。
+
 需要优先启动指定对照时，可加 `--prefer control.json`。参数填写 `backlog/` 中的文件名，
 重复指定时按给定顺序安排尚未启动的 BRAIN 规格。恢复任务仍先推进。
 
-| 场景 | 读哪个状态 |
-| --- | --- |
-| 首次推进 | `campaign status` 的 `data.jobs` 显示规格、批次和已保存的执行状态。首次启动使用配置的等待预算。 |
-| 回合结束时仍在等平台 | `--watch` 每轮只读一次新受理或已到期的 native Multi 父任务，将平台的 `Retry-After` 保存到检查点后推进队列。直接运行 `probe` 时默认按指定预算等待。 |
-| 有 `next_poll_at` | 这是检查点记录的下次轮询时间。监视器按时间推进，原生 Multi 的时间来自父任务。 |
-| 全部仍排队，字段预检暂缓 | 看 `preflight_deferred` 中的 `retry_at`、失败次数和未核验字段。已成功的精确字段证据按账户、作用域和原有效期保存；下一轮只补缺项。提前恢复不会重查仍在退避的组。 |
-| 进程或连接中断 | 先读原批次。用 `campaign run --recover-only` 补回已受理的结果。需要继续未启动的臂时，再让普通队列推进。 |
-| QUICK 训练已记录，日 PnL 尚欠 | `data.archived_quick_pnl` 有待补批次、臂数和不可读批次数。用其中的 `jobs[].batch` 定位原批次。 |
+### 看见一个状态，只选择它对应的下一步
+
+`ok: true` 表示命令被正常处理。是否取得结果，要读 `execution`、任务 ID 和证据状态。
+`campaign status` 的 `data.jobs` 给出规格、原批次、执行计数和下一步；列表截断时同时看 `omitted`。
+已有批次优先读 `diagnosis.state`、`diagnosis.reason` 和 `diagnosis.next_action.argv`。
+这些从当前保存的批次推导；尚无批次的新规格显示 `state: queued`。
+具体命令由回执给出，仍由当前执行者推进。
+
+| 看到的状态或现象 | 下一步 | 保留什么 |
+| --- | --- | --- |
+| `queued` / `queued_work`，尚未受理 | 交给现有 `campaign run --watch` 推进；没有执行者时才启动一个 | 原规格、标签、设置与批次路径 |
+| `gate_blocking` 或事件 `matching_request` | 阅读 gate 的引用，或事件的 `owner_batch` 与恢复命令，推进原检查点 | 精确请求身份；等待次数不能使重复请求获得新身份 |
+| `batch_identity_mismatch` | 对照原规格与检查点；恢复原规格，或明确另建一个不同实验 | 原请求指纹；不靠改名绕过身份校验 |
+| `preflight_backoff` / `preflight_deferred` | 看 `retry_at`、失败次数和未核验字段，由队列到期续跑 | 已成功的精确字段证据及原有效期；不连续提前恢复 |
+| `platform_pending`，或有 `next_poll_at` | 由原执行者按时间恢复；手动接管时使用原批次 | 平台任务 ID、URL 和受理记录；本地超时不取消远端任务 |
+| `batch_locked` / `runner_locked` | 读取锁冲突回执，确认现有写入者；交接后再继续 | `lock_path` 与观察到的 owner；不并行启动第二个写入者 |
+| `shared_slots_occupied` | 从原检查点回读平台终态，再由恢复路径更新 reservation | 受理身份；任务年龄和空指标都不能证明可以释放槽位 |
+| `submission_cooldown` | 等保存的发单退避时间；原执行者仍可恢复已受理任务 | 原检查点与退避时间 |
+| 模拟 `UNKNOWN_SUBMISSION` / `submission_unknown` | 核对原 POST 的任务身份，读取返回的恢复指引 | 原提交意图；在身份不明时不再次 POST |
+| 最终 Alpha 提交 `UNCERTAIN` / `UNKNOWN` | 运行 `alpha submit ALPHA_ID --max-wait 30` 只读检查，查看 `submission_recovery`；详见下文 | 最终提交与模拟状态分开；`UNSUBMITTED` 本身不证明此前 POST 未发生 |
+| `terminal_failure`，已确认终态 `ERROR` / `FAIL` / `FAILED` | 复盘错误及输入证据；修正研究构造时另建规格 | 失败臂、idea／机制和原始错误；执行失败不自动证明经济假设已被证伪 |
+| 晋级 `metadata_required`，`buffered=false` | 给 `next_action.argv` 补齐 `required_options` 中的候选说明参数，沿原冻结选择运行 `promote` | 已完成的验证回执和 selection；不重新模拟、不循环重试空元数据 |
+| QUICK 训练已记录，日 PnL 尚欠 | 从 `data.archived_quick_pnl.jobs[].batch` 找原批次，按候选 ID 补读 | 已保存的训练汇总；不为补 PnL 重跑模拟 |
+
+手动恢复只由当前执行者使用。需要继续已确认排队和已受理的臂时用
+`probe --resume BATCH.json`；只读取已有平台任务和补证据时用 `probe --recover BATCH.json`。
+`campaign run --recover-only` 用于集中补回已有任务，不启动未受理的臂。
+原生 Multi 的监视轮次会保存平台的 `Retry-After`，未到期时让出队列；直接 Probe 则按本次预算等待。
+
+最终 Alpha 提交沿用 `alpha submit`。无 `--yes` 时只读检查待核实的提交，不改提交日志。
+若读到已完成且明确拒绝的提交结果，回执会给出 `REJECTED` 和失败项。针对已有的未决提交，
+在原有提交授权下用同一命令加 `--yes` 可持久化这次核实结果，该轮不会再 POST。
+只有能证明在 POST 前结束的准备失败才记为 `NOT_SENT`；传输不明、空响应、404 或仍在等待的
+结果保留不确定性。`post_attempted` 描述本次调用，不能单凭本次为 `false` 推断上一轮没有发出请求。
 
 同一队列的在途或待核实请求会占用其精确请求身份，后来的重复规格等待原检查点。
+删除或归档原规格不会释放这个身份；只有原批次的终态证据能解除占用。
 同一账号和研究目录已确认占满槽位时，启动流程先暂缓新请求的字段和算子预检。监视器在同一轮复用刚取得的满槽证据，暂缓同账号、同并发设置且尚未启动的 native Multi 批次。每轮重新核对，检查点的回收仍可继续。
 要单独查看预检结果，可以运行 `probe --check`。
-平台槽位、限流和结果可见时间仍由账号与平台决定。若 `campaign status` 的列表被截断，
-看 `omitted` 和汇总计数。运行中的状态可从另一终端查询，`--stream` 事件写到 stderr。
+平台槽位、限流和结果可见时间仍由账号与平台决定。`--stream` 事件写到 stderr。
 
 队列通常把批次和回执保存为 `backlog-results/<spec-stem>-batch.json` 和
 `backlog-results/<spec-stem>-result.json`。取实际路径时优先用保存的 Probe 回执
 `data.path` 或状态中的 `batch`。待补列表只列仍欠证据的归档批次。
+
+### 区分等待与零进展
+
+比较相邻两次状态：新增受理多少条、新增终态多少条、新增有效指标／检查证据多少条，
+以及最后一次有实质变化的时间。正常等待应能指向原任务、阻塞原因和下次轮询／重试时间。
+进程仍在运行、日志继续增长或又得到一份 `deferred` 回执，都不能替代这些变化。
+
+`jobs[].last_attempt` 保存最近一次执行观察，不代表当前平台状态。它的 `observed_at`、
+`detail`、`diagnosis` 和 `progress` 用于复盘；`matches_current_progress` 说明这份观察是否
+仍匹配当前批次。`progress` 包含 `changed`、`unchanged_rounds`、`last_progress_at` 和 `stalled`。
+连续至少三轮已结束的尝试没有实质变化，且没有未来轮询时间解释等待时，会标记 `stalled`。
+这个标记只要求排查，不会解锁、重发或宣判远端失败。单纯保存文件、更新时间和追加调度日志不算进展。
+`last_runner_event` 同样是上一次 runner 冲突的记录，不是现在仍有活进程的证明。
+
+交接或报告时用固定格式：**原批次；本轮新增受理／终态／记录；当前阻塞；下一步与时间**。
+如果连续观察没有变化，就明确报告“无新进展”，核对对应的状态行，不再复制原命令循环。
+OMP 正在等子代理属于宿主编排状态，应另报代理任务和最后一条状态；仓库的 Campaign
+回执不能用来判断 VPS 已死，也不能证明宿主代理仍在推进。
 
 ## 用台账找候选
 
@@ -70,6 +123,32 @@ python research_cli.py ledger analyze --region ASI --delay 1 --mode QUICK \
 默认初筛要求有检查记录且无已知硬失败，训练 Sharpe 达到下限，多空持仓数为正，
 扣成本后仍有正的训练 margin。换手上限为可选参数。待定检查列在 `unresolved_checks`。
 同一 Alpha ID 的诊断标记对它的所有台账键生效。
+
+### 失败也留种子，缺失 idea 明确报告
+
+已确认终态的执行失败写入同一个 `alpha-registry.jsonl`，保留表达式、设置、原始错误和来源。
+这类记录使用稳定的 `failure:` 键，`execution_outcome=failed`、`alpha_id=null`；若原请求带有
+Alpha ID，它只作为 `related_alpha_id` 保留。记录不编造指标或检查，也不因执行错误自动
+标记经济假设为 `falsified` / `rejected`。仍在等待的任务或一次结果读取失败不因此成为终态。
+
+```bash
+python research_cli.py ledger list --idea "研究问题" --format markdown
+python research_cli.py ledger list --expression "表达式片段" --format markdown
+```
+
+复盘失败时不用最低 Sharpe/Fitness 过滤，否则无指标的记录会被筛掉。
+Probe 优先保存臂上的 `idea`，没有时用规格的 `idea`，不从文件名或标签猜经济解释。
+`provenance` 保留 `run_id`、`request_fingerprint`、`source_spec` 和 `arm_label`，可回查原实验。
+`recording` 摘要报告 `recorded_failures`、`missing_idea_count` 和最多二十个
+`missing_idea_labels`；缺失时应补齐下一份规格的问题定义，保留原始缺失事实。
+
+这里的“留种子”是保存研究记忆，包括失败尝试。已验证的提交候选另有 buffer/seed store，
+由下文的 `promote` 保存候选说明；不用为 QUICK 和 ERROR 再建一套人工留种子流程。
+
+`simulate --record` 整批失败仍返回 `SIMULATION_FAILED`，其 `error.details.recording`、
+`error.details.summary` 和检查点引用可用于找回已记录的失败。Probe 的 `execution.terminal`
+单列无 Alpha ID 且已确认终态的臂数；`probe.complete` 要求所需训练证据齐全。
+记录了错误不等于拿到了有效训练证据，也不能算一次成功出分。
 
 ### 检查缺失、历史证据与研究标签
 
@@ -161,7 +240,35 @@ python research_cli.py campaign preview FULL-SPEC.json
 `prepare-full` 按原批次的训练 Sharpe 排序，筛掉缺失训练证据及非正训练指标的候选。
 对照实验会保留原对照，并计入上限。检查 `data.quick_source.arms[].alpha_id` 是否与
 逐年复核后选定的 QUICK ID 一致。该命令按批次取臂。若名单有差异，依据已选的臂另行起草规格，
-保留其来源与原对照，再预览、确认和入队。FULL 完成后用其新 Alpha ID 冻结和验证。对照、逐年及成本证据先于平台相关性核验。
+保留其来源与原对照，再预览、确认和入队。FULL 完成后使用其新 Alpha ID。
+对照、逐年及成本证据先于平台相关性核验。
+
+## 选定 FULL 候选后，一次补齐说明并晋级
+
+Campaign 为满足训练门槛的 FULL Regular 候选保存冻结选择，在 `training-frozen` 事件中
+返回 `selection_path`。沿用该路径和候选 ID，在原执行者结束该批次后运行一次 `promote`。
+以下名称、标签和说明是格式示例，实际填写该候选的机制与证据：
+
+```bash
+python research_cli.py promote FULL_ALPHA_ID --selection SELECTION.json \
+  --name "分析师预期修正" --category ANALYST --tags analyst revision \
+  --description "研究假设是分析师预期修正的信息逐步进入价格；使用事先指定的修正字段、地区和时间窗，避免把数值缺失或覆盖变化当成信号。训练选择已经冻结，留出期只用于核对这一选择。复盘时需要结合原对照、成本、分期表现和相关性检查解释结果，并保留不支持该假设的证据。"
+```
+
+`name` 非空；`category` 取 `ANALYST`、`FUNDAMENTAL`、`PRICE_VOLUME`、`SENTIMENT` 或
+`VOLUME`；`tags` 至少一个；`description` 去掉首尾空白后至少 100 个字符。
+说明应交代真实机制、输入、对照与证据，缺失信息明确写缺失，不为凑长度编造发现。
+`promote` 使用原冻结选择做验证、核对平台检查，再保存 buffer 和 seed metadata。
+无须再手动执行一次 `buffer add`，也不手改 `seeds.jsonl`。
+
+若验证和检查通过，但说明未齐，回执为 `outcome=metadata_required`、`buffered=false`，
+`metadata_required` 列出缺项，`next_action` 给出原冻结选择的命令和 `required_options`。
+补齐后运行一次该命令。`campaign run --validate` 也可能停在这个状态；无说明的 `--dry-run`
+同样不会报告 `would_buffer`。若使用自定义 `--seeds PATH`，晋级和后续提交沿用同一路径。
+
+本地 seed metadata 和平台 Alpha 的名称、分类、标签是两份不同记录；本地入库不会自动
+修改远端属性。真正提交仍走既有授权入口，并按回执补齐平台要求的属性。
+已有未决提交的只读核实和持久化恢复不因缺少新 seed metadata 而阻塞。
 
 ## 索引与故障定位
 

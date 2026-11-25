@@ -9,11 +9,33 @@ research loop without reading the source.** The core workflow is exposed by
 `research_cli.py`, whose contract is documented by the tool itself. Batch
 runners and the separate SPC client sit under `tools/`.
 
-```
-python research_cli.py brief                # current evidence and source paths
-python research_cli.py help                 # concise command map, when needed
-python research_cli.py schema catalog fields # one command's machine contract
-```
+## Start here
+
+Use one research directory and one execution owner. The normal batch workflow is:
+
+| Step | Command |
+| --- | --- |
+| Read the current workspace and existing jobs | `python research_cli.py brief` and `python research_cli.py campaign status --limit 10` |
+| Review a new spec with its question, mechanism and stable arm labels | `python research_cli.py campaign preview SPEC.json` |
+| Put the reviewed spec in `backlog/`, then let one runner advance it | `python research_cli.py campaign run --watch --defer-quick-pnl --stream` |
+| Review results and failure evidence | `python research_cli.py ledger analyze --group-by scope --limit 8` |
+| Validate a chosen FULL candidate and preserve its metadata | Use the saved training selection with the [promotion command below](#screen-a-campaign-candidate-before-promotion). |
+
+Keep a running spec and its canonical checkpoint unchanged. Campaign owns both
+new launches and recovery; subagents can prepare separate drafts and inspect
+results while that owner runs. If a command returns `deferred`, a saved batch's
+`jobs[].diagnosis` in `campaign status` gives its current reason, `next_action.argv`
+and retry/poll time. Fresh specs without a saved batch have `state: queued`.
+`last_attempt.progress` reports unchanged turns and a stalled
+observation; `last_attempt` is historical, with `matches_current_progress` marking
+whether it still matches the saved batch. Repeating a command or starting a
+second writer is not evidence of progress.
+
+[Batch execution and recovery](docs/ledger-workflow.md) is the operating guide,
+including the state-to-next-action table. [Tooling](docs/tooling.md) is a reference
+for a specific question; `help COMMAND` and `schema COMMAND` expose that command's
+options and machine contract. `simulate`, direct `probe` and older runners remain
+available for their specific uses.
 
 ## Layout
 
@@ -43,7 +65,7 @@ python research_cli.py schema catalog fields # one command's machine contract
 | `paper_search.py` | OpenAlex paper search: journal, DOI, citations, reconstructed abstract. |
 | `field_contract.py` | Field contracts: declared vs inferred period/unit/sign, verdicts. |
 | `research_paths.py` | Resolves where results go -- always outside this working tree. |
-| `alpha_registry.py` | Append-only ledger of alphas worth remembering. |
+| `alpha_registry.py` | Append-only ledger of measured evidence and terminal failed attempts. |
 | `correlation.py` | Align daily PnL on shared dates, Pearson, residualise against a control. |
 | `ablation.py` | Leave-one-out and solo variants, so a leg can be shown to earn its place. |
 | `cache_store.py` | Small JSON cache with TTL, so repeat calls do not re-fetch. |
@@ -654,7 +676,10 @@ train-period metrics by default. Validation requires an existing frozen selectio
 `comparisons` reports arm-minus-control train deltas, with missing evidence listed
 under `unavailable`; explore batches report no attribution. Spec `idea`, `mechanism`
 and `note` travel with the preview, batch file and summary. Existing batch files
-are protected before simulation; choose another path/name or pass `--force`.
+are protected before simulation. Continue an existing experiment through its
+saved checkpoint; use a new spec and path for a different experiment. `--force`
+is an explicit overwrite switch, not a recovery command or a way to resolve
+an active writer, duplicate request or uncertain POST.
 
 `--strict-gate` refuses a finished registry result with the same source identity
 and complete effective settings. A dry run exposes `gate_blocking` and
@@ -740,8 +765,14 @@ Missing train margin is never replaced by full-window margin.
 
 ```bash
 python research_cli.py triage --ids ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --min-delta 0 --freeze campaign-choice.json
-python research_cli.py promote ALPHA_ID --selection campaign-choice.json --max-self-correlation 0.7
+python research_cli.py promote ALPHA_ID --selection campaign-choice.json --max-self-correlation 0.7 \
+    --name "Analyst revision hypothesis" --category ANALYST --tags analyst revision \
+    --description "The hypothesis is that analyst estimate revisions contain information that enters prices gradually. Keep the specified inputs, region and timing assumptions with the frozen training comparison, and retain contrary evidence when interpreting validation."
 ```
+
+If Campaign already emitted `training-frozen`, use its `selection_path` instead of
+freezing the candidate again. Replace the example metadata with the selected
+candidate's actual hypothesis and evidence.
 
 With a shelf ceiling, `triage` writes the selection only after the local training
 gate passes. It requires measured PnL coverage, positive book contribution,
@@ -755,6 +786,18 @@ platform results, and writes to the shelf only if the gates pass. The optional
 self-correlation ceiling is a separate live requirement. `--dry-run` still
 accesses the test view and runs the platform checks.
 
+Promotion records the submission candidate's metadata in the existing buffer/seed
+store: a nonempty `name`, an allowed `category`, at least one entry in `tags`, and a
+`description` containing at least 100 characters after trimming outer whitespace.
+Supply these once through `promote`; a second `buffer add` or manual seed-file edit
+is unnecessary. `--seeds PATH` selects an alternate metadata store; use the same
+path for promotion and any later `alpha submit` or `buffer submit`.
+
+Research seeds have a different purpose: successful and terminal failed attempts
+stay in the normal ledger with their original question and evidence. They do not
+need submission metadata merely to be remembered. See the
+[operating guide](docs/ledger-workflow.md) for the single workflow.
+
 `campaign` uses the existing `backlog/` inbox and durable Probe checkpoints.
 It previews or advances Regular, Power Pool, ATOM, and Python research, and
 compares recorded SPC outputs locally. See [the campaign workflow](docs/tooling.md#长程研究队列).
@@ -767,8 +810,13 @@ python research_cli.py campaign run --watch --multi-size 4 --stream
 ```
 
 The unified runner freezes eligible FULL Regular training choices. Use
-`--validate` to continue with validation and shelf admission. Missing
-evidence stays queued with a recorded reason.
+`--validate` to continue with validation. If validation and checks pass but the
+candidate's metadata is missing, promotion returns `outcome: metadata_required`,
+`buffered: false`, the missing fields and a `next_action` using the frozen choice.
+Supply its `required_options` through the promotion command above. The runner
+retains this outcome rather than retrying the same missing metadata each round.
+A dry run without the metadata also reports `metadata_required`, not `would_buffer`.
+Missing scientific evidence stays queued with a recorded reason.
 
 ### Inspect results
 
@@ -1001,8 +1049,12 @@ An alpha also carries metadata, and a submission is unattributable without it. `
 `category` and `tags` are top-level properties; `description` is writable too but **nested
 under `regular`** — `{"regular": {"description": ...}}`. Eighteen *top-level* spellings all
 returned `Unexpected property` and the conclusion drawn was that the field did not exist;
-it was the shape that was wrong. `alpha submit` refuses an alpha with no name or category
-and prints the exact command to fix it.
+it was the shape that was wrong. A new `alpha submit` requires both the local seed
+record produced by promotion and the required live platform metadata. Local seed
+metadata does not automatically update the platform's properties; use
+`alpha describe` for an authorized remote metadata change when the receipt calls
+for it. Saved pending submission recovery and confirmed-submission reconciliation
+remain available without creating a new seed record.
 
 ```bash
 python research_cli.py alpha describe ALPHA_ID \
@@ -1018,27 +1070,48 @@ Three outcomes look similar and are not:
 
 | response | meaning |
 | --- | --- |
-| `403` with a check list | evaluated and refused; only here do you learn the real value |
+| `403` with a check list | evaluated and refused; retain the reported checks |
 | `201` with an empty body | accepted for asynchronous evaluation; **not** a submission |
-| `dateSubmitted` set | the only trustworthy evidence that it went in |
+| `dateSubmitted` set, or a live `ACTIVE` / `SUBMITTED` status | confirmed platform submission evidence |
 
 A first `POST` may return before asynchronous evaluation finishes. A later check
-can still refuse the candidate. Always confirm with `dateSubmitted`, never with
-the initial status code alone.
+can still refuse the candidate. Confirm the platform's read-back evidence rather
+than inferring success from the initial HTTP status alone.
 
 `alpha submit` reports an explicit `submission` state instead of treating HTTP success as confirmation:
 
 | `submission` | meaning |
 | --- | --- |
-| `CONFIRMED` | `dateSubmitted` is set; it is in the book |
+| `CONFIRMED` | read-back confirms submission by `dateSubmitted` or live `ACTIVE` / `SUBMITTED` status |
 | `ACCEPTED` | the platform took the request but `dateSubmitted` is still empty - re-check before counting it |
 | `REJECTED` | refused, with `failed_checks` naming what failed and its value |
 | `UNCERTAIN` | accepted, but the read-back failed; the outcome is unknown |
 | `INTENT` / `UNKNOWN` | a durable attempt lacks a confirmed outcome; read back, never implicitly POST again |
-| `NOT_SENT` | dry run, nothing was written |
+| `NOT_SENT` | a dry run or a preparation failure known to have ended before POST |
 
 `submitted` is true only for `CONFIRMED`. An HTTP status below 400 alone does not
 establish that the alpha entered the book.
+
+To inspect a pending final-alpha submission without sending another POST:
+
+```bash
+python research_cli.py alpha submit ALPHA_ID --max-wait 30
+```
+
+For a saved unresolved attempt, this reads the alpha and its submission endpoint.
+`submission_recovery` records the source, state, reason and any retry time. Ready,
+resolved failure checks establish `REJECTED`; missing, pending, empty, 404 or failed
+reads keep the outcome uncertain. `UNSUBMITTED` alone does not prove that a prior
+POST never happened. Without `--yes`, the submission journal is unchanged.
+
+When a saved unresolved attempt exists, repeating the command with `--yes` under
+the existing submission authorization persists a confirmed recovery outcome and
+returns without another POST in that invocation. A new-format interrupted intent
+still in `PREPARING` can likewise be resolved to `NOT_SENT` before a later explicit
+attempt. The durable `submit_posting`
+boundary separates preparation failure from ambiguous transport after POST begins.
+`post_attempted` describes the current invocation; a read-only recovery reporting
+`false` does not erase uncertainty about the earlier attempt.
 
 The platform's own view names the counterpart, which is what makes the substitute route
 decidable:
@@ -1326,16 +1399,27 @@ python research_cli.py ledger record ALPHA_ID --idea "Sample hypothesis" \
 python research_cli.py ledger list --format markdown --min-sharpe 1.25
 ```
 
-`<research_dir>/alpha-registry.jsonl` is an append-only ledger, one alpha per
-line, kept outside git so findings outlive a chat window without turning the
+`<research_dir>/alpha-registry.jsonl` is an append-only ledger, one evidence event
+per line, kept outside git so findings outlive a chat window without turning the
 repository into a data dump. Back that file up like any other result; it is the
-durable memory of the research. Each entry is self-contained:
-the expression, the full settings, the in-sample metrics, the platform checks,
-the idea it belongs to, a verdict (`candidate` / `watch` / `rejected` / `no_go`)
-and a note. Re-recording the same alpha replaces it on read without rewriting
-history. `simulate --record` classifies automatically (clears the bar →
+durable memory of the research. Entries retain the expression, full settings,
+idea and source, with observed metrics and checks when available, a research
+verdict and a note. Re-recording the same key folds its latest evidence on read
+without rewriting history. `simulate --record` classifies automatically (clears the bar →
 `candidate`, fails a check → `rejected`, otherwise `watch`); `ledger record` takes
 an explicit verdict when you have actually decided something.
+
+Terminal execution failures are also retained. They have a stable `failure:` key,
+`execution_outcome: failed`, `alpha_id: null`, the original terminal status and
+error; any originating Alpha ID is kept as `related_alpha_id`. Missing metrics
+and checks are not invented, and an execution error does not automatically
+falsify the hypothesis. Probe records the arm's explicit `idea`, falling back to
+the spec's `idea`, and preserves run/request/spec/arm provenance. The recording
+summary exposes `recorded_failures`, `missing_idea_count` and up to twenty
+`missing_idea_labels`, so a blank hypothesis is visible instead of inferred.
+Use `ledger list --idea TEXT` or `ledger list --expression TEXT` to find these
+records without a minimum-metrics filter. See the
+[ledger workflow](docs/ledger-workflow.md) for recovery and failure receipts.
 
 ## Track how alphas relate
 
@@ -1359,10 +1443,12 @@ superseded judgement stays visible. `ledger coverage` exists because independenc
 counted on the `family` column, and that column being partly empty is itself a
 finding rather than something to paper over.
 
-Record identity also changed: an entry with no alpha id is now keyed on the
-expression **and** a fingerprint of the settings that alter results (universe,
-region, delay, decay, neutralisation, truncation, test period). Keying on the
-expression alone silently merged the same formula run under two universes.
+Ordinary entries without an Alpha ID are keyed on the expression **and** a
+fingerprint of the settings that alter results (universe, region, delay, decay,
+neutralisation, truncation, test period). Terminal failed attempts use their
+separate `failure:` key, binding the request and its batch/run/arm provenance.
+This keeps distinct settings and failed execution attempts from erasing measured
+evidence under an existing Alpha ID.
 
 `ask` reads the same ledger offline for filters, grouped statistics, within-panel
 comparisons and cached-PnL correlations. For example,

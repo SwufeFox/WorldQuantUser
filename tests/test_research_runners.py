@@ -75,6 +75,7 @@ class ResearchRunnerTests(TestCase):
         self.assertEqual(result.state, "done")
         run.assert_called_once()
         self.assertEqual(run.call_args.args[2:4], ("--resume", self.batch))
+        self.assertNotIn("--batch-size", run.call_args.args)
 
     def test_terminal_platform_task_without_alpha_does_not_defer_the_queue(self):
         for status in ("WARNING", "COMPLETE"):
@@ -102,6 +103,49 @@ class ResearchRunnerTests(TestCase):
         self.assertEqual(runner.probe_state(data), ("deferred", "recover"))
         execution.update(unknown_submission=0, finished=1, terminal=1)
         self.assertEqual(runner.probe_state(data), ("failed", None))
+
+    def test_mixed_canonical_batch_resumes_to_refill_but_unknown_post_still_recovers(self):
+        rows = [arm("PENDING", submission_state="accepted", progress_url="https://test.invalid/job"),
+                arm("QUEUED", submission_state="not_submitted")]
+        data = {"rows": rows, "execution": {"total": 2, "finished": 0, "terminal": 0,
+                                             "accepted": 1, "not_submitted": 1, "unknown_submission": 0},
+                "next_actions": [{"action": "recover"}, {"action": "resume"}]}
+        self.assertEqual(runner.probe_state(data), ("deferred", "resume"))
+        rows[0]["submission_state"] = "unknown_submission"
+        self.assertEqual(runner.probe_state(data), ("deferred", "recover"))
+
+    def test_cli_preserves_batch_lock_reason_for_runner_diagnosis(self):
+        details = {"reason": "batch_locked", "batch_path": str(self.batch),
+                   "lock_path": str(self.batch) + ".lock", "owner": {"pid": 123}}
+        output = json.dumps({"ok": False, "error": {"code": "SERVICE_ERROR",
+                            "message": "this probe batch is already being updated", "details": details}})
+        with mock.patch.object(runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, output, "")):
+            response = runner.run_cli(self.root, "probe", "--resume", self.batch)
+        self.assertEqual(response.error_details, details)
+        self.saved(self.batch, [arm("QUEUED", submission_state="not_submitted")])
+        with mock.patch.object(runner, "run_cli", return_value=response):
+            result = self.run_probe()
+        self.assertEqual(result.state, "deferred")
+        diagnosis = result.data["diagnosis"]
+        self.assertEqual((diagnosis["state"], diagnosis["reason"]), ("blocked", "batch_locked"))
+        self.assertEqual(diagnosis["owner"], {"pid": 123})
+        self.assertEqual(diagnosis["next_action"]["action"], "status")
+
+    def test_process_timeout_is_bounded_and_preserves_unknown_post_recovery(self):
+        rows = [arm("UNKNOWN_SUBMISSION", submission_state="unknown_submission", submission_attempted=True)]
+        self.saved(self.batch, rows)
+        checkpoint = self.batch.read_bytes()
+        with mock.patch.object(runner.subprocess, "run", side_effect=subprocess.TimeoutExpired("probe", 70)) as run:
+            result = runner.run_probe(self.root, self.spec, self.batch, self.receipt, max_wait=55)
+        self.assertEqual(run.call_args.kwargs["timeout"], 70)
+        self.assertEqual(result.state, "deferred")
+        self.assertEqual(result.data["diagnosis"]["error_code"], "TIMEOUT")
+        self.assertEqual(result.data["diagnosis"]["batch_path"], str(self.batch))
+        self.assertEqual(self.batch.read_bytes(), checkpoint)
+        with mock.patch.object(runner, "run_cli", return_value=runner.CliResult(True, {"rows": rows})) as retry:
+            self.run_probe()
+        self.assertEqual(retry.call_args.args[2:4], ("--recover", self.batch))
+        self.assertNotIn("--batch-path", retry.call_args.args)
 
     def test_recover_only_never_launches_unposted_work(self):
         with mock.patch.object(runner, "run_cli", return_value=self.preview) as run:
@@ -201,10 +245,18 @@ class ResearchRunnerTests(TestCase):
     def test_changed_spec_cannot_resume_existing_batch(self):
         self.saved(self.batch, [arm("QUEUED", submission_state="not_submitted")],
                    fingerprint="old request")
+        checkpoint = self.batch.read_bytes()
         with mock.patch.object(runner, "run_cli") as run:
             result = self.run_probe()
         self.assertEqual(result.state, "failed")
         self.assertIn("does not match", result.detail)
+        self.assertNotIn("new spec name", result.detail)
+        self.assertIn("restore the queued spec", result.detail)
+        self.assertEqual(result.data["diagnosis"]["reason"], "batch_identity_mismatch")
+        action = result.data["diagnosis"]["next_action"]
+        self.assertEqual(action["action"], "inspect_saved_identity")
+        self.assertEqual(action["argv"][-3:], ["probe", str(self.spec), "--dry-run"])
+        self.assertEqual(self.batch.read_bytes(), checkpoint)
         run.assert_not_called()
 
     def test_changed_quick_provenance_cannot_resume_the_same_full_request(self):
@@ -245,7 +297,7 @@ class ResearchRunnerTests(TestCase):
 
         self.assertEqual(campaign.run_campaign(self.root, once=True, execute=execute,
                                               log_event=log, recover_only=True), 3)
-        execute.assert_called_once_with(self.root, accepted, batch, receipt, max_wait=600, concurrency=3)
+        execute.assert_called_once_with(self.root, accepted, batch, receipt, max_wait=600, concurrency=None)
         self.assertTrue(new.is_file())
         self.assertTrue(queued.is_file())
         self.assertEqual(log.call_args.args[0]["spec"], accepted.name)
@@ -268,7 +320,7 @@ class ResearchRunnerTests(TestCase):
             self.assertEqual(campaign.run_campaign(self.root, once=True, execute=execute,
                                                    log_event=mock.Mock()), 0)
         execute.assert_called_once_with(self.root, ready, *campaign.campaign_paths(self.root, ready),
-                                      max_wait=600, concurrency=3)
+                                      max_wait=600, concurrency=None)
         self.assertTrue(waiting.is_file())
         self.assertTrue(fresh.is_file())
 
@@ -318,7 +370,7 @@ class ResearchRunnerTests(TestCase):
               mock.patch.object(runner.time, "sleep", side_effect=InterruptedError) as sleep,
               self.assertRaises(InterruptedError)):
             campaign.run_campaign(self.root, max_wait=600, interval=30, execute=execute, log_event=mock.Mock())
-        self.assertEqual(calls, [(pending.name, 30, 3), (fresh.name, 600, 3)])
+        self.assertEqual(calls, [(pending.name, 30, None), (fresh.name, 600, None)])
         sleep.assert_called_once_with(7)
         self.assertTrue(pending.is_file())
         self.assertTrue((backlog / "done" / fresh.name).is_file())
@@ -413,6 +465,139 @@ class ResearchRunnerTests(TestCase):
         self.assertTrue(any(event.args[0].get("detail") == f"waiting for matching request in {first.name}"
                             for event in events.call_args_list))
 
+    def test_repeated_conflicts_report_stall_without_releasing_an_unknown_request(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        owner, duplicate = [backlog / name for name in ("a-owner.json", "b-repeat.json")]
+        request = {"expression": "rank(close)", "settings": {"region": "USA", "decay": 5}}
+        for spec in (owner, duplicate):
+            spec.write_text("{}", encoding="utf-8")
+        batch, _ = campaign.campaign_paths(self.root, owner)
+        self.saved(batch, [arm("UNKNOWN_SUBMISSION", submission_state="unknown_submission", **request)])
+        calls = []
+
+        def execute(_root, spec, saved, _receipt, **_options):
+            self.assertEqual(spec, owner, "waiting rounds must never authorize the duplicate POST")
+            calls.append(spec)
+            document = json.loads(saved.read_text())
+            document.update(updated_at=len(calls), scheduling=[{"attempt": len(calls)}])
+            saved.write_text(json.dumps(document))
+            return runner.ProbeRun("deferred", document)
+
+        with (mock.patch.object(experiments, "probe_spec_identity", return_value={"results": [request]}),
+              mock.patch.object(runner.time, "sleep", side_effect=[None, None, None, InterruptedError]),
+              self.assertRaises(InterruptedError)):
+            campaign.run_campaign(self.root, execute=execute, log_event=mock.Mock())
+        self.assertEqual(calls, [owner] * 4)
+        latest = runner.recent_campaign_attempts(self.root)
+        blocked = latest[duplicate.name]
+        self.assertEqual(blocked["diagnosis"]["reason"], "matching_request")
+        self.assertEqual(blocked["diagnosis"]["owner_batch"], str(batch))
+        self.assertEqual(blocked["diagnosis"]["next_action"]["action"], "recover")
+        self.assertEqual(blocked["progress"]["unchanged_rounds"], 4)
+        self.assertTrue(blocked["progress"]["stalled"])
+        self.assertTrue(latest[owner.name]["progress"]["stalled"])
+        self.assertIsNone(latest[owner.name]["progress"]["last_progress_at"])
+        self.assertTrue(duplicate.exists())
+
+    def test_archived_unknown_owner_blocks_until_its_checkpoint_is_terminal(self):
+        backlog = self.root / "backlog"
+        archived = backlog / "failed"
+        archived.mkdir(parents=True)
+        owner, duplicate = [backlog / name for name in ("owner.json", "repeat.json")]
+        (archived / owner.name).write_text("{}")
+        duplicate.write_text("{}")
+        request = {"expression": "rank(close)", "settings": {"region": "USA", "decay": 5}}
+        batch, _ = campaign.campaign_paths(self.root, owner)
+        self.saved(batch, [arm("UNKNOWN_SUBMISSION", submission_state="unknown_submission", **request)])
+        execute = mock.Mock(return_value=runner.ProbeRun("done", {}))
+        log = mock.Mock()
+        with mock.patch.object(experiments, "probe_spec_identity", return_value={"results": [request]}):
+            for _ in range(2):
+                self.assertEqual(campaign.run_campaign(self.root, once=True, execute=execute, log_event=log), 3)
+            execute.assert_not_called()
+            diagnosis = log.call_args.args[0]["diagnosis"]
+            self.assertEqual(diagnosis["reason"], "matching_request")
+            self.assertEqual(diagnosis["owner_batch"], str(batch))
+            self.assertEqual(diagnosis["next_action"]["argv"][-2:], ["--recover", str(batch)])
+            waits = []
+
+            def finish_owner(_seconds):
+                if waits:
+                    raise InterruptedError
+                waits.append(True)
+                self.saved(batch, [arm("ERROR", submission_state="terminal", **request)])
+
+            with (mock.patch.object(runner.time, "sleep", side_effect=finish_owner),
+                  self.assertRaises(InterruptedError)):
+                campaign.run_campaign(self.root, execute=execute, log_event=log)
+        execute.assert_called_once()
+        self.assertEqual(execute.call_args.args[1], duplicate)
+        self.assertTrue((archived / owner.name).exists())
+
+    def test_owner_spec_disappearing_does_not_release_a_saved_unknown_post(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        owner, duplicate = [backlog / name for name in ("a-owner.json", "b-repeat.json")]
+        request = {"expression": "rank(close)", "settings": {"region": "USA", "decay": 5}}
+        for spec in (owner, duplicate):
+            spec.write_text("{}")
+        calls = []
+
+        def execute(_root, spec, batch, _receipt, **_options):
+            self.assertEqual(spec, owner, "a missing source file must never authorize a duplicate POST")
+            calls.append(spec)
+            self.saved(batch, [arm("UNKNOWN_SUBMISSION", submission_state="unknown_submission", **request)])
+            spec.unlink()
+            return runner.ProbeRun("deferred", {})
+
+        waits = []
+
+        def unreadable_checkpoint(_seconds):
+            if waits:
+                raise InterruptedError
+            waits.append(True)
+            batch, _ = campaign.campaign_paths(self.root, owner)
+            batch.write_text("{}")
+
+        with (mock.patch.object(experiments, "probe_spec_identity", return_value={"results": [request]}),
+              mock.patch.object(runner.time, "sleep", side_effect=unreadable_checkpoint),
+              self.assertRaises(InterruptedError)):
+            campaign.run_campaign(self.root, execute=execute, log_event=mock.Mock())
+        self.assertEqual(calls, [owner])
+        self.assertTrue(duplicate.exists())
+        latest = runner.recent_campaign_attempts(self.root)[duplicate.name]
+        self.assertEqual(latest["diagnosis"]["reason"], "matching_request")
+        self.assertEqual(latest["progress"]["unchanged_rounds"], 2)
+
+    def test_saved_platform_poll_time_survives_a_short_turn_without_busy_retries(self):
+        backlog = self.root / "backlog"
+        backlog.mkdir()
+        pending, fresh = [backlog / name for name in ("a-pending.json", "b-fresh.json")]
+        for spec in (pending, fresh):
+            spec.write_text("{}", encoding="utf-8")
+        batch, _ = campaign.campaign_paths(self.root, pending)
+        self.saved(batch, [arm("PENDING", submission_state="accepted",
+                              progress_url="https://test.invalid/slow", next_poll_at=300)])
+        document = json.loads(batch.read_text())
+        document["execution"] = {"total": 1, "finished": 0}
+        batch.write_text(json.dumps(document))
+        clock, calls = [55], []
+
+        def execute(_root, spec, _batch, _receipt, **_options):
+            calls.append((spec, clock[0]))
+            return runner.ProbeRun("done", {})
+
+        def sleep(seconds):
+            if len(calls) == 2:
+                raise InterruptedError
+            clock[0] += seconds
+
+        with (mock.patch.object(runner.time, "time", side_effect=lambda: clock[0]),
+              mock.patch.object(runner.time, "sleep", side_effect=sleep), self.assertRaises(InterruptedError)):
+            campaign.run_campaign(self.root, max_wait=55, interval=20, execute=execute, log_event=mock.Mock())
+        self.assertEqual(calls, [(fresh, 55), (pending, 300)])
+
     def test_campaign_once_defers_a_queued_repeat_of_a_cooling_legacy_job(self):
         backlog = self.root / "backlog"
         backlog.mkdir()
@@ -458,7 +643,7 @@ class ResearchRunnerTests(TestCase):
             self.assertEqual(campaign.run_campaign(self.root, once=True, execute=execute,
                                                    log_event=mock.Mock()), 0)
         execute.assert_called_once_with(self.root, fresh, *campaign.campaign_paths(self.root, fresh),
-                                      max_wait=600, concurrency=3)
+                                      max_wait=600, concurrency=None)
         self.assertTrue(waiting.is_file())
 
         anchor.pop("slot_reservation_state")
@@ -598,6 +783,24 @@ class ResearchRunnerTests(TestCase):
                     campaign.process(self.root, self.root, log, self.spec, {"rows": rows})
         self.assertEqual([call.args[1] for call in cli.call_args_list], ["triage", "promote"])
         self.assertTrue((self.root / "campaign-freeze-candidate.json").is_file())
+
+    def test_campaign_preserves_metadata_request_without_repeating_platform_checks(self):
+        choice = self.root / "campaign-freeze-candidate.json"
+        selection.freeze(choice, source="triage", rows=[{"alpha_id": "candidate"}])
+        action = {"action": "complete_seed_metadata", "argv": [
+            "python", "research_cli.py", "promote", "candidate", "--selection", str(choice)],
+            "required_options": ["--name", "--category", "--tags", "--description"]}
+        data = {"alpha_id": "candidate", "freeze_path": str(choice),
+                "outcome": "metadata_required", "buffered": False,
+                "metadata_required": ["name", "description"], "next_action": action}
+        (self.root / "promote-candidate.json").write_text(json.dumps({
+            "command": "promote", "ok": True, "data": data}), encoding="utf-8")
+        with mock.patch.object(campaign, "run_cli", side_effect=AssertionError("repeated validation")):
+            for _ in range(2):
+                result = campaign.promote(self.root, self.root, "candidate", "base", choice)
+                self.assertEqual(result["outcome"], "metadata_required")
+                self.assertEqual(result["next_action"], action)
+                self.assertEqual(result["metadata_required"], ["name", "description"])
 
     def test_campaign_archives_unresolved_check_only_after_a_retry(self):
         attempted = []

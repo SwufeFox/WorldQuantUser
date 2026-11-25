@@ -51,6 +51,8 @@ def _load(path, fingerprint):
         or not isinstance(journal.get("not_submitted", {}), dict)
         or not isinstance(journal.get("quick_resolved", {}), dict)
         or any(not isinstance(value, dict) for value in journal.get("quick_resolved", {}).values())
+        or not isinstance(journal.get("resolved", {}), dict)
+        or any(not isinstance(value, dict) for value in journal.get("resolved", {}).values())
     ):
         raise cache_store.CacheError("simulation slot journal cannot be read safely: %s" % (error or path))
     return journal
@@ -154,6 +156,84 @@ def release_url(url):
         cache_store.write_json_atomic(str(path), journal)
         released.extend(dropped)
     return released
+
+
+ORPHAN_RELEASE_STATUSES = TERMINAL_STATUSES
+
+
+def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0,
+                      now=None, deadline=None, ordinary_only=False):
+    """Release only observed terminal acceptances, retaining their receipts.
+
+    ``poll(url)`` supplies an authenticated observation for that exact URL.
+    Age is diagnostic: time passing, a failed read or HTTP 404 cannot prove a
+    live job finished or an ambiguous POST never happened. Network reads run
+    outside the journal lock, and changed reservations are not overwritten.
+    """
+    fingerprint = _fingerprint(account)
+    if not fingerprint:
+        return {"released": [], "kept": [], "state": "account_unknown"}
+    path, lock = _paths(fingerprint)
+    stamp = time.time() if now is None else now
+
+    def lock_options():
+        return {} if deadline is None else {"timeout": max(0, deadline - time.monotonic())}
+
+    # Snapshot under the lock, then poll outside it. Holding the lock across
+    # network reads made every other writer time out at 60s.
+    with cache_store.file_lock(lock, **lock_options()):
+        snapshot = dict((_load(path, fingerprint).get("reservations") or {}))
+
+    decisions, kept = [], []
+    for key, entry in snapshot.items():
+        if ordinary_only and entry.get("quick_job_key"):
+            continue
+        url = entry.get("progress_url")
+        created = _quota_number(entry.get("created_at"))
+        age_min = max(0, stamp - created) / 60.0 if created is not None else None
+        item = {"id": key, "age_min": round(age_min, 1) if age_min is not None else None,
+                "overdue": age_min is not None and age_min > min(max_age_min, hard_max_age_min)}
+        unavailable = (entry.get("state") != "accepted" or not url
+                       or entry.get("manual_location") or entry.get("identity_unverified")
+                       or (entry.get("quick_job_key") and _quick_owner_is_live(entry.get("quick_owner"))))
+        if unavailable:
+            kept.append({**item, "status": None, "reason": "acceptance_unverified_or_owned"})
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            kept.append({**item, "status": None, "reason": "recovery_budget_exhausted"})
+            continue
+        answer = poll(url)
+        if isinstance(answer, dict):
+            status, alpha = answer.get("status"), answer.get("alpha") or answer.get("alpha_id")
+        else:
+            status, alpha = answer, None
+        status = status.upper() if isinstance(status, str) else None
+        if status in ORPHAN_RELEASE_STATUSES:
+            decisions.append({**item, "status": status, "alpha": alpha})
+        else:
+            kept.append({**item, "status": status,
+                         "reason": "platform_pending" if status not in {None, "NOT_FOUND"} else "outcome_unknown"})
+
+    released = []
+    if decisions:
+        with cache_store.file_lock(lock, **lock_options()):
+            journal = _load(path, fingerprint)
+            reservations = journal.get("reservations") or {}
+            for item in decisions:
+                key = item["id"]
+                if reservations.get(key) != snapshot[key]:
+                    kept.append({**item, "reason": "reservation_changed"})
+                    continue
+                entry = reservations.pop(key)
+                collection = "quick_resolved" if entry.get("quick_job_key") else "resolved"
+                journal.setdefault(collection, {})[key] = {
+                    **entry, "quick_owner": None, "resolved_at": stamp,
+                    "terminal_result": {"status": item["status"], "alpha_id": item["alpha"]},
+                }
+                released.append(item)
+            if released:
+                cache_store.write_json_atomic(path, journal)
+    return {"released": released, "kept": kept}
 
 
 def _active_limit(journal, limit):
@@ -538,6 +618,25 @@ def _restore_unposted(record):
     return True
 
 
+def _restore_terminal(record, entry):
+    receipt = entry.get("terminal_result") or {}
+    if not isinstance(receipt, dict):
+        return False
+    status, alpha_id = receipt.get("status"), receipt.get("alpha_id")
+    if status not in TERMINAL_STATUSES:
+        return False
+    record.update(status=status, simulation_status=status, submission_attempted=True,
+                  slot_reservation_state="released")
+    record.pop("progress_url", None)
+    record.pop("next_poll_at", None)
+    record.pop("poll_after_seconds", None)
+    if alpha_id:
+        record.update(alpha_id=alpha_id, status="PENDING", metrics_pending=True)
+    if status in TERMINAL_FAILURE_STATUSES and not record.get("error"):
+        record["error"] = "simulation ended with %s" % status
+    return True
+
+
 def restore_record(record, account=None):
     """Restore a missing progress URL or a definitely unposted attempt.
 
@@ -549,13 +648,18 @@ def restore_record(record, account=None):
     if terminal and account is None:
         return False
     identity = _reservation_identity(record, account)
-    if not identity or record.get("progress_url") or terminal:
+    if not identity or terminal:
         return False
     fingerprint = identity["account_fingerprint"]
     path, lock = _paths(fingerprint)
     # Writers replace the complete journal atomically.
     journal = _load(path, fingerprint)
     attempt = identity["id"]
+    resolved = journal.get("resolved", {}).get(attempt)
+    if resolved and _restore_terminal(record, resolved):
+        return True
+    if record.get("progress_url"):
+        return False
     entry = journal["reservations"].get(attempt, {})
     if attempt in journal.get("not_submitted", {}):
         return _restore_unposted(record)

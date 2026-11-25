@@ -301,6 +301,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertEqual(rows[0]["alpha_id"], "recovered")
         self.assertEqual(rows[1]["status"], "FAILED")
         self.assertFalse(rows[1]["submission_attempted"])
+        self.assertTrue(rows[1]["submission_refused"])
         self.assertEqual(rows[1]["settings_capabilities"]["unsupported"][0]["setting"], "decay")
         self.assertEqual(simulation_slots.snapshot(ACCOUNT, 3)["active"], 0)
 
@@ -451,6 +452,21 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         self.assertEqual(simulation_slots.snapshot(ACCOUNT, 1)["active"], 0)
         self.assertEqual(events[-1][0], "deferred")
         self.assertFalse(events[-1][1]["submission_attempted"])
+        self.assertFalse(events[-1][1].get("submission_refused"))
+
+    def test_definite_request_refusal_is_terminal_for_this_request_and_survives_resume(self):
+        response = requests.Response()
+        response.status_code = 400
+        response._content = b'{"message":"invalid expression"}'
+        failure = requests.HTTPError("request refused", response=response)
+        with mock.patch.object(ml, "submit_single_simulation", side_effect=failure) as post:
+            records = self.simulate(concurrency=1)
+            resumed = self.simulate(concurrency=1, initial_records=records)
+        post.assert_called_once()
+        self.assertEqual(resumed[0]["status"], "FAILED")
+        self.assertTrue(resumed[0]["submission_refused"])
+        self.assertFalse(resumed[0]["submission_attempted"])
+        self.assertEqual(simulation_slots.snapshot(ACCOUNT, 1)["active"], 0)
 
     def test_rate_limit_refusal_releases_but_transport_uncertainty_retains(self):
         for error, active in [(ml.RateLimited("refused"), 0), (requests.Timeout("uncertain"), 1)]:
@@ -458,6 +474,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
                 records = self.simulate(concurrency=1)
             self.assertEqual(simulation_slots.snapshot(ACCOUNT, 1)["active"], active)
             self.assertEqual(records[0]["status"], "QUEUED" if active == 0 else "UNKNOWN_SUBMISSION")
+            self.assertFalse(records[0].get("submission_refused"))
 
     def test_nonterminal_poll_retains_accepted_reservation(self):
         with mock.patch.object(ml, "submit_single_simulation", return_value="https://api.worldquantbrain.com/simulations/offline"), \

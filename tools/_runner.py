@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import glob
+import hashlib
 import json
 import math
 import os
@@ -20,6 +21,7 @@ import research_paths
 import simulation_slots
 
 REPO = Path(__file__).resolve().parents[1]
+CLI_TIMEOUT_GRACE_SECONDS = 15
 _FINISHED = alpha_registry.FINISHED_STATUSES | {"ACTIVE", "SUBMITTED", "UNSUBMITTED"}
 _FAILED = simulation_slots.TERMINAL_FAILURE_STATUSES | {"FAILED"}
 _RETRYABLE = {"RATE_LIMITED", "SERVICE_ERROR", "AUTH_MISSING", "AUTH_FAILED", "AUTH_CAPTCHA", "INTERRUPTED", "TIMEOUT",
@@ -36,6 +38,7 @@ class CliResult:
     data: dict
     detail: str = ""
     code: str = ""
+    error_details: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +53,7 @@ class _ProbeSchedule:
     priority: int = 0
     poll_at: float | None = None
     recovery: bool = False
+    terminal: bool = False
     occupied: frozenset[tuple[str, str]] = frozenset()
     queued: frozenset[tuple[str, str]] | None = None
     native_admission_scope: tuple[str, int, int] | None = None
@@ -82,7 +86,9 @@ def run_cli(root, *args, timeout=None, input_text=None):
             return CliResult(True, data)
         error = payload.get("error") or {}
         if isinstance(error, dict) and error.get("code"):
-            return CliResult(False, data, error.get("message") or error["code"], error["code"])
+            details = error.get("details")
+            return CliResult(False, data, error.get("message") or error["code"], error["code"],
+                             details if isinstance(details, dict) else None)
     detail = (completed.stderr or completed.stdout).strip()[-600:]
     return CliResult(False, {}, detail or f"invalid CLI response (exit {completed.returncode})",
                      "INVALID_RESPONSE")
@@ -99,11 +105,15 @@ def probe_state(data):
             and all(type(execution.get(key)) is int for key in (
                 "total", "finished", "terminal", "unknown_submission"))):
         next_actions = {item.get("action") for item in actions if isinstance(item, dict)}
-        if execution["unknown_submission"]:
+        if execution["unknown_submission"] or any(row.get("submission_state") == "unknown_submission" for row in rows):
             return "deferred", "recover"
         if execution["finished"] + execution["terminal"] >= execution["total"]:
             state = "failed" if execution["terminal"] else "done"
             return state, None
+        if "resume" in next_actions and any(row.get("submission_state") == "not_submitted" for row in rows):
+            # Resume also recovers accepted rows, then refills available slots.
+            # An ambiguous POST above still forces read-only reconciliation.
+            return "deferred", "resume"
         if "recover" in next_actions:
             return "deferred", "recover"
         if "resume" in next_actions:
@@ -156,7 +166,11 @@ def _saved_probe(preview, batch):
             or preview.get("breeding_source") != saved.get("breeding_source")
             or ("track" in saved and preview.get("track") != saved["track"])
             or roles(preview.get("results") or []) != roles(saved.get("arms") or [])):
-        return CliResult(False, {}, f"queued spec does not match {batch.name}; choose a new spec name")
+        return CliResult(False, {},
+                         f"queued spec does not match {batch.name}; inspect the original spec and checkpoint, "
+                         "then restore the queued spec or deliberately create a separate experiment",
+                         error_details={"reason": "batch_identity_mismatch", "batch_path": str(batch),
+                                        "next_action": "inspect_saved_identity"})
     return CliResult(True, saved)
 
 
@@ -220,7 +234,14 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
     if saved_path is not None:
         saved = _saved_probe(identity, saved_path)
         if not saved.ok:
-            return ProbeRun("failed", {}, saved.detail)
+            data = {}
+            if saved.error_details:
+                data["diagnosis"] = {"state": "blocked", "reason": saved.error_details["reason"],
+                    "batch_path": str(saved_path), "spec_path": str(spec),
+                    "next_action": {"action": saved.error_details["next_action"],
+                        "argv": ["python", "research_cli.py", "--research-dir", str(root),
+                                 "probe", str(spec), "--dry-run"]}}
+            return ProbeRun("failed", data, saved.detail)
         state, action = probe_state(saved.data)
         if state == "failed" and not (saved.data.get("execution") or {}).get("finished"):
             return ProbeRun(state, {}, f"saved batch has terminal failures ({saved_path.name})")
@@ -245,10 +266,18 @@ def run_probe(root, spec, batch, receipt, *, max_wait, concurrency=None,
     if native_poll_once:
         run_options += ("--native-poll-once",)
     result = run_cli(root, "probe", *arguments, *wait, *budget, *run_options, "--save", receipt,
-                     timeout=max_wait + 900)
+                     timeout=max_wait + CLI_TIMEOUT_GRACE_SECONDS)
     if not result.ok:
         state = "deferred" if result.code in _RETRYABLE else "failed"
-        return ProbeRun(state, result.data, result.detail)
+        details = result.error_details or {}
+        diagnosis = {"state": "blocked" if details.get("reason") == "batch_locked" else state,
+                     "reason": details.get("reason") or result.code.lower(),
+                     "error_code": result.code,
+                     "batch_path": str(saved_path or batch),
+                     "next_action": {"action": "status", "argv": ["python", "research_cli.py",
+                         "--research-dir", str(root), "campaign", "status"]}}
+        diagnosis.update({key: details[key] for key in ("batch_path", "lock_path", "owner") if key in details})
+        return ProbeRun(state, {**result.data, "diagnosis": diagnosis}, result.detail)
     state, action = probe_state(result.data)
     detail = {"done": "all arms finished", "deferred": f"awaiting probe --{action}",
               "failed": "one or more arms failed or the receipt has no arm evidence"}[state]
@@ -319,6 +348,95 @@ def probe_poll_at(document):
     return min(times, default=None) if finished == execution["finished"] else None
 
 
+def probe_diagnosis(document, batch, *, root=None):
+    """Explain the next safe operation from saved evidence, without platform calls."""
+    state, action = probe_state(document)
+    execution = document.get("execution") or {}
+    execution = execution if isinstance(execution, dict) else {}
+    rows = document.get("rows") or []
+    next_action = None
+    if action:
+        prefix = ["python", "research_cli.py", *(["--research-dir", str(root)] if root else [])]
+        next_action = {"action": action, "argv": [*prefix, "probe",
+                                                     "--" + action, str(batch)]}
+    if execution.get("unknown_submission") or any(
+            row.get("submission_state") == "unknown_submission" for row in rows
+            if isinstance(row, dict)):
+        return {"state": "blocked", "reason": "submission_unknown", "next_action": next_action}
+    if state in {"done", "failed"}:
+        return {"state": state, "reason": "complete" if state == "done" else "terminal_failure",
+                "next_action": next_action}
+    poll_at = probe_poll_at(document)
+    deferred = document.get("preflight_deferred")
+    field_waits = [entry.get("retry_at") for entry in deferred.values() if isinstance(entry, dict)] \
+        if isinstance(deferred, dict) else []
+    if poll_at is not None and poll_at > time.time():
+        return {"state": "waiting", "reason": "preflight_backoff" if poll_at in field_waits else "platform_pending",
+                "next_poll_at": poll_at, "next_action": next_action}
+    events = document.get("scheduling")
+    last = events[-1] if isinstance(events, list) and events and isinstance(events[-1], dict) else {}
+    if action == "resume" and last.get("reason") in {"shared_slots_occupied", "submission_cooldown"}:
+        return {"state": "waiting", "reason": last["reason"], "next_action": next_action}
+    return {"state": "ready" if action == "resume" else "waiting",
+            "reason": "queued_work" if action == "resume" else "platform_pending", "next_action": next_action}
+
+
+def _progress_fingerprint(document):
+    """Measure evidence changes, excluding saves, retry clocks and scheduling events."""
+    if not isinstance(document, dict):
+        return None
+    keys = ("label", "status", "submission_state", "alpha_id", "progress_url", "simulation_status",
+            "multi_parent_url", "multi_parent_terminal", "metrics_pending", "train_sharpe", "train_fitness",
+            "train_sharpe_h1", "train_sharpe_h2", "failing_checks")
+    deferred, proofs = document.get("preflight_deferred"), {}
+    if isinstance(deferred, dict):
+        for name, entry in deferred.items():
+            fields = entry.get("required_fields") if isinstance(entry, dict) else None
+            if isinstance(fields, dict):
+                proofs[name] = fields.get("verified_ids")
+    rows = document.get("rows")
+    rows = rows if isinstance(rows, list) else []
+    evidence = {"execution": document.get("execution"),
+                "rows": [{key: row.get(key) for key in keys} for row in rows
+                         if isinstance(row, dict)],
+                "field_proofs": proofs}
+    return hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _saved_progress(batch):
+    try:
+        document = json.loads(batch.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return _progress_fingerprint(document)
+
+
+def recent_campaign_attempts(root):
+    """Read a bounded tail of the existing log; old observations are never live locks."""
+    try:
+        with (Path(root) / "campaign-log.jsonl").open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            start = max(0, handle.tell() - 256 * 1024)
+            handle.seek(start)
+            if start:
+                handle.readline()
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return {}
+    result = {}
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if (isinstance(event, dict) and isinstance(event.get("spec"), str)
+                and isinstance(event.get("progress"), dict)):
+            result[event["spec"]] = event
+        elif isinstance(event, dict) and event.get("kind") == "busy":
+            result[None] = event
+    return result
+
+
 def _recovery_schedule(root, batch, receipt, include_requests):
     if not batch.is_file():
         if not receipt.is_file():
@@ -358,6 +476,7 @@ def _recovery_schedule(root, batch, receipt, include_requests):
             scope = (fingerprint, concurrency, multi_size)
     return _ProbeSchedule(priority=2 if wholly_queued else 0,
                           poll_at=probe_poll_at(document), recovery=recovery,
+                          terminal=bool(rows) and state in {"done", "failed"},
                           occupied=_watch_requests(active) if include_requests else frozenset(),
                           queued=_watch_requests(queued) if include_requests else frozenset(),
                           native_admission_scope=scope, scheduling_events=len(events) if isinstance(events, list) else 0)
@@ -376,6 +495,17 @@ def _watch_occupy(occupied, spec, requests):
         occupied.setdefault(key, set()).add(spec)
 
 
+def _watch_refresh(occupied, spec, schedule):
+    """Only saved terminal evidence releases an owner's request identities."""
+    if schedule.terminal:
+        for key, owners in list(occupied.items()):
+            owners.discard(spec)
+            if not owners:
+                del occupied[key]
+    else:
+        _watch_occupy(occupied, spec, schedule.occupied)
+
+
 def _watch_conflict(spec, requests, occupied):
     if not occupied:
         return None
@@ -388,8 +518,14 @@ def _watch_conflict(spec, requests, occupied):
         except CliError:
             # The executor reports invalid Probe specs and handles local SPC specs.
             return None
-    conflicts = {owner for key in requests for owner in occupied.get(key, ()) if owner != spec}
+    # Moving or deleting a spec says nothing about whether its POST was accepted.
+    # _watch_refresh releases ownership only from saved terminal evidence.
+    conflicts = {owner for key in requests for owner in occupied.get(key, ())
+                 if owner != spec}
     return min(conflicts, default=None)
+
+
+STALLED_ROUNDS = 3
 
 
 def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
@@ -413,17 +549,35 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
             watch = schedule_recovery and not once
             guard = schedule_recovery and not recover_only
             full_recovery_turn = set()
+            attempts = recent_campaign_attempts(root)
+            occupied = {}
+            saved_owners = {}
+            if guard:
+                # Seed old archived work once. Later sweeps reread only owners
+                # whose checkpoint still has accepted or ambiguous requests.
+                for state in ("done", "failed"):
+                    for archived in (inbox / state).glob("*.json"):
+                        owner = inbox / archived.name
+                        saved_owners.setdefault(owner, paths(owner))
             while True:
                 scheduled = []
-                occupied = {}
                 specs = sorted(inbox.glob("*.json"))
                 full_recovery_turn.intersection_update(specs)
+                for owner, (batch, receipt) in list(saved_owners.items()):
+                    if owner in specs:
+                        continue
+                    owner_schedule = _recovery_schedule(root, batch, receipt, True)
+                    _watch_refresh(occupied, owner, owner_schedule)
+                    if not any(owner in owners for owners in occupied.values()):
+                        saved_owners.pop(owner)
                 for spec in specs:
                     batch, receipt = paths(spec)
                     schedule = (_recovery_schedule(root, batch, receipt, guard)
                                 if schedule_recovery else _ProbeSchedule())
                     scheduled.append((spec, batch, receipt, schedule))
-                    _watch_occupy(occupied, spec, schedule.occupied)
+                    _watch_refresh(occupied, spec, schedule)
+                    if schedule.occupied and not schedule.terminal:
+                        saved_owners[spec] = (batch, receipt)
                 if schedule_recovery:
                     scheduled.sort(key=lambda item: (item[3].priority,
                         launch_rank(item[0]) if launch_rank and guard and item[3].priority == 2 else 0))
@@ -445,13 +599,25 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                         continue
                     log({"kind": "start", "spec": spec.name})
                     wait = max_wait
+                    before = _saved_progress(batch)
+                    source_fingerprint = None
                     try:
                         source = spec.read_bytes()
+                        source_fingerprint = hashlib.sha256(source).hexdigest()
                         recovery = schedule.recovery or recover_only
                         owner = _watch_conflict(spec, schedule.queued, occupied) if not recovery and guard else None
                         if owner is not None:
-                            result = ProbeRun("deferred", {}, f"waiting for matching request in {owner.name}")
+                            owner_batch, _ = paths(owner)
+                            diagnosis = {"state": "blocked", "reason": "matching_request", "owner_spec": str(owner),
+                                         "owner_batch": str(owner_batch), "next_action": {"action": "recover",
+                                             "argv": ["python", "research_cli.py", "--research-dir", str(root),
+                                                      "probe", "--recover", str(owner_batch)]}}
+                            result = ProbeRun("deferred", {"diagnosis": diagnosis},
+                                              f"waiting for matching request in {owner.name}")
                         else:
+                            # A local turn is not the remote job's lifetime. Give
+                            # other ready work a turn; untimed recovery gets a
+                            # full-budget turn next time if the short read deferred.
                             if ready and recovery and schedule.priority == 0 and spec not in full_recovery_turn:
                                 wait = min(max_wait, interval)
                             full_recovery_turn.discard(spec)
@@ -467,10 +633,15 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                             shutil.move(spec, destination)
                     except Exception as error:
                         # Leave the spec and any saved POST intent for an exact retry.
-                        result = ProbeRun("deferred", {}, f"{type(error).__name__}: {error}")
+                        result = ProbeRun("deferred", {"diagnosis": {"state": "blocked", "reason": "runner_error",
+                            "next_action": {"action": "status", "argv": ["python", "research_cli.py",
+                                "--research-dir", str(root), "campaign", "status"]}}},
+                            f"{type(error).__name__}: {error}")
                     if watch:
                         updated = _recovery_schedule(root, batch, receipt, guard)
-                        _watch_occupy(occupied, spec, updated.occupied)
+                        _watch_refresh(occupied, spec, updated)
+                        if updated.occupied and not updated.terminal:
+                            saved_owners[spec] = (batch, receipt)
                         events = result.data.get("scheduling")
                         # Reuse only fresh authenticated capacity evidence for this sweep.
                         # Saved evidence alone can outlive a released slot or account change.
@@ -485,8 +656,32 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                         elif result.state == "deferred" and wait < max_wait:
                             # Untimed recovery can need longer than a short turn.
                             full_recovery_turn.add(spec)
-                    log({"kind": result.state, "spec": spec.name, "detail": result.detail,
-                         "batch": str(batch), "receipt": str(receipt)})
+                    after = _saved_progress(batch)
+                    previous = attempts.get(spec.name) or {}
+                    if previous.get("source_fingerprint") != source_fingerprint:
+                        previous = {}
+                    progress = previous.get("progress") or {}
+                    prior_rounds = progress.get("unchanged_rounds", 0)
+                    prior_rounds = prior_rounds if type(prior_rounds) is int and prior_rounds >= 0 else 0
+                    changed = (before != after or result.state in {"done", "failed"}
+                               or "progress_fingerprint" in previous and previous["progress_fingerprint"] != after)
+                    rounds = 0 if changed else prior_rounds + 1
+                    diagnosis = result.data.get("diagnosis")
+                    if not isinstance(diagnosis, dict):
+                        diagnosis = (probe_diagnosis(result.data, batch, root=root) if result.data.get("rows") else
+                                     {"state": result.state, "reason": "no_progress_observed" if result.state == "deferred"
+                                      else "complete" if result.state == "done" else "terminal_failure"})
+                    observed = time.time()
+                    timed_wait = type(diagnosis.get("next_poll_at")) in (int, float) and diagnosis["next_poll_at"] > observed
+                    progress = {"changed": changed, "unchanged_rounds": rounds,
+                                "last_progress_at": observed if changed else progress.get("last_progress_at"),
+                                "stalled": result.state == "deferred" and rounds >= STALLED_ROUNDS and not timed_wait}
+                    event = {"kind": result.state, "spec": spec.name, "detail": result.detail,
+                             "batch": str(batch), "receipt": str(receipt), "observed_at": observed,
+                             "diagnosis": diagnosis, "progress": progress, "source_fingerprint": source_fingerprint,
+                             "progress_fingerprint": after}
+                    attempts[spec.name] = event
+                    log(event)
                     if once:
                         return {"done": 0, "failed": 1, "deferred": 3}[result.state]
                 if skipped_launches:
@@ -500,5 +695,8 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                 delay = interval if next_poll is None else min(interval, max(0, next_poll - time.time()))
                 time.sleep(delay)
     except cache_store.LockTimeout:
-        log({"kind": "busy", "detail": f"another runner is active for {inbox}"})
+        log({"kind": "busy", "detail": f"another runner is active for {inbox}",
+             "diagnosis": {"state": "blocked", "reason": "runner_locked", "lock_path": str(inbox / ".runner.lock"),
+                 "next_action": {"action": "status", "argv": ["python", "research_cli.py",
+                     "--research-dir", str(root), "campaign", "status"]}}})
         return 3

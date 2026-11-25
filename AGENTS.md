@@ -1,27 +1,74 @@
 # AGENTS.md
 
-## Start with the current question
+## Follow one execution path
 
 ```bash
 python research_cli.py brief
+python research_cli.py campaign status --limit 10
 ```
 
 Read `research_dir`, source existence, open questions and recent evidence before
 choosing a direction. Missing or empty local records do not mean a direction is
-untested. Check the workspace before drawing conclusions from an empty brief.
+untested. Use the same research directory for every step.
 
-Discover only the interface needed next:
+| Step | Command and decision |
+| --- | --- |
+| Inspect | `brief` and `campaign status` identify existing work and its canonical batch. Recover that work before drafting a replacement. |
+| Prepare | Put the question in the spec's `idea`, declare its mechanism and stable arm labels, then `campaign preview SPEC.json`. Read `would_block`, `blocking`, `gate_blocking` and the returned recovery references. |
+| Execute | Put the reviewed spec in `backlog/`; one owner runs `campaign run --watch --defer-quick-pnl --stream`. That owner handles submission and recovery. |
+| Review | `ledger analyze --group-by scope`, then narrow to the mechanism and inspect failures as well as usable results. |
+| Validate | Use the frozen FULL training selection in `promote ALPHA_ID --selection SELECTION.json`, supplying `--name`, `--category`, `--tags` and `--description` once. Platform submission uses its existing authorized entry point. |
 
-```bash
-python research_cli.py help                 # command map, only when needed
-python research_cli.py help catalog fields  # one task's options and examples
-python research_cli.py schema probe         # one command's machine contract
-```
+After execution starts, keep the spec, arm labels, settings and batch path fixed.
+Use the returned checkpoint path, not a reconstructed filename. An edited
+hypothesis is a new spec; a retry is the same checkpoint. Do not rename arms or
+switch runners to evade a duplicate or unresolved submission.
 
-The full `schema` is for tooling integrations, not routine session startup.
-Do not read `research_cli.py` to learn the interface. The question-to-command map
-and research workflow live in [docs/tooling.md](docs/tooling.md); open the relevant
-section when needed, rather than loading every recipe.
+Subagents may draft separate specs, inspect receipts and analyse results. Only
+one owner advances a queue or batch. While Campaign owns it, other agents use
+read-only status/inspection; they do not start another Campaign, direct Probe
+resume, or compatibility runner against the same work. Hand off the checkpoint
+after the existing writer exits. A lock file's presence is not proof of a live owner.
+
+The step-by-step guide and state table live in
+[docs/ledger-workflow.md](docs/ledger-workflow.md). Use `help COMMAND` for the
+next command's options and examples; use `schema COMMAND` for its machine
+contract. The full schema and source files are not startup reading.
+
+## Read progress literally
+
+- `ok: true` means the command was handled. For a saved batch, start with
+  Campaign's current `jobs[].diagnosis` and its `next_action.argv`; a fresh spec
+  without a batch has `state: queued`. Use saved task IDs and Probe's
+  `execution` / `next_actions` to inspect the underlying evidence.
+- Accepted simulation: recover the original task. Unknown simulation POST:
+  reconcile its identity before any new POST. Final-alpha `UNCERTAIN` is a
+  separate submission state; read its saved submission outcome.
+- A local wait budget ending does not cancel a platform task. A retry time is
+  a reason to wait, not a reason to start another resume loop.
+- Report changes since the previous observation: newly accepted arms, new
+  terminal results, new recorded evidence, the blocker and the next action/time.
+  Repeated deferred receipts, a live process or growing logs are not output.
+- `last_attempt` and `last_runner_event` are historical observations. Check
+  `matches_current_progress` before using an old attempt as current evidence.
+  `progress.stalled` requests diagnosis; it does not authorize an unlock or POST.
+- If receipts stop changing, say that there is no new progress and identify
+  what evidence is missing. Do not silently repeat, delete locks or release
+  ambiguous reservations by age. An OMP/subagent wait is host orchestration;
+  report the pending agent/task separately from BRAIN and machine health.
+- Terminal execution failures belong in the same ledger with their input and
+  error evidence; they are not automatic scientific rejections. Check
+  `recording.recorded_failures` and `recording.missing_idea_count`. An idea comes
+  from the arm or spec, never from a guessed explanation of its filename.
+- Research seeds are the ledger's experiment records, including failed attempts.
+  Submission-candidate metadata belongs to the existing buffer/seed store and is
+  written by promotion. Supply a nonempty name, an allowed category, at least one
+  tag and a rationale of at least 100 characters after trimming outer whitespace.
+  Describe the actual hypothesis and evidence; do not invent a rationale to fill
+  the field or maintain another seed-tracking loop.
+  `metadata_required` means validation reached missing candidate metadata; append
+  the listed `required_options` to `next_action.argv` and reuse its frozen choice.
+  It does not mean the candidate was buffered or that a new simulation is needed.
 
 ## Research loop
 
@@ -59,13 +106,16 @@ section when needed, rather than loading every recipe.
 
 ## Execution invariants
 
-1. Always `simulate FILE --dry-run` / `probe FILE --dry-run` before a real run.
+1. Preview before a real run: `campaign preview FILE` for the default queue,
+   or `simulate FILE --dry-run` / `probe FILE --dry-run` for a standalone task.
    Simulations consume time and platform capacity; account limits are live facts.
    Reuse stored results through `alpha get` / `alpha list` instead of rerunning.
    Probe preview can point to past results and a recoverable job in the
    expected batch file. References do not start jobs or substitute results.
-   If a run stops, inspect its saved progress first: `resume CHECKPOINT` for
-   simulation jobs, `probe --recover BATCH` for probe evidence. To inspect a
+   If a run stops, inspect its saved progress first. The execution owner uses
+   `probe --resume BATCH` to advance known queued/accepted work and
+   `probe --recover BATCH` for read-only platform recovery. Standalone simulation
+   jobs use `resume CHECKPOINT`. To inspect a
    platform task started elsewhere, use `probe --from-simulation ID` for child
    states and Alpha IDs. Reuse saved evidence when stdout was lost.
 2. Check `auth check` before designing around an unfamiliar account or region.

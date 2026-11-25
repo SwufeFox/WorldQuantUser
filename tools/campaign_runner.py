@@ -111,7 +111,7 @@ def promote(root, results, alpha_id, label, selection_path):
     data = receipt["data"] if receipt else {}
     if receipt and Path(data["freeze_path"]).resolve() != selection_path.resolve():
         raise ValueError(f"promotion receipt uses a different choice for {alpha_id}")
-    if (not receipt or not receipt.get("ok") or data.get("outcome") not in {"buffered", "rejected"}
+    if (not receipt or not receipt.get("ok") or data.get("outcome") not in {"buffered", "rejected", "metadata_required"}
             or _promotion_pending(data)):
         response = run_cli(root, "promote", alpha_id, "--note",
                            f"backlog admission: {label}; training gate cleared.",
@@ -125,6 +125,7 @@ def promote(root, results, alpha_id, label, selection_path):
     validation = data.get("validate") or {}
     return {"alpha_id": alpha_id, "outcome": data.get("outcome"),
             "reasons": data.get("reasons"),
+            **{key: data[key] for key in ("metadata_required", "next_action") if key in data},
             "self_correlation": ((check.get("checks") or {}).get("SELF_CORRELATION") or {}).get("value"),
             "test_sharpe": validation.get("test_sharpe"), "retention": validation.get("retention")}
 
@@ -202,7 +203,7 @@ def campaign_paths(root, spec):
     return results / f"{stem}-batch.json", results / f"{stem}-result.json"
 
 
-def run_campaign(root, *, once=False, max_wait=600, interval=30, concurrency=3,
+def run_campaign(root, *, once=False, max_wait=600, interval=30, concurrency=None,
                  log_event=None, execute=None, validate=True, multi_size=None,
                  recover_only=False, strict_gate=False, launch_rank=None):
     results = root / "backlog-results"

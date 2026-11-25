@@ -240,6 +240,9 @@ def shelf_context(monkeypatch, tmp_path):
     selection.freeze(chosen, source="triage", rows=[{"alpha_id": "A"}])
     args = Namespace(alpha_id="A", buffer=str(tmp_path / "shelf.jsonl"),
                      registry=str(tmp_path / "ledger.jsonl"), selection=str(chosen),
+                     name="Synthetic checked candidate", category="PRICE_VOLUME", tags=["synthetic"],
+                     description="Synthetic offline metadata for the shelf eligibility regression. " * 2,
+                     seeds=str(tmp_path / "seeds.jsonl"),
                      note=None, max_wait=None, yes=False, force=False)
     monkeypatch.setattr(buffer_cmd, "with_session", lambda _args, work: work(object()))
     monkeypatch.setattr(ml, "fetch_alpha_metrics", lambda *_args: {

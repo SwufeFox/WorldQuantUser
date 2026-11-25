@@ -31,9 +31,11 @@ from check_evidence import normalize_checks, summarize_checks
 import machine_lib as ml
 import research_paths
 
-from .runtime import CliError, with_session
+from .runtime import CliError, protect_output, with_session
 
 BUFFER_FILENAME = "submit-buffer.jsonl"
+SEEDS_FILENAME = "seeds.jsonl"
+SEED_CATEGORIES = ("ANALYST", "FUNDAMENTAL", "PRICE_VOLUME", "SENTIMENT", "VOLUME")
 
 #: Above this, the platform would refuse the submission.
 GATE = 0.70
@@ -176,13 +178,143 @@ def _checks_summary(checks):
     return {key: summary[key] for key in ("passed", "failed", "pending", "warned")}
 
 
+def seeds_path(args=None):
+    explicit = getattr(args, "seeds", None) if args is not None else None
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path(research_paths.research_dir()) / SEEDS_FILENAME
+
+
+def read_seeds(path):
+    """Read seeds without silently discarding damaged or unrelated state."""
+    state = {}
+    if not Path(path).exists():
+        return state
+    for number, line in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError as exc:
+            raise ValueError("seed store contains invalid JSON at line %d" % number) from exc
+        if not isinstance(row, dict) or not ml.valid_simulation_id(row.get("alpha_id")):
+            raise ValueError("seed store has no valid Alpha ID at line %d" % number)
+        state[row["alpha_id"]] = row
+    return state
+
+
+def validate_seed(name, category, tags, description):
+    """Return the list of missing/invalid seed fields; empty means valid."""
+    problems = []
+    if not isinstance(name, str) or not name.strip():
+        problems.append("name")
+    if category not in SEED_CATEGORIES:
+        problems.append("category (one of %s)" % ", ".join(SEED_CATEGORIES))
+    if (not isinstance(tags, (list, tuple)) or not all(isinstance(t, str) for t in tags)
+            or not any(t.strip() for t in tags)):
+        problems.append("tags (at least one)")
+    if not isinstance(description, str) or len(description.strip()) < 100:
+        problems.append("description (>=100 characters)")
+    return problems
+
+
+def _seed_paths(args, *, selection_path=None):
+    """Keep seed writes separate from the shelf and its supporting evidence."""
+    import alpha_registry
+    from .alphas import _submission_path
+
+    shelf, seeds = buffer_path(args).resolve(), seeds_path(args).resolve()
+    protected = {
+        "registry": Path(getattr(args, "registry", None) or alpha_registry.default_registry_path()).expanduser().resolve(),
+        "submission journal": _submission_path(args.alpha_id).resolve(),
+    }
+    selected = selection_path or getattr(args, "selection", None)
+    if selected:
+        protected["selection"] = Path(selected).expanduser().resolve()
+    protect_output(args, shelf, seeds, *protected.values())
+    if shelf == seeds:
+        raise CliError("INVALID_INPUT", "--buffer and --seeds must use distinct paths")
+    for name, target in (("buffer", shelf), ("seeds", seeds)):
+        for kind, source in protected.items():
+            if target == source:
+                raise CliError("INVALID_INPUT", "--%s would overwrite the %s" % (name, kind))
+    return shelf, seeds
+
+
+def submission_seed(args, current):
+    """Validate local seed evidence for a new submission, without writing it."""
+    path = seeds_path(args)
+    try:
+        seed = read_seeds(path).get(args.alpha_id)
+    except (OSError, ValueError) as exc:
+        raise CliError("INVALID_INPUT", "cannot read seed store safely: %s" % exc,
+                       "repair the seed store before starting a new submission") from exc
+    if seed is None:
+        raise CliError("INVALID_INPUT", "%s is not in the seed store" % args.alpha_id,
+                       "add it with buffer add and its name, category, tags and description first")
+    problems = validate_seed(seed.get("name"), seed.get("category"),
+                             seed.get("tags"), seed.get("description"))
+    if problems:
+        raise CliError("INVALID_INPUT", "stored seed missing or invalid: " + ", ".join(problems),
+                       "refresh it with buffer add and complete seed metadata")
+    if current.get("id") not in (None, args.alpha_id):
+        raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested seed")
+    if seed.get("expression") is not None and not isinstance(seed["expression"], str):
+        raise CliError("INVALID_INPUT", "stored seed expression must be text")
+    expression, _description, _ops = ml.regular_expression(current)
+    if seed.get("expression") and expression:
+        import alpha_registry
+        language = ml.alpha_language(current)
+        if alpha_registry.expression_hash(seed["expression"], language) != alpha_registry.expression_hash(expression, language):
+            raise CliError("INVALID_INPUT", "stored seed expression differs from this Alpha ID")
+    saved_settings, observed_settings = seed.get("settings"), current.get("settings")
+    if saved_settings is not None and not isinstance(saved_settings, dict):
+        raise CliError("INVALID_INPUT", "stored seed settings must be an object")
+    if isinstance(saved_settings, dict) and isinstance(observed_settings, dict):
+        if any(saved_settings[key] != observed_settings[key] for key in saved_settings.keys() & observed_settings.keys()):
+            raise CliError("INVALID_INPUT", "stored seed settings differ from this Alpha ID")
+    return seed
+
+
+def _write_seed(path, row):
+    path = Path(path)
+    if not isinstance(row, dict) or not ml.valid_simulation_id(row.get("alpha_id")):
+        raise ValueError("seed requires a valid Alpha ID")
+    problems = validate_seed(row.get("name"), row.get("category"), row.get("tags"), row.get("description"))
+    if problems:
+        raise ValueError("seed missing or invalid: " + ", ".join(problems))
+    with cache_store.file_lock(str(path) + ".lock"):
+        existing = read_seeds(path)
+        if row["alpha_id"] in existing:
+            merged = {**existing[row["alpha_id"]], **row}
+            row = merged
+            comparable = lambda value: {key: item for key, item in value.items() if key != "recorded_at"}
+            if comparable(existing[row["alpha_id"]]) == comparable(row):
+                return False
+        lines = [json.dumps(r, ensure_ascii=False) for r in existing.values()
+                 if r.get("alpha_id") != row["alpha_id"]]
+        lines.append(json.dumps(row, ensure_ascii=False))
+        cache_store.write_text_atomic(path, "\n".join(lines) + "\n")
+        return True
+
+
 def cmd_buffer_add(args, _sink, *, checked=None):
     """Run the checks on a finished alpha and put it on the shelf without submitting."""
     from .alphas import _candidate_role, _reject_quick_simulation, _selection_id
+    if not ml.valid_simulation_id(args.alpha_id):
+        raise CliError("INVALID_INPUT", "invalid Alpha ID")
     role = _candidate_role(args)
+    problems = validate_seed(getattr(args, "name", None), getattr(args, "category", None),
+                             getattr(args, "tags", None), getattr(args, "description", None))
+    if problems:
+        raise CliError("INVALID_INPUT", "seed missing or invalid: " + ", ".join(problems),
+                       "supply name, category, at least one tag, and a >=100 character description")
+    path, seed_path = _seed_paths(args)
     selection_id = _selection_id(args)
     def work(session):
         payload = ml.fetch_alpha_metrics(session, args.alpha_id)
+        if payload.get("id") not in (None, args.alpha_id):
+            raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested seed")
         if str(payload.get("status") or "").upper() in {"ACTIVE", "SUBMITTED"}:
             raise CliError("INVALID_INPUT", "submitted alphas cannot enter the shelf",
                            "use alpha submit --yes to repair their local records")
@@ -193,6 +325,8 @@ def cmd_buffer_add(args, _sink, *, checked=None):
         wait = getattr(args, "max_wait", None)
         computed = checked if checked is not None else ml.fetch_alpha_checks(
             session, args.alpha_id, max_wait_seconds=60 if wait is None else wait)
+        if computed.get("alpha_id") not in (None, args.alpha_id):
+            raise CliError("SERVICE_ERROR", "checks belong to a different Alpha ID")
         checks = normalize_checks(computed.get("checks"))
         split = ml.extract_split(payload) or {}
         train = split.get("train") or {}
@@ -214,6 +348,7 @@ def cmd_buffer_add(args, _sink, *, checked=None):
         return {"event": "shelved", "alpha_id": args.alpha_id,
                 "role": role,
                 "expression": code,
+                "settings": dict(payload.get("settings") or {}),
                 "name": payload.get("name"), "category": payload.get("category"),
                 "status": payload.get("status"),
                 "train": {k: train.get(k) for k in ("sharpe", "fitness", "turnover", "returns", "margin")},
@@ -239,9 +374,32 @@ def cmd_buffer_add(args, _sink, *, checked=None):
             raise CliError("INVALID_INPUT",
                            "%s fails %s" % (args.alpha_id, ", ".join(failed)),
                            "record failed research with ledger record instead")
-        path = buffer_path(args)
-        written = _append(path, entry)
-    return {"path": str(path), "entry": entry, "written": written}
+        seed = {
+            "alpha_id": args.alpha_id,
+            "name": args.name.strip(),
+            "category": args.category,
+            "tags": [t.strip() for t in args.tags if t.strip()],
+            "description": args.description.strip(),
+            "expression": entry.get("expression"),
+            "settings": (entry.get("settings") or {}),
+            "metrics": {"train": entry.get("train"), "test": entry.get("test"),
+                        "full": entry.get("full")},
+            "self_corr": entry.get("self_correlation"),
+            "recorded_at": entry["at"],
+        }
+        seed_complete = False
+        try:
+            seed_written = _write_seed(seed_path, seed)
+            seed_complete = True
+            written = _append(path, entry)
+        except (OSError, ValueError, cache_store.CacheError) as exc:
+            raise CliError("SERVICE_ERROR", "cannot finish shelving %s: %s" % (args.alpha_id, exc),
+                           "rerun buffer add with the same seed metadata to finish the local writes",
+                           details={"alpha_id": args.alpha_id, "partial": seed_complete,
+                                    "seed": {"complete": seed_complete, "path": str(seed_path)},
+                                    "shelf": {"complete": False, "path": str(path)}}) from exc
+    return {"path": str(path), "seeds": str(seed_path), "entry": entry,
+            "seed": seed, "written": written, "seed_written": seed_written}
 
 
 def cmd_buffer_list(args, _sink):

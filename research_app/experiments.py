@@ -267,6 +267,24 @@ def _simulation_checkpoint_document(settings, pairs, batch_size, labels, familie
     }
 
 
+def _checkpoint_lock_details(path):
+    """Describe contention without treating an old lock file as a live lease."""
+    path = Path(path)
+    lock_path = path.with_name(path.name + ".lock")
+    details = {"reason": "batch_locked", "batch_path": str(path),
+               "checkpoint": str(path), "lock_path": str(lock_path),
+               "next_action": "inspect_existing_writer"}
+    try:
+        with lock_path.open(encoding="utf-8") as handle:
+            pid, stamp = handle.readline(200).strip().split(" ", 1)
+        if pid.isdigit():
+            datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            details["owner"] = {"pid": int(pid), "acquired_at": stamp, "observed": True}
+    except (OSError, ValueError):
+        pass
+    return details
+
+
 @contextmanager
 def _locked_simulation_checkpoint(path, args):
     lock_path = path.with_name(path.name + ".lock")
@@ -282,7 +300,8 @@ def _locked_simulation_checkpoint(path, args):
                                details={"checkpoint": str(path)}) from exc
     except cache_store.LockTimeout as exc:
         raise CliError("SERVICE_ERROR", "this simulation checkpoint is already being updated",
-                       details={"checkpoint": str(path)}) from exc
+                       "inspect the existing writer; do not delete its lock or start another writer",
+                       details=_checkpoint_lock_details(path)) from exc
 
 
 def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, explicit):
@@ -306,6 +325,14 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
     display = _sort_simulation_results([dict(record) for record in records], args)
     summary = summarize(records)
     unknown = [index for index, record in enumerate(records) if record.get("status") == "UNKNOWN_SUBMISSION"]
+    recording = None
+    if getattr(args, "record", False):
+        try:
+            recording = _record_simulation(records, settings, args)
+        except (OSError, cache_store.CacheError) as exc:
+            raise CliError("SERVICE_ERROR", "cannot record simulation results: %s" % exc,
+                           "run `resume` with the saved checkpoint to retry recording",
+                           details={"checkpoint": str(checkpoint_path)}) from exc
     if summary["completed"] == 0 and summary["total"] and not (
         summary["pending"] or summary["queued"] or unknown
     ):
@@ -318,15 +345,9 @@ def _finalize_simulation(records, settings, args, checkpoint_path, checkpoint, e
             "SIMULATION_FAILED",
             "all %d simulations failed" % summary["total"],
             str(first_error),
+            details={"checkpoint": None if discard_checkpoint else str(checkpoint_path),
+                     "summary": summary, "recording": recording},
         )
-    recording = None
-    if getattr(args, "record", False):
-        try:
-            recording = _record_simulation(records, settings, args)
-        except (OSError, cache_store.CacheError) as exc:
-            raise CliError("SERVICE_ERROR", "cannot record simulation results: %s" % exc,
-                           "run `resume` with the saved checkpoint to retry recording",
-                           details={"checkpoint": str(checkpoint_path)}) from exc
     if discard_checkpoint:
         Path(checkpoint_path).unlink(missing_ok=True)
         checkpoint_path = None
@@ -1064,6 +1085,10 @@ def _load_probe_spec(path):
                            "\"settings\": {...} (optional)}")
         if "track" in arm:
             raise CliError("INVALID_INPUT", "declare the research track on the spec, not on individual arms")
+        if "expr" in arm:
+            if "expression" in arm and arm["expression"] != arm["expr"]:
+                raise CliError("INVALID_INPUT", "arm %d has conflicting expr and expression" % index)
+            arm["expression"] = arm.pop("expr")
         _selection_call(alpha_registry.evidence_role, arm)
         if "source_file" in arm:
             if "expression" in arm:
@@ -1085,6 +1110,14 @@ def _load_probe_spec(path):
             except ValueError as exc:
                 raise CliError("INVALID_INPUT", "arm %d settings: %s" % (index, exc)) from exc
         arm.setdefault("label", "arm%d" % index)
+        if not isinstance(arm["label"], str) or not arm["label"].strip():
+            raise CliError("INVALID_INPUT", "arm %d label must be a nonempty string" % index)
+    labels = [arm["label"] for arm in arms]
+    duplicates = sorted({label for label in labels if labels.count(label) > 1})
+    if duplicates:
+        raise CliError("INVALID_INPUT", "probe arm labels must be unique",
+                       "labels identify saved arms; assign unique labels before the first run",
+                       details={"reason": "duplicate_arm_labels", "labels": duplicates})
     return spec
 
 
@@ -1165,6 +1198,11 @@ def _has_finished_result(record):
         return False
     metrics = record.get("metrics") or _train_metrics(record)
     return any(_finite_metric(metrics.get(key)) for key in ("sharpe", "fitness", "returns", "turnover"))
+
+
+def _batch_incomplete_labels(rows, records):
+    """Scientific evidence completeness is separate from terminal execution."""
+    return [row["label"] for row in rows if row.get("train_fitness") is None]
 
 
 def _probe_comparisons(rows, design):
@@ -1264,7 +1302,11 @@ def _probe_recovery_index(session, limit, pages, deadline):
 
 def _terminal_probe_without_alpha(record):
     attempted = record.get("submission_attempted")
-    if record.get("alpha_id") or attempted is False:
+    if record.get("alpha_id"):
+        return False
+    if record.get("submission_refused") is True and alpha_registry.terminal_execution_failure(record):
+        return True
+    if attempted is False:
         return False
     status = str(record.get("status") or "").upper()
     # Legacy rows can describe unlocated successful results. An explicit POST
@@ -1306,32 +1348,44 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
         try:
             alpha_id = row.get("alpha_id")
             if not alpha_id and row.get("progress_url"):
-                progress = ml.poll_simulation(session, row["progress_url"], deadline=deadline)
-                status = str(progress.get("status") or "").upper()
-                row["status"] = status or None
-                row["submission_attempted"] = True
-                alpha_id = progress.get("alpha")
-                if not alpha_id:
-                    row["error"] = progress.get("message")
-                    if _terminal_probe_without_alpha(row):
-                        for key in _CHECKPOINT_POLL_FIELDS:
-                            row.pop(key, None)
-                    else:
-                        wait = progress.get("next_poll_after_seconds")
-                        if wait is not None:
-                            row["next_poll_at"] = time.time() + max(0, float(wait))
+                try:
+                    progress = ml.poll_simulation(session, row["progress_url"], deadline=deadline)
+                except ml.NotFound:
+                    # An expired or temporarily invisible receipt does not prove
+                    # that POST never happened. An older matching expression is
+                    # not proof of this job's outcome either; retain the receipt.
+                    row["error"] = "simulation receipt not found; submission remains unresolved"
+                    row["next_poll_at"] = time.time() + 15
                     still_missing.add(label)
                     if on_progress:
                         on_progress(row)
                     continue
-                row["alpha_id"] = alpha_id
-                row["simulation_status"] = row["status"]
-                row["metrics_pending"] = True
-                row.pop("progress_url", None)
-                row.pop("next_poll_at", None)
-                row.pop("poll_after_seconds", None)
-                if on_progress:
-                    on_progress(row)
+                if progress is not None:
+                    status = str(progress.get("status") or "").upper()
+                    row["status"] = status or None
+                    row["submission_attempted"] = True
+                    alpha_id = progress.get("alpha")
+                    if not alpha_id:
+                        row["error"] = progress.get("message")
+                        if _terminal_probe_without_alpha(row):
+                            for key in _CHECKPOINT_POLL_FIELDS:
+                                row.pop(key, None)
+                        else:
+                            wait = progress.get("next_poll_after_seconds")
+                            if wait is not None:
+                                row["next_poll_at"] = time.time() + max(0, float(wait))
+                        still_missing.add(label)
+                        if on_progress:
+                            on_progress(row)
+                        continue
+                    row["alpha_id"] = alpha_id
+                    row["simulation_status"] = row["status"]
+                    row["metrics_pending"] = True
+                    row.pop("progress_url", None)
+                    row.pop("next_poll_at", None)
+                    row.pop("poll_after_seconds", None)
+                    if on_progress:
+                        on_progress(row)
             if not alpha_id:
                 if not row.get("settings") and row.get("settings_signature") in (None, "", "{}"):
                     still_missing.add(label)
@@ -1399,14 +1453,8 @@ def _recover_probe_rows(session, rows, limit=400, pages=3, max_wait_seconds=300.
         except ml.AuthError:
             raise
         except ml.NotFound:
-            missing_url = row.get("progress_url")
-            row["error"] = "simulation not found; reservation released for resubmission"
-            row["submission_attempted"] = False
-            row["status"] = "QUEUED"
-            for key in ("progress_url", "next_poll_at", "poll_after_seconds", "metrics_pending"):
-                row.pop(key, None)
-            if isinstance(missing_url, str):
-                simulation_slots.release_url(missing_url)
+            row["error"] = "alpha evidence not found; keep the accepted request for read-only recovery"
+            row["next_poll_at"] = time.time() + 15
             still_missing.add(label)
             if on_progress:
                 on_progress(row)
@@ -1506,7 +1554,8 @@ def _load_probe_batch(value, *, source_paths=None, within=None, observe_source=N
         record = {**record, "expression": arm["expression"], "settings": arm["settings"],
                   "decay": arm["settings"].get("decay"), "mechanism": arm["label"]}
         record["role"] = role
-        for key in ("alpha_id", "status", "submission_attempted", "error", "simulation_status", "classification_ids",
+        for key in ("alpha_id", "status", "submission_attempted", "submission_refused",
+                    "error", "simulation_status", "classification_ids",
                     *_CHECKPOINT_POLL_FIELDS, *_MULTI_CHECKPOINT_FIELDS):
             if key not in record and key in row:
                 record[key] = row[key]
@@ -1545,7 +1594,9 @@ def _cmd_probe_recover(args):
         with cache_store.file_lock(str(path) + ".lock", timeout=0):
             return _recover_probe_batch(args, path)
     except cache_store.LockTimeout as exc:
-        raise CliError("SERVICE_ERROR", "this probe batch is already being updated", str(path)) from exc
+        raise CliError("SERVICE_ERROR", "this probe batch is already being updated",
+                       "inspect the existing writer; keep this batch and its lock",
+                       details=_checkpoint_lock_details(path)) from exc
 
 
 def _native_probe_groups(document):
@@ -2124,7 +2175,12 @@ def _cmd_probe(args, _sink):
             "concurrency": _requested_concurrency(args),
             "settings": [group["settings"] for group in groups.values()], **multi}
     gate_blocking = [{"code": "exact_repeat", "label": arm["label"],
-                      "evidence_keys": verdict["exact_repeat_keys"]}
+                      "evidence_keys": verdict["exact_repeat_keys"],
+                      "completed_refs": verdict.get("completed_refs", []),
+                      "inspect_argv": ["python", "research_cli.py", "ledger", "list",
+                                       "--expression", arm["expression"],
+                                       "--registry", str(getattr(args, "registry", None)
+                                                         or alpha_registry.default_registry_path())]}
                      for arm, verdict in zip(arms, gate)
                      if getattr(args, "strict_gate", False) and verdict.get("already_simulated")]
     if dry_run:
@@ -2175,7 +2231,9 @@ def _cmd_probe(args, _sink):
                 "next_actions": recovery_actions or [{"action": "check", "spec": str(args.spec), **multi}]}
     if gate_blocking:
         raise CliError("INVALID_INPUT", "exact finished requests repeat under --strict-gate",
-                       details={"gate_blocking": gate_blocking})
+                       "inspect the recorded evidence; resume the original batch for unfinished work",
+                       details={"reason": "exact_repeat", "next_action": "inspect_existing_evidence",
+                                "gate_blocking": gate_blocking})
     if check:
         deadline = _simulation_deadline(args)
         proof_cache = {}
@@ -2202,7 +2260,9 @@ def _cmd_probe(args, _sink):
                                "recover or resume the saved batch, or choose another --batch-path")
             return _run_probe(args, spec, name, groups, design, gate, target)
     except cache_store.LockTimeout as exc:
-        raise CliError("SERVICE_ERROR", "this probe batch is already being updated", str(target)) from exc
+        raise CliError("SERVICE_ERROR", "this probe batch is already being updated",
+                       "inspect the existing writer; keep this batch and its lock",
+                       details=_checkpoint_lock_details(target)) from exc
 
 
 def _probe_row(record, arm, gate, show_test):
@@ -2223,7 +2283,8 @@ def _probe_row(record, arm, gate, show_test):
     row["incentives"] = incentives.check_summary(record.get("checks"))
     if "classification_ids" in record:
         row["classification_ids"] = record["classification_ids"]
-    for key in (*_CHECKPOINT_POLL_FIELDS, *_MULTI_CHECKPOINT_FIELDS, "submission_attempted"):
+    for key in (*_CHECKPOINT_POLL_FIELDS, *_MULTI_CHECKPOINT_FIELDS,
+                "submission_attempted", "submission_refused"):
         if key in record:
             row[key] = record[key]
     if show_test:
@@ -2252,7 +2313,7 @@ def _probe_document_update(document, target):
         row["arm_index"] = index
         row["submission_state"] = _submission_state(records[index])
         row["cost_evidence"] = costs.evidence(_train_metrics(records[index]), "train", document.get("cost_bps"))
-    incomplete = [row["label"] for row in rows if row.get("train_fitness") is None]
+    incomplete = _batch_incomplete_labels(rows, records)
     document.update({"rows": rows, "complete": not incomplete, "incomplete": incomplete,
                      "all_empty": bool(rows) and len(incomplete) == len(rows),
                      "comparisons": _probe_comparisons(rows, document.get("design"))})
@@ -2328,8 +2389,15 @@ def _probe_reconcile(document):
             "reason": "recording_disabled" if policy else "legacy_recording_policy_unknown",
             "recorded": 0, "appended": 0}
         return
+    records = []
+    for arm, record in zip(document["arms"], document["records"]):
+        records.append({**record, "idea": arm.get("idea") or document.get("idea"),
+            "note": arm.get("note") or document.get("note"),
+            "provenance": {"run_id": document.get("run_id"),
+                "request_fingerprint": document.get("request_fingerprint"),
+                "source_spec": document.get("spec"), "arm_label": arm["label"]}})
     document["recording"] = {"state": "reconciled", **alpha_registry.record_simulation(
-        document["records"], {}, idea=document.get("idea"), mechanism=document.get("mechanism"),
+        records, {}, idea=document.get("idea"), mechanism=document.get("mechanism"),
         note=document.get("note"), registry_path=policy["registry"], source="simulate", batch=document.get("name"))}
 
 
@@ -2501,6 +2569,7 @@ def _execute_probe(args, document, target, groups):
                            if launching and group_retry_at(group) <= time.time()), default=-1)
         launch_limit = None
         capabilities_ready = False
+        slots_reconciled = False
         deferred_metrics = []
         for position, (launching, group) in enumerate(ordered):
             if time.monotonic() >= deadline:
@@ -2528,6 +2597,12 @@ def _execute_probe(args, document, target, groups):
                         capabilities_ready = True
                 if deferred is None and launch_limit:
                     accepted = simulation_slots.confirmed_accepted_count(account)
+                    if accepted is not None and accepted >= launch_limit and not slots_reconciled:
+                        slots_reconciled = True
+                        reconciliation = ml.recover_accepted_slots(session, account, deadline=deadline)
+                        document.setdefault("scheduling", []).append({
+                            "reason": "accepted_slot_reconciliation", **reconciliation})
+                        accepted = simulation_slots.confirmed_accepted_count(account)
                     if accepted is not None and accepted >= launch_limit:
                         deferred = {
                             "state": "deferred", "reason": "shared_slots_occupied",
@@ -2687,7 +2762,9 @@ def _cmd_probe_resume(args):
             path, document = _load_probe_batch(path)
             return _execute_probe(args, document, path, groups_for(document))
     except cache_store.LockTimeout as exc:
-        raise CliError("SERVICE_ERROR", "this probe batch is already being updated", str(path)) from exc
+        raise CliError("SERVICE_ERROR", "this probe batch is already being updated",
+                       "inspect the existing writer; keep this batch and its lock",
+                       details=_checkpoint_lock_details(path)) from exc
 
 
 def cmd_simulate(args, sink):

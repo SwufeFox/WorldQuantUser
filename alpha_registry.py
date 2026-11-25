@@ -40,6 +40,7 @@ from functools import partial
 import research_paths
 import cache_store
 import machine_lib as ml
+import simulation_slots
 from check_evidence import normalize_checks, platform_check_names, summarize_checks
 
 __all__ = [
@@ -380,7 +381,7 @@ def fold_evidence(entry, previous=None):
     # Repair only recognizable automatic defaults in legacy views. A manual
     # provisional candidate label is separate from resolved platform evidence.
     if (entry.get("verdict") == "candidate" and not entry.get("verdict_manual")
-            and source in {"simulate", "sync", "submit"}
+            and source in {"simulate", "quick-batch", "sync", "submit"}
             and (entry["checks_state"] != "observed" or not summarize_checks(checks)["resolved"])):
         entry["verdict"] = "watch"
     return entry
@@ -441,6 +442,21 @@ def build_entry(alpha, idea=None, mechanism=None, verdict="watch", note=None,
         "batch": batch,
         "recorded_at": _now(),
     }
+    # Operator count has two incompatible meanings: the platform's operatorCount
+    # counts call sites (duplicates included), while a deduplicated set count
+    # makes PP eligibility look far better than it is. Record the basis so a
+    # filter can tell them apart.
+    operator_count = alpha.get("operator_count")
+    if isinstance(operator_count, int) and not isinstance(operator_count, bool) and operator_count >= 0:
+        entry["operator_count"] = operator_count
+        entry["operator_count_basis"] = "platform"
+    elif expression:
+        # Imported lazily: the help/schema path must not pull the parser in.
+        from expression_lint import estimate_operator_count
+        estimate = estimate_operator_count(expression)
+        if isinstance(estimate, int) and estimate >= 0:
+            entry["operator_count"] = estimate
+            entry["operator_count_basis"] = "estimate_total"
     if extra:
         entry["extra"] = extra
     # Lineage is recorded, never inferred: an ablation variant knows which
@@ -572,6 +588,24 @@ def record_entry(entry, path=None, skip_unchanged=True, allow_metrics_loss=False
         return append(entry, skip_unchanged=skip_unchanged, allow_metrics_loss=allow_metrics_loss)
 
 
+def record_arm(entry, path=None):
+    """Compatibility wrapper for the simulation ledger's evidence policy.
+
+    Returns ``(stored_entry, written)``; unfinished or incomplete observations
+    return ``(None, False)``. Replaying one observation is idempotent. Failed
+    executions retain their own identity and cannot replace a successful Alpha.
+    """
+    source = entry.get("source") or "simulate"
+    if source == "manual":  # build_entry's default is not a manual verdict pin.
+        source = "simulate"
+    summary, entries = _record_simulation(
+        [entry], entry.get("settings") or {}, idea=entry.get("idea"),
+        mechanism=entry.get("mechanism"), family=entry.get("family"), note=entry.get("note"),
+        verdict=entry.get("verdict") if entry.get("verdict_manual") else None,
+        registry_path=path, source=source, batch=entry.get("batch"))
+    return (entries[0], bool(summary["appended"])) if entries else (None, False)
+
+
 @contextmanager
 def append_batch(path=None):
     """Load the latest rows under the append lock for a batch of local writes.
@@ -694,7 +728,7 @@ def _inherit_judgement(entry, previous, pinned_verdict=False):
     entry["role"] = evidence_role(previous, entry)
     if previous.get("source") == "relabel":
         manual_fields.update(("family", "mechanism", "idea", "note"))
-    for field in ("family", "mechanism", "idea", "note", "parent", "op", "legs", "batch"):
+    for field in ("family", "mechanism", "idea", "note", "parent", "op", "legs", "batch", "provenance"):
         if (not entry.get(field) or field in manual_fields) and previous.get(field) is not None:
             entry[field] = previous[field]
     if manual_fields:
@@ -710,10 +744,34 @@ def _inherit_judgement(entry, previous, pinned_verdict=False):
     return entry
 
 
+def terminal_execution_failure(record):
+    """Recognize a failed attempt, without mistaking a failed read for its outcome."""
+    if record.get("multi_parent_url") and not record.get("multi_parent_terminal"):
+        return False
+    status = str(record.get("status") or "").upper()
+    if status in simulation_slots.TERMINAL_FAILURE_STATUSES:
+        return True
+    return (status == "FAILED" and not record.get("progress_url")
+            and not record.get("metrics_pending"))
+
+
+def _failure_key(record, settings, batch):
+    provenance = record.get("provenance") or {}
+    identity = {"request": placeholder_key(record.get("expression") or "", settings),
+                "settings": settings,
+                "batch": batch, "related_alpha_id": record.get("alpha_id"),
+                "candidate_id": record.get("candidate_id"),
+                "arm_label": provenance.get("arm_label") or record.get("mechanism"),
+                **{key: provenance.get(key) for key in
+                   ("run_id", "request_fingerprint")}}
+    return "failure:" + hashlib.sha256(json.dumps(identity, sort_keys=True,
+        separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()[:24]
+
+
 def record_simulation(records, settings, idea=None, mechanism=None, family=None,
                        note=None, verdict=None, registry_path=None, source="simulate",
                        batch=None):
-    """Append one ledger entry per finished simulation record; return a summary.
+    """Record finished evidence and terminal failed attempts; return a summary.
 
     ``record["mechanism"]`` and ``record["family"]`` win over the run-wide default,
     so a batch spanning several mechanisms still lands labelled per entry. ``verdict``
@@ -725,6 +783,14 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
     every experiment is copied from was the one path that could silently skip the
     durable record.
     """
+    summary, _ = _record_simulation(records, settings, idea=idea, mechanism=mechanism, family=family,
+        note=note, verdict=verdict, registry_path=registry_path, source=source, batch=batch)
+    return summary
+
+
+def _record_simulation(records, settings, *, idea, mechanism, family, note, verdict,
+                       registry_path, source, batch):
+    """Shared write path, also returning the stored entries for single-arm callers."""
     path = registry_path or default_registry_path()
     entries = []
     written = 0
@@ -736,11 +802,26 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
             key = record.get("alpha_id")
             status = record.get("status")
             evidence_status = (status or "").upper()
-            if evidence_status not in FINISHED_STATUSES | {"UNSUBMITTED", "ACTIVE", "SUBMITTED"}:
+            if record.get("metrics_pending") or record.get("submission_state") == "unknown_submission":
                 deferred.append({"alpha_id": key, "label": record.get("mechanism"),
                                  "status": status, "reason": "execution_not_finished"})
                 continue
-            if not key or not _pick_metrics(record.get("metrics")):
+            failed = terminal_execution_failure(record)
+            record_settings = record.get("settings") or settings
+            record_batch = batch or record.get("batch")
+            if failed:
+                if record.get("decay") is not None:
+                    record_settings = {**record_settings, "decay": record["decay"]}
+                # A failed attempt has its own identity. Never erase a live alpha's
+                # metrics, or create a zero-fitness example from an execution error.
+                key = _failure_key(record, record_settings, record_batch)
+            elif evidence_status not in FINISHED_STATUSES | {"UNSUBMITTED", "ACTIVE", "SUBMITTED"}:
+                deferred.append({"alpha_id": key, "label": record.get("mechanism"),
+                                 "status": status, "reason": "execution_not_finished"})
+                continue
+            has_metrics = any(isinstance(value, (int, float)) and not isinstance(value, bool)
+                              and math.isfinite(value) for value in _pick_metrics(record.get("metrics")).values())
+            if not failed and (not key or not has_metrics):
                 deferred.append({"alpha_id": key, "label": record.get("mechanism"),
                                  "status": status, "reason": "completed_evidence_missing"})
                 continue
@@ -757,28 +838,36 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
                     status = previous.get("status")
                 if not verdict:
                     chosen_verdict = previous.get("verdict") or chosen_verdict
+            record_idea = record.get("idea") or idea
+            if isinstance(record_idea, str):
+                record_idea = record_idea.strip() or None
             entry = build_entry(
                 {
-                    "alpha_id": key,
+                    "alpha_id": None if failed else key,
                     "role": record.get("role"),
                     "expression": record.get("expression"),
                     "decay": record.get("decay"),
-                    "settings": record.get("settings") or settings,
+                    "settings": record_settings,
                     "language": entry_language(record),
-                    "metrics": record.get("metrics"),
-                    "checks": record.get("checks"),
-                    "out_of_sample": record.get("out_of_sample"),
+                    "metrics": None if failed else record.get("metrics"),
+                    "checks": None if failed else record.get("checks"),
+                    "out_of_sample": None if failed else record.get("out_of_sample"),
                     "status": status,
                     "error": record.get("error"),
                 },
-                idea=idea,
+                idea=record_idea,
                 mechanism=record.get("mechanism") or mechanism,
                 family=record.get("family") or family,
                 verdict=chosen_verdict,
-                note=note,
+                note=record.get("note") or note,
                 source=source,
-                batch=batch or record.get("batch"),
+                batch=record_batch,
             )
+            if failed:
+                entry.update({"key": key, "execution_outcome": "failed",
+                              "related_alpha_id": record.get("alpha_id")})
+            if isinstance(record.get("provenance"), dict):
+                entry["provenance"] = dict(record["provenance"])
             if previous:
                 entry = _inherit_judgement(entry, previous, pinned_verdict=verdict is not None)
                 entry["metrics"] = {**(previous.get("metrics") or {}), **entry["metrics"]}
@@ -808,6 +897,10 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
     return {
         "registry": path,
         "recorded": len(entries),
+        "recorded_failures": sum(entry.get("execution_outcome") == "failed" for entry in entries),
+        "missing_idea_count": sum(not entry.get("idea") for entry in entries),
+        "missing_idea_labels": [entry.get("mechanism") or entry["key"]
+                                for entry in entries if not entry.get("idea")][:20],
         "appended": written,
         "skipped": skipped,
         "deferred": deferred,
@@ -818,7 +911,7 @@ def record_simulation(records, settings, idea=None, mechanism=None, family=None,
             name: sum(1 for entry in entries if entry["verdict"] == name)
             for name in VERDICTS
         },
-    }
+    }, entries
 
 
 def find_entries(entries, field=None, mechanism=None, idea=None,

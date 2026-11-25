@@ -13,6 +13,8 @@ import machine_lib as ml
 import requests
 import research_paths
 
+import alpha_registry
+
 from . import alphas, buffer_cmd, selection, triage
 from .experiments import _selection_call
 from .runtime import CliError, note, protect_output, with_session
@@ -180,6 +182,28 @@ def _review_receipt(args):
     }
 
 
+def _record_current_evidence(payload, alpha_id):
+    """Write the platform's current metrics/splits into the ledger first.
+
+    Validation joins evidence by alpha id. A fresh FULL alpha is absent from the
+    ledger, which used to report test_sharpe_missing even though the platform
+    carried both train and test splits.
+    """
+    expression, _, operator_count = ml.regular_expression(payload)
+    entry = alpha_registry.build_entry(
+        {"alpha_id": payload.get("id") or alpha_id,
+         "expression": expression,
+         "settings": payload.get("settings") or {},
+         "language": ml.alpha_language(payload),
+         "metrics": payload.get("is") or {},
+         "checks": (payload.get("is") or {}).get("checks") or {},
+         "operator_count": operator_count,
+         "status": payload.get("status") or "UNSUBMITTED",
+         "out_of_sample": ml.extract_split(payload)},
+        source="promote")
+    return alpha_registry.record_entry(entry, alpha_registry.default_registry_path())
+
+
 def cmd_promote(args, sink):
     """Compose existing commands; operational failures carry the completed evidence."""
     if getattr(args, "review_receipt", None):
@@ -194,9 +218,10 @@ def cmd_promote(args, sink):
     freeze = Path(saved_choice or args.freeze or research_paths.resolve(
         "promote-freeze-%s-%s.json" % (safe_id, stamp))).expanduser().resolve()
     shelf = buffer_cmd.buffer_path(args).resolve()
-    protect_output(args, freeze, shelf)
     if freeze == shelf:
         raise CliError("INVALID_INPUT", "--freeze and --buffer must use distinct paths")
+    shelf, seeds = buffer_cmd._seed_paths(args, selection_path=freeze)
+    protect_output(args, freeze, shelf, seeds)
 
     data = {"alpha_id": alpha_id, "freeze_path": str(freeze),
             "validate": dict.fromkeys(("train_sharpe", "test_sharpe", "retention",
@@ -238,6 +263,10 @@ def cmd_promote(args, sink):
             raise CliError("INVALID_INPUT", "retention floor must be finite")
         payload = with_session(args, lambda session: ml.fetch_alpha_metrics(session, alpha_id))
         alphas._reject_quick_simulation(args, payload)
+        # Validation joins current evidence by alpha id; a fresh FULL alpha is not
+        # in the ledger yet, which used to report "test_sharpe_missing" even though
+        # the platform already carried train and test splits.
+        _record_current_evidence(payload, alpha_id)
         if not saved_choice:
             freeze_args = parser.parse_args(["triage", "--ids", alpha_id, "--freeze", str(freeze)])
             freeze_args.retention_floor = retention_floor
@@ -290,6 +319,25 @@ def cmd_promote(args, sink):
         if reasons:
             data["steps"]["buffer"] = {"status": "skipped"}
             return data
+        metadata_required = buffer_cmd.validate_seed(getattr(args, "name", None),
+            getattr(args, "category", None), getattr(args, "tags", None), getattr(args, "description", None))
+        if metadata_required:
+            data.update(outcome="metadata_required", metadata_required=metadata_required)
+            data["steps"]["buffer"] = {"status": "blocked", "reason": "seed_metadata_required"}
+            data["next_action"] = {
+                "action": "complete_seed_metadata",
+                "argv": ["python", "research_cli.py", "--research-dir", research_paths.research_dir(),
+                         "promote", alpha_id, "--selection", str(freeze),
+                         "--buffer", str(shelf), "--seeds", str(seeds)],
+                "required_options": ["--name", "--category", "--tags", "--description"],
+            }
+            if max_corr is not None:
+                data["next_action"]["argv"].extend(["--max-self-correlation", str(max_corr)])
+            if args.note:
+                data["next_action"]["argv"].extend(["--note", args.note])
+            if args.dry_run:
+                data["next_action"]["argv"].append("--dry-run")
+            return data
         if args.dry_run:
             data["outcome"] = "would_buffer"
             data["steps"]["buffer"] = {"status": "would_buffer"}
@@ -298,6 +346,11 @@ def cmd_promote(args, sink):
         step = "buffer"
         buffer_args = parser.parse_args(["buffer", "add", alpha_id, "--selection", str(freeze)])
         buffer_args.buffer, buffer_args.note = args.buffer, args.note
+        buffer_args.name = getattr(args, "name", None)
+        buffer_args.category = getattr(args, "category", None)
+        buffer_args.tags = getattr(args, "tags", None)
+        buffer_args.description = getattr(args, "description", None)
+        buffer_args.seeds = getattr(args, "seeds", None)
         buffer_args.cost_bps = cost_bps
         buffered = buffer_cmd.cmd_buffer_add(buffer_args, sink, checked=result)
         data["steps"][step] = {"status": "completed", "evidence": buffered}

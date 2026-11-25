@@ -1108,6 +1108,89 @@ class CliWorkflowContractTests(unittest.TestCase):
                     self.assertEqual(json.loads(stdout)["data"]["command"]["command"], "alpha get")
                     self.assertEqual(stderr, "")
 
+    def test_competing_writer_receipt_identifies_lock_without_network(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "batch.json"
+            lock = str(checkpoint) + ".lock"
+            with cli_experiments.cache_store.file_lock(lock), \
+                    mock.patch.object(ml, "load_session") as login:
+                code, stdout, _ = self.invoke("resume", str(checkpoint),
+                                             "--research-dir", directory, "--quiet")
+            receipt = json.loads(stdout)
+            self.assertNotEqual(code, 0)
+            self.assertEqual(receipt["error"]["code"], "SERVICE_ERROR")
+            details = receipt["error"]["details"]
+            self.assertEqual(details["reason"], "batch_locked")
+            self.assertEqual(details["batch_path"], str(checkpoint))
+            self.assertEqual(details["owner"]["pid"], os.getpid())
+            self.assertTrue(details["owner"]["observed"])
+            self.assertTrue(Path(lock).is_file())
+            login.assert_not_called()
+
+    def test_all_failed_batch_records_seed_before_cli_error_and_replays_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = Path(directory) / "failed.json"
+            registry = Path(directory) / "ledger.jsonl"
+            settings = ml.resolve_settings()
+            checkpoint.write_text(json.dumps({"format": "worldquantuser.simulation-checkpoint", "version": 1,
+                "settings": settings, "recording_policy": {"record": True, "registry": str(registry)},
+                "records": [{"expression": "rank(close)", "status": "ERROR", "settings": settings,
+                    "submission_attempted": True, "error": "synthetic terminal failure",
+                    "mechanism": "failed-arm", "idea": "explicit hypothesis"}]}), encoding="utf-8")
+            with mock.patch.object(ml, "load_session") as login:
+                for appended in (1, 0):
+                    code, stdout, _ = self.invoke("resume", str(checkpoint),
+                                                 "--research-dir", directory, "--quiet")
+                    receipt = json.loads(stdout)
+                    self.assertNotEqual(code, 0)
+                    self.assertEqual(receipt["error"]["code"], "SIMULATION_FAILED")
+                    details = receipt["error"]["details"]
+                    self.assertEqual(details["checkpoint"], str(checkpoint))
+                    self.assertEqual(details["recording"]["recorded_failures"], 1)
+                    self.assertEqual(details["recording"]["appended"], appended)
+                login.assert_not_called()
+            entry, = alpha_registry.load_entries(str(registry))
+            self.assertEqual(entry["idea"], "explicit hypothesis")
+            self.assertEqual(entry["metrics"], {})
+            self.assertIsNone(entry["alpha_id"])
+
+    def test_duplicate_arm_labels_fail_before_authentication(self):
+        with tempfile.TemporaryDirectory() as directory:
+            spec = Path(directory) / "ambiguous.json"
+            spec.write_text(json.dumps({"design": "explore", "arms": [
+                {"label": "same", "expression": "rank(close)"},
+                {"label": "same", "expression": "rank(volume)"}]}), encoding="utf-8")
+            with mock.patch.object(ml, "load_session") as login:
+                code, stdout, _ = self.invoke("probe", str(spec), "--research-dir", directory)
+            receipt = json.loads(stdout)
+            self.assertEqual(code, 2)
+            self.assertEqual(receipt["error"]["details"]["reason"], "duplicate_arm_labels")
+            login.assert_not_called()
+
+    def test_seed_metadata_store_is_protected_from_output_and_usage_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for command in (("promote", "A"), ("buffer", "add", "A"),
+                            ("buffer", "submit", "A"), ("alpha", "submit", "A")):
+                for explicit in (False, True):
+                    with self.subTest(command=command, explicit=explicit):
+                        target = Path(directory) / ("custom-seeds.jsonl" if explicit else "seeds.jsonl")
+                        original = b'{"alpha_id":"A","name":"existing metadata"}\n'
+                        target.write_bytes(original)
+                        flags = ["--seeds", str(target)] if explicit else []
+                        with mock.patch.object(ml, "load_session") as login:
+                            code, stdout, _ = self.invoke(*command, *flags, "--save", str(target),
+                                                         "--research-dir", directory, "--quiet")
+                        receipt = json.loads(stdout)
+                        self.assertEqual(code, 2)
+                        self.assertEqual(receipt["error"]["details"]["protected_path"], str(target))
+                        self.assertEqual(target.read_bytes(), original)
+                        login.assert_not_called()
+            code, stdout, _ = self.invoke("promote", "A", "--unknown-option", "--seeds", str(target),
+                                         "--save", str(target), "--research-dir", directory)
+            self.assertEqual(code, 2)
+            self.assertEqual(json.loads(stdout)["error"]["details"]["protected_path"], str(target))
+            self.assertEqual(target.read_bytes(), original)
+
     def test_saved_usage_failure_keeps_envelope_and_command_context(self):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "failure.json"

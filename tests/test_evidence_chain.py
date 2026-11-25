@@ -66,9 +66,17 @@ class WarningStatusTests(unittest.TestCase):
             before = open(path, encoding="utf-8").read()
             result = alpha_registry.record_simulation([record(status="FAILED", sharpe=0, fitness=0)],
                                                        {}, registry_path=path)
-            self.assertEqual(result["recorded"], 0)
-            self.assertEqual(len(result["deferred"]), 1)
-            self.assertEqual(open(path, encoding="utf-8").read(), before)
+            self.assertEqual(result["recorded_failures"], 1)
+            stored = {row["key"]: row for row in alpha_registry.load_entries(path)}
+            self.assertEqual(stored["A1"]["metrics"], original["metrics"])
+            self.assertEqual(stored["A1"]["mechanism"], "human")
+            self.assertEqual(stored["A1"]["status"], "ACTIVE")
+            failed = next(row for row in stored.values() if row["key"].startswith("failure:"))
+            self.assertIsNone(failed["alpha_id"])
+            self.assertEqual(failed["related_alpha_id"], "A1")
+            self.assertEqual(failed["metrics"], {})
+            self.assertEqual(failed["verdict"], "watch")
+            self.assertTrue(open(path, encoding="utf-8").read().startswith(before))
 
     def test_an_all_warning_batch_does_not_raise(self):
         tmp = tempfile.mkdtemp()
@@ -79,6 +87,57 @@ class WarningStatusTests(unittest.TestCase):
         result = cli_experiments._finalize_simulation(records, {"region": "USA"}, args,
                                           checkpoint_path, {"records": []}, explicit=True)
         self.assertEqual(result["summary"]["completed"], 2)
+
+
+class TerminalFailureRecordingTests(unittest.TestCase):
+    def test_failure_identity_keeps_per_arm_decay_and_full_request_settings(self):
+        settings = cli_experiments.ml.resolve_settings({"decay": 6})
+        records = [{"expression": "rank(close)", "status": "ERROR", "decay": decay,
+                    "settings": {**settings, "simulationMode": mode}}
+                   for decay, mode in ((3, "QUICK"), (9, "QUICK"), (3, "FULL"))]
+        with tempfile.TemporaryDirectory() as directory:
+            registry = os.path.join(directory, "ledger.jsonl")
+            result = alpha_registry.record_simulation(records, settings, registry_path=registry)
+            stored = alpha_registry.load_entries(registry)
+        self.assertEqual(result["recorded_failures"], 3)
+        self.assertEqual(len(stored), 3)
+        self.assertEqual({(row["settings"]["decay"], row["settings"]["simulationMode"]) for row in stored},
+                         {(3, "QUICK"), (9, "QUICK"), (3, "FULL")})
+
+    def test_failed_seed_is_idempotent_and_does_not_create_quality_evidence(self):
+        failed = {"expression": "rank(close)", "settings": {"region": "USA"},
+                  "status": "ERROR", "error": "synthetic platform failure",
+                  "mechanism": "control", "idea": "explicit arm hypothesis",
+                  "provenance": {"run_id": "run-1", "arm_label": "control"}}
+        with tempfile.TemporaryDirectory() as directory:
+            registry = os.path.join(directory, "ledger.jsonl")
+            first = alpha_registry.record_simulation([failed], {}, idea="batch idea", registry_path=registry)
+            again = alpha_registry.record_simulation([failed], {}, registry_path=registry)
+            self.assertEqual((first["recorded_failures"], first["appended"]), (1, 1))
+            self.assertEqual((again["recorded_failures"], again["appended"]), (1, 0))
+            stored = alpha_registry.load_entries(registry)
+            self.assertEqual(len(stored), 1)
+            self.assertEqual(stored[0]["idea"], "explicit arm hypothesis")
+            self.assertEqual(stored[0]["provenance"], failed["provenance"])
+            self.assertEqual(stored[0]["execution_outcome"], "failed")
+            self.assertEqual(stored[0]["metrics"], {})
+            self.assertEqual(stored[0]["checks_state"], "missing")
+            self.assertNotIn("out_of_sample", stored[0])
+            with alpha_registry.indexed_registry(registry) as index:
+                self.assertIsNotNone(index)
+                from registry_index import LedgerRows
+                self.assertEqual(LedgerRows(index).get(stored[0]["key"]), stored[0])
+
+    def test_unfinished_reads_stay_deferred_and_missing_ideas_are_reported(self):
+        records = [{"status": "ERROR", "expression": "rank(close)", "mechanism": "failed"},
+                   {"status": "FAILED", "progress_url": "https://example.invalid/task", "mechanism": "reading"},
+                   {"status": "UNKNOWN_SUBMISSION", "mechanism": "unknown"}]
+        with tempfile.TemporaryDirectory() as directory:
+            result = alpha_registry.record_simulation(records, {}, registry_path=os.path.join(directory, "ledger.jsonl"))
+            self.assertEqual(result["recorded_failures"], 1)
+            self.assertEqual(result["deferred_count"], 2)
+            self.assertEqual(result["missing_idea_count"], 1)
+            self.assertEqual(result["missing_idea_labels"], ["failed"])
 
 
 class TopTruncationTests(unittest.TestCase):

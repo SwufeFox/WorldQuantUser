@@ -1327,7 +1327,9 @@ def _read_simulation_snapshot(s, url, simulation_id, *, deadline):
     if status not in (200, 400, 429):
         raise ServiceError(f"simulation inspection returned HTTP {status}")
     seconds = _retry_after_seconds(response, cap_error_wait=False)
-    retry_after = seconds if math.isfinite(seconds) and seconds > 0 else None
+    if not math.isfinite(seconds):
+        raise ServiceError("simulation inspection returned an invalid Retry-After")
+    retry_after = seconds if seconds > 0 else None
     if status == 429:
         wait = f", retry after {retry_after:g} seconds" if retry_after is not None else ""
         raise RateLimited(f"simulation inspection rate limited{wait}", retry_after=retry_after)
@@ -1372,6 +1374,66 @@ def simulation_progress_receipt(response, body, simulation_id):
 
 
 QUICK_ORPHAN_SWEEP_SECONDS = 5
+
+
+def recover_accepted_slots(s, account, *, deadline=None):
+    """Read ordinary/native acceptances before declaring the shared slots full.
+
+    The sweep has one short budget, never posts, and never turns age or a
+    missing response into proof of completion. Native reservations point to
+    their parent, so child metrics cannot release or multiply parent slots.
+    """
+    import simulation_capabilities
+    import simulation_slots
+
+    fingerprint = account.get("fingerprint")
+    if not fingerprint or simulation_capabilities.account_provenance(s).get("fingerprint") != fingerprint:
+        return {"state": "account_unverified", "released": [], "kept": [], "checked": 0}
+    end = time.monotonic() + QUICK_ORPHAN_SWEEP_SECONDS
+    if deadline is not None:
+        end = min(end, deadline)
+    remaining = max(1, simulation_slots.confirmed_accepted_count(account) or 0)
+    observed = {}
+
+    def poll(url):
+        nonlocal remaining
+        try:
+            simulation_id = simulation_reference_id(url)
+        except ValueError:
+            return None
+        if simulation_id in observed:
+            return observed[simulation_id]
+        now = time.monotonic()
+        request_deadline = now + max(0, end - now) / remaining
+        remaining = max(1, remaining - 1)
+        try:
+            payload, delay = read_simulation_snapshot(s, simulation_id, deadline=request_deadline)
+        except AuthError:
+            raise
+        except NotFound:
+            answer = "NOT_FOUND"
+        except Exception:
+            answer = None
+        else:
+            status = str(payload.get("status") or "").upper()
+            alpha = payload.get("alpha") or payload.get("alphaId")
+            if (payload.get("id") not in (None, simulation_id)
+                    or (alpha is not None and not valid_simulation_id(alpha))):
+                answer = None
+            elif delay:
+                answer = "PENDING"
+            else:
+                answer = {"status": status, "alpha": alpha}
+        observed[simulation_id] = answer
+        return answer
+
+    try:
+        report = simulation_slots.reconcile_orphans(account, poll, deadline=end, ordinary_only=True)
+    except cache_store.LockTimeout:
+        report = {"state": "journal_busy", "released": [], "kept": []}
+    report.setdefault("state", "observed")
+    report["checked"] = len(observed)
+    return report
 
 
 def recover_quick_orphans(s, account, *, deadline=None, exclude_job=None, limit=None, offset=0):
@@ -2243,7 +2305,7 @@ def simulate_alphas(
         if not capability_check["unsupported"]:
             return True
         record = records[index]
-        record.update(status="FAILED", submission_attempted=False,
+        record.update(status="FAILED", submission_attempted=False, submission_refused=True,
                       error="settings are unsupported by current account metadata",
                       settings_capabilities=capability_check)
         emit("failed", index, record)
@@ -2305,7 +2367,7 @@ def simulate_alphas(
                 if is_python_language(settings.get("language")) and isinstance(detail, str) and detail.strip():
                     record["error"] += " (" + detail.strip()[:500] + ")"
                 simulation_slots.reconcile_record(record, plan["account"], outcome="refused")
-                record["status"] = "FAILED"
+                record.update(status="FAILED", submission_refused=True)
                 if not is_python_language(settings.get("language")):
                     note_operator_rejection(record.get("expression"), record["error"])
             records[index] = record
@@ -2424,7 +2486,15 @@ def simulate_alphas(
                     if outcome == "contended" and not attempted_orphan_recovery:
                         attempted_orphan_recovery = True
                         try:
-                            if recover_quick_orphans(s, plan["account"], deadline=deadline):
+                            recovery_deadline = time.monotonic() + QUICK_ORPHAN_SWEEP_SECONDS
+                            if deadline is not None:
+                                recovery_deadline = min(recovery_deadline, deadline)
+                            recovered = recover_accepted_slots(s, plan["account"], deadline=recovery_deadline)
+                            if scheduling_report is not None:
+                                scheduling_report["accepted_slot_recovery"] = recovered
+                            if recovered["released"]:
+                                continue
+                            if recover_quick_orphans(s, plan["account"], deadline=recovery_deadline):
                                 continue
                         except AuthError as exc:
                             if not launched_here:
@@ -3018,6 +3088,59 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
     return out
 
 
+def read_alpha_submission_status(s, alpha_id, *, max_wait_seconds=30.0):
+    """Read an earlier submission's outcome without issuing another POST.
+
+    An UNSUBMITTED alpha snapshot is not a rejection receipt: evaluation may
+    still be running. Only a ready submission endpoint with resolved failing
+    checks proves that this evaluation ended in rejection.
+    """
+    from check_evidence import summarize_checks
+    from requests.exceptions import RequestException
+
+    if not valid_simulation_id(alpha_id):
+        raise ValueError("invalid Alpha ID")
+    report = {"state": "unknown", "source": "submission_status", "alpha_id": alpha_id}
+    if max_wait_seconds is not None and max_wait_seconds <= 0:
+        return {**report, "reason": "read_budget_exhausted"}
+    deadline = time.monotonic() + min(30, max_wait_seconds or 30)
+    try:
+        response = s.get(BRAIN_API_URL + "/alphas/" + alpha_id + "/submit",
+                         timeout=_request_timeout(deadline), allow_redirects=False)
+    except RequestException as exc:
+        raise ReadInterrupted("submission status read failed (%s)" % type(exc).__name__) from exc
+    status = response.status_code
+    report["status_code"] = status
+    if status in (401, 403):
+        raise AuthError("BRAIN denied the submission status read")
+    delay = _retry_after_seconds(response, cap_error_wait=False)
+    if not math.isfinite(delay):
+        return {**report, "reason": "invalid_retry_after"}
+    if delay > 0:
+        return {**report, "state": "pending", "reason": "platform_retry_after",
+                "retry_at": time.time() + delay}
+    if status not in (200, 400):
+        return {**report, "reason": "submission_status_unavailable"}
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict) or payload.get("id") not in (None, alpha_id):
+        return {**report, "reason": "submission_response_unverified"}
+    platform_status = str(payload.get("status") or "").upper()
+    if platform_status in {"PENDING", "RUNNING", "SIMULATING", "CHECKING", "ACCEPTED"}:
+        return {**report, "state": "pending", "reason": "platform_evaluating"}
+    if payload.get("is") is not None and not isinstance(payload["is"], dict):
+        return {**report, "reason": "submission_response_unverified"}
+    checks = _extract_checks(payload)
+    summary = summarize_checks(checks)
+    report["checks"] = checks
+    if summary["resolved"] and summary["failed"]:
+        return {**report, "state": "rejected", "failed_checks": summary["failed"],
+                "reason": "completed_submission_checks_failed"}
+    return {**report, "reason": "no_terminal_submission_evidence"}
+
+
 def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=None):
     """Submit one alpha to its competition, or report what would happen.
 
@@ -3040,6 +3163,7 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
         "alpha_id": alpha_id,
         "status": status,
         "submitted": False,
+        "post_attempted": False,
     }
     if status in ("ACTIVE", "SUBMITTED"):
         document.update({
@@ -3071,6 +3195,11 @@ def submit_alpha(s, alpha_id, confirm=False, max_wait_seconds=180.0, on_event=No
         return document
     deadline = time.monotonic() + (max_wait_seconds or 0)
     url = BRAIN_API_URL + "/alphas/" + alpha_id + "/submit"
+    if on_event:
+        # The caller checkpoints this boundary before transport can accept the
+        # irreversible request. A failed callback prevents the POST entirely.
+        on_event({"event": "submit_posting", "alpha_id": alpha_id})
+    document["post_attempted"] = True
     response = s.post(url, timeout=_request_timeout(deadline))
     post_status = response.status_code
     retry_after = _retry_after_seconds(response, cap_error_wait=False)
