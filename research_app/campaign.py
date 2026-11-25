@@ -61,8 +61,6 @@ def _spc_report(path, route, runs, reference):
 
 def cmd_campaign_preview(args, _sink):
     """Inspect one campaign input without allocating a simulation."""
-    from tools._runner import research_root, run_cli
-
     path = Path(args.spec).expanduser().resolve()
     protect_output(args, path)
     spec, route = _campaign_spec(path, args)
@@ -71,13 +69,11 @@ def cmd_campaign_preview(args, _sink):
             raise CliError("USAGE", "--multi-size applies to BRAIN simulations")
         runs, reference = _spc_inputs(path, spec)
         return _spc_report(path, route, runs, reference)
-    multi = ("--multi-size", args.multi_size) if args.multi_size else ()
-    result = run_cli(research_root(args.research_dir), "probe", path, "--dry-run",
-                     "--strict-gate", *multi, timeout=120)
-    if not result.ok:
-        raise CliError(result.code or "SERVICE_ERROR", result.detail)
-    protect_output(args, result.data.get("path"))
-    return result.data
+    data = experiments.preview_probe_spec(
+        path, research_dir=args.research_dir, multi_size=args.multi_size, strict_gate=True
+    )
+    protect_output(args, data.get("path"))
+    return data
 
 
 def _quick_training(arm, row):
@@ -90,7 +86,7 @@ def _quick_training(arm, row):
     if not arm["expression"].strip():
         return None, "missing_captured_expression"
     training = {name: row.get(f"train_{name}") for name in ("sharpe", "fitness")}
-    if not all(map(experiments._finite_metric, training.values())):
+    if not all(map(experiments.finite_metric, training.values())):
         return None, "missing_train_metrics"
     return training, None
 
@@ -115,7 +111,7 @@ def _followup_paths(args, name, input_kind):
     protect_output(args, source, output)
     protected = set()
     try:
-        path, batch = experiments._load_probe_batch(source, source_paths=protected)
+        path, batch = experiments.load_probe_batch(source, source_paths=protected)
     finally:
         protect_output(args, *protected)
     for item in (batch.get("spec"), *(arm.get("source_file") for arm in batch["arms"])):
@@ -130,7 +126,7 @@ def _followup_paths(args, name, input_kind):
 
 
 def _write_followup(output, lock, spec, name):
-    experiments._probe_design(spec, {})
+    experiments.validate_probe_design(spec, {})
     try:
         with cache_store.file_lock(lock, timeout=0):
             if output.exists():
@@ -182,9 +178,9 @@ def cmd_campaign_prepare_full(args, _sink):
                        details={"control": control_label})
 
     selected = [control] if control else []
-    identities = {experiments._probe_identity(arm["expression"], arm["settings"]) for arm, _ in selected}
+    identities = {experiments.probe_identity(arm["expression"], arm["settings"]) for arm, _ in selected}
     for arm, evidence in sorted(eligible, key=lambda entry: (-entry[1]["train"]["sharpe"], str(entry[0]["label"]))):
-        identity = experiments._probe_identity(arm["expression"], arm["settings"])
+        identity = experiments.probe_identity(arm["expression"], arm["settings"])
         if identity in identities:
             omitted["duplicate_full_request"] += 1
         elif len(selected) >= args.limit:
@@ -368,7 +364,7 @@ def _archived_quick_pnl(root, args, *, live_specs=None, archived_specs=None):
                 try:
                     if source == receipt and _campaign_spec(spec)[1]["track"] == "SPC":
                         continue
-                    path, document = experiments._load_probe_batch(
+                    path, document = experiments.load_probe_batch(
                         source, source_paths=protected, within=root, observe_source=observe)
                 except CliError:
                     unreadable += 1
@@ -419,7 +415,7 @@ def cmd_campaign_status(args, _sink):
             _, route = _campaign_spec(path)
             job["track"] = route["track"]
             if batch.exists() and route["track"] != "SPC":
-                source, document = experiments._load_probe_batch(batch)
+                source, document = experiments.load_probe_batch(batch)
                 state, action = probe_state(document)
                 job.update(state=state, next_action=action, batch=str(source), execution=document["execution"])
                 job["diagnosis"] = probe_diagnosis(document, source, root=root)

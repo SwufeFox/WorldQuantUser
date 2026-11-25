@@ -15,7 +15,7 @@ import research_paths
 
 import alpha_registry
 
-from . import alphas, buffer_cmd, selection, triage
+from . import alphas, buffer_cmd, capabilities, description, pp_budget, rules_snapshot, selection, triage
 from .experiments import _selection_call
 from .runtime import CliError, note, protect_output, with_session
 
@@ -263,9 +263,14 @@ def cmd_promote(args, sink):
             raise CliError("INVALID_INPUT", "retention floor must be finite")
         payload = with_session(args, lambda session: ml.fetch_alpha_metrics(session, alpha_id))
         alphas._reject_quick_simulation(args, payload)
-        # Validation joins current evidence by alpha id; a fresh FULL alpha is not
-        # in the ledger yet, which used to report "test_sharpe_missing" even though
-        # the platform already carried train and test splits.
+        code, _expr_desc, operator_count = ml.regular_expression(payload)
+        pp_summary = pp_budget.alpha_budget(
+            code, payload.get("settings"), platform_operator_count=operator_count
+        )
+        if pp_summary is not None:
+            data["power_pool_budget"] = {"budget": pp_summary, "gates": None}
+        # Validation joins current evidence by alpha id; record the platform's
+        # fresh FULL metrics and train/test split before running triage.
         _record_current_evidence(payload, alpha_id)
         if not saved_choice:
             freeze_args = parser.parse_args(["triage", "--ids", alpha_id, "--freeze", str(freeze)])
@@ -302,6 +307,20 @@ def cmd_promote(args, sink):
         if result.get("error"):
             error = result["error"]
             raise CliError(error["code"], error["message"], error.get("hint"))
+        if pp_summary is not None:
+            data["power_pool_budget"] = pp_budget.alpha_budget(
+                code, payload.get("settings"),
+                checks=result.get("checks"),
+                platform_operator_count=operator_count,
+            )
+        if not args.dry_run and checked.get("complete") and result.get("complete"):
+            try:
+                rules_snapshot.record_observed_checks(
+                    result.get("checks"),
+                    scope=capabilities.scope_settings(payload.get("settings")),
+                )
+            except (OSError, Exception):  # noqa: BLE001 - snapshot persistence is non-fatal
+                pass
 
         summary = summarize_checks(result.get("checks"))
         if (not checked.get("complete") or not result.get("complete")
@@ -338,6 +357,17 @@ def cmd_promote(args, sink):
             if args.dry_run:
                 data["next_action"]["argv"].append("--dry-run")
             return data
+        try:
+            existing_seeds = buffer_cmd.read_seeds(seeds) if seeds.exists() else {}
+        except (OSError, ValueError):
+            existing_seeds = {}
+        other_descriptions = [
+            item.get("description", "") for aid, item in existing_seeds.items()
+            if aid != alpha_id and isinstance(item.get("description"), str)
+        ]
+        data["description_review"] = description.check(
+            getattr(args, "description", None), others=other_descriptions
+        )
         if args.dry_run:
             data["outcome"] = "would_buffer"
             data["steps"]["buffer"] = {"status": "would_buffer"}

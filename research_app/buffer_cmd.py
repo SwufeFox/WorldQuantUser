@@ -363,12 +363,13 @@ def cmd_buffer_add(args, _sink, *, checked=None):
                 "book": _book_evidence(args),
                 "self_correlation": self_corr,
                 "book_size": _book_size(args),
-                "note": args.note}
+                "note": args.note}, checks
 
     from datetime import datetime, timezone
+    from . import capabilities, description, rules_snapshot
     from .alphas import _submission_path
     with cache_store.file_lock(str(_submission_path(args.alpha_id)) + ".lock"):
-        entry = with_session(args, work)
+        entry, observed_checks = with_session(args, work)
         entry["at"] = datetime.now(timezone.utc).isoformat()
         failed = entry["checks"]["failed"]
         if failed:
@@ -390,6 +391,12 @@ def cmd_buffer_add(args, _sink, *, checked=None):
         }
         seed_complete = False
         try:
+            prior_seeds = read_seeds(seed_path) if Path(seed_path).exists() else {}
+            other_descriptions = [
+                item.get("description", "") for aid, item in prior_seeds.items()
+                if aid != args.alpha_id and isinstance(item.get("description"), str)
+            ]
+            description_review = description.check(seed["description"], others=other_descriptions)
             seed_written = _write_seed(seed_path, seed)
             seed_complete = True
             written = _append(path, entry)
@@ -399,8 +406,61 @@ def cmd_buffer_add(args, _sink, *, checked=None):
                            details={"alpha_id": args.alpha_id, "partial": seed_complete,
                                     "seed": {"complete": seed_complete, "path": str(seed_path)},
                                     "shelf": {"complete": False, "path": str(path)}}) from exc
+        if entry.get("checks_complete") and observed_checks:
+            try:
+                rules_snapshot.record_observed_checks(
+                    observed_checks,
+                    scope=capabilities.scope_settings(entry.get("settings")),
+                )
+            except (OSError, cache_store.CacheError):
+                pass
     return {"path": str(path), "seeds": str(seed_path), "entry": entry,
-            "seed": seed, "written": written, "seed_written": seed_written}
+            "seed": seed, "written": written, "seed_written": seed_written,
+            "description_review": description_review}
+
+
+def _shelf_submission_plan(rows, args):
+    """Build a train-only independent submission subset for shelved candidates."""
+    import itertools
+    import math
+    import alpha_registry
+    from . import book_state, legs, stats, submission_planner
+
+    eligible = [
+        row for row in rows
+        if type(row.get("train_sharpe")) in (int, float)
+        and math.isfinite(row["train_sharpe"]) and row["train_sharpe"] > 0
+    ]
+    if len(eligible) < 2:
+        return None
+    registry = getattr(args, "registry", None) or alpha_registry.default_registry_path()
+    try:
+        entries = alpha_registry.load_entries(registry)
+    except Exception:  # noqa: BLE001
+        entries = []
+    latest = {entry["alpha_id"]: entry for entry in entries if entry.get("alpha_id")}
+    ids = [row["alpha_id"] for row in eligible]
+    bounds, missing_bounds = book_state.test_boundaries(latest, set(ids))
+    pnl_dir = os.path.join(research_paths.research_dir(), "pnl")
+    pnls = {aid: legs.load_pnl(aid, pnl_dir) if os.path.isdir(pnl_dir) else {} for aid in ids}
+    correlations = {}
+    for a, b in itertools.combinations(ids, 2):
+        if a in missing_bounds or b in missing_bounds:
+            continue
+        cutoff = min(bounds[a], bounds[b])
+        series_a, series_b = pnls[a], pnls[b]
+        if not series_a or not series_b:
+            continue
+        shared = sorted(day for day in series_a if day < cutoff and day in series_b)
+        if len(shared) < stats.MIN_PORTFOLIO_OVERLAP:
+            continue
+        rho = legs.correlation([series_a[day] for day in shared], [series_b[day] for day in shared])
+        if rho is not None:
+            correlations[(a, b)] = round(rho, 4)
+    candidates = [{"id": row["alpha_id"], "weight": row["train_sharpe"]} for row in eligible]
+    planned = submission_planner.plan(candidates, correlations, max_correlation=GATE)
+    planned["weight_basis"] = "train_sharpe"
+    return planned
 
 
 def cmd_buffer_list(args, _sink):
@@ -457,8 +517,13 @@ def cmd_buffer_list(args, _sink):
             "note": entry.get("note"),
             "expression": entry.get("expression"),
         })
-    return {"path": str(path), "count": len(rows), "gate": GATE, "rows": rows,
-            "book": current_evidence, "order": "alpha_id; test metrics never determine order"}
+    result = {"path": str(path), "count": len(rows), "gate": GATE, "rows": rows,
+              "book": current_evidence, "order": "alpha_id; test metrics never determine order"}
+    if len(rows) >= 2:
+        planned = _shelf_submission_plan(rows, args)
+        if planned is not None:
+            result["submission_plan"] = planned
+    return result
 
 
 def cmd_buffer_drop(args, _sink):

@@ -21,35 +21,53 @@ SECTION_DATA = "DATA:"
 SECTION_RATIONALE = "RATIONALE:"
 
 
-def compose(idea, fields, operators=(), field_notes=None, operator_notes=None):
+def compose(idea, fields, operators=(), field_notes=None, operator_notes=None, *,
+            rationale=None):
     """Build the text from the researcher's idea plus catalog descriptions.
 
     ``fields`` are data-field ids; ``field_notes`` maps each to its catalog
     description.  ``operators`` are operator names; ``operator_notes`` maps each
-    to what it does in this signal.  Any field or operator without a note is
-    reported under ``missing`` and the draft is not produced.
+    to what it does in this signal.  Any missing input is reported under
+    ``missing`` and no draft is produced.
     """
+    field_list = [f for f in (fields or ()) if isinstance(f, str) and f.strip()]
+    op_list = [o for o in (operators or ()) if isinstance(o, str) and o.strip()]
     field_notes = field_notes or {}
     operator_notes = operator_notes or {}
-    missing = [f for f in fields if not (field_notes.get(f) or "").strip()]
-    missing += ["op:%s" % o for o in operators if not (operator_notes.get(o) or "").strip()]
+    missing = []
     text_idea = (idea or "").strip()
     if not text_idea:
-        missing.insert(0, "idea")
+        missing.append("idea")
+    if not field_list:
+        missing.append("fields")
+    missing.extend(f for f in field_list if not (field_notes.get(f) or "").strip())
+    missing.extend("op:%s" % o for o in op_list if not (operator_notes.get(o) or "").strip())
     if missing:
         return {"ok": False, "text": None,
                 "missing": missing,
                 "reason": "no description evidence for %s" % ", ".join(missing)}
 
-    data = "; ".join("%s is %s" % (f, field_notes[f].strip().rstrip(".")) for f in fields)
+    data = "; ".join("%s is %s" % (f, field_notes[f].strip().rstrip(".")) for f in field_list) + "."
     ops = "; ".join("%s %s" % (name, operator_notes[name].strip().rstrip("."))
-                    for name in operators) if operators else ""
-    rationale = ("%s A negative rank keeps the signal dollar- and industry-neutral, "
-                 "so the result comes from the cross-section rather than from market beta." %
-                 ("The construction uses " + ops + "." if ops else "The signal is ranked inside its group."))
+                    for name in op_list)
+    if rationale is not None and str(rationale).strip():
+        text_rationale = str(rationale).strip()
+    elif ops:
+        text_rationale = (
+            "The signal combines %s through %s so cross-sectional variation "
+            "in the documented inputs drives the resulting weights."
+            % (", ".join(field_list), ops)
+        )
+    else:
+        text_rationale = (
+            "The signal maps %s directly to evaluate the stated hypothesis across "
+            "instruments using only the documented input fields."
+            % ", ".join(field_list)
+        )
     text = "%s %s\n\n%s %s\n\n%s %s" % (SECTION_IDEA, text_idea, SECTION_DATA, data,
-                                        SECTION_RATIONALE, rationale)
-    return {"ok": True, "text": text, "check": check(text)}
+                                        SECTION_RATIONALE, text_rationale)
+    checked = check(text)
+    return {"ok": checked["ok"], "text": text, "check": checked}
 
 
 def check(text, others=(), min_chars=MIN_CHARS, near_duplicate_ratio=0.9):

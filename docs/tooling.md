@@ -352,6 +352,8 @@ Campaign 用同一份训练筛选生成的冻结选择调用 `promote`，沿用�
 
 回执包含 `alpha_id`、`freeze_path`、`validate` 的训练/测试 Sharpe、retention、
 rho_book、max_member_rho，以及 `checks`、`buffered`、`outcome`、`reasons`。
+对 FASTEXPR 候选，`alpha get` 与 `promote` 还会附带 `power_pool_budget`（算子计费/豁免、数据字段与单数据集状态，以及与平台 checks 合并后的门控摘要）；提供入库说明时，`promote` 与 `buffer add` 附带非阻断的 `description_review`（章节结构与已有种子的近似重复度检查），并在实时检查完成后将最新平台阈值、配额和 Theme 倍率去重记录到 `rules-snapshot.jsonl`。
+多候选训练筛选（`triage` 含两个及以上正边际候选）与候选架盘点（`buffer list`）会基于训练窗日度 PnL 相关矩阵生成 `submission_plan`（带权最大独立集与建议提交顺序，未测量的候选对列入 `unknown_pairs` 且绝不假定独立）。各模块的设计边界见 [候选门槛与提交规划](tool-absorption.md)。
 测试期门未通过时，`steps.checks` 为 `skipped`。
 `steps` 保存各步状态和已完成的冻结、验证及入库证据。任何执行异常立即停止，
 返回 `ok: false`、现有类型的 `error` 和退出码，同时在 `data` 保留已完成证据及 `failed_step`；
@@ -1488,7 +1490,7 @@ Campaign 的 `campaign-freeze-ALPHA_ID.json` 和 `promote-ALPHA_ID.json` 回执�
 ATOM 的默认批次路径在 `checkpoints/`，以臂清单内容生成名称。已有同名批次时使用
 `--recover` 或 `--resume`。`--recover` 回读已知任务，`--resume` 也可继续已知未提交的臂。
 `--dry-run` 可用于新扫描和续跑预览，跳过结果账本写入。
-`atom-results.jsonl` 保存带 `metrics_scope: full_is` 的指标与平台检查快照，供子宇宙初筛。
+`atom-results.jsonl` 保存带 `metrics_scope: full_is` 的指标、平台检查快照及 `pp_budget` 结构预算摘要，供子宇宙与 Power Pool 初筛。
 常规训练筛选使用训练期回执，提交资格仍需实时平台 checks。
 
 ### 做 SPC 提示词实验

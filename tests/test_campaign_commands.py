@@ -388,7 +388,14 @@ def test_campaign_archive_cache_follows_receipt_alias_and_protects_cached_inputs
     _, batch, receipt = campaign_pnl_fixture(root, "legacy", "done")
     checkpoint = batch.replace(root / "checkpoint.json")
     alias = root / "checkpoint-alias.json"
-    alias.symlink_to(checkpoint)
+    try:
+        alias.symlink_to(checkpoint)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            import pytest
+
+            pytest.skip("symlinks require Windows Developer Mode or administrator privilege")
+        raise
     cache_store.write_json_atomic(receipt, {"data": {"path": "../checkpoint-alias.json"}})
 
     load = experiments._load_probe_batch

@@ -53,13 +53,26 @@ available for their specific uses.
 | `research_app/experiments.py` | Simulation, resumption, labelled probes, ablation and comparison. |
 | `research_app/alphas.py` | Platform alpha inspection, native recordsets, submission and correlation. |
 | `research_app/simulation_import.py` | Read existing BRAIN simulations and recover their Alpha IDs. |
+| `research_app/triage.py` | Train-only candidate screening, book leave-one-out health and frozen validation. |
+| `research_app/promote.py` | Freeze, validate, run live checks and shelve a FULL candidate in one workflow. |
+| `research_app/selection.py` | Immutable training selection manifests and drift verification. |
+| `research_app/buffer_cmd.py` | Append-only candidate shelf (`submit-buffer.jsonl`) and submission seed store. |
+| `research_app/pp_budget.py` | Structural Power Pool operator/field/dataset budget and gate summary. |
+| `research_app/submission_planner.py` | Maximum-weight independent subset and submission ordering from train PnL correlations. |
+| `research_app/description.py` | Evidence-bound Power Pool description assembly and near-duplicate checks. |
+| `research_app/rules_snapshot.py` | Scoped, provenance-tagged snapshots of platform thresholds, quotas and themes. |
 | `research_app/ledger.py` | Local ledger recording, labels, lineage, coverage, shared legs and offline queries. |
-| `research_app/campaign.py` | Research briefs and train/test view history. |
+| `research_app/ledger_analysis.py` | Indexed funnel, failure-driver and cohort summaries over the local ledger. |
+| `research_app/campaign.py` | Research campaigns, bounded briefs and train/test view history. |
+| `research_app/feed.py` | Multi-source research leads (papers, news, forum, market snapshots) with seen tracking. |
 | `research_app/literature.py` | OpenAlex paper discovery and reading. |
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and research scripts. |
 | `machine_lib.py` | BRAIN API client, settings, cache policy and simulation execution. |
+| `check_evidence.py` | Shared normalization and status classification for platform check payloads. |
 | `simulation_capabilities.py` | Account identity and current settings evidence; unknown capabilities remain explicit. |
 | `simulation_slots.py` | Durable simulation reservations shared by the same account and research workspace. |
+| `simulation_multi.py` | Native Multi Simulation grouping, parent/child state tracking and reconciliation. |
+| `registry_index.py` | Incremental SQLite index over `alpha-registry.jsonl` for fast novelty and cohort queries. |
 | `expression_lint.py` | Pre-flight checks: real operator names, arity, learned rejections. |
 | `expression_types.py` | Five field types, operator signatures, and the mismatches they imply. |
 | `field_index.py` | Live field-name verification and vocabulary-free variant grouping. |
@@ -82,6 +95,9 @@ available for their specific uses.
 | `tools/guarded_sim.py` | Bind simulation launches to preflight for the exact source and settings. |
 | `tools/_runner.py` | Shared workspace and durable Probe handling for research queues. |
 | `tools/campaign_runner.py` | Screen completed experiments on training evidence before candidate promotion. |
+| `tools/atom_runner.py` | Run ATOM / Power Pool exploration scans through the durable Probe lifecycle. |
+| `tools/atom_screen.py` | Screen saved ATOM results by sub-universe check margins and Sharpe. |
+| `tools/pipeline/batch_quick.py` | Compatibility Quick exploration batch runner with skeleton and dataset admission gates. |
 | `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
 | `research_app/substitution.py` | Whole-token field substitution: the "change exactly one input" batch. Exact and identifier-bounded, because `replace("sales", ...)` also rewrote `sales_growth`. |
 | `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |
@@ -161,6 +177,7 @@ pattern-matching the string.
 | [Fast backtesting (中文)](docs/fast-backtest.md) | Diagnose slow or stalled work and measure accepted jobs, finished results and complete evidence separately. |
 | [Expression pipeline](docs/ast-pipeline.md) | Understand FASTEXPR parsing, source identity, and structural analysis. |
 | [Unit compression](docs/unit-compression.md) | Inspect FASTEXPR construction coverage and reproduce the report. |
+| [Candidate gates and submission planning](docs/tool-absorption.md) | Understand Power Pool structural budgets, independent-subset planning, description checks and rule snapshots. |
 | [Backup and replay](docs/backup-replay.md) | Archive research state, restore a workspace, or check historical results. |
 
 ## Install
@@ -194,10 +211,8 @@ cp .env.example .env
 ```
 
 `.env.example` lists the credentials and settings the tool reads, including BRAIN,
-OpenAlex and Alpaca access and the research directory.
-It is guarded by a test that extracts environment names from the source, because that list
-had already drifted once - four variables were documented nowhere, including the one that
-decides where the ledger lives.
+OpenAlex and Alpaca access and the research directory. A contract test verifies
+that every environment variable referenced in the codebase stays documented there.
 
 `.env` must sit next to `machine_lib.py`; the loader resolves it relative to the module,
 so a `.env` elsewhere is silently ignored. It is git-ignored. Real environment variables (`BRAIN_USERNAME`,

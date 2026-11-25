@@ -204,3 +204,42 @@ def test_reconcile_keeps_ancient_reservation_when_platform_is_running(tmp_path, 
     assert result["released"] == []
     assert result["kept"][0]["status"] == "RUNNING"
     assert slots.snapshot(ACCOUNT, 1)["active"] == 1
+
+
+def _sleep_briefly(ready, release):
+    ready.set()
+    release.wait(10)
+
+
+def test_quick_owner_liveness_checks_start_token_and_invalid_pids():
+    owner = slots._quick_owner()
+    assert isinstance(owner["pid"], int) and owner["pid"] > 0
+    assert slots._quick_owner_is_live(owner) is True
+    if owner["start"] is not None:
+        assert slots._quick_owner_is_live({"pid": owner["pid"], "start": "mismatched-start"}) is False
+    for bad_owner in (
+        None,
+        {},
+        {"pid": 0},
+        {"pid": -5},
+        {"pid": True},
+        {"pid": 99_999_999, "start": None},
+        {"pid": 1 << 40, "start": None},
+    ):
+        assert slots._quick_owner_is_live(bad_owner) is False
+
+    context = multiprocessing.get_context("spawn")
+    ready, release = context.Event(), context.Event()
+    child = context.Process(target=_sleep_briefly, args=(ready, release))
+    child.start()
+    try:
+        assert ready.wait(5)
+        state, child_start = slots._process_stat(child.pid)
+        child_owner = {"pid": child.pid, "start": child_start}
+        assert slots._quick_owner_is_live(child_owner) is True
+    finally:
+        child.kill()
+        child.join(5)
+    # Even while `child` still holds its OS process handle in this scope, a
+    # terminated worker must immediately report as not live.
+    assert slots._quick_owner_is_live(child_owner) is False

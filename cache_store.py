@@ -311,15 +311,21 @@ def prune_corrupt(path, keep=3):
 # ---------------------------------------------------------------------------
 # Locking
 # ---------------------------------------------------------------------------
+# Offset locked by msvcrt.locking on Windows so bytes 0..255 (holding the
+# diagnostic "<pid> <iso>" owner line) remain readable by contenders.
+_WIN_LOCK_OFFSET = 0x10000
+
+
 @contextlib.contextmanager
 def file_lock(path, timeout=60.0, poll=0.1):
-    """Hold an exclusive advisory lock on ``path`` for the duration of the block.
+    """Hold an exclusive lock on ``path`` for the duration of the block.
 
     Used to make login single-flight: the first process authenticates and writes
     the session cache, everyone else blocks and then finds a valid cache instead
     of logging in again (repeat logins are what trigger BRAIN's captcha).
 
-    POSIX uses ``flock``; Windows locks the first byte with ``msvcrt.locking``.
+    POSIX uses ``flock``; Windows locks a high byte offset with ``msvcrt.locking``
+    so contenders can still read the owner PID/timestamp written at offset 0.
     Both locks are released by the OS when the owning process dies. The lock
     file stays in place so every contender locks the same file. Legacy ``.pid``
     sentinels are ignored and left untouched. Raises :class:`LockTimeout` when
@@ -339,8 +345,9 @@ def file_lock(path, timeout=60.0, poll=0.1):
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 else:
                     # Windows permits locking beyond EOF, so an empty file
-                    # needs no unprotected initialization write.
-                    os.lseek(fd, 0, os.SEEK_SET)
+                    # needs no unprotected initialization write, and offset 0
+                    # stays unlocked for diagnostic owner reads.
+                    os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 acquired = True
                 break
@@ -353,6 +360,7 @@ def file_lock(path, timeout=60.0, poll=0.1):
                         "timed out after %.1fs waiting for %s" % (timeout, path))
                 time.sleep(min(poll, remaining))
         try:
+            os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
             os.write(fd, ("%d %s\n" % (os.getpid(), _to_iso(utc_now()))).encode())
         except OSError:
@@ -364,7 +372,7 @@ def file_lock(path, timeout=60.0, poll=0.1):
                 if fcntl is not None:
                     fcntl.flock(fd, fcntl.LOCK_UN)
                 else:
-                    os.lseek(fd, 0, os.SEEK_SET)
+                    os.lseek(fd, _WIN_LOCK_OFFSET, os.SEEK_SET)
                     msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
         with contextlib.suppress(OSError):
             os.close(fd)

@@ -12,6 +12,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import cache_store
+from research_app import pp_budget
 from research_app.research_route import ATOM_RUNNER_MECHANISM
 from tools._runner import research_root, run_cli
 
@@ -57,17 +58,24 @@ def _read_batch(path):
 def _result_row(batch, index, arm, record):
     metrics = record.get("metrics") or {}
     sharpe, turnover = metrics.get("sharpe"), metrics.get("turnover")
+    checks = record.get("checks") or {}
+    budget = pp_budget.alpha_budget(
+        arm["expression"], arm.get("settings"),
+        checks=checks,
+        platform_operator_count=record.get("operator_count"),
+    )
     return {
         "label": arm["label"].split(": ", 1)[-1],
         "alpha_id": record.get("alpha_id"),
         "status": record.get("status"),
         **{key: metrics.get(key) for key in IS_METRICS},
-        "checks": record.get("checks") or {},
+        "checks": checks,
         **({"classification_ids": record["classification_ids"]} if "classification_ids" in record else {}),
         "expr": arm["expression"],
         "error": record.get("error"),
-        "power_pool_sharpe": isinstance(sharpe, (int, float)) and sharpe >= 1.0,
-        "turnover_ok": isinstance(turnover, (int, float)) and 0.01 <= turnover <= 0.70,
+        "power_pool_sharpe": type(sharpe) in (int, float) and sharpe >= 1.0,
+        "turnover_ok": type(turnover) in (int, float) and 0.01 <= turnover <= 0.70,
+        "pp_budget": budget,
         "metrics_scope": "full_is",
         "run_id": batch["run_id"],
         "arm_index": index,
@@ -84,7 +92,7 @@ def _project(batch_path, output):
                 for index, (arm, record) in enumerate(zip(batch["arms"], batch["records"]))]
         with cache_store.file_lock(str(output) + ".lock"):
             try:
-                previous = output.read_bytes().decode("utf-8")
+                previous = output.read_text(encoding="utf-8")
                 mode = stat.S_IMODE(output.stat().st_mode)
             except FileNotFoundError:
                 previous, mode = "", 0o600

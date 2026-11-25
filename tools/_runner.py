@@ -306,11 +306,11 @@ def probe_poll_at(document):
         and not record.get("multi_parent_terminal")
         and isinstance(record.get("multi_request_id"), str) and isinstance(record.get("multi_parent_url"), str)
     } if isinstance(records, list) else {}
-    from research_app.experiments import _matching_preflight_deferrals
+    from research_app.experiments import matching_preflight_deferrals
 
     snapshot = document.get("capability_snapshot")
     account = snapshot.get("account") if isinstance(snapshot, dict) else None
-    deferred = (_matching_preflight_deferrals(document, account.get("fingerprint"))
+    deferred = (matching_preflight_deferrals(document, account.get("fingerprint"))
                 if isinstance(account, dict) else {})
     account_retry_at = max((entry["retry_at"] for entry in deferred.values()
                            if entry.get("code") == "RATE_LIMITED"), default=0)
@@ -483,9 +483,9 @@ def _recovery_schedule(root, batch, receipt, include_requests):
 
 
 def _watch_requests(rows):
-    from research_app.experiments import _probe_identity
+    from research_app.experiments import probe_identity
 
-    return frozenset(_probe_identity(row["expression"], row["settings"]) for row in rows
+    return frozenset(probe_identity(row["expression"], row["settings"]) for row in rows
                      if isinstance(row, dict) and isinstance(row.get("expression"), str)
                      and isinstance(row.get("settings"), dict) and row["settings"])
 

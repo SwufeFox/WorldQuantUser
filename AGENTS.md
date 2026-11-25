@@ -157,9 +157,10 @@ For throughput, shared budgets and concurrency measurements, read the Chinese
 | Read-only inspection of existing simulation tasks | `research_app/simulation_import.py` |
 | Catalog and validation | `research_app/catalog.py`, `research_app/validation.py` |
 | Training selection, promotion, candidate shelf | `research_app/triage.py`, `research_app/selection.py`, `research_app/promote.py`, `research_app/buffer_cmd.py` |
-| Platform alphas and local ledger | `research_app/alphas.py`, `research_app/ledger.py` |
-| Briefs, account, literature | `research_app/campaign.py`, `research_app/account.py`, `research_app/literature.py` |
-| Research-file contract and BRAIN client | `research_config.py`, `machine_lib.py` |
+| Power Pool budget, submission planning, descriptions, rule snapshots | `research_app/pp_budget.py`, `research_app/submission_planner.py`, `research_app/description.py`, `research_app/rules_snapshot.py` |
+| Platform alphas and local ledger | `research_app/alphas.py`, `research_app/ledger.py`, `research_app/ledger_analysis.py`, `registry_index.py` |
+| Campaigns, briefs, feeds, account, literature | `research_app/campaign.py`, `research_app/feed.py`, `research_app/account.py`, `research_app/literature.py` |
+| Research-file contract, check normalization, slots and BRAIN client | `research_config.py`, `check_evidence.py`, `simulation_slots.py`, `simulation_multi.py`, `machine_lib.py` |
 
 Put behavior in its owning module and bind it explicitly in `parser.py`. Tests
 import that module; `research_cli.py` is executable only. Core libraries must not

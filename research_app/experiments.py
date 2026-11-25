@@ -32,9 +32,9 @@ from .validation import (FieldEvidenceRefreshError, _preflight_lint, attach_fiel
                          cached_field_scope, lint_python_source)
 
 
-#: Operators per arm above which the report says so. Not a hard limit (the platform's
-#: is 64); a research limit. The user's rule from 2026-11-07: many operators means more
-#: room to fit, and mixed signals blur what a result actually tests.
+#: Operators per arm above which the report flags complexity. Not a platform ceiling
+#: (the platform allows up to 64); a research discipline threshold to keep arms
+#: interpretable and avoid overfitting multi-term composites.
 SIMPLE_OPERATOR_LIMIT = 8
 
 
@@ -1212,8 +1212,16 @@ def _probe_design(spec, settings):
             "designs": {arm["label"]: arm["design"] for arm in arms}}
 
 
+def validate_probe_design(spec, settings):
+    return _probe_design(spec, settings)
+
+
 def _finite_metric(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def finite_metric(value):
+    return _finite_metric(value)
 
 
 def _has_finished_result(record):
@@ -1611,6 +1619,11 @@ def _load_probe_batch(value, *, source_paths=None, within=None, observe_source=N
     return path, document
 
 
+def load_probe_batch(value, *, source_paths=None, within=None, observe_source=None):
+    return _load_probe_batch(value, source_paths=source_paths, within=within,
+                             observe_source=observe_source)
+
+
 def _cmd_probe_recover(args):
     path, _document = _load_probe_batch(args.recover)
     protect_output(args, path)
@@ -1864,6 +1877,10 @@ def _probe_identity(expression, settings):
     return alpha_registry.expression_hash(expression, language=language), _settings_signature(settings)
 
 
+def probe_identity(expression, settings):
+    return _probe_identity(expression, settings)
+
+
 def _scan_novelty_history(registry, arm_keys, arm_identities):
     """Scan the authoritative ledger when the derived index is unavailable."""
     from . import mechanisms
@@ -2083,6 +2100,35 @@ def probe_spec_identity(path):
     return {"track": spec["track"], "design": design,
             **{key: spec[key] for key in ("quick_source", "breeding_source") if key in spec},
             "request_fingerprint": _request_fingerprint(arms), "results": arms}
+
+
+def preview_probe_spec(path, *, research_dir=None, multi_size=None, strict_gate=True):
+    """Preview a BRAIN Probe spec offline in-process without spawning a child CLI."""
+    import os
+    from . import runtime
+    from .parser import build_parser
+
+    argv = ["probe", str(path), "--dry-run"]
+    if strict_gate:
+        argv.append("--strict-gate")
+    if multi_size is not None:
+        argv.extend(["--multi-size", str(multi_size)])
+    root = (research_dir or os.environ.get(research_paths.ENV_VAR)
+            or os.environ.get("WQ_RESEARCH_DIR"))
+    previous_dir = os.environ.get(research_paths.ENV_VAR)
+    previous_quiet = runtime._QUIET
+    try:
+        if root is not None:
+            os.environ[research_paths.ENV_VAR] = str(Path(root).expanduser().resolve())
+        runtime._QUIET = True
+        parsed = build_parser().parse_args(argv)
+        return cmd_probe(parsed, None)
+    finally:
+        runtime._QUIET = previous_quiet
+        if previous_dir is None:
+            os.environ.pop(research_paths.ENV_VAR, None)
+        else:
+            os.environ[research_paths.ENV_VAR] = previous_dir
 
 
 def _request_fingerprint(arms):
@@ -2523,6 +2569,10 @@ def _matching_preflight_deferrals(document, account_fingerprint):
             # rate limit still applies to that endpoint's new requests.
             matched[label] = entry
     return matched
+
+
+def matching_preflight_deferrals(document, account_fingerprint):
+    return _matching_preflight_deferrals(document, account_fingerprint)
 
 
 def _execute_probe(args, document, target, groups):

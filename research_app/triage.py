@@ -27,7 +27,7 @@ from check_evidence import normalize_checks, platform_check_names, summarize_che
 import machine_lib as ml
 import research_paths
 
-from . import benchmark, costs, legs, mechanisms, selection, stats
+from . import benchmark, costs, legs, mechanisms, selection, stats, submission_planner
 from .book_state import describe_book, member_digest, test_boundaries
 from .runtime import CliError
 
@@ -73,12 +73,11 @@ def _sub_universe(entry):
 
 
 def _unresolved(entry):
-    """Checks the platform never resolved for this record.
+    """Checks the platform has not yet resolved for this record.
 
-    A simulation response carries SELF_CORRELATION as PENDING: it is computed by the
-    check endpoint afterwards. Treating a PENDING as "not failing" made every unresolved
-    candidate look clean, which is how a 0.99 self-correlation sat on the shelf looking
-    like 0.44.
+    A simulation snapshot often carries SELF_CORRELATION as PENDING until the check
+    endpoint evaluates it. Treating PENDING or ERROR as passing would let unverified
+    candidates advance without a resolved correlation verdict.
     """
     required = {"SELF_CORRELATION", "MATCHES_COMPETITION"}
     if entry.get("checks_state") == "partial":
@@ -377,6 +376,41 @@ def _verdict(row, criteria):
     return "shelve", "recorded checks resolved and moves the book +%.3f; recheck platform eligibility before submission" % row["delta"]
 
 
+def _candidate_submission_plan(rows, candidate_pnls, scoring_days, max_correlation=None):
+    """Suggest an independent candidate subset using train-only PnL and marginal weights."""
+    import itertools
+
+    eligible = [
+        row for row in rows
+        if not row.get("missing") and not row.get("member") and row.get("role") != "diagnostic"
+        and type(row.get("delta")) in (int, float) and math.isfinite(row["delta"]) and row["delta"] > 0
+    ]
+    if len(eligible) < 2:
+        return None
+    ids = [row["alpha_id"] for row in eligible]
+    correlations = {}
+    for a, b in itertools.combinations(ids, 2):
+        series_a = candidate_pnls.get(a) or {}
+        series_b = candidate_pnls.get(b) or {}
+        if not series_a or not series_b:
+            continue
+        shared = [day for day in scoring_days if day in series_a and day in series_b]
+        if len(shared) < MIN_OVERLAP_DAYS:
+            continue
+        rho = legs.correlation([series_a[day] for day in shared], [series_b[day] for day in shared])
+        if rho is not None:
+            correlations[(a, b)] = round(rho, 4)
+    threshold = (max_correlation if max_correlation is not None
+                 else submission_planner.DEFAULT_MAX_CORRELATION)
+    planned = submission_planner.plan(
+        [{"id": row["alpha_id"], "weight": row["delta"]} for row in eligible],
+        correlations,
+        max_correlation=threshold,
+    )
+    planned["weight_basis"] = "train_marginal_sharpe"
+    return planned
+
+
 def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
            retention_floor=None, internal=False, whole_book=False, criteria=None,
            show_test=False, train_end=None, freeze_path=None, selection_path=None,
@@ -515,6 +549,7 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
     peer_series = {peer: legs.load_pnl(peer, directory) for peer in shelf["member_ids"]} if against_shelf else {}
     peer_coverage = {peer: ml.pnl_cache_status(directory, peer, values) for peer, values in peer_series.items()}
     rows = []
+    candidate_pnls = {}
     for alpha_id in targets:
         entry = latest.get(alpha_id)
         if entry is not None and roles and alpha_id in roles:
@@ -528,6 +563,7 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
                 rows.append(row)
             continue
         candidate = series[alpha_id] if alpha_id in series else legs.load_pnl(alpha_id, directory)
+        candidate_pnls[alpha_id] = candidate
         row = _score(alpha_id, entry, series, scoring_days, settings, candidate=candidate,
                      book_daily=book_daily, unit_book=unit_book)
         row["evidence"] = _candidate_evidence(
@@ -558,6 +594,10 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
         "note": ("Validation evidence in immutable training order; missing candidates remain missing."
                  if show_test else "Selection view: train metrics and PnL only. Missing train metrics stay unknown."),
     }
+    if not whole_book and not show_test and len(rows) >= 2:
+        planned = _candidate_submission_plan(rows, candidate_pnls, scoring_days, max_shelf_correlation)
+        if planned is not None:
+            result["submission_plan"] = planned
     if freeze_path and (max_shelf_correlation is None or (
             rows and all(row["training_gate"]["state"] == "pass" for row in rows))):
         inputs = {"registry_path": os.path.abspath(os.path.expanduser(os.fspath(

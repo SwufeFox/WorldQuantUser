@@ -1,29 +1,25 @@
 #!/usr/bin/env python3
-"""A real parser for FASTEXPR, plus a macro layer that compiles sugar into it.
+"""Structural parser and AST transformations for FASTEXPR expressions.
 
-Why a parser instead of regexes: every analysis we want downstream needs the tree,
-not the string. Field extraction by regex cannot tell an assignment target from a
-call argument, cannot see that ``eps`` is a local variable, and cannot tell that
-two expressions differ only in a constant. All three have already caused wrong
-conclusions here.
+Why a parser instead of regexes: downstream analysis needs the syntax tree,
+not the raw string. Regex extraction cannot distinguish an assignment target
+from a call argument, cannot see that ``eps`` is a bound local variable, and
+cannot tell when two expressions differ only in numeric constants.
 
-What the tree buys, in the order it matters:
+What the tree provides:
 
-* **Exact field sets.** Locals bound by ``a = ...`` are not fields. The regex path
-  reports them as unknown identifiers unless a field happens to share the name.
-* **Skeletons.** Replace every field with ``F`` and every literal with ``L`` and
-  you get a structure key. Two alphas with the same key are the same bet with
-  different inputs -- that is the family tree question, answered structurally
-  instead of by correlation, which costs an API call per pair.
-* **Composition.** Because a signal is a tree, assembling legs is tree surgery:
-  scale a subtree, substitute one field family for another, or splice a whole
-  program in as a subexpression.
+* **Exact field sets.** Locals bound by ``a = ...`` are excluded automatically
+  rather than misclassified as unknown fields.
+* **Skeletons.** Replacing every field with ``F`` and every literal with ``L``
+  produces a structural key so parameter variants of the same construction are
+  detected without pairwise PnL calls.
+* **Composition.** Scaling a subtree, substituting one field family for another,
+  or splicing subexpressions operates on parsed nodes rather than substrings.
 
-Macros are the "post-compile" layer: you write ``band(r)`` and the parser expands
-it to ``-(abs(r) - 0.25)`` before anything else sees it. Expansion happens on the
-AST, so a macro can take a subtree, not just text. Nothing in this module knows
-any BRAIN field or operator name: the macro table starts empty and is filled by
-whoever imports :func:`macro`.
+Optional macro hooks (:func:`macro`, :func:`expand`) remain available for legacy
+generator scripts (`alpha_sugar.py`) that explicitly emit native FASTEXPR; for
+ledger compression and construction coverage, prefer ``alpha_unit.py``.
+Nothing in this module hard-codes BRAIN field or operator names.
 """
 
 from __future__ import annotations

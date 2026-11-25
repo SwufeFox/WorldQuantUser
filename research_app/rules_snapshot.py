@@ -18,14 +18,30 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import time
+
+import cache_store
+from check_evidence import CLIENT_PARSE_ERROR, normalize_checks
+import research_paths
 
 #: Names that describe a quota rather than a test.
 QUOTA_SUFFIX = "_SUBMISSION"
+SNAPSHOT_FILENAME = "rules-snapshot.jsonl"
 
 
 def _now_iso():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return cache_store._to_iso(cache_store.utc_now())
+
+
+def _timestamp(value):
+    moment = cache_store._from_iso(value)
+    return None if moment is None else moment.timestamp()
+
+
+def default_snapshot_path():
+    """Default JSONL path under the active research directory."""
+    return Path(research_paths.research_dir()) / SNAPSHOT_FILENAME
 
 
 def extract_check_rules(check, *, scope, observed_at=None):
@@ -37,13 +53,21 @@ def extract_check_rules(check, *, scope, observed_at=None):
     """
     records = []
     observed = observed_at or _now_iso()
-    items = check if isinstance(check, list) else [
-        dict(record or {}, name=name) for name, record in (check or {}).items()]
+    if isinstance(check, list):
+        items = check
+    else:
+        normalized = normalize_checks(check)
+        items = [
+            dict(record, name=name)
+            for name, record in normalized.items()
+            if name != CLIENT_PARSE_ERROR
+            and not (record.get("source") == "client_parser" and record.get("client_parse_error"))
+        ]
     for item in items:
         if not isinstance(item, dict):
             continue
         name = item.get("name")
-        if not name:
+        if not isinstance(name, str) or not name.strip():
             continue
         base = {
             "name": name,
@@ -97,15 +121,56 @@ def measured_rule(name, value, *, sample_size, scope=None, note=None, observed_a
 
 
 def append(path, records):
-    """Append records as JSON lines; the file is created when absent."""
+    """Append rule dictionaries atomically under a file lock."""
     if isinstance(records, dict):
         records = [records]
-    directory = os.path.dirname(os.path.abspath(path))
-    os.makedirs(directory, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-    return {"path": path, "appended": len(records)}
+    valid = [record for record in (records or ()) if isinstance(record, dict)]
+    target = os.path.abspath(os.fspath(path))
+    if not valid:
+        return {"path": target, "appended": 0}
+    with cache_store.file_lock(target + ".lock"):
+        existing = ""
+        if os.path.exists(target):
+            with open(target, encoding="utf-8") as handle:
+                existing = handle.read()
+        prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+        delta = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                        for record in valid)
+        cache_store.write_text_atomic(target, prefix + delta)
+    return {"path": target, "appended": len(valid)}
+
+
+def record_observed_checks(check, *, scope, path=None, observed_at=None):
+    """Persist changed check/quota/theme observations to the workspace snapshot."""
+    candidates = extract_check_rules(check, scope=scope, observed_at=observed_at)
+    target = os.path.abspath(os.fspath(path or default_snapshot_path()))
+    if not candidates:
+        return {"path": target, "appended": 0}
+    comparable = lambda row: {k: v for k, v in row.items() if k != "observed_at"}
+    with cache_store.file_lock(target + ".lock"):
+        prior = load(target)
+        latest = {}
+        for row in prior:
+            key = (row.get("name"), json.dumps(row.get("scope") or {}, sort_keys=True))
+            latest[key] = comparable(row)
+        changed = []
+        for record in candidates:
+            key = (record.get("name"), json.dumps(record.get("scope") or {}, sort_keys=True))
+            body = comparable(record)
+            if latest.get(key) != body:
+                latest[key] = body
+                changed.append(record)
+        if not changed:
+            return {"path": target, "appended": 0}
+        existing = ""
+        if os.path.exists(target):
+            with open(target, encoding="utf-8") as handle:
+                existing = handle.read()
+        prefix = existing if not existing or existing.endswith("\n") else existing + "\n"
+        delta = "".join(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+                        for record in changed)
+        cache_store.write_text_atomic(target, prefix + delta)
+    return {"path": target, "appended": len(changed)}
 
 
 def load(path):
@@ -118,40 +183,45 @@ def load(path):
             if not line:
                 continue
             try:
-                records.append(json.loads(line))
+                item = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(item, dict):
+                records.append(item)
     return records
 
 
 def _matches(record_scope, wanted):
+    if not isinstance(record_scope, dict):
+        record_scope = {}
     for key, value in (wanted or {}).items():
         if value is None:
             continue
-        if (record_scope or {}).get(key) != value:
+        if record_scope.get(key) != value:
             return False
     return True
 
 
 def lookup(records, name, scope=None, *, max_age_seconds=None, now=None):
-    """Newest record for a rule and scope, with its age and staleness.
+    """Newest record for a rule and scope, with its UTC age and staleness.
 
     Returns ``None`` when nothing matches: absence is information the caller has
     to handle, not a default value.
     """
-    matches = [r for r in records
-               if r.get("name") == name and _matches(r.get("scope"), scope)]
+    matches = [r for r in (records or ())
+               if isinstance(r, dict) and r.get("name") == name
+               and _matches(r.get("scope"), scope)]
     if not matches:
         return None
-    def stamp(record):
-        try:
-            return time.mktime(time.strptime(record.get("observed_at"), "%Y-%m-%dT%H:%M:%SZ"))
-        except (TypeError, ValueError):
-            return 0.0
-    newest = max(matches, key=stamp)
-    age = None
-    if newest.get("observed_at"):
-        age = max(0.0, (now or time.time()) - stamp(newest))
+
+    def rank(record):
+        ts = _timestamp(record.get("observed_at"))
+        return (ts is not None, ts if ts is not None else float("-inf"))
+
+    newest = max(matches, key=rank)
+    newest_ts = _timestamp(newest.get("observed_at"))
+    current = time.time() if now is None else float(now)
+    age = None if newest_ts is None else max(0.0, current - newest_ts)
     stale = None if (max_age_seconds is None or age is None) else age > max_age_seconds
     return {"rule": newest, "age_seconds": age, "stale": stale,
             "alternatives": len(matches) - 1}

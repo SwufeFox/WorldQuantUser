@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -243,7 +244,66 @@ def _reserve(journal, account, limit, phase):
     return identity, _report(account, limit, active + 1)
 
 
+@lru_cache(maxsize=1)
+def _win32_kernel():
+    import ctypes
+    from ctypes import wintypes
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = [("dwLowDateTime", wintypes.DWORD), ("dwHighDateTime", wintypes.DWORD)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.GetProcessTimes.argtypes = [
+        wintypes.HANDLE, ctypes.POINTER(_FileTime), ctypes.POINTER(_FileTime),
+        ctypes.POINTER(_FileTime), ctypes.POINTER(_FileTime),
+    ]
+    kernel32.GetProcessTimes.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    return ctypes, wintypes, _FileTime, kernel32
+
+
+def _windows_process_stat(pid):
+    """Query process liveness and creation time via Win32 without console signals."""
+    if pid > 0xFFFFFFFF:
+        return "X", None
+    ctypes, wintypes, file_time_cls, kernel32 = _win32_kernel()
+    # PROCESS_QUERY_LIMITED_INFORMATION (0x1000) inspects exit status and times
+    # without sending CTRL_C_EVENT (which CPython's os.kill(pid, 0) triggers on Windows).
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return ("R", None) if ctypes.get_last_error() == 5 else ("X", None)
+    try:
+        exit_code = wintypes.DWORD()
+        code_ok = bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)))
+        creation = file_time_cls()
+        exited = file_time_cls()
+        kernel = file_time_cls()
+        user = file_time_cls()
+        times_ok = bool(kernel32.GetProcessTimes(
+            handle, ctypes.byref(creation), ctypes.byref(exited),
+            ctypes.byref(kernel), ctypes.byref(user),
+        ))
+        start = (str((creation.dwHighDateTime << 32) | creation.dwLowDateTime)
+                 if times_ok else None)
+        # STILL_ACTIVE is 259; also check exited FILETIME because an open parent
+        # handle keeps the kernel process object addressable after termination.
+        if (code_ok and exit_code.value != 259) or (
+            times_ok and (exited.dwHighDateTime or exited.dwLowDateTime)
+        ):
+            return "Z", start
+        return "R", start
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _process_stat(pid):
+    if os.name == "nt":
+        return _windows_process_stat(pid)
     try:
         fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         return fields[0], fields[19]
@@ -262,13 +322,18 @@ def _quick_owner_is_live(owner):
         return False
     state, start = _process_stat(pid)
     if state is not None:
-        return state not in {"Z", "X"} and (owner.get("start") is None or owner["start"] == start)
+        if state in {"Z", "X"}:
+            return False
+        recorded_start = owner.get("start")
+        return recorded_start is None or (start is not None and recorded_start == start)
+    if os.name == "nt":
+        return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
     except PermissionError:
         return True
+    except (ProcessLookupError, OSError):
+        return False
     return True
 
 

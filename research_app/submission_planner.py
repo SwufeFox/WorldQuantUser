@@ -17,8 +17,13 @@ Two rules keep it honest:
 from __future__ import annotations
 
 import itertools
+import math
 
 DEFAULT_MAX_CORRELATION = 0.5
+
+
+def _finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
 
 
 def _key(a, b):
@@ -37,17 +42,19 @@ def conflict_graph(candidate_ids, correlations, max_correlation=DEFAULT_MAX_CORR
     missing = []
     for a, b in itertools.combinations(ids, 2):
         rho = correlations.get((a, b), correlations.get(_key(a, b)))
-        if not isinstance(rho, (int, float)):
-            missing.append((a, b))
+        if not _finite_number(rho):
+            missing.append(_key(a, b))
             continue
         if abs(rho) >= max_correlation:
-            edges[_key(a, b)] = rho
+            edges[_key(a, b)] = float(rho)
     return {"ids": ids, "edges": edges, "missing": missing, "threshold": max_correlation}
 
 
 def _neighbours(graph):
     out = {}
-    for (a, b) in graph["edges"]:
+    # Unmeasured pairs are never assumed independent: two candidates without a
+    # measured correlation cannot both enter the same selected subset.
+    for (a, b) in itertools.chain(graph["edges"], graph.get("missing") or ()):
         out.setdefault(a, set()).add(b)
         out.setdefault(b, set()).add(a)
     return out
@@ -82,11 +89,11 @@ def weighted_independent_set(weights, graph):
             best["selected"] = list(chosen)
         if index >= len(order):
             return
-        remaining = sum(weights[i] for i in order[index:] if i not in blocked)
+        remaining = sum(weights[i] for i in order[index:] if i not in blocked and weights[i] > 0)
         if weight + remaining <= best["weight"]:
             return
         candidate = order[index]
-        if candidate not in blocked:
+        if candidate not in blocked and weights[candidate] > 0:
             chosen.append(candidate)
             search(index + 1, chosen, weight + weights[candidate],
                    blocked | neighbours.get(candidate, set()))
@@ -102,8 +109,8 @@ def plan(candidates, correlations, max_correlation=DEFAULT_MAX_CORRELATION):
     """Select an independent subset and order it for submission.
 
     ``candidates`` is a list of ``{"id": str, "weight": float}``.  Anything the
-    planner cannot measure is reported under ``unknown`` and left out of the
-    selection: an unmeasured pair is not evidence of independence.
+    planner cannot measure is reported under ``unknown_pairs`` and cannot be
+    co-selected: an unmeasured pair is not evidence of independence.
     """
     weights = {}
     unnamed = []
@@ -111,7 +118,7 @@ def plan(candidates, correlations, max_correlation=DEFAULT_MAX_CORRELATION):
         if not isinstance(item, dict) or not item.get("id"):
             continue
         weight = item.get("weight")
-        if not isinstance(weight, (int, float)):
+        if not _finite_number(weight):
             unnamed.append(item.get("id"))
             continue
         weights[item["id"]] = float(weight)
@@ -126,6 +133,7 @@ def plan(candidates, correlations, max_correlation=DEFAULT_MAX_CORRELATION):
                 "order": [], "excluded": [], "unknown": graph["missing"]}
 
     selected = set(solution["selected"])
+    missing_pairs = set(graph["missing"])
     excluded = []
     for candidate in graph["ids"]:
         if candidate in selected:
@@ -137,8 +145,15 @@ def plan(candidates, correlations, max_correlation=DEFAULT_MAX_CORRELATION):
             other = b if a == candidate else a
             if other in selected:
                 conflicts.append((other, rho))
-        excluded.append({"id": candidate, "weight": weights.get(candidate),
-                         "conflicts": [{"id": other, "rho": rho} for other, rho in conflicts]})
+        unmeasured = sorted(
+            other for other in selected
+            if _key(candidate, other) in missing_pairs
+        )
+        entry = {"id": candidate, "weight": weights.get(candidate),
+                 "conflicts": [{"id": other, "rho": rho} for other, rho in conflicts]}
+        if unmeasured:
+            entry["unmeasured_with"] = unmeasured
+        excluded.append(entry)
 
     order = sorted(selected, key=lambda i: (-weights[i], i))
     return {

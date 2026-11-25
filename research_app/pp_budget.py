@@ -14,6 +14,9 @@ missing instead of passing.
 
 from __future__ import annotations
 
+import math
+
+from check_evidence import CLIENT_PARSE_ERROR, normalize_checks
 import fastexpr_ast
 
 PP_MAX_OPERATORS = 8
@@ -26,6 +29,10 @@ FREE_OPERATORS = frozenset({"ts_backfill", "group_backfill"})
 GROUPING_FIELDS = frozenset({
     "country", "industry", "subindustry", "currency", "market", "sector", "exchange",
 })
+
+
+def _finite_number(value):
+    return type(value) in (int, float) and math.isfinite(value)
 
 
 def operator_usage(program):
@@ -58,6 +65,19 @@ def data_fields(program):
     return [name for name in fastexpr_ast.field_names(program) if name not in GROUPING_FIELDS]
 
 
+def field_datasets_from_records(records):
+    """Extract ``{field_id: dataset_id}`` from catalog records when present."""
+    mapping = {}
+    for row in records or ():
+        if not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]:
+            continue
+        dataset = row.get("dataset")
+        dataset_id = dataset.get("id") if isinstance(dataset, dict) else dataset
+        if isinstance(dataset_id, str) and dataset_id:
+            mapping[row["id"]] = dataset_id
+    return mapping
+
+
 def pp_budget(expression, *, field_datasets=None, platform_operator_count=None):
     """Structural Power Pool budget of one expression.
 
@@ -70,14 +90,16 @@ def pp_budget(expression, *, field_datasets=None, platform_operator_count=None):
     text = expression or ""
     try:
         program = fastexpr_ast.parse(text)
-    except fastexpr_ast.ParseError as exc:
+    except (fastexpr_ast.ParseError, RecursionError) as exc:
         return {"ok": False, "expression": text, "issues": ["parse error: %s" % exc],
                 "operators": None, "operators_total": None, "free_operators": None,
                 "fields": [], "n_fields": None, "datasets": [], "unresolved_fields": [],
                 "operator_count_source": "unparsed"}
 
     usage = operator_usage(program)
-    platform = platform_operator_count if isinstance(platform_operator_count, int) else None
+    platform = (platform_operator_count
+                if type(platform_operator_count) is int and platform_operator_count >= 0
+                else None)
     total = platform if platform is not None else usage["total"]
     charged = max(0, total - usage["free"]) if platform is not None else usage["charged"]
     fields = data_fields(program)
@@ -119,22 +141,24 @@ def gate_summary(budget, check=None):
     is reported as ``unknown``; it is never ``pass``.  ``check`` is the payload
     from ``alpha check`` (name -> record or a list of records).
     """
-    records = {}
-    if isinstance(check, list):
-        for record in check:
-            if isinstance(record, dict) and record.get("name"):
-                records.setdefault(record["name"], record)
-    elif isinstance(check, dict):
-        for name, record in check.items():
-            records[name] = record if isinstance(record, dict) else {"result": record}
+    normalized = normalize_checks(check)
+    records = {
+        name: body for name, body in normalized.items()
+        if name != CLIENT_PARSE_ERROR
+        and not (body.get("source") == "client_parser" and body.get("client_parse_error"))
+    }
 
     def result(name):
-        record = records.get(name) or {}
-        return record.get("result")
+        return (records.get(name) or {}).get("result")
 
     def value(name):
         return (records.get(name) or {}).get("value")
 
+    def limit_or(name, default):
+        observed = (records.get(name) or {}).get("limit")
+        return observed if _finite_number(observed) else default
+
+    corr_limit = limit_or("POWER_POOL_CORRELATION", 0.5)
     gates = {
         "operators": {"value": budget.get("operators"), "limit": PP_MAX_OPERATORS,
                       "state": "pass" if budget.get("operators") is not None
@@ -149,15 +173,16 @@ def gate_summary(budget, check=None):
                      ("pass" if budget.get("single_dataset") else "note")},
         "sharpe": {"value": value("LOW_SHARPE"), "limit": 1.0,
                    "state": _state(result("LOW_SHARPE"), value("LOW_SHARPE"), 1.0)},
-        "power_pool_correlation": {"value": value("POWER_POOL_CORRELATION"), "limit": 0.5,
+        "power_pool_correlation": {"value": value("POWER_POOL_CORRELATION"), "limit": corr_limit,
                                    "state": _state(result("POWER_POOL_CORRELATION"),
-                                                   value("POWER_POOL_CORRELATION"), 0.5,
-                                                   upper=True)},
+                                                   value("POWER_POOL_CORRELATION"), corr_limit,
+                                                   strict_upper=True)},
         "turnover": {"value": value("HIGH_TURNOVER"),
                      "state": _pass_state(result("HIGH_TURNOVER"))},
         "sub_universe": {"value": value("LOW_SUB_UNIVERSE_SHARPE"),
                          "state": _pass_state(result("LOW_SUB_UNIVERSE_SHARPE"))},
-        "themes": {"value": [t.get("name") for t in (records.get("MATCHES_THEMES") or {}).get("themes") or []],
+        "themes": {"value": [t.get("name") for t in (records.get("MATCHES_THEMES") or {}).get("themes") or []
+                             if isinstance(t, dict)],
                    "state": _pass_state(result("MATCHES_THEMES"))},
         "description": {"value": value("POWER_POOL_DESCRIPTION_LENGTH"), "limit": 100,
                         "state": _pass_state(result("POWER_POOL_DESCRIPTION_LENGTH"))},
@@ -168,16 +193,50 @@ def gate_summary(budget, check=None):
             "ok": not blocking and not unknown}
 
 
+def alpha_budget(expression, settings=None, *, checks=None, platform_operator_count=None,
+                 field_datasets=None):
+    """Build the structural Power Pool budget (and optional check gates) for FASTEXPR."""
+    import machine_lib as ml
+
+    if not isinstance(expression, str) or not expression.strip():
+        return None
+    if ml.is_python_language((settings or {}).get("language")):
+        return None
+    if field_datasets is None:
+        from . import capabilities
+
+        scoped = capabilities.cached_field_scope(settings or {})
+        field_datasets = field_datasets_from_records(scoped.get("records"))
+    budget = pp_budget(expression, field_datasets=field_datasets,
+                       platform_operator_count=platform_operator_count)
+    if checks is None:
+        return budget
+    return {"budget": budget, "gates": gate_summary(budget, checks)}
+
+
+def _norm_result(result):
+    return result.strip().upper() if isinstance(result, str) else None
+
+
 def _pass_state(result):
-    if result in ("PASS", "WARNING"):
-        return "pass" if result == "PASS" else "note"
-    if result in ("FAIL", "ERROR"):
+    verdict = _norm_result(result)
+    if verdict == "PASS":
+        return "pass"
+    if verdict == "WARNING":
+        return "note"
+    if verdict in ("FAIL", "ERROR"):
         return "fail"
     return "unknown"
 
 
-def _state(result, number, limit, *, upper=False):
-    if isinstance(number, (int, float)):
-        bad = number > limit if upper else number < limit
-        return "fail" if bad else "pass"
-    return _pass_state(result)
+def _state(result, number, limit, *, strict_upper=False):
+    verdict = _norm_result(result)
+    if verdict in ("FAIL", "ERROR"):
+        return "fail"
+    if number is not None:
+        if not _finite_number(number):
+            return "unknown"
+        bad = number >= limit if strict_upper else number < limit
+        if bad:
+            return "fail"
+    return _pass_state(verdict)

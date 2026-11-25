@@ -112,6 +112,16 @@ def cmd_alpha_get(args, _sink):
         "classification_ids": ml.alpha_classification_ids(payload),
     }
     document["incentives"] = incentives.check_summary(document["checks"])
+    if code and not ml.is_python_language(document["language"]):
+        from . import pp_budget
+
+        pp_summary = pp_budget.alpha_budget(
+            code, payload.get("settings"),
+            checks=document["checks"],
+            platform_operator_count=operator_count,
+        )
+        if pp_summary is not None:
+            document["power_pool_budget"] = pp_summary
     split = ml.extract_split(payload)
     if split:
         document["out_of_sample"] = split
@@ -133,15 +143,14 @@ def cmd_alpha_get(args, _sink):
 def cmd_alpha_near(args, _sink):
     """Find the book alphas closest in *structure* to an expression, before simulating.
 
-    Duplicate detection came in two flavours and both arrive too late: PnL correlation
-    needs the simulation, and eyeballing expressions is not reliable at 55 alphas. On
-    2026-11-08 several composites were built only to discover they were structural
-    variants of what the book already held.
+    PnL correlation requires spending a simulation first, while manual inspection does
+    not scale across a large book. Comparing structure catches near-duplicate variants
+    before any quota is spent.
 
     Structure is compared with the AST skeleton (fields blanked) plus the field set:
     an identical skeleton means "same construction, different grid point", which is the
-    definition of a duplicate the campaign uses. Overlapping fields with a different
-    skeleton is a much weaker signal and is reported separately.
+    definition of a structural duplicate. Overlapping fields with a different skeleton
+    is a weaker signal and is reported separately.
     """
     import fastexpr_ast
 

@@ -186,12 +186,10 @@ REGIONS = [
     "AMR", "EMEA", "APAC",
 ]
 
-#: Neutralizations seen accepted by the API. **A record, not a gate.** The platform
-#: owns this enum and answers for it; until 2026-11-04 a value missing here was
-#: refused before a request was ever sent, which turned "we never tried STATISTICAL"
-#: into "the tool cannot say the word". Well-formed values that are not on this list
-#: are now *sent*, and the platform's 400 is the authority. Malformed values still
-#: fail locally, because that is a typo and not a discovery.
+#: Known neutralization values accepted by the API. **A hint list, not a local gate.**
+#: The platform owns this enum; well-formed uppercase tokens outside this list are still
+#: sent so new platform options work without client code changes, while malformed tokens
+#: fail locally as input typos.
 NEUTRALIZATIONS = ["NONE", "MARKET", "SECTOR", "INDUSTRY", "SUBINDUSTRY",
                    "STATISTICAL", "FAST"]
 
@@ -582,12 +580,10 @@ def load_session(cache_path=None, use_cache=True, refresh=False, meta=None, *,
 # ---------------------------------------------------------------------------
 # Metadata cache
 #
-# Catalog responses are quota-free but slow: the USA field catalog is 4367 rows
-# over fourteen paginated calls, and one field audit plus a preflight lint reads
-# most of it. Those answers also change on the order of days, not seconds. So
-# they are cached with a TTL, and a stale snapshot is served when the network
-# fails -- a flaky link should degrade into "older catalog", not into "the audit
-# could not run at all".
+# Catalog responses are quota-free, paginated across many requests, and change on
+# the order of days rather than seconds. Caching them with a TTL avoids redundant
+# pagination across preflight and catalog queries, while serving a clearly marked
+# stale snapshot if a transient network error interrupts a refresh.
 # ---------------------------------------------------------------------------
 DEFAULT_METADATA_TTL = float(environ.get("BRAIN_METADATA_TTL", 24 * 3600) or 0)
 
