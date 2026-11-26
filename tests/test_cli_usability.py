@@ -86,6 +86,13 @@ def test_probe_summary_flags_compacted_evidence_even_when_all_rows_fit():
     assert response["preflight"][0]["checked_requests_omitted"] == 1
 
 
+def _official_description(total=100):
+    lead = "Idea:\n- "
+    tail = ("\n\nRationale for data used:\n- x"
+            "\n\nRationale for operators used:\n- y")
+    return lead + "x" * (total - len(lead) - len(tail)) + tail
+
+
 @pytest.mark.parametrize("description, actual", ((None, 0), ("  \n  ", 0),
                                                 (" " + "x" * 99 + "\n", 99), ("字" * 99, 99)))
 def test_seed_rationale_reports_the_trimmed_character_count(description, actual):
@@ -96,6 +103,13 @@ def test_seed_rationale_reports_the_trimmed_character_count(description, actual)
     assert "minimum=100" in problems[0]
 
 
-@pytest.mark.parametrize("description", ("x" * 100, " \n" + "字" * 100 + " \n"))
+@pytest.mark.parametrize("description", (_official_description(100),
+                                        " \n" + _official_description(100) + " \n"))
 def test_seed_rationale_accepts_the_existing_hundred_character_boundary(description):
     assert buffer_cmd.validate_seed("Seed", "SENTIMENT", ["signal"], description) == []
+
+
+def test_seed_rationale_rejects_plain_prose_even_when_long_enough():
+    problems = buffer_cmd.validate_seed("Seed", "SENTIMENT", ["signal"], "x" * 100)
+    assert len(problems) == 1
+    assert "official Power Pool template" in problems[0]

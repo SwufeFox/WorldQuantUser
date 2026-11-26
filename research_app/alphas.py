@@ -1180,6 +1180,7 @@ def cmd_alpha_readiness(args, _sink):
                 field_notes=field_notes,
                 operator_notes=operator_notes,
                 rationale=getattr(args, "rationale", None),
+                operator_rationale=getattr(args, "operator_rationale", None),
             )
             if getattr(args, "apply_description", False):
                 if not draft["ok"]:
@@ -1308,6 +1309,18 @@ def cmd_alpha_readiness(args, _sink):
 
 def cmd_alpha_describe(args, _sink):
     """Write an alpha's metadata and verify it stuck."""
+    if args.description is not None:
+        from . import description
+        review = description.check(args.description)
+        if not review["required_ok"]:
+            raise CliError(
+                "INVALID_INPUT",
+                "description does not follow the official Power Pool template: "
+                + "; ".join(review["template_errors"] or review["errors"]),
+                "use the exact Idea: / Rationale for data used: / Rationale for operators used: "
+                "headings, each followed by a '- ' bullet list",
+                details={"description_review": review},
+            )
     tags = parse_tags(args.tags)
     color_arg = getattr(args, "color", None)
     color = ml._UNSET if color_arg is None else (None if color_arg.upper() == "NONE" else color_arg.upper())

@@ -814,9 +814,21 @@ Missing train margin is never replaced by full-window margin.
 
 ```bash
 python research_cli.py triage --ids ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --min-delta 0 --freeze campaign-choice.json
+DESCRIPTION='Idea:
+- Analyst estimate revisions contain information that enters prices gradually.
+
+Rationale for data used:
+- The specified analyst fields measure revisions and remain comparable in the frozen scope.
+
+Rationale for operators used:
+- rank compares firms cross-sectionally without treating raw scale as signal.
+'
+python research_cli.py alpha describe ALPHA_ID \
+    --name "Analyst revision hypothesis" --category ANALYST --tags analyst revision \
+    --description "$DESCRIPTION"
 python research_cli.py promote ALPHA_ID --selection campaign-choice.json --max-self-correlation 0.7 \
     --name "Analyst revision hypothesis" --category ANALYST --tags analyst revision \
-    --description "The hypothesis is that analyst estimate revisions contain information that enters prices gradually. Keep the specified inputs, region and timing assumptions with the frozen training comparison, and retain contrary evidence when interpreting validation."
+    --description "$DESCRIPTION"
 ```
 
 If Campaign already emitted `training-frozen`, use its `selection_path` instead of
@@ -838,9 +850,15 @@ accesses the test view and runs the platform checks.
 Promotion records the submission candidate's metadata in the existing buffer/seed
 store: a nonempty `name`, an allowed `category`, at least one entry in `tags`, and a
 `description` containing at least 100 characters after trimming outer whitespace.
-Supply these once through `promote`; a second `buffer add` or manual seed-file edit
-is unnecessary. `--seeds PATH` selects an alternate metadata store; use the same
-path for promotion and any later `alpha submit` or `buffer submit`.
+The description must use these exact headings, each followed by a `- ` list:
+`Idea:`, `Rationale for data used:` and `Rationale for operators used:`. The old
+all-caps `IDEA:` / `RATIONALE:` form is rejected. The order is: FULL complete →
+`alpha describe` writes the description → `promote`/`buffer add` stores the seed
+and checks for FAIL → `alpha submit` is called twice. `buffer add` rereads the
+platform description and requires it to match `--description`, so the remote write
+cannot be skipped. A FAIL such as `LOW_FITNESS 0.63` blocks shelving and submission.
+`--seeds PATH` selects an alternate metadata store; use the same path for promotion
+and any later `alpha submit` or `buffer submit`.
 
 Research seeds have a different purpose: successful and terminal failed attempts
 stay in the normal ledger with their original question and evidence. They do not
@@ -1087,6 +1105,10 @@ python research_cli.py alpha submit ALPHA_ID --yes --selection choice.json
 ```
 
 A new real submission requires membership in a saved compare/triage training choice.
+It also requires a valid seed stored by `buffer add` and a matching official-template
+description already written to the alpha with `alpha describe`. The required order is:
+FULL complete → `alpha describe` → `buffer add --name --category --tags --description`
+→ `alpha submit` twice.
 Confirmed submissions always reconcile the ledger, shelf and PnL cache and invalidate
 the old platform book snapshot. `--record` is no longer a submission option. The result
 separates remote `submission` from local `reconciliation` and lists `repair_actions`.
@@ -1107,18 +1129,29 @@ returned `Unexpected property` and the conclusion drawn was that the field did n
 it was the shape that was wrong. A new `alpha submit` requires both the local seed
 record produced by promotion and the required live platform metadata. Local seed
 metadata does not automatically update the platform's properties; use
-`alpha describe` for an authorized remote metadata change when the receipt calls
-for it. Saved pending submission recovery and confirmed-submission reconciliation
+`alpha describe` before `buffer add` for the authorized remote description write.
+Saved pending submission recovery and confirmed-submission reconciliation
 remain available without creating a new seed record.
 
 ```bash
 python research_cli.py alpha describe ALPHA_ID \
     --name "Sample research candidate" --category FUNDAMENTAL \
-    --tags quality,cashflow --color GREEN
+    --tags quality,cashflow --color GREEN \
+    --description 'Idea:
+- Higher quality firms should earn higher subsequent returns.
+
+Rationale for data used:
+- assets: total reported corporate assets.
+
+Rationale for operators used:
+- rank: compares firms cross-sectionally.'
 ```
 
 Categories are an enum discovered by probing, because an invalid value returns 400 without
 listing the choices: `ANALYST`, `FUNDAMENTAL`, `PRICE_VOLUME`, `SENTIMENT`, `VOLUME`.
+Power Pool descriptions must use exactly `Idea:`, `Rationale for data used:` and
+`Rationale for operators used:`, each on its own line and followed by at least one
+`- ` bullet. The template source is `getting-started-power-pool-alphas`.
 
 ### What "submitted" actually means
 

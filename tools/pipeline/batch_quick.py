@@ -933,8 +933,25 @@ def _build_admission(arms, session, account, *, recover_only=False):
             "field_evidence": evidence, "next_retry_at": max(retry_times, default=None)}
 
 
+def _write_admission(out, input_path, admission, account):
+    path = out.with_suffix(out.suffix + ".admission.json")
+    admission.update(path=str(path), input_path=str(Path(input_path).resolve()),
+                     account_fingerprint=account["fingerprint"])
+    cache_store.write_json_atomic(path, admission)
+    print(json.dumps({"event": "batch_admission", "path": str(path),
+                      "new_posts_allowed": admission["ok"], "recovery_allowed": True,
+                      "blocking": admission["blocking"],
+                      "next_retry_at": admission["next_retry_at"]}, ensure_ascii=False), file=sys.stderr)
+
+
 def _run_batch(args, out):
     arms = _load_arms(Path(args.arms))
+    if getattr(args, "admission_only", False):
+        with machine_lib.load_session() as session:
+            account = _account_slot_plan(session, args.account_slots)["account"]
+            admission = _build_admission(arms, session, account)
+            _write_admission(out, args.arms, admission, account)
+        return 0 if admission["ok"] else 2
     if not arms:
         return 0
     recover_job = getattr(args, "recover_job", None)
@@ -965,20 +982,16 @@ def _run_batch(args, out):
             if previous is not None:
                 _record_seed(arm, previous, payload, args.arms, out)
         todo = _select_arms(arms, runner, done)
+        recover_only = getattr(args, "recover_only", False)
+        if recover_only:
+            todo = [arm for arm in todo if not runner.needs_new_submission(arm)]
         if args.limit:
             todo = todo[:args.limit]
         if todo:
-            recover_only = not any(runner.needs_new_submission(arm) for arm in todo)
+            recover_only = recover_only or not any(runner.needs_new_submission(arm) for arm in todo)
             admission = _build_admission(arms, session, account, recover_only=recover_only)
-            path = out.with_suffix(out.suffix + ".admission.json")
-            admission.update(path=str(path), input_path=str(Path(args.arms).resolve()),
-                             account_fingerprint=account["fingerprint"])
-            cache_store.write_json_atomic(path, admission)
+            _write_admission(out, args.arms, admission, account)
             runner.admission = admission
-            print(json.dumps({"event": "batch_admission", "path": str(path),
-                              "new_posts_allowed": admission["ok"], "recovery_allowed": True,
-                              "blocking": admission["blocking"],
-                              "next_retry_at": admission["next_retry_at"]}, ensure_ascii=False), file=sys.stderr)
     print(f"arms={len(arms)} todo={len(todo)} workers={args.concurrency} account_slots={plan['effective']}",
           flush=True)
     if not todo:
@@ -1043,6 +1056,9 @@ def _batch_args(parser):
     args = parser.parse_args()
     if min(args.concurrency, args.account_slots) <= 0 or args.limit < 0:
         parser.error("workers and account slots must be positive and limit cannot be negative")
+    args.concurrency = simulation_slots.quick_single_slot_limit(
+        simulation_slots.quick_slot_limit(args.concurrency),
+    )
     return args
 
 
@@ -1052,6 +1068,10 @@ def main(*, default_out="batch-results.jsonl", default_concurrency=DEFAULT_ACCOU
                         help="Seconds per stage for queueing, progress, and metrics (default: %(default)s). "
                              "An in-flight POST uses its own network timeout.")
     parser.add_argument("--recover-job", help="Job key from a result with an uncertain POST outcome.")
+    parser.add_argument("--admission-only", action="store_true",
+                        help="Write the full Quick admission receipt without submitting or recovering tasks.")
+    parser.add_argument("--recover-only", action="store_true",
+                        help="Recover existing tasks and record their results without submitting queued arms.")
     parser.add_argument("--recover-location", help="Original BRAIN progress Location for that POST.")
     parser.add_argument("--confirm-original-failure", action="store_true",
                         help="Confirm the supplied Location is original and release its slot after a BRAIN terminal failure.")
@@ -1062,6 +1082,10 @@ def main(*, default_out="batch-results.jsonl", default_concurrency=DEFAULT_ACCOU
         parser.error("--recover-job and --recover-location must be used together")
     if args.confirm_original_failure and not args.recover_job:
         parser.error("--confirm-original-failure requires --recover-job and --recover-location")
+    if args.admission_only and args.recover_job:
+        parser.error("--admission-only and --recover-job are mutually exclusive")
+    if args.recover_only and (args.admission_only or args.recover_job):
+        parser.error("--recover-only cannot be combined with --admission-only or --recover-job")
     return _run_locked(parser, args, _run_batch)
 
 

@@ -205,6 +205,8 @@ def read_seeds(path):
 
 def validate_seed(name, category, tags, description):
     """Return the list of missing/invalid seed fields; empty means valid."""
+    from . import description as description_mod
+
     problems = []
     if not isinstance(name, str) or not name.strip():
         problems.append("name")
@@ -216,6 +218,13 @@ def validate_seed(name, category, tags, description):
     description_length = len(description.strip()) if isinstance(description, str) else 0
     if description_length < 100:
         problems.append("description (actual=%d characters; minimum=100)" % description_length)
+    elif description_length:
+        review = description_mod.check(description)
+        if not review["required_ok"]:
+            problems.append(
+                "description (official Power Pool template: %s)"
+                % "; ".join(review["template_errors"] or review["errors"])
+            )
     return problems
 
 
@@ -262,12 +271,18 @@ def submission_seed(args, current):
         raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested seed")
     if seed.get("expression") is not None and not isinstance(seed["expression"], str):
         raise CliError("INVALID_INPUT", "stored seed expression must be text")
-    expression, _description, _ops = ml.regular_expression(current)
+    expression, live_description, _ops = ml.regular_expression(current)
     if seed.get("expression") and expression:
         import alpha_registry
         language = ml.alpha_language(current)
         if alpha_registry.expression_hash(seed["expression"], language) != alpha_registry.expression_hash(expression, language):
             raise CliError("INVALID_INPUT", "stored seed expression differs from this Alpha ID")
+    if _normalized_description(seed.get("description")) != _normalized_description(live_description):
+        raise CliError(
+            "INVALID_INPUT",
+            "stored seed description differs from the platform Alpha description",
+            "write the exact official-template description with alpha describe before submitting",
+        )
     saved_settings, observed_settings = seed.get("settings"), current.get("settings")
     if saved_settings is not None and not isinstance(saved_settings, dict):
         raise CliError("INVALID_INPUT", "stored seed settings must be an object")
@@ -275,6 +290,10 @@ def submission_seed(args, current):
         if any(saved_settings[key] != observed_settings[key] for key in saved_settings.keys() & observed_settings.keys()):
             raise CliError("INVALID_INPUT", "stored seed settings differ from this Alpha ID")
     return seed
+
+
+def _normalized_description(text):
+    return " ".join((text or "").replace("\r\n", "\n").replace("\r", "\n").split())
 
 
 def _write_seed(path, row):
@@ -311,7 +330,8 @@ def cmd_buffer_add(args, _sink, *, checked=None):
                              tags, getattr(args, "description", None))
     if problems:
         raise CliError("INVALID_INPUT", "seed missing or invalid: " + ", ".join(problems),
-                       "supply name, category, at least one tag, and a >=100 character description")
+                       "supply name, category, at least one tag, and a >=100 character "
+                       "description using the official Power Pool template")
     path, seed_path = _seed_paths(args)
     selection_id = _selection_id(args)
     def work(session):
@@ -322,6 +342,13 @@ def cmd_buffer_add(args, _sink, *, checked=None):
             raise CliError("INVALID_INPUT", "submitted alphas cannot enter the shelf",
                            "use alpha submit --yes to repair their local records")
         _reject_quick_simulation(args, payload)
+        code, live_description, _ops = ml.regular_expression(payload)
+        if _normalized_description(args.description) != _normalized_description(live_description):
+            raise CliError(
+                "INVALID_INPUT",
+                "%s platform description differs from --description" % args.alpha_id,
+                "run alpha describe with the exact official-template description before buffer add",
+            )
         # The body's snapshot usually has SELF_CORRELATION PENDING; the check endpoint
         # computes it. Shelving on the snapshot would record a NULL where the whole
         # point of the shelf is that number.
@@ -341,7 +368,6 @@ def cmd_buffer_add(args, _sink, *, checked=None):
             for name, body in (checks or {}).items():
                 if name == "SELF_CORRELATION" and isinstance(body, dict):
                     self_corr = body.get("value")
-        code, _description, _ops = ml.regular_expression(payload)
         from . import costs
         from .alphas import _selection_id
         evidence = summarize_checks(checks)

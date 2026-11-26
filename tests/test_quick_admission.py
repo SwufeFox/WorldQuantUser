@@ -123,6 +123,21 @@ def test_verified_batch_posts_and_reuses_scope_evidence_once(workflow):
     assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0
 
 
+@pytest.mark.parametrize("valid", [True, False])
+def test_admission_only_leaves_submission_and_recording_untouched(workflow, valid):
+    rows = arms()
+    if not valid:
+        rows[-1]["idea"] = ""
+    workflow.args.admission_only = True
+
+    assert workflow.run(rows) == (0 if valid else 2)
+    receipt = json.loads(workflow.out.with_suffix(".jsonl.admission.json").read_text())
+    assert receipt["new_posts_allowed"] is valid
+    workflow.session.post.assert_not_called()
+    assert not workflow.out.exists()
+    assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 0
+
+
 @pytest.mark.parametrize("unknown, code", [(False, "dataset_diversity_insufficient"),
                                           (True, "dataset_diversity_unverified")])
 def test_proven_shortfall_and_missing_evidence_are_distinct(workflow, unknown, code):
@@ -136,6 +151,27 @@ def test_proven_shortfall_and_missing_evidence_are_distinct(workflow, unknown, c
     assert workflow.run(arms()) == 2
     workflow.session.post.assert_not_called()
     assert all(code in row["admission_codes"] for row in quick._jsonl_rows(workflow.out))
+
+
+def test_recover_only_records_accepted_arm_without_starting_other_arms(workflow):
+    rows = arms()
+    accepted = rows[1]
+    runner = quick.Runner(workflow.out, ACCOUNT, 3, 2)
+    key = runner._job_key(accepted["label"], quick._payload(accepted))
+    slot = simulation_slots.quick_acquire(
+        ACCOUNT, 3, key, existing_url=ml.BRAIN_API_URL + "/simulations/prior",
+    )
+    simulation_slots.quick_update(ACCOUNT, slot["id"], "parked")
+    runner.close()
+    workflow.args.recover_only = True
+
+    assert workflow.run(rows) == 0
+    workflow.session.post.assert_not_called()
+    workflow.cached.assert_not_called()
+    workflow.required.assert_not_called()
+    results = quick._jsonl_rows(workflow.out)
+    assert [(row["label"], row["alpha_id"]) for row in results] == [(accepted["label"], "Alpha_prior")]
+    assert [entry["alpha_id"] for entry in alpha_registry.load_entries()] == ["Alpha_prior"]
 
 
 @pytest.mark.parametrize("kind", ["accepted", "unknown", "preparing"])

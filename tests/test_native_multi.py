@@ -1,6 +1,7 @@
 """Offline contracts for sending and recovering native multi-simulation requests."""
 
 import os
+from threading import Event
 from unittest import mock
 
 import pytest
@@ -51,6 +52,105 @@ def test_native_preview_keeps_child_order_and_singleton_tail(simulator):
     duplicate = {}
     simulator([EXPRESSIONS[0], EXPRESSIONS[0], EXPRESSIONS[1]], dry_run=True, scheduling_report=duplicate)
     assert [request["indices"] for request in duplicate["multi_requests"]] == [[0], [1, 2]]
+
+
+def test_workspace_quick_ceiling_leaves_a_slot_for_full(tmp_path, simulator):
+    policy = tmp_path / "simulation-slots" / "quick-slot-limit"
+    policy.parent.mkdir()
+    policy.write_text("6\n")
+    for index in range(6):
+        assert simulation_slots.quick_acquire(ACCOUNT, 7, f"quick-{index}")
+    assert simulation_slots.quick_acquire(ACCOUNT, 7, "quick-6") is None
+    full_reservation, shared = simulation_slots.reserve(ACCOUNT, 7)
+    assert full_reservation and shared["active"] == 7
+
+    quick = {}
+    simulator(dry_run=True, concurrency=7, scheduling_report=quick)
+    full = {}
+    ml.simulate_alphas(None, EXPRESSIONS[:2], settings={"simulationMode": "FULL"},
+                       concurrency=7, dry_run=True, scheduling_report=full)
+    assert quick["effective"] == 6
+    assert full["effective"] == 7
+
+
+def test_legacy_single_ceiling_preserves_native_and_full_slots(tmp_path, simulator):
+    policies = tmp_path / "simulation-slots"
+    policies.mkdir()
+    (policies / "quick-slot-limit").write_text("6\n")
+    (policies / "quick-single-slot-limit").write_text("2\n")
+    for index in range(2):
+        assert simulation_slots.quick_acquire(ACCOUNT, 7, f"legacy-{index}")
+    assert simulation_slots.quick_acquire(ACCOUNT, 7, "legacy-2") is None
+    for index in range(4):
+        reservation, shared = simulation_slots.reserve(ACCOUNT, 6)
+        assert reservation and shared["active"] == index + 3
+    assert simulation_slots.reserve(ACCOUNT, 6)[0] is None
+    full, shared = simulation_slots.reserve(ACCOUNT, 7)
+    assert full and shared["active"] == 7
+
+
+def test_native_batch_waits_for_shared_capacity_before_one_post(simulator):
+    occupied, _ = simulation_slots.reserve(ACCOUNT, 1)
+    replies = {
+        "NativeParent": {"id": "NativeParent", "status": "COMPLETE", "children": ["Child1", "Child2"]},
+        "Child1": child(1),
+        "Child2": child(2),
+    }
+
+    def release_other_runner(_seconds):
+        simulation_slots.reconcile_record({"slot_reservation": occupied}, ACCOUNT, outcome="refused")
+
+    with mock.patch.object(ml, "sleep", side_effect=release_other_runner) as wait, \
+            mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL) as post, \
+            mock.patch.object(ml, "read_simulation_snapshot",
+                              side_effect=lambda _session, identity, **_kwargs: (replies[identity], None)), \
+            mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {"fitness": 1}}):
+        records = simulator(concurrency=1)
+
+    wait.assert_called_once()
+    post.assert_called_once()
+    assert [record["alpha_id"] for record in records] == ["Alpha1", "Alpha2"]
+    assert simulation_slots.snapshot(ACCOUNT, 1)["active"] == 0
+
+
+def test_native_batch_fills_slot_from_peer_while_its_first_parent_is_pending(simulator):
+    occupied, _ = simulation_slots.reserve(ACCOUNT, 2)
+    next_submitted = Event()
+    expressions = [*EXPRESSIONS, "rank(high)"]
+    second_url = PARENT_URL + "Second"
+    replies = {
+        "NativeParent": {"id": "NativeParent", "status": "COMPLETE", "children": ["Child1", "Child2"]},
+        "NativeParentSecond": {"id": "NativeParentSecond", "status": "COMPLETE", "children": ["Child3", "Child4"]},
+        **{f"Child{index}": child(index, parent="NativeParent" if index < 3 else "NativeParentSecond",
+                                 expression=expression)
+           for index, expression in enumerate(expressions, 1)},
+    }
+
+    def submit(_session, requests, **_kwargs):
+        if requests[0]["regular"] == expressions[0]:
+            return PARENT_URL
+        next_submitted.set()
+        return second_url
+
+    def inspect(_session, identity, **_kwargs):
+        if identity == "NativeParent":
+            assert next_submitted.wait(2)
+        return replies[identity], None
+
+    def release_peer(*_args, **_kwargs):
+        simulation_slots.reconcile_record({"slot_reservation": occupied}, ACCOUNT, outcome="refused")
+        return {"released": []}
+
+    with mock.patch.object(ml, "submit_multi_simulation", side_effect=submit) as post, \
+            mock.patch.object(ml, "read_simulation_snapshot", side_effect=inspect), \
+            mock.patch.object(ml, "recover_accepted_slots", side_effect=release_peer), \
+            mock.patch.object(ml, "recover_quick_orphans", return_value=False), \
+            mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {"fitness": 1}}):
+        records = simulator(expressions, concurrency=2, max_wait_seconds=4)
+
+    assert post.call_count == 2
+    assert [record["alpha_id"] for record in records] == ["Alpha1", "Alpha2", "Alpha3", "Alpha4"]
+    assert simulation_slots.snapshot(ACCOUNT, 2)["active"] == 0
 
 
 def test_native_matches_child_echo_without_assuming_order_and_preserves_failure(simulator):

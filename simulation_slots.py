@@ -34,6 +34,28 @@ def _fingerprint(account):
     return account.get("fingerprint") if isinstance(account, dict) else None
 
 
+def _configured_slot_limit(requested, name):
+    path = research_paths.resolve("simulation-slots", name)
+    try:
+        with open(path, encoding="ascii") as handle:
+            ceiling = int(handle.read().strip())
+    except FileNotFoundError:
+        return requested
+    if ceiling < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return min(requested, ceiling)
+
+
+def quick_slot_limit(requested):
+    """Apply the optional workspace QUICK ceiling to new reservations."""
+    return _configured_slot_limit(requested, "quick-slot-limit")
+
+
+def quick_single_slot_limit(requested):
+    """Apply the optional ceiling on compatibility-runner SINGLE requests."""
+    return _configured_slot_limit(requested, "quick-single-slot-limit")
+
+
 def _paths(fingerprint):
     key = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
     root = research_paths.resolve("simulation-slots")
@@ -459,7 +481,7 @@ def _quick_owner_is_live(owner):
         os.kill(pid, 0)
     except PermissionError:
         return True
-    except (ProcessLookupError, OSError):
+    except (OverflowError, OSError):
         return False
     return True
 
@@ -540,8 +562,13 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False,
                     entry["identity_unverified"] = True
                 reservations[key] = entry
             else:
+                single_limit = quick_single_slot_limit(limit)
+                if single_limit < limit and sum(
+                    bool(slot.get("quick_job_key")) for slot in reservations.values()
+                ) >= single_limit:
+                    return None
                 phase = "quick_preparing" if prepare else "submitting"
-                identity, _ = _reserve(journal, account, limit, phase)
+                identity, _ = _reserve(journal, account, quick_slot_limit(limit), phase)
                 if identity is None:
                     return None
                 key = identity["id"]

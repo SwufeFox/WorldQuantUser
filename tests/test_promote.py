@@ -11,6 +11,12 @@ from research_app import alphas, app, buffer_cmd, promote, selection, triage
 from research_app.runtime import CliError
 from tools import campaign_runner
 
+SEED_DESCRIPTION = (
+    "Idea:\n- Higher quality firms should earn higher subsequent returns.\n\n"
+    "Rationale for data used:\n- assets: total reported corporate assets.\n\n"
+    "Rationale for operators used:\n- rank: compares firms cross-sectionally."
+)
+
 
 @pytest.fixture
 def flow(monkeypatch, tmp_path):
@@ -70,7 +76,7 @@ def flow(monkeypatch, tmp_path):
 
 def invoke(capsys, *extra, metadata=True):
     seed = (["--name", "Seed A1", "--category", "FUNDAMENTAL", "--tags", "quality",
-             "--description", "d" * 120] if metadata else [])
+             "--description", SEED_DESCRIPTION] if metadata else [])
     code = app.main(["promote", "A1", *seed, *map(str, extra)])
     output = capsys.readouterr()
     return code, json.loads(output.out)
@@ -83,7 +89,7 @@ def test_all_pass_buffers_with_forwarded_options(flow, capsys, tmp_path):
                           "--note", "chosen candidate", "--cost-bps", 5, 10, 20,
                           "--retention-floor", 0.4, "--compact", "--quiet",
                           "--name", "seed A1", "--category", "FUNDAMENTAL",
-                          "--tags", "quality", "--description", "d" * 120)
+                          "--tags", "quality", "--description", SEED_DESCRIPTION)
     assert code == 0 and output["ok"] and output["command"] == "promote"
     data = output["data"]
     assert data["outcome"] == "buffered" and data["buffered"] is True
@@ -306,11 +312,12 @@ def test_real_buffer_add_reuses_checks_without_second_request(flow, capsys, monk
     monkeypatch.setattr(buffer_cmd, "with_session", lambda args, work: work(object()))
     monkeypatch.setattr(ml, "fetch_alpha_checks", lambda *args, **kwargs: pytest.fail("duplicate checks"))
     monkeypatch.setattr(ml, "fetch_alpha_metrics", lambda *args: {
-        "id": "A1", "status": "COMPLETE", "regular": {"code": "rank(close)"},
+        "id": "A1", "status": "COMPLETE",
+        "regular": {"code": "rank(close)", "description": SEED_DESCRIPTION},
         "is": {}, "oos": {"train": {"sharpe": 2.0}, "test": {"sharpe": 1.0}}})
     code, output = invoke(capsys, "--note", "keep", "--cost-bps", 5, 10, 20,
                           "--name", "seed A1", "--category", "FUNDAMENTAL", "--tags", "quality",
-                          "--description", "d" * 120)
+                          "--description", SEED_DESCRIPTION)
     assert code == 0 and output["data"]["buffered"] is True
     entries = buffer_cmd.read_events(buffer_cmd.buffer_path())
     assert len(entries) == 1 and entries[0]["note"] == "keep"

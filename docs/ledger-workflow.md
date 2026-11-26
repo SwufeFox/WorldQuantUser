@@ -251,23 +251,47 @@ python research_cli.py campaign preview FULL-SPEC.json
 保留其来源与原对照，再预览、确认和入队。FULL 完成后使用其新 Alpha ID。
 对照、逐年及成本证据先于平台相关性核验。
 
-## 选定 FULL 候选后，一次补齐说明并晋级
+## 选定 FULL 候选后：写平台描述、入库、再提交
 
 Campaign 为满足训练门槛的 FULL Regular 候选保存冻结选择，在 `training-frozen` 事件中
-返回 `selection_path`。沿用该路径和候选 ID，在原执行者结束该批次后运行一次 `promote`。
-以下名称、标签和说明是格式示例，实际填写该候选的机制与证据：
+返回 `selection_path`。沿用该路径和候选 ID。硬顺序是：FULL 完成 → `alpha describe`
+写官方模板描述 → `buffer add` 入库 → `alpha submit` 双次调用。以下名称和说明是格式示例，
+实际填写该候选的机制与证据：
 
 ```bash
-python research_cli.py promote FULL_ALPHA_ID --selection SELECTION.json \
+DESCRIPTION='Idea:
+- 分析师预期修正的信息会逐步进入价格，而不是当天完全反映。
+
+Rationale for data used:
+- 使用事先指定的分析师预期字段，字段描述支持其衡量预期变化。
+
+Rationale for operators used:
+- rank 将可比公司横截面排序，避免直接比较不同规模公司的原始值。
+'
+
+python research_cli.py alpha describe FULL_ALPHA_ID \
   --name "分析师预期修正" --category ANALYST --tags analyst revision \
-  --description "研究假设是分析师预期修正的信息逐步进入价格；使用事先指定的修正字段、地区和时间窗，避免把数值缺失或覆盖变化当成信号。训练选择已经冻结，留出期只用于核对这一选择。复盘时需要结合原对照、成本、分期表现和相关性检查解释结果，并保留不支持该假设的证据。"
+  --description "$DESCRIPTION"
+
+python research_cli.py buffer add FULL_ALPHA_ID \
+  --selection SELECTION.json \
+  --name "分析师预期修正" --category ANALYST --tags analyst revision \
+  --description "$DESCRIPTION"
+
+python research_cli.py alpha submit FULL_ALPHA_ID --yes --selection SELECTION.json
+python research_cli.py alpha submit FULL_ALPHA_ID --yes --selection SELECTION.json
 ```
 
 `name` 非空；`category` 取 `ANALYST`、`FUNDAMENTAL`、`PRICE_VOLUME`、`SENTIMENT` 或
 `VOLUME`；`tags` 至少一个；`description` 去掉首尾空白后至少 100 个字符。
+标题必须逐字使用 `Idea:`、`Rationale for data used:`、`Rationale for operators used:`，
+每个标题独占一行并跟至少一个 `- ` 列表项；旧的全大写 `IDEA:` / `RATIONALE:` 会被拒绝。
+模板出处是官方文档 `getting-started-power-pool-alphas`。
 说明应交代真实机制、输入、对照与证据，缺失信息明确写缺失，不为凑长度编造发现。
-`promote` 使用原冻结选择做验证、核对平台检查，再保存 buffer 和 seed metadata。
-无须再手动执行一次 `buffer add`，也不手改 `seeds.jsonl`。
+`buffer add` 会回读平台 `regular.description` 并要求与 `--description` 完全一致，
+所以不能跳过 `alpha describe`。seed 检查只要出现 `FAIL` 就拒绝入库；例如
+`LOW_FITNESS 0.63` 必须留在库外，不再进入提交。`promote` 是等价的组合入口，
+但仍须先写好平台描述。
 
 若验证和检查通过，但说明未齐，回执为 `outcome=metadata_required`、`buffered=false`，
 `metadata_required` 列出缺项，`next_action` 给出原冻结选择的命令和 `required_options`。

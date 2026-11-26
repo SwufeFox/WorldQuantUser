@@ -16,10 +16,17 @@ import machine_lib as ml
 from research_app import alphas, buffer_cmd, confirm, selection
 from research_app.runtime import CliError
 
+SEED_DESCRIPTION = (
+    "Idea:\n- Higher quality firms should earn higher subsequent returns.\n\n"
+    "Rationale for data used:\n- assets: total reported corporate assets.\n\n"
+    "Rationale for operators used:\n- rank: compares firms cross-sectionally."
+)
+
 
 def platform_alpha(alpha_id="CANDIDATE", status="COMPLETE"):
     return {"id": alpha_id, "status": status, "name": "Synthetic candidate",
-            "category": "QUALITY", "regular": {"code": "rank(close)"},
+            "category": "QUALITY",
+            "regular": {"code": "rank(close)", "description": SEED_DESCRIPTION},
             "is": {"sharpe": 2.0, "fitness": 1.3, "turnover": 0.2, "margin": 0.001,
                    "checks": [{"name": "SELF_CORRELATION", "result": "PASS", "value": 0.2}]},
             "train": {"sharpe": 2.0, "margin": 0.001, "turnover": 0.2},
@@ -56,14 +63,14 @@ class SubmissionWorkflowTests(unittest.TestCase):
             buffer_cmd._write_seed(buffer_cmd.seeds_path(),
                                    {"alpha_id": aid, "name": "seed " + aid,
                                     "category": "FUNDAMENTAL", "tags": ["test"],
-                                    "description": "y" * 120})
+                                    "description": SEED_DESCRIPTION})
         self.manifest = selection.freeze(self.manifest_path, source="triage",
                                          rows=[{"alpha_id": "CANDIDATE"}, {"alpha_id": "OTHER"}])
 
     def args(self, **overrides):
         values = {"alpha_id": "CANDIDATE", "registry": self.registry,
                   "name": "seed CANDIDATE", "category": "FUNDAMENTAL", "tags": ["test"],
-                  "description": "y" * 120, "seeds": str(buffer_cmd.seeds_path()),
+                  "description": SEED_DESCRIPTION, "seeds": str(buffer_cmd.seeds_path()),
                   "buffer": self.shelf, "selection": str(self.manifest_path),
                   "yes": True, "max_wait": 0, "force": False, "note": None, "cost_bps": [5]}
         values.update(overrides)
@@ -200,6 +207,16 @@ class SubmissionWorkflowTests(unittest.TestCase):
                 self.assertIn("stored seed missing", caught.exception.message)
                 post.assert_not_called()
 
+    def test_new_attempt_requires_alpha_describe_to_match_the_seed_description(self):
+        current = platform_alpha()
+        current["regular"]["description"] = "Idea:\n- Different platform description."
+        with mock.patch.object(ml, "fetch_alpha_metrics", return_value=current), \
+                mock.patch.object(ml, "submit_alpha") as post:
+            with self.assertRaises(CliError) as caught:
+                alphas.cmd_alpha_submit(self.args(yes=False), None)
+        self.assertIn("alpha describe", caught.exception.hint)
+        post.assert_not_called()
+
     def test_pending_and_confirmed_attempts_do_not_depend_on_seed_store_health(self):
         buffer_cmd.seeds_path().write_text("broken seed JSON\n", encoding="utf-8")
         path = alphas._submission_path("CANDIDATE")
@@ -219,7 +236,7 @@ class SubmissionWorkflowTests(unittest.TestCase):
     def test_custom_seed_store_is_used_and_wrong_request_seed_is_rejected(self):
         path = self.root / "custom-seeds.jsonl"
         seed = {"alpha_id": "CANDIDATE", "name": "Seed", "category": "FUNDAMENTAL",
-                "tags": ["quality"], "description": "d" * 120,
+                "tags": ["quality"], "description": SEED_DESCRIPTION,
                 "expression": "rank(close)", "settings": {"region": "USA"}}
         buffer_cmd._write_seed(path, seed)
         current = {**platform_alpha(), "settings": {"region": "USA"}}

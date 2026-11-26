@@ -527,7 +527,8 @@ def build_parser():
                     "Keep every completed step's evidence; stop on an operational failure. "
                     "Dry runs still open the test view and perform platform checks. "
                     "Shelving needs name, category, tags and description. An eligible result without "
-                    "them returns metadata_required and a concrete next action.")
+                    "them returns metadata_required and a concrete next action. The alpha must already "
+                    "carry the same official-template description written by alpha describe.")
     promote_parser.add_argument("alpha_id", metavar="ALPHA_ID")
     promote_parser.add_argument("--note", default=None)
     retention_option = promote_parser.add_argument(
@@ -557,7 +558,9 @@ def build_parser():
                                 help="Seed category: ANALYST, FUNDAMENTAL, PRICE_VOLUME, SENTIMENT, VOLUME.")
     promote_parser.add_argument("--tags", nargs="+", default=None, help="At least one seed tag.")
     promote_parser.add_argument("--description", default=None,
-                                help="Seed rationale, at least 100 characters.")
+                                help="Official Power Pool description, at least 100 characters; exact "
+                                     "Idea: / Rationale for data used: / Rationale for operators used: "
+                                     "headings with '-' bullet lists.")
     _add_cost_args(promote_parser)
     promote_parser.bind_handler("promote.cmd_promote")
 
@@ -1305,14 +1308,17 @@ def build_parser():
         help="One-shot submission readiness check, Power Pool budget and catalog-backed description builder.",
         description="Runs live platform checks, resolves field/operator catalog metadata, evaluates "
                     "Regular or Power Pool gates, and optionally composes and applies a verified "
-                    "IDEA / DATA / RATIONALE description.")
+                    "official Power Pool description with Idea:, Rationale for data used: and "
+                    "Rationale for operators used: sections.")
     a_ready.add_argument("alpha_id")
     a_ready.add_argument("--track", choices=["REGULAR", "POWER_POOL"], type=str.upper, default=None,
                          help="Target track (auto-detected from live checks when omitted).")
     a_ready.add_argument("--idea", default=None,
-                         help="Economic hypothesis used to compose a verified IDEA/DATA/RATIONALE description.")
-    a_ready.add_argument("--rationale", default=None,
-                         help="Optional custom rationale paragraph when composing with --idea.")
+                         help="Economic hypothesis used to compose the verified official description.")
+    a_ready.add_argument("--rationale", "--data-rationale", dest="rationale", default=None,
+                         help="Optional custom data-rationale bullet when composing with --idea.")
+    a_ready.add_argument("--operator-rationale", default=None,
+                         help="Optional custom operator-rationale bullet when composing with --idea.")
     a_ready.add_argument("--apply-description", action="store_true",
                          help="Write the composed description to the alpha before running live checks.")
     a_ready.add_argument("--seeds", default=None,
@@ -1334,7 +1340,9 @@ def build_parser():
     a_desc.add_argument("--tags", nargs="+", default=None,
                         help="Comma- or space-separated tags.")
     a_desc.add_argument("--description", default=None,
-                        help="Free-text rationale/note, written under `regular.description`.")
+                        help="Official Power Pool description under `regular.description`; exact "
+                             "Idea: / Rationale for data used: / Rationale for operators used: "
+                             "headings and '-' bullet lists are required.")
     a_desc.add_argument("--color", default=None, type=str.upper,
                         choices=[*ml.ALPHA_COLORS, "NONE"],
                         help="Color tag (RED, YELLOW, GREEN, BLUE, PURPLE, or NONE to clear).")
@@ -1673,7 +1681,9 @@ def build_parser():
                        help="Seed category: ANALYST, FUNDAMENTAL, PRICE_VOLUME, SENTIMENT, VOLUME.")
     b_add.add_argument("--tags", nargs="+", default=None, help="At least one tag.")
     b_add.add_argument("--description", default=None,
-                       help="Seed rationale, at least 100 characters.")
+                       help="Official Power Pool description, at least 100 characters; exact "
+                            "Idea: / Rationale for data used: / Rationale for operators used: "
+                            "headings with '-' bullet lists. Must already match the platform description.")
     b_add.add_argument("--seeds", default=None, help="Seed store path (default: seeds.jsonl).")
     b_add.add_argument("--max-wait-seconds", "--max-wait", type=int, default=None, dest="max_wait")
     b_add.add_argument("--buffer", default=None, help="Shelf file (default: in research dir).")

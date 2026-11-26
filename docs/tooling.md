@@ -22,7 +22,7 @@ python3 research_cli.py schema alpha get      # 单个命令的机器契约
 - **目录直查**：`catalog fields fundamental6`（位置参数直传数据集）、`catalog dataset DATASET_ID`、`catalog field FIELD_ID`（单次请求返回字段元数据与可直接粘贴的 FASTEXPR 包装）。
 - **模拟与取消**：`simulate "rank(close)" --quick --dry-run`（位置参数直传单条表达式，`--quick` / `--full` 快捷切换 `simulationMode`，`probe` 同样支持）、`alpha cancel-sim SIM_ID`（调用 `DELETE /simulations/{id}`，收到终态回执后释放本地共享槽位）。
 - **筛选与相关性**：`triage BATCH.json` 或 `triage A1 A2`、`alpha near "rank(close)"`、`alpha get ID --correlations`、`alpha prod-corr ID --save-archive pc.json`、`alpha pp-corr ID`。
-- **一站式就绪检查与描述生成**：`alpha readiness ID [--track POWER_POOL] [--idea "..." --apply-description]` 自动拉取实时检查、字段/算子目录释义、核验 Power Pool 预算并合成符合规范的 `IDEA / DATA / RATIONALE` 描述。
+- **一站式就绪检查与描述生成**：`alpha readiness ID [--track POWER_POOL] [--idea "..." --apply-description]` 自动拉取实时检查、字段/算子目录释义、核验 Power Pool 预算并合成官方三段式描述；标题逐字为 `Idea:`、`Rationale for data used:`、`Rationale for operators used:`，每段后跟 `-` 列表。
 - **Python 调用门面**：脚本或 Notebook 直接使用 `with machine_lib.BrainClient() as brain:`，按需加载缓存会话并在遇到过期 401 时自动重登一次。
 
 常用路径是 `catalog` 找数据、`lint` 检查表达式、`simulate` / `probe`
@@ -329,8 +329,28 @@ python3 research_cli.py promote ALPHA_ID --selection choice.json --max-self-corr
 运行 `alpha check`，最后满足条件时调用 `buffer add`。冻结时就保存本次 retention floor 和 cost scenarios，
 验证沿用同一标准；入库复用第三步的实时检查结果，避免重复等待检查接口。
 
-真正入库时在同一 `promote` 命令补充 `--name`、`--category`、`--tags` 和 `--description`。
-这是候选的明确研究说明；description 至少 100 个字符，category 按 `help promote` 所列值填写。
+真正入库时补充 `--name`、`--category`、`--tags` 和 `--description`。
+这是候选的明确研究说明；description 去掉首尾空白后至少 100 个字符，且必须逐字使用官方模板：
+
+```text
+Idea:
+- 可证伪的经济假设。
+
+Rationale for data used:
+- 每个数据字段是什么，以及为什么能检验该假设。
+
+Rationale for operators used:
+- 每个算子如何改变信号。
+```
+
+标题大小写和冒号必须完全一致；旧的全大写 `IDEA:` / `RATIONALE:` 会被拒绝。
+每个标题必须独占一行，并至少跟一个 `- ` 列表项。模板出处是
+`getting-started-power-pool-alphas`。Category 按 `help promote` 所列值填写。
+完整顺序是：FULL 完成 → `alpha describe ALPHA_ID --description ...` → `buffer add`
+（`--name --category --tags --description`）→ `alpha submit` 双次调用。`buffer add`
+会回读平台描述并要求与 `--description` 一致，因此不能跳过 `alpha describe`。
+入库前 seed 检查一旦出现任何 `FAIL` 就拒绝入库；例如 `LOW_FITNESS 0.63`
+必须留在库外，不得继续提交。
 完整示例见 [台账工作流](ledger-workflow.md)。`buffer add` 使用同一校验并维护 seed 元数据，
 无需另开一个种子维护循环。自定义存储路径使用 `--seeds PATH`，后续 `alpha submit` / `buffer submit`
 沿用相同路径。研究失败记录仍保存在台账，不受这组入库元数据要求影响。
@@ -360,7 +380,7 @@ Campaign 用同一份训练筛选生成的冻结选择调用 `promote`，沿用�
 
 回执包含 `alpha_id`、`freeze_path`、`validate` 的训练/测试 Sharpe、retention、
 rho_book、max_member_rho，以及 `checks`、`buffered`、`outcome`、`reasons`。
-对 FASTEXPR 候选，`alpha get` 与 `promote` 还会附带 `power_pool_budget`（算子计费/豁免、数据字段与单数据集状态，以及与平台 checks 合并后的门控摘要）；提供入库说明时，`promote` 与 `buffer add` 附带非阻断的 `description_review`（章节结构与已有种子的近似重复度检查），并在实时检查完成后将最新平台阈值、配额和 Theme 倍率去重记录到 `rules-snapshot.jsonl`。
+对 FASTEXPR 候选，`alpha get` 与 `promote` 还会附带 `power_pool_budget`（算子计费/豁免、数据字段与单数据集状态，以及与平台 checks 合并后的门控摘要）；提供入库说明时，`promote` 与 `buffer add` 附带 `description_review`（官方模板结构、必需章节与已有种子的近似重复度检查），并在实时检查完成后将最新平台阈值、配额和 Theme 倍率去重记录到 `rules-snapshot.jsonl`。
 多候选训练筛选（`triage` 含两个及以上正边际候选）与候选架盘点（`buffer list`）会基于训练窗日度 PnL 相关矩阵生成 `submission_plan`（带权最大独立集与建议提交顺序，未测量的候选对列入 `unknown_pairs` 且绝不假定独立）。各模块的设计边界见 [候选门槛与提交规划](tool-absorption.md)。
 测试期门未通过时，`steps.checks` 为 `skipped`。
 `steps` 保存各步状态和已完成的冻结、验证及入库证据。任何执行异常立即停止，

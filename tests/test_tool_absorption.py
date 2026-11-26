@@ -153,6 +153,18 @@ class DescriptionTests(unittest.TestCase):
         self.assertTrue(draft["ok"])
         self.assertGreaterEqual(draft["check"]["length"], 100)
         self.assertTrue(draft["check"]["ok"], draft["check"]["errors"])
+        self.assertEqual(
+            [line for line in draft["text"].splitlines()
+             if line in description.SECTION_TITLES],
+            list(description.SECTION_TITLES),
+        )
+        for title in description.SECTION_TITLES:
+            start = draft["text"].index(title) + len(title)
+            end = min((draft["text"].index(other, start)
+                       for other in description.SECTION_TITLES
+                       if other in draft["text"][start:]), default=len(draft["text"]))
+            self.assertTrue(any(line.startswith("- ")
+                                for line in draft["text"][start:end].splitlines()))
         self.assertNotIn("negative rank", draft["text"].lower())
         self.assertNotIn("market beta", draft["text"].lower())
 
@@ -160,11 +172,23 @@ class DescriptionTests(unittest.TestCase):
         result = description.check("too short")
         self.assertFalse(result["ok"])
         self.assertTrue(any("length" in e for e in result["errors"]))
-        self.assertTrue(any("RATIONALE" in e for e in result["errors"]))
+        self.assertTrue(any(description.SECTION_OPERATORS in e for e in result["errors"]))
+
+    def test_check_rejects_the_old_uppercase_template(self):
+        text = ("IDEA:\n- " + "leverage predicts returns. " * 5 +
+                "\n\nRATIONALE:\n- " + "ranked inside subindustry. " * 4)
+        result = description.check(text)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["template_ok"])
+        self.assertTrue(any(description.SECTION_IDEA in e
+                            for e in result["template_errors"]))
 
     def test_check_flags_a_near_duplicate(self):
-        text = ("IDEA: " + "leverage predicts returns. " * 6 +
-                "\n\nRATIONALE: " + "ranked inside subindustry. " * 4)
+        text = (
+            "Idea:\n- " + "leverage predicts returns. " * 5 +
+            "\n\nRationale for data used:\n- " + "assets and liabilities are documented inputs. " * 3 +
+            "\n\nRationale for operators used:\n- rank compares firms inside subindustry. " * 3
+        )
         result = description.check(text, others=[text])
         self.assertFalse(result["ok"])
         self.assertTrue(any("near-duplicate" in e for e in result["errors"]))
@@ -303,6 +327,7 @@ class ModuleWiringTests(unittest.TestCase):
             ["fnd6_assets"],
             field_notes={"fnd6_assets": "total book assets"},
         )
+        alpha_payload["regular"]["description"] = draft["text"]
         check_payload = {
             "alpha_id": "A100",
             "complete": True,

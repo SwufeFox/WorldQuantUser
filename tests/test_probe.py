@@ -453,7 +453,7 @@ class ProbeTests(unittest.TestCase):
         ]
         self._write(self.spec)
         preview = self._run(dry_run=True)
-        with mock.patch.object(alpha_registry, "record_simulation", return_value={}) as ledger:
+        with mock.patch.object(alpha_registry, "record_simulation", return_value={"appended": 0}) as ledger:
             data = self._run(no_record=False)
         self.assertEqual(len(self.fake.calls), 2)
         self.assertEqual([call["settings"]["decay"] for call in self.fake.calls], [4, 2])

@@ -14,11 +14,18 @@ import machine_lib as ml
 from research_app import alphas, confirm, promote, selection
 from research_app.runtime import CliError
 
+SEED_DESCRIPTION = (
+    "Idea:\n- Higher quality firms should earn higher subsequent returns.\n\n"
+    "Rationale for data used:\n- assets: total reported corporate assets.\n\n"
+    "Rationale for operators used:\n- rank: compares firms cross-sectionally."
+)
+
 
 def platform(alpha_id="mLKwo5Nx", status="UNSUBMITTED", named=True):
     return {"id": alpha_id, "status": status,
             "name": "n" if named else None, "category": "FUNDAMENTAL" if named else None,
-            "regular": {"code": "rank(close)", "operatorCount": 8},
+            "regular": {"code": "rank(close)", "operatorCount": 8,
+                        "description": SEED_DESCRIPTION},
             "is": {"sharpe": 1.65, "fitness": 0.9, "turnover": 0.2},
             "train": {"sharpe": 1.65}, "test": {"sharpe": 0.93},
             "dateSubmitted": None}
@@ -36,7 +43,7 @@ class SubmitReconcileTests(unittest.TestCase):
         buffer_cmd._write_seed(buffer_cmd.seeds_path(),
                                {"alpha_id": "mLKwo5Nx", "name": "seed",
                                 "category": "FUNDAMENTAL", "tags": ["test"],
-                                "description": "z" * 120})
+                                "description": SEED_DESCRIPTION})
 
     def args(self, **kw):
         base = {"alpha_id": "mLKwo5Nx", "yes": False, "max_wait": 0, "selection": None,
@@ -119,7 +126,7 @@ class SeedStoreTests(unittest.TestCase):
         base = {"alpha_id": "A1", "buffer": str(self.root / "buffer.jsonl"),
                 "seeds": str(self.root / "seeds.jsonl"), "note": None,
                 "name": "seed", "category": "FUNDAMENTAL", "tags": ["quality"],
-                "description": "d" * 120, "max_wait": 0, "force": False,
+                "description": SEED_DESCRIPTION, "max_wait": 0, "force": False,
                 "selection": None, "cost_bps": [5]}
         base.update(overrides)
         return argparse.Namespace(**base)

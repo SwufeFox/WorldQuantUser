@@ -17,7 +17,7 @@ untested. Use the same research directory for every step.
 | Prepare | Put the question in the spec's `idea`, declare its mechanism and stable arm labels, then `campaign preview SPEC.json`. Read `would_block`, `blocking`, `gate_blocking` and the returned recovery references. |
 | Execute | Put the reviewed spec in `backlog/`; one owner runs `campaign run --watch --defer-quick-pnl --stream`. That owner handles submission and recovery. |
 | Review | `ledger analyze --group-by scope`, then narrow to the mechanism and inspect failures as well as usable results. |
-| Validate | Use the frozen FULL training selection in `promote ALPHA_ID --selection SELECTION.json`, supplying `--name`, `--category`, `--tags` and `--description` once. Platform submission uses its existing authorized entry point. |
+| Validate | After FULL completes, write the official-template description with `alpha describe`, then run `buffer add` (or `promote`, which calls it) with `--name`, `--category`, `--tags` and `--description`. Only then may the authorized `alpha submit` entry point be called twice. |
 
 After execution starts, keep the spec, arm labels, settings and batch path fixed.
 Use the returned checkpoint path, not a reconstructed filename. An edited
@@ -70,11 +70,19 @@ For throughput, shared budgets and concurrency measurements, read the Chinese
   remain recoverable. These exploration rules do not redefine a controlled
   two-arm Probe or FULL validation. See the Quick section in `docs/tooling.md`.
 - Research seeds are the ledger's experiment records, including failed attempts.
-  Submission-candidate metadata belongs to the existing buffer/seed store and is
-  written by promotion. Supply a nonempty name, an allowed category, at least one
-  tag and a rationale of at least 100 characters after trimming outer whitespace.
-  Describe the actual hypothesis and evidence; do not invent a rationale to fill
-  the field or maintain another seed-tracking loop.
+  Submission-candidate metadata belongs to the existing buffer/seed store. The
+  exact order is FULL complete → `alpha describe` writes the platform description
+  → `buffer add --name --category --tags --description` stores the seed and checks
+  → `alpha submit` is issued twice. `buffer add` rereads the platform description
+  and requires an exact match, so the remote write is not optional.
+  Every candidate description must use the official Power Pool template, with the
+  exact headings `Idea:`, `Rationale for data used:` and `Rationale for operators
+  used:`; each heading is followed by a `- ` bullet list. The old all-caps `IDEA:`
+  / `RATIONALE:` form is invalid. The overall description must contain at least
+  100 characters after trimming outer whitespace. Describe the actual hypothesis
+  and evidence; do not invent a rationale to fill the field or maintain another
+  seed-tracking loop. A seed check with any `FAIL` blocks shelving and submission;
+  for example, `LOW_FITNESS 0.63` stays out of the seed store.
   `metadata_required` means validation reached missing candidate metadata; append
   the listed `required_options` to `next_action.argv` and reuse its frozen choice.
   It does not mean the candidate was buffered or that a new simulation is needed.

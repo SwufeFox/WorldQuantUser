@@ -20,7 +20,9 @@ import cache_store
 import machine_lib as ml
 import simulation_slots
 from research_app import app as cli_app
+from research_app import alphas
 from research_app import promote as cli_promote
+from research_app.runtime import CliError
 
 
 def invoke_cli(*arguments: str) -> tuple[int, dict, str]:
@@ -392,8 +394,9 @@ def test_alpha_readiness_composes_and_applies_verified_description(tmp_path):
     data = doc["data"]
     assert data["description_applied"] is True
     assert data["draft_description"]["ok"] is True
-    assert "IDEA:" in data["expression_description"]
-    assert "RATIONALE:" in data["expression_description"]
+    assert "Idea:" in data["expression_description"]
+    assert "Rationale for data used:" in data["expression_description"]
+    assert "Rationale for operators used:" in data["expression_description"]
     assert data["power_pool_budget"]["budget"]["operators"] == 1  # ts_backfill exempt!
     assert data["power_pool_budget"]["budget"]["single_dataset"] is True
     assert data["ready"] is True
@@ -457,6 +460,25 @@ def test_alpha_list_filters_and_describe_color_hide_tags(tmp_path):
         assert desc_doc["data"]["tags"] == ["alpha", "beta", "gamma"]
         assert desc_doc["data"]["color"] == "GREEN"
         assert desc_doc["data"]["hidden"] is True
+
+
+def test_alpha_describe_rejects_old_template_before_the_remote_write():
+    args = SimpleNamespace(
+        alpha_id="A55",
+        description="IDEA:\n- " + "quality " * 20 + "\n\nRATIONALE:\n- " + "rank " * 20,
+        name=None,
+        category=None,
+        tags=None,
+        color=None,
+        hide=False,
+        unhide=False,
+    )
+    with mock.patch.object(alphas, "with_session") as session:
+        with pytest.raises(CliError) as caught:
+            alphas.cmd_alpha_describe(args, None)
+    assert "official Power Pool template" in caught.value.message
+    assert "Rationale for operators used:" in caught.value.hint
+    session.assert_not_called()
 
 
 def test_ergonomic_cli_shortcuts_simulate_probe_triage_and_near(tmp_path):

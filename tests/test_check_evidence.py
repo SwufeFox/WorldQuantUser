@@ -14,6 +14,12 @@ import registry_index
 from research_app import alphas, buffer_cmd, selection, triage
 from research_app.runtime import CliError
 
+SHELF_DESCRIPTION = (
+    "Idea:\n- Higher quality firms should earn higher subsequent returns.\n\n"
+    "Rationale for data used:\n- assets: total reported corporate assets.\n\n"
+    "Rationale for operators used:\n- rank: compares firms cross-sectionally."
+)
+
 
 @pytest.mark.parametrize("shape", ["mapping", "list", "legacy"])
 @pytest.mark.parametrize("verdict,passed,failed,pending,warned,errored,resolved", [
@@ -241,12 +247,13 @@ def shelf_context(monkeypatch, tmp_path):
     args = Namespace(alpha_id="A", buffer=str(tmp_path / "shelf.jsonl"),
                      registry=str(tmp_path / "ledger.jsonl"), selection=str(chosen),
                      name="Synthetic checked candidate", category="PRICE_VOLUME", tags=["synthetic"],
-                     description="Synthetic offline metadata for the shelf eligibility regression. " * 2,
+                     description=SHELF_DESCRIPTION,
                      seeds=str(tmp_path / "seeds.jsonl"),
                      note=None, max_wait=None, yes=False, force=False)
     monkeypatch.setattr(buffer_cmd, "with_session", lambda _args, work: work(object()))
     monkeypatch.setattr(ml, "fetch_alpha_metrics", lambda *_args: {
-        "id": "A", "status": "COMPLETE", "regular": {"code": "rank(close)"},
+        "id": "A", "status": "COMPLETE",
+        "regular": {"code": "rank(close)", "description": SHELF_DESCRIPTION},
         "settings": {"simulationMode": "FULL"}, "is": {"sharpe": 2.0, "fitness": 1.2},
     })
     return args

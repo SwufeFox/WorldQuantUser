@@ -24,9 +24,16 @@ from research_app import buffer_cmd, selection
 from research_app.runtime import CliError
 
 
-def _payload(name="A1", checks=None, self_corr=0.45):
+OFFICIAL_DESCRIPTION = (
+    "Idea:\n- Higher quality firms should earn higher subsequent returns.\n\n"
+    "Rationale for data used:\n- assets: total reported corporate assets.\n\n"
+    "Rationale for operators used:\n- rank: compares firms cross-sectionally."
+)
+
+
+def _payload(name="A1", checks=None, self_corr=0.45, description=OFFICIAL_DESCRIPTION):
     return {"id": name, "status": "COMPLETE", "name": "x", "category": "QUALITY",
-            "regular": {"code": "rank(close)"},
+            "regular": {"code": "rank(close)", "description": description},
             "settings": {"region": "USA", "universe": "TOP3000", "simulationMode": "FULL"},
             "is": {"sharpe": 2.4, "fitness": 1.7, "turnover": 0.2},
             "oos": {"train": {"sharpe": 2.6, "fitness": 2.0, "turnover": 0.22,
@@ -62,7 +69,8 @@ class BufferTests(unittest.TestCase):
     def _args(self, **overrides):
         base = dict(alpha_id="A1", buffer=self.shelf, note=None,
                     name="seed A1", category="FUNDAMENTAL", tags=["quality"],
-                    description="x" * 120, seeds=str(Path(self.shelf).with_name("seeds.jsonl")),
+                    description=OFFICIAL_DESCRIPTION,
+                    seeds=str(Path(self.shelf).with_name("seeds.jsonl")),
                     registry=os.path.join(self.tmp, "ledger.jsonl"),
                     selection=self.selection_path, max_wait=None, yes=False, force=False)
         base.update(overrides)
@@ -149,12 +157,33 @@ class BufferTests(unittest.TestCase):
     def test_a_failing_check_is_refused(self):
         failing = {"alpha_id": "A1", "complete": True,
                    "self_correlation": {"result": "PASS", "value": 0.4},
-                   "checks": {"LOW_SHARPE": {"result": "FAIL"}}}
+                   "checks": {"LOW_FITNESS": {"result": "FAIL", "value": 0.63}}}
         with mock.patch.object(ml, "fetch_alpha_metrics", return_value=_payload()), \
                 mock.patch.object(ml, "fetch_alpha_checks", return_value=failing):
-            with self.assertRaises(Exception):
+            with self.assertRaises(CliError) as caught:
                 buffer_cmd.cmd_buffer_add(self._args(), mock.MagicMock())
+        self.assertIn("LOW_FITNESS", caught.exception.message)
         self.assertFalse(os.path.exists(self.shelf))
+        self.assertFalse(Path(self._args().seeds).exists())
+
+    def test_old_template_is_refused_before_any_platform_read(self):
+        with mock.patch.object(ml, "fetch_alpha_metrics") as read:
+            with self.assertRaises(CliError) as caught:
+                buffer_cmd.cmd_buffer_add(
+                    self._args(description="IDEA:\n- " + "quality " * 20 +
+                               "\nRATIONALE:\n- " + "rank " * 20), None)
+        self.assertIn("official Power Pool template", caught.exception.message)
+        read.assert_not_called()
+        self.assertFalse(Path(self.shelf).exists())
+
+    def test_platform_description_must_be_written_before_buffer_add(self):
+        with mock.patch.object(ml, "fetch_alpha_metrics",
+                               return_value=_payload(description="old description")):
+            with self.assertRaises(CliError) as caught:
+                buffer_cmd.cmd_buffer_add(self._args(), None)
+        self.assertIn("alpha describe", caught.exception.hint)
+        self.assertFalse(Path(self.shelf).exists())
+        self.assertFalse(Path(self._args().seeds).exists())
 
     def test_quick_mode_is_refused_before_checks_or_shelving(self):
         payload = {**_payload(), "settings": {"simulationMode": "QUICK"}}

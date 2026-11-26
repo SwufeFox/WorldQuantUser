@@ -36,6 +36,7 @@ from check_evidence import CLIENT_PARSE_ERROR, summarize_checks
 import field_index
 from research_app import app as cli_app
 from research_app import catalog as cli_catalog
+from research_app import description as cli_description
 from research_app import experiments as cli_experiments
 from research_app import parser as cli_parser
 from research_app import runtime as cli_runtime
@@ -91,6 +92,25 @@ class SchemaContractTests(unittest.TestCase):
                 self.assertEqual(parsed.command, "alpha")
                 self.assertEqual(parsed.subcommand, argv[1])
                 self.assertEqual(parsed.alpha_id, "SYNTHETIC")
+
+    def test_power_pool_description_headings_are_an_exact_contract(self):
+        text = (
+            "Idea:\n- Higher quality firms should earn higher subsequent returns.\n\n"
+            "Rationale for data used:\n- assets: total reported corporate assets.\n\n"
+            "Rationale for operators used:\n- rank: compares firms cross-sectionally."
+        )
+        checked = cli_description.check(text)
+        self.assertTrue(checked["required_ok"], checked)
+        self.assertEqual(
+            [line for line in text.splitlines() if line in cli_description.SECTION_TITLES],
+            list(cli_description.SECTION_TITLES),
+        )
+        old = text.replace("Idea:", "IDEA:").replace(
+            "Rationale for data used:", "RATIONALE:")
+        rejected = cli_description.check(old)
+        self.assertFalse(rejected["template_ok"])
+        self.assertTrue(any(cli_description.SECTION_IDEA in error
+                            for error in rejected["template_errors"]))
 
     def test_wait_budget_aliases_preserve_destinations_defaults_and_numeric_types(self):
         parser = cli_parser.build_parser()

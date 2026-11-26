@@ -2206,6 +2206,8 @@ def simulate_alphas(
         capability_snapshot = simulation_capabilities.cached()
     plan = concurrency_plan(None if dry_run else s, concurrency,
                             (capability_snapshot or {}) if dry_run else capability_snapshot)
+    if settings.get("simulationMode") == "QUICK":
+        plan["effective"] = simulation_slots.quick_slot_limit(plan["effective"])
     if native_enabled:
         plan["multi_parent_limit"] = simulation_multi.CONSULTANT_PARENT_LIMIT
         plan["effective"] = min(plan["effective"], plan["multi_parent_limit"])
@@ -2648,6 +2650,7 @@ def simulate_alphas(
         # unidentified legacy jobs, wait for the original reads before using slots.
         untracked_reads = set() if plan["account"].get("fingerprint") else set(progress_reads)
         while True:
+            shared_slot_wait = None
             while (next_group is not None and not stop_submitting and not untracked_reads
                    and len(progress_reads) + unresolved_polls < plan["effective"]
                    and (deadline is None or time.monotonic() < deadline)):
@@ -2674,13 +2677,24 @@ def simulate_alphas(
                                 raise
                             # Keep this invocation's accepted jobs available to its caller.
                             note(str(exc))
+                    if (outcome == "contended" and len(next_group) > 1
+                            and not native_poll_once and deadline is not None):
+                        if progress_reads:
+                            # A different runner can release capacity while our
+                            # own accepted parents still need to be polled.
+                            shared_slot_wait = min(0.25, max(0.0, deadline - time.monotonic()))
+                        else:
+                            while time.monotonic() < deadline and not shared_state()["available"]:
+                                sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+                            if time.monotonic() < deadline:
+                                continue
                     stop_submitting = outcome == "blocked"
                     break
                 next_group = next(groups, None)
 
             if not progress_reads:
                 break
-            ready, _ = wait(progress_reads, return_when=FIRST_COMPLETED)
+            ready, _ = wait(progress_reads, timeout=shared_slot_wait, return_when=FIRST_COMPLETED)
             for future in ready:
                 group = progress_reads.pop(future)
                 read_result(future)
