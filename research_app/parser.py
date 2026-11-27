@@ -721,6 +721,16 @@ def build_parser():
     _add_session_args(cat_find)
     cat_find.bind_handler("catalog.cmd_catalog_find")
 
+    inventory = cat.add_parser("inventory", help="Enumerate all scoped datasets and fields with native coverage.")
+    inventory.add_argument("--region", type=str.upper, required=True)
+    inventory.add_argument("--universe", type=str.upper, required=True)
+    inventory.add_argument("--delay", type=_non_negative_integer, default=ml.DEFAULT_SETTINGS["delay"])
+    inventory.add_argument("--instrument-type", type=str.upper, default=ml.DEFAULT_SETTINGS["instrumentType"])
+    inventory.add_argument("--stream", action="store_true", help="Emit catalog enumeration progress on stderr.")
+    _add_session_args(inventory)
+    inventory.set_defaults(query=None, dataset=None, min_coverage=None, limit=None)
+    inventory.bind_handler("catalog.cmd_catalog_inventory")
+
     cat_unused = cat.add_parser(
         "unused",
         help="Which catalog fields the book has never touched, by dataset.")
@@ -1137,6 +1147,23 @@ def build_parser():
     campaign_preview.add_argument("spec", metavar="SPEC")
     _add_multi_size_arg(campaign_preview)
     campaign_preview.bind_handler("campaign.cmd_campaign_preview")
+
+    campaign_publish = campaign_sub.add_parser(
+        "publish", help="Strictly preflight one QUICK spec and publish it to the campaign backlog.")
+    campaign_publish.add_argument("spec", metavar="SPEC")
+    campaign_publish.add_argument("--campaign-dir", metavar="DIR", help="Directory containing backlog.")
+    campaign_publish.add_argument("--phase", choices=["pilot", "expansion"], default="pilot")
+    campaign_publish.add_argument("--pilot-batch", metavar="BATCH", help="Completed QUICK pilot for expansion.")
+    campaign_publish.add_argument("--max-wait-seconds", type=_positive_seconds, default=180)
+    _add_multi_size_arg(campaign_publish)
+    _add_session_args(campaign_publish)
+    campaign_publish.bind_handler("campaign_delivery.cmd_campaign_publish")
+
+    campaign_diagnose = campaign_sub.add_parser(
+        "diagnose", help="Explain ready work, saved checkpoints, failed deliveries, and reserve depth offline.")
+    campaign_diagnose.add_argument("--campaign-dir", metavar="DIR", help="Directory containing backlog.")
+    campaign_diagnose.add_argument("--limit", type=_positive_count, default=20)
+    campaign_diagnose.bind_handler("campaign_delivery.cmd_campaign_diagnose")
 
     campaign_prepare = campaign_sub.add_parser(
         "prepare-full", help="Draft bounded FULL simulations from a saved QUICK batch's training results.")
@@ -1869,6 +1896,7 @@ _COMMAND_EXAMPLES = {
     "catalog field": ["catalog field fnd6_newa1v1300_assets"],
     "catalog fields": ["catalog fields fundamental6 --search liability --expressions --limit 10",
                        "catalog fields --dataset fundamental6 --summary"],
+    "catalog inventory": ["catalog inventory --region KOR --universe TOP600 --stream"],
     "catalog find": ["catalog find debt --min-coverage 0.8",
                      "catalog find --region EUR --universe TOP2500 --dataset analyst69,analyst15 "
                      "--type MATRIX --max-alpha-count 0 --min-coverage 0.8 --sort pyramid-multiplier --stream"],
@@ -1911,7 +1939,8 @@ _COMMAND_EXAMPLES = {
               "probe batch.spec.json --batch-path BATCH.json --save response.json",
               "probe --recover BATCH.json --max-wait-seconds 60",
               "probe --resume BATCH.json --dry-run", "probe --from-simulation SIMULATION_ID"],
-    "campaign": ["campaign status", "campaign preview batch.spec.json",
+    "campaign": ["campaign status", "campaign diagnose", "campaign publish pilot.json",
+                 "campaign preview batch.spec.json",
                  "campaign prepare-full quick-batch.json --out full.spec.json --limit 4",
                  "campaign breed batch.json --out offspring.spec.json --seed 17 --limit 4",
                  "campaign run --recover-only", "campaign run --watch --defer-quick-pnl --stream",

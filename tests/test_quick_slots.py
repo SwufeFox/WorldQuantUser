@@ -135,7 +135,8 @@ def test_admission_evidence_counts_only_distinct_durable_ordinary_acceptances(tm
     assert slots.confirmed_accepted_count(ACCOUNT) is None
 
 
-def test_dead_quick_owner_does_not_cap_the_workspace(tmp_path, monkeypatch):
+@pytest.mark.parametrize("owner", [{"pid": 999999, "start": "0"}, None], ids=["exited", "parked"])
+def test_inactive_quick_owner_does_not_cap_the_workspace(tmp_path, monkeypatch, owner):
     import json
     monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
     account = {"fingerprint": "dead-owner-test"}
@@ -145,8 +146,7 @@ def test_dead_quick_owner_does_not_cap_the_workspace(tmp_path, monkeypatch):
         "version": 1,
         "account_fingerprint": slots._fingerprint(account),
         "reservations": {
-            "stale": {"state": "accepted", "quick_limit": 1,
-                      "quick_owner": {"pid": 999999, "start": "0"}},
+            "stale": {"state": "accepted", "quick_limit": 1, "quick_owner": owner},
         },
     }
     Path(path).write_text(json.dumps(journal))

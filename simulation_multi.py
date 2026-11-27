@@ -209,7 +209,8 @@ class MultiRuns:
                                              "slot_reservation_state": "submitting"})
             self._emit("multi_submitting", indices)
 
-        identity, slots = simulation_slots.prepare_submission(self.account, self.limit, checkpoint)
+        quick = all(payload.get("settings", {}).get("simulationMode") == "QUICK" for payload in payloads)
+        identity, slots = simulation_slots.prepare_submission(self.account, self.limit, checkpoint, quick_native=quick)
         if identity is None and slots["available"] == 0:
             for index in indices:
                 self.records[index]["error"] = "shared simulation slots are occupied; reconcile or resume existing attempts"

@@ -90,6 +90,30 @@ class CatalogFindTests(unittest.TestCase):
         self.assertEqual(data["datasets_scanned"], 1)
         self.assertEqual({row["dataset"] for row in data["fields"]}, {"fundamental2"})
 
+    def test_inventory_returns_every_scoped_field_and_retains_unknown_coverage(self):
+        def datasets(_access, **kwargs):
+            self.assertEqual((kwargs["region"], kwargs["universe"]), ("KOR", "TOP600"))
+            kwargs["report"].update(complete=True)
+            return self.datasets
+
+        def fields(_access, **kwargs):
+            self.assertIsNone(kwargs.get("limit"))
+            kwargs["report"].update(complete=True, hit=True)
+            return ([_field(f"signal{i}", 0 if i == 0 else None if i == 1 else 0.9)
+                     for i in range(57)] if kwargs["dataset_id"] == "fundamental6" else [])
+
+        with mock.patch.object(ml, "get_datasets", side_effect=datasets), \
+                mock.patch.object(ml, "get_datafields", side_effect=fields):
+            data = cli_catalog.cmd_catalog_inventory(self._args(
+                subcommand="inventory", query=None, limit=None, region="KOR", universe="TOP600"), None)
+        self.assertEqual(data["dataset_count"], 2)
+        self.assertEqual(len(data["fields"]), 57)
+        self.assertEqual(data["unknown_coverage_count"], 1)
+        self.assertEqual({row["id"]: row["coverage"] for row in data["fields"]}["signal0"], 0)
+        self.assertTrue(data["discovery"]["complete"])
+        self.assertEqual(data["discovery"]["catalogs"][1]["state"], "cached")
+        self.assertEqual(data["discovery"]["catalogs"][1]["fields_scanned"], 0)
+
 
 class CatalogCacheTests(unittest.TestCase):
     def setUp(self):

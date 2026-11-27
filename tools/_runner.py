@@ -660,6 +660,15 @@ def run_queue(root, inbox, paths, log, *, max_wait, interval, once=False,
                             else:
                                 if consume is not None and result.data.get("rows"):
                                     consume(spec, result.data)
+                                if result.state == "failed":
+                                    reason = inbox / "failed" / ".reasons" / destination.name
+                                    cache_store.write_json_atomic(reason, {
+                                        "source_fingerprint": source_fingerprint,
+                                        "detail": result.detail or "terminal probe failure",
+                                        "diagnosis": result.data.get("diagnosis"),
+                                        "receipt": str(receipt),
+                                        "observed_at": time.time(),
+                                    })
                                 shutil.move(spec, destination)
                     except Exception as error:
                         # Leave the spec and any saved POST intent for an exact retry.

@@ -1073,6 +1073,10 @@ def _load_probe_spec(path):
                        "pass a JSON file shaped like "
                        "{\"name\": ..., \"settings\": {...}, \"arms\": [{\"label\", "
                        "\"expression\"}]}") from exc
+    return _normalize_probe_spec(spec, path)
+
+
+def _normalize_probe_spec(spec, path):
     if not isinstance(spec, dict):
         raise CliError("INVALID_INPUT", "spec must be a JSON object",
                        "see `research_cli.py schema probe`")
@@ -2052,9 +2056,10 @@ def _recoverable_probe_reference(row):
     return True
 
 
-def _probe_inputs(args):
+def _probe_inputs(args, document=None):
     """Materialize request settings, source, and controls without searching history."""
-    spec = _load_probe_spec(_require_spec(args))
+    path = _require_spec(args)
+    spec = _load_probe_spec(path) if document is None else _normalize_probe_spec(document, path)
     name = getattr(args, "name", None) or spec.get("name") or Path(args.spec).stem
     groups = {}
     arms = []
@@ -2096,9 +2101,9 @@ def _prepare_probe(args):
     return spec, name, groups, arms, design, gate
 
 
-def probe_spec_identity(path):
+def probe_spec_identity(path, *, document=None):
     """Bind a materialized file to its checkpoint without repeating discovery."""
-    spec, _, _, arms, design = _probe_inputs(SimpleNamespace(spec=str(path)))
+    spec, _, _, arms, design = _probe_inputs(SimpleNamespace(spec=str(path)), document)
     return {"track": spec["track"], "design": design,
             **{key: spec[key] for key in ("quick_source", "breeding_source") if key in spec},
             "request_fingerprint": _request_fingerprint(arms), "results": arms}

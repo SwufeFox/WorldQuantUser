@@ -73,6 +73,25 @@ def test_workspace_quick_ceiling_leaves_a_slot_for_full(tmp_path, simulator):
     assert full["effective"] == 7
 
 
+def test_native_partition_preserves_legacy_and_full_capacity(tmp_path, simulator):
+    policies = tmp_path / "simulation-slots"
+    policies.mkdir()
+    (policies / "quick-slot-limit").write_text("7\n")
+    (policies / "quick-single-slot-limit").write_text("2\n")
+    (policies / "quick-native-slot-limit").write_text("4\n")
+    checkpoint = mock.Mock()
+    for _ in range(4):
+        identity, _ = simulation_slots.prepare_submission(ACCOUNT, 7, checkpoint, quick_native=True)
+        assert identity
+    identity, state = simulation_slots.prepare_submission(ACCOUNT, 7, checkpoint, quick_native=True)
+    assert identity is None and state["available"] == 0 and checkpoint.call_count == 4
+    for index in range(2):
+        assert simulation_slots.quick_acquire(ACCOUNT, 7, f"legacy-{index}")
+    assert simulation_slots.quick_acquire(ACCOUNT, 7, "legacy-extra") is None
+    full, state = simulation_slots.prepare_submission(ACCOUNT, 8, checkpoint)
+    assert full and state["active"] == 7
+
+
 def test_legacy_single_ceiling_preserves_native_and_full_slots(tmp_path, simulator):
     policies = tmp_path / "simulation-slots"
     policies.mkdir()

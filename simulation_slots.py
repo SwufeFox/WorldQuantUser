@@ -13,6 +13,7 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -373,10 +374,9 @@ def _active_limit(journal, limit):
         shared_limit = entry.get("quick_limit")
         if type(shared_limit) is int and shared_limit > 0:
             owner = entry.get("quick_owner")
-            # A reservation whose worker is gone must not keep throttling the
-            # workspace at the budget it happened to request. Probe reservations
-            # carry no owner and no quick_limit, so they are unaffected.
-            if owner is not None and not _quick_owner_is_live(owner):
+            # A parked or abandoned reservation still occupies a slot. Only a
+            # live worker's requested limit can constrain the workspace budget.
+            if not _quick_owner_is_live(owner):
                 continue
             limit = min(limit, shared_limit)
     return limit
@@ -749,7 +749,7 @@ def _record_unposted(journal, identity):
     journal.setdefault("not_submitted", {})[identity] = entry.get("created_at")
 
 
-def prepare_submission(account, limit, checkpoint):
+def prepare_submission(account, limit, checkpoint, *, quick_native=False):
     """Reserve, checkpoint, then authorize the caller to POST.
 
     The preparation lock is never held during network I/O. If its owner dies,
@@ -769,7 +769,20 @@ def prepare_submission(account, limit, checkpoint):
                          if entry.get("state") == "preparing"]
             for identity in abandoned:
                 _record_unposted(journal, identity)
-            identity, state = _reserve(journal, account, limit, "preparing")
+            native_available = True
+            if quick_native:
+                native_limit = _configured_slot_limit(limit, "quick-native-slot-limit")
+                native_active = sum(
+                    bool(entry.get("quick_native")) for entry in journal["reservations"].values()
+                )
+                native_available = native_active < native_limit
+            if native_available:
+                identity, state = _reserve(journal, account, limit, "preparing")
+                if identity and quick_native:
+                    journal["reservations"][identity["id"]]["quick_native"] = True
+            else:
+                identity, state = None, _report(account, limit, len(journal["reservations"]))
+                state.update(available=0, lane="quick_native")
             if identity or abandoned or pruned:
                 cache_store.write_json_atomic(path, journal)
         if identity is None:
@@ -1025,8 +1038,56 @@ def defer_submission(account, wait_seconds, *, deadline=None):
     return retry_at
 
 
+def _quota_reset_at(observation):
+    observed = _quota_number(observation.get("observed_at"))
+    delay = _quota_number(observation.get("reset_seconds"))
+    return observed + delay if observed is not None and delay is not None else None
+
+
+def _merge_quota(previous, incoming):
+    """Select one authoritative balance without resurrecting stale quota."""
+    if not isinstance(previous, dict):
+        return incoming
+    past = _quota_number(previous.get("observed_at"))
+    now = incoming["observed_at"]
+    if past is None:
+        return incoming
+    previous_header = _quota_number(previous.get("header_at"))
+    incoming_header = incoming.get("header_at")
+    old_reset, new_reset = _quota_reset_at(previous), _quota_reset_at(incoming)
+    old_remaining = _quota_number(previous.get("remaining"), integer=True)
+    remaining = incoming["remaining"]
+    if now < past or (previous_header is not None and incoming_header is not None
+                      and incoming_header < previous_header):
+        # A slower writer can still bring a lower balance for the same window.
+        # Retain the journal's newer timestamp and its established boundary.
+        if (old_reset is not None and new_reset is not None and abs(old_reset - new_reset) <= 2
+                and remaining is not None and (old_remaining is None or remaining < old_remaining)):
+            return {**previous, "remaining": remaining}
+        return previous
+    if old_reset is None and new_reset is not None and new_reset > now and remaining is not None:
+        # A header without a reset cannot establish a durable window. Use the
+        # first complete observation when one arrives.
+        return incoming
+    # Reaching the old deadline is insufficient. A subsequent window must
+    # provide both a fresh balance and a new future reset boundary.
+    if old_reset is not None and now >= old_reset:
+        issued = incoming.get("header_at", now)
+        if remaining is not None and issued >= old_reset and new_reset is not None and new_reset > now:
+            return incoming
+        return previous
+    if remaining is None or (old_remaining is not None and remaining > old_remaining):
+        return previous
+    if incoming["limit"] is None:
+        incoming = {**incoming, "limit": previous.get("limit")}
+    if old_reset is not None:
+        # Keep the established boundary despite header/transport jitter.
+        incoming = {**incoming, "reset_seconds": old_reset - now}
+    return incoming
+
+
 def observe_quota(account, headers):
-    """Retain only documented simulation-quota headers, never unrelated headers."""
+    """Publish response quota through the account journal's exclusive writer lock."""
     if not isinstance(headers, Mapping):
         return None
     headers = {str(key).lower(): value for key, value in headers.items()}
@@ -1040,15 +1101,28 @@ def observe_quota(account, headers):
     if (observation["limit"] is not None and observation["remaining"] is not None
             and observation["remaining"] > observation["limit"]):
         observation["remaining"] = None
-    observation.update(observed_at=time.time(), source="POST /simulations response headers")
+    now = time.time()
+    observation.update(observed_at=now, source="POST /simulations response headers")
+    if headers.get("date"):
+        try:
+            issued = parsedate_to_datetime(headers["date"]).timestamp()
+            if issued <= now + 60:
+                observation["header_at"] = issued
+                if observation["reset_seconds"] is not None:
+                    observation["reset_seconds"] = max(0.0, issued + observation["reset_seconds"] - now)
+        except (AttributeError, TypeError, ValueError, OverflowError, OSError):
+            pass
     fingerprint = _fingerprint(account)
     if fingerprint:
         path, lock = _paths(fingerprint)
         try:
             with cache_store.file_lock(lock):
                 journal = _load(path, fingerprint)
-                journal["quota"] = observation
-                cache_store.write_json_atomic(path, journal)
+                previous = journal.get("quota")
+                observation = _merge_quota(previous, observation)
+                if observation != previous:
+                    journal["quota"] = observation
+                    cache_store.write_json_atomic(path, journal)
         except (OSError, cache_store.CacheError) as error:
             # Losing telemetry must not lose an already accepted progress URL.
             observation["storage_error"] = type(error).__name__
@@ -1074,7 +1148,7 @@ def quota_snapshot(account, observation=None):
     reset_seconds = _quota_number(observation.get("reset_seconds"))
     if observed_at is None or (limit is not None and remaining is not None and remaining > limit):
         remaining = None
-    reset_at = observed_at + reset_seconds if observed_at is not None and reset_seconds is not None else None
+    reset_at = _quota_reset_at(observation)
     now = time.time()
     state = ("unknown" if observed_at is None or remaining is None else
              "reset_unknown" if reset_at is None else

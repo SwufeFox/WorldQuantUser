@@ -17,9 +17,12 @@ Use one research directory and one execution owner. The normal batch workflow is
 | --- | --- |
 | Read the current workspace and existing jobs | `python research_cli.py brief` and `python research_cli.py campaign status --limit 10` |
 | Review a new spec with its question, mechanism and stable arm labels | `python research_cli.py campaign preview SPEC.json` |
-| Put the reviewed spec in `backlog/`, then let one runner advance it | `python research_cli.py campaign run --watch --defer-quick-pnl --stream` |
+| Preflight and queue a 16-arm QUICK pilot, then let one runner advance it | `python research_cli.py campaign publish SPEC.json`, then `python research_cli.py campaign run --watch --defer-quick-pnl --stream` |
 | Review results and failure evidence | `python research_cli.py ledger analyze --group-by scope --limit 8` |
 | Validate a chosen FULL candidate and preserve its metadata | Use the saved training selection with the [promotion command below](#screen-a-campaign-candidate-before-promotion). |
+
+See [research campaign delivery](docs/research-campaign-queue.md) for regional field
+inventory, pilot expansion and offline queue diagnosis.
 
 Keep a running spec and its canonical checkpoint unchanged. Campaign owns both
 new launches and recovery; subagents can prepare separate drafts and inspect

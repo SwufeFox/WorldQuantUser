@@ -1776,7 +1776,8 @@ def _submit_simulation_request(s, simulation_data, max_retries, on_event, deadli
                        if response.status_code not in (401, 403) else None)
         if observation is not None and on_event:
             on_event("quota", observation)
-        if response.status_code == 429 and observation is not None and observation["remaining"] == 0:
+        if (response.status_code == 429 and observation is not None
+                and simulation_slots.quota_snapshot(account, observation)["blocked"]):
             raise RateLimited("daily simulation quota exhausted; resume after the reported reset")
         if response.status_code == 429:
             wait = _retry_after_seconds(response, cap_error_wait=False)
@@ -2309,7 +2310,7 @@ def simulate_alphas(
         nonlocal quota_exhausted
         if kind == "quota":
             payload = simulation_slots.quota_snapshot(plan["account"], observation=payload)
-            quota_exhausted = quota_exhausted or payload["remaining"] == 0
+            quota_exhausted = quota_exhausted or payload["blocked"]
             if scheduling_report is not None:
                 scheduling_report["quota"] = payload
         emit(kind, index, payload)

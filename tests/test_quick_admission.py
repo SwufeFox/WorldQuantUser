@@ -24,6 +24,26 @@ FIELDS = [
 ]
 
 
+def test_worker_handoff_parks_fresh_spec_without_changing_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    inbox = tmp_path / "scope" / "backlog"
+    claims = inbox.parent / "backlog-claimed"
+    inbox.mkdir(parents=True)
+    claims.mkdir()
+    claim = claims / "w3-fresh.json"
+    claim.write_text('{"name":"fresh"}')
+    switch = tmp_path / "quick-worker-handoff.json"
+    switch.write_text(json.dumps({"worker": "w3", "inbox": str(inbox)}))
+    monkeypatch.setattr(quick.time, "sleep", lambda _seconds: switch.unlink())
+    args = Namespace(arms=str(tmp_path / "arms-w3-fresh.json"),
+                     out=str(tmp_path / "out-w3-fresh.jsonl"),
+                     recover_only=False, admission_only=False, recover_job=None)
+    assert quick._handoff_watcher(args)
+    assert claim.samefile(inbox / "fresh.json")
+    assert (inbox.parent / ".w3-parked.json").is_file()
+    assert not Path(args.out).exists()
+
+
 def response(status, body=None, **headers):
     result = requests.Response()
     result.status_code = status

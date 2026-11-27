@@ -249,6 +249,29 @@ class SimulationQuotaTests(unittest.TestCase):
         journal, _ = simulation_slots._paths(ACCOUNT["fingerprint"])
         self.assertNotIn("unrelated-secret", Path(journal).read_text(encoding="utf-8"))
 
+    def test_quota_rejects_balance_rebound_and_requires_next_window_evidence(self):
+        def observe(now, remaining, reset=None, date=None):
+            headers = {"X-Ratelimit-Limit": "5000", "X-Ratelimit-Remaining": str(remaining)}
+            if reset is not None:
+                headers["X-Ratelimit-Reset"] = str(reset)
+            if date:
+                headers["Date"] = date
+            with mock.patch.object(simulation_slots.time, "time", return_value=now):
+                return simulation_slots.observe_quota(ACCOUNT, headers)
+
+        first = observe(100, 2975, 60)
+        self.assertEqual(observe(101, 2983, 59), first)
+        lower = observe(102, 2960, 59)
+        self.assertEqual(lower["remaining"], 2960)
+        self.assertEqual(simulation_slots._quota_reset_at(lower), 160)
+        lower = observe(101, 2959, 59)
+        self.assertEqual((lower["remaining"], lower["observed_at"]), (2959, 102))
+        self.assertEqual(observe(161, 4999), lower)
+        self.assertEqual(observe(162, 2983, 6, "Thu, 01 Jan 1970 00:02:39 GMT"), lower)
+        renewed = observe(163, 4998, 60, "Thu, 01 Jan 1970 00:02:43 GMT")
+        self.assertEqual(renewed["remaining"], 4998)
+        self.assertEqual(observe(164, 2960, 8, "Thu, 01 Jan 1970 00:02:38 GMT"), renewed)
+
     def test_quota_storage_failure_does_not_discard_accepted_progress_identity(self):
         session = mock.Mock()
         session.post.return_value = response(headers=quota_headers(0))

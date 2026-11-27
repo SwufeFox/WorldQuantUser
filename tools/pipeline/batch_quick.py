@@ -33,6 +33,7 @@ import alpha_registry
 import machine_lib
 import simulation_capabilities
 import simulation_slots
+import research_paths
 from check_evidence import normalize_checks, summarize_checks
 from research_app import capabilities
 from tools.pipeline import batch_policy
@@ -246,6 +247,7 @@ def _payload(arm):
 def _record_seed(arm, row, payload, source_spec, out):
     """Reconcile a Quick observation through the shared simulation ledger."""
     source_spec = str(Path(source_spec).resolve())
+    family = arm.get("family")
     record = {"alpha_id": row.get("alpha_id"), "expression": payload["regular"],
         "settings": payload["settings"], "status": row.get("status"),
         "metrics": {name: row[name] for name in METRIC_NAMES if row.get(name) is not None},
@@ -253,7 +255,8 @@ def _record_seed(arm, row, payload, source_spec, out):
         # observed. Keep that absence explicit instead of manufacturing a pass.
         "checks": row.get("checks"), "error": row.get("error") or row.get("detail"),
         "idea": arm.get("idea"), "mechanism": arm.get("mechanism") or arm["label"],
-        "family": arm.get("family"), "role": arm.get("role"), "note": arm.get("note"),
+        "family": family if family in alpha_registry.FAMILIES else None,
+        "role": arm.get("role"), "note": arm.get("note"),
         "provenance": {"run_id": row.get("simulation_job_key"),
             "request_fingerprint": row.get("simulation_key") or _simulation_key(payload),
             "source_spec": source_spec, "arm_label": arm["label"], "result_ledger": str(out),
@@ -611,7 +614,7 @@ class Runner:
         if response.status_code in (401, 403):
             return
         observation = simulation_slots.observe_quota(self.account, response.headers)
-        if ((observation and observation["remaining"] == 0)
+        if ((observation and simulation_slots.quota_snapshot(self.account, observation)["blocked"])
                 or (response.status_code == 429
                     and _json_object(response).get("detail") == "DAILY_SIMULATION_LIMIT_EXCEEDED")):
             self.quota_exhausted.set()
@@ -1062,6 +1065,40 @@ def _batch_args(parser):
     return args
 
 
+def _handoff_watcher(args):
+    """Park a superseded compatibility watcher before its next new submission."""
+    configuration = Path(research_paths.resolve("quick-worker-handoff.json"))
+    if args.recover_only or args.recover_job or not configuration.is_file():
+        return False
+    handoff = json.loads(configuration.read_text())
+    inbox = Path(handoff["inbox"])
+    worker = handoff["worker"]
+    root = configuration.parent
+    raw = Path(args.arms).resolve()
+    out = Path(args.out).resolve()
+    prefix = f"arms-{worker}-"
+    if raw.parent != root or not raw.name.startswith(prefix) or raw.suffix != ".json":
+        return False
+    name = raw.stem.removeprefix(prefix)
+    if not name or out != root / f"out-{worker}-{name}.jsonl":
+        return False
+    if not out.exists():
+        claim = inbox.parent / "backlog-claimed" / f"{worker}-{name}.json"
+        queued = inbox / f"{name}.json"
+        try:
+            queued.hardlink_to(claim)
+        except FileExistsError:
+            if not queued.samefile(claim):
+                raise
+    parent = os.getppid()
+    cache_store.write_json_atomic(inbox.parent / f".{worker}-parked.json", {
+        "worker": worker, "pid": os.getpid(), "parent": parent, "parked_at": time.time(),
+    })
+    while configuration.is_file() and os.getppid() == parent:
+        time.sleep(5)
+    return True
+
+
 def main(*, default_out="batch-results.jsonl", default_concurrency=DEFAULT_ACCOUNT_SLOTS):
     parser = _batch_parser(__doc__, default_out, default_concurrency)
     parser.add_argument("--poll-timeout", type=float, default=420,
@@ -1086,6 +1123,8 @@ def main(*, default_out="batch-results.jsonl", default_concurrency=DEFAULT_ACCOU
         parser.error("--admission-only and --recover-job are mutually exclusive")
     if args.recover_only and (args.admission_only or args.recover_job):
         parser.error("--recover-only cannot be combined with --admission-only or --recover-job")
+    if _handoff_watcher(args):
+        return 3
     return _run_locked(parser, args, _run_batch)
 
 

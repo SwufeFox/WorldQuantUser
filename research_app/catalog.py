@@ -293,7 +293,8 @@ def cmd_catalog_find(args, sink):
     max_alpha_count = getattr(args, "max_alpha_count", None)
     field_type = getattr(args, "field_type", None)
     sort_by = getattr(args, "sort", "relevance")
-    if query is None and max_alpha_count is None and args.min_coverage is None and not field_type:
+    if (getattr(args, "subcommand", None) != "inventory" and query is None
+            and max_alpha_count is None and args.min_coverage is None and not field_type):
         raise CliError("INVALID_INPUT", "provide a search query or a field filter",
                        "use --max-alpha-count, --min-coverage or --type to scan without a query")
     if max_alpha_count is not None and max_alpha_count < 0:
@@ -319,7 +320,7 @@ def cmd_catalog_find(args, sink):
     missing = [dataset_id for dataset_id in wanted if dataset_id not in available]
     if wanted:
         datasets = [row for row in datasets if row["id"] in wanted]
-    if not datasets:
+    if not datasets and getattr(args, "subcommand", None) != "inventory":
         raise CliError("INVALID_INPUT", "no datasets for %s/%s/delay %s"
                        % (args.region, args.universe, args.delay),
                        details={"cache": cache_report, "missing_datasets": missing})
@@ -380,6 +381,19 @@ def cmd_catalog_find(args, sink):
             data["hint"] = "nothing matched; try --fuzzy or --any-term, or adjust the filters"
         else:
             data["hint"] = "nothing matched the filters in the available catalog records"
+    return data
+
+
+def cmd_catalog_inventory(args, sink):
+    """Enumerate a complete, unfiltered scope with coverage and per-dataset evidence."""
+    data = cmd_catalog_find(args, sink)
+    catalogs = data["discovery"]["catalogs"]
+    data["instrument_type"] = args.instrument_type
+    data["dataset_count"] = len(catalogs)
+    data["unknown_coverage_count"] = sum(row["coverage"] is None for row in data["fields"])
+    for catalog in catalogs:
+        if catalog.get("complete") and catalog.get("metadata", {}).get("hit"):
+            catalog["state"] = "cached"
     return data
 
 
