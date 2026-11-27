@@ -33,7 +33,8 @@ def _campaign_spec(path, output_args=None):
                                                for item in sources if isinstance(item, str) and item))
         return spec, research_route.normalize_route(spec)
     except (OSError, ValueError) as exc:
-        raise CliError("INVALID_INPUT", f"cannot inspect {path.name}: {exc}") from exc
+        raise CliError("INVALID_INPUT", f"cannot inspect {path.name}: {exc}",
+                       "pass a readable JSON campaign spec (see `python research_cli.py schema campaign`)") from exc
 
 
 def _spc_inputs(path, spec):
@@ -41,12 +42,15 @@ def _spc_inputs(path, spec):
     reference = spec.get("reference")
     if (not isinstance(runs, list) or not runs
             or not all(isinstance(item, str) and item.strip() for item in runs)):
-        raise CliError("INVALID_INPUT", "SPC campaigns need a nonempty runs list of captured output files")
+        raise CliError("INVALID_INPUT", "SPC campaigns need a nonempty runs list of captured output files",
+                       "set \"runs\": [\"run1.json\", ...] in the SPC spec")
     if reference is not None and (not isinstance(reference, str) or not reference.strip()):
-        raise CliError("INVALID_INPUT", "SPC reference must be a file path")
+        raise CliError("INVALID_INPUT", "SPC reference must be a file path",
+                       "pass a path string or omit \"reference\"")
     sources = [(path.parent / Path(item).expanduser()).resolve() for item in runs]
     if len(set(sources)) != len(sources):
-        raise CliError("INVALID_INPUT", "SPC runs must be distinct files")
+        raise CliError("INVALID_INPUT", "SPC runs must be distinct files",
+                       "remove duplicate file paths from \"runs\"")
     reference = (path.parent / Path(reference).expanduser()).resolve() if reference else None
     return sources, reference
 
@@ -66,7 +70,8 @@ def cmd_campaign_preview(args, _sink):
     spec, route = _campaign_spec(path, args)
     if route["track"] == "SPC":
         if args.multi_size is not None:
-            raise CliError("USAGE", "--multi-size applies to BRAIN simulations")
+            raise CliError("USAGE", "--multi-size applies to BRAIN simulations",
+                           "omit --multi-size when previewing an SPC spec")
         runs, reference = _spc_inputs(path, spec)
         return _spc_report(path, route, runs, reference)
     data = experiments.preview_probe_spec(
@@ -105,7 +110,8 @@ def _full_arm(arm):
 
 def _followup_paths(args, name, input_kind):
     if args.out == "-":
-        raise CliError("USAGE", f"--out requires a file path for the {name} spec")
+        raise CliError("USAGE", f"--out requires a file path for the {name} spec",
+                       "pass a destination file path, e.g. --out spec.json")
     source = Path(args.batch).expanduser().resolve()
     output = Path(args.out).expanduser().resolve()
     protect_output(args, source, output)
@@ -121,7 +127,8 @@ def _followup_paths(args, name, input_kind):
     lock = Path(f"{output}.lock")
     protect_output(args, lock, *protected)
     if output in protected or lock in protected or lock.is_symlink():
-        raise CliError("INVALID_INPUT", f"--out would overwrite a {input_kind} input")
+        raise CliError("INVALID_INPUT", f"--out would overwrite a {input_kind} input",
+                       "choose an output path distinct from the batch, spec, and source files")
     return path, batch, output, lock
 
 
@@ -131,13 +138,16 @@ def _write_followup(output, lock, spec, name):
         with cache_store.file_lock(lock, timeout=0):
             if output.exists():
                 if json.loads(output.read_text(encoding="utf-8")) != spec:
-                    raise CliError("INVALID_INPUT", f"refusing to replace a different {name} spec")
+                    raise CliError("INVALID_INPUT", f"refusing to replace a different {name} spec",
+                                   "choose a new --out filename or remove the obsolete draft")
             else:
                 cache_store.write_json_atomic(output, spec, indent=2)
     except cache_store.LockTimeout as exc:
-        raise CliError("SERVICE_ERROR", f"the {name} spec is being prepared by another process") from exc
+        raise CliError("SERVICE_ERROR", f"the {name} spec is being prepared by another process",
+                       "wait for the active writer to finish before retrying") from exc
     except (OSError, ValueError) as exc:
-        raise CliError("INVALID_INPUT", f"cannot save {name} spec: {exc}") from exc
+        raise CliError("INVALID_INPUT", f"cannot save {name} spec: {exc}",
+                       "check directory permissions and disk space for --out") from exc
 
 
 def cmd_campaign_prepare_full(args, _sink):
@@ -147,10 +157,12 @@ def cmd_campaign_prepare_full(args, _sink):
     design = batch.get("design") or {}
     mode = design.get("mode")
     if mode not in {"explore", "controlled"}:
-        raise CliError("INVALID_INPUT", "QUICK batch has no recorded experiment design")
+        raise CliError("INVALID_INPUT", "QUICK batch has no recorded experiment design",
+                       "prepare-full requires a saved Probe batch with explore or controlled design")
     control_label = design.get("control") if mode == "controlled" else None
     if mode == "controlled" and (not control_label or args.limit < 2):
-        raise CliError("INVALID_INPUT", "controlled FULL specs require the original control and at least two slots")
+        raise CliError("INVALID_INPUT", "controlled FULL specs require the original control and at least two slots",
+                       "pass --limit 2 or greater")
     control = None
     eligible = []
     omitted = Counter()
@@ -162,6 +174,7 @@ def cmd_campaign_prepare_full(args, _sink):
         training, reason = _quick_training(arm, row)
         if is_control and (reason or arm.get("design") != "control"):
             raise CliError("INVALID_INPUT", "the original control lacks completed QUICK training evidence",
+                           "recover the QUICK batch with `probe --recover` until the control finishes",
                            details={"control": control_label, "reason": reason or "invalid_design"})
         if not reason and not is_control and min(training.values()) <= 0:
             reason = "nonpositive_train_metrics"
@@ -175,6 +188,7 @@ def cmd_campaign_prepare_full(args, _sink):
             eligible.append(entry)
     if control_label and control is None:
         raise CliError("INVALID_INPUT", "the original control is missing from the QUICK batch",
+                       "check the QUICK batch's arms and control label",
                        details={"control": control_label})
 
     selected = [control] if control else []
@@ -190,6 +204,7 @@ def cmd_campaign_prepare_full(args, _sink):
             selected.append((arm, evidence))
     if not selected or (control is not None and len(selected) == 1):
         raise CliError("INVALID_INPUT", "no completed QUICK candidate has eligible training evidence",
+                       "inspect `details.omitted` or recover pending arms with `probe --recover`",
                        details={"omitted": dict(omitted)})
 
     provenance = {"batch_path": str(path), "run_id": batch.get("run_id"),
@@ -234,7 +249,8 @@ def _execute_campaign(root, path, batch, receipt, *, max_wait, concurrency,
                 return ProbeRun("failed", {}, "SPC spec collides with a saved BRAIN probe")
             runs, reference = _spc_inputs(path, spec)
             if receipt.resolve() in {path.resolve(), *runs, reference}:
-                raise CliError("INVALID_INPUT", "the SPC receipt would overwrite an input")
+                raise CliError("INVALID_INPUT", "the SPC receipt would overwrite an input",
+                               "move or rename the spec/run/reference files so the receipt path in backlog-results/ is distinct")
             data = _spc_report(path, route, runs, reference)
             valid = data["experiment"]["ok"]
             cache_store.write_json_atomic(receipt, {"ok": valid, "command": "campaign", "data": data})
@@ -515,10 +531,12 @@ def cmd_campaign_run(args, sink):
     root = research_root(args.research_dir)
     _protect_campaign_output(args, root)
     if args.recover_only and args.validate:
-        raise CliError("USAGE", "--recover-only cannot open a validation view")
+        raise CliError("USAGE", "--recover-only cannot open a validation view",
+                       "run `campaign run --recover-only` first, then run `promote --selection` or `campaign run --validate`")
     preferred = getattr(args, "prefer", None) or ()
     if any(Path(name).name != name or Path(name).suffix != ".json" for name in preferred):
-        raise CliError("USAGE", "--prefer takes a .json filename from the campaign inbox")
+        raise CliError("USAGE", "--prefer takes a .json filename from the campaign inbox",
+                       "pass only the filename inside backlog/, e.g. --prefer control.json")
     ranks = {name: rank for rank, name in enumerate(dict.fromkeys(preferred))}
     events = deque(maxlen=20)
 
@@ -737,7 +755,8 @@ def cmd_health(args, _sink):
                 raise ValueError("--train-end must be YYYY-MM-DD")
             bounds, _ = book_state.test_boundaries(latest, series)
         except ValueError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "pass --train-end YYYY-MM-DD and ensure recorded test boundaries are valid ISO dates") from exc
         train_end = min(requested_end, min(bounds.values(), default=requested_end))
         dates = [day for day in dates if day < train_end]
     if len(dates) < args.min_overlap:
@@ -922,7 +941,8 @@ def cmd_brief(args, _sink):
     from datetime import datetime, timedelta, timezone
 
     if args.top < 1:
-        raise CliError("INVALID_INPUT", "--top must be at least 1")
+        raise CliError("INVALID_INPUT", "--top must be at least 1",
+                       "pass --top 1 or greater")
 
     def excerpt(text):
         if isinstance(text, str) and len(text) > 240:

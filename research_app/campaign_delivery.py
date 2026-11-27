@@ -33,7 +33,8 @@ def _locations(args):
     _protect_campaign_output(args, box)
     inbox = box / "backlog"
     if inbox.is_symlink():
-        raise CliError("INVALID_INPUT", "backlog must be a real top-level campaign directory")
+        raise CliError("INVALID_INPUT", "backlog must be a real top-level campaign directory",
+                       "replace the symlink with a plain directory under the campaign root")
     return root, box, inbox
 
 
@@ -50,10 +51,12 @@ def _mechanism(arm):
 def _pilot_evidence(args, arms, track, box):
     if args.phase == "pilot":
         if args.pilot_batch or len(arms) != PILOT_SIZE:
-            raise CliError("INVALID_INPUT", f"pilot publication requires exactly {PILOT_SIZE} arms and no --pilot-batch")
+            raise CliError("INVALID_INPUT", f"pilot publication requires exactly {PILOT_SIZE} arms and no --pilot-batch",
+                           f"pass a {PILOT_SIZE}-arm spec for --phase pilot or switch to --phase expansion")
         return None
     if not args.pilot_batch:
-        raise CliError("USAGE", "expansion requires --pilot-batch with completed QUICK training evidence")
+        raise CliError("USAGE", "expansion requires --pilot-batch with completed QUICK training evidence",
+                       "pass --pilot-batch PATH to the completed 16-arm QUICK pilot batch checkpoint")
     source = Path(args.pilot_batch).expanduser().resolve()
     protected = set()
     try:
@@ -62,7 +65,8 @@ def _pilot_evidence(args, arms, track, box):
     finally:
         protect_output(args, source, *protected)
     if not batch.get("complete") or len(batch["arms"]) != PILOT_SIZE or batch.get("track") != track:
-        raise CliError("INVALID_INPUT", "expansion requires a completed 16-arm pilot on the same track")
+        raise CliError("INVALID_INPUT", "expansion requires a completed 16-arm pilot on the same track",
+                       "finish or recover the 16-arm pilot batch before publishing an expansion")
     qualified = {}
     for arm, row in zip(batch["arms"], batch["rows"]):
         mechanism = _mechanism(arm)
@@ -77,15 +81,24 @@ def _pilot_evidence(args, arms, track, box):
     unsupported = [arm["label"] for arm in arms if _mechanism(arm) not in qualified]
     if unsupported:
         raise CliError("INVALID_INPUT", "expansion has arms without qualifying same-scope pilot evidence",
+                       "limit expansion arms to mechanisms that passed train Sharpe >= 1.0, positive fitness and turnover <= 0.35 in the same scope",
                        details={"unsupported_arms": unsupported, "qualified_mechanisms": sorted(qualified)})
     return {"batch": str(path), "qualifying_alpha_ids_by_mechanism": qualified}
 
 
 def _published_location(inbox, target, payload):
     """Perform the actual top-level listing and account for an immediate claim."""
-    listing = subprocess.run(["ls", "-d", "--", str(target)], capture_output=True, text=True, check=False)
-    if listing.returncode == 0:
-        return str(target), "queued", listing.stdout.strip()
+    try:
+        listing = subprocess.run(["ls", "-d", "--", str(target)], capture_output=True, text=True, check=False)
+        listed_ok = listing.returncode == 0
+        listed_out = listing.stdout.strip()
+        listing_error = listing.stderr.strip()
+    except FileNotFoundError:
+        listed_ok = target.is_file()
+        listed_out = str(target) if listed_ok else ""
+        listing_error = "" if listed_ok else "target not visible after link"
+    if listed_ok:
+        return str(target), "queued", listed_out
     claimed = inbox.parent / "backlog-claimed"
     consumed = inbox.parent / "backlog-consumed"
     locations = ((claimed, "claimed"), (consumed, "consumed"),
@@ -100,7 +113,8 @@ def _published_location(inbox, target, payload):
             except FileNotFoundError:
                 continue
     raise CliError("SERVICE_ERROR", "published spec disappeared before its destination could be confirmed",
-                   details={"destination": str(target), "listing_error": listing.stderr.strip()})
+                   "run `research_cli.py campaign diagnose` to inspect backlog and claimed directories",
+                   details={"destination": str(target), "listing_error": listing_error})
 
 
 def _publish(inbox, target, payload):
@@ -112,13 +126,15 @@ def _publish(inbox, target, payload):
         try:
             os.link(handle.name, target)
         except FileExistsError as exc:
-            raise CliError("INVALID_INPUT", f"backlog already contains {target.name}") from exc
+            raise CliError("INVALID_INPUT", f"backlog already contains {target.name}",
+                           "run `research_cli.py campaign diagnose` or pick a distinct spec filename") from exc
         listing = _published_location(inbox, target, payload)
-        directory = os.open(inbox, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        if hasattr(os, "O_DIRECTORY"):
+            directory = os.open(inbox, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     return listing
 
 
@@ -129,7 +145,8 @@ def cmd_campaign_publish(args, _sink):
     root, box, inbox = _locations(args)
     source = Path(args.spec).expanduser().resolve()
     if source.suffix != ".json" or source.name.startswith("."):
-        raise CliError("INVALID_INPUT", "the spec filename must be a visible .json file")
+        raise CliError("INVALID_INPUT", "the spec filename must be a visible .json file",
+                       "rename the spec to a non-hidden *.json filename")
     destination = inbox / source.name
     batch, receipt = campaign_paths(box, destination)
     protect_output(args, source, destination, batch, receipt)
@@ -141,7 +158,8 @@ def cmd_campaign_publish(args, _sink):
         raw = payload.decode("utf-8-sig")
         document = json.loads(raw)
     except (OSError, ValueError) as exc:
-        raise CliError("INVALID_INPUT", f"cannot read spec {source.name}: {exc}") from exc
+        raise CliError("INVALID_INPUT", f"cannot read spec {source.name}: {exc}",
+                       "pass a readable UTF-8 JSON campaign spec file") from exc
     identity = experiments.probe_spec_identity("-", document=document)
     arms = identity["results"]
     if len(arms) < PILOT_SIZE or len({_scope(arm) for arm in arms}) != 1 or any(
@@ -152,6 +170,7 @@ def cmd_campaign_publish(args, _sink):
     structural = batch_policy.analyze_arms(arms)
     if not structural["ok"]:
         raise CliError("INVALID_INPUT", "bulk structural admission blocked",
+                       "inspect error.details.blocking (every arm needs an idea and at most 8 arms per normalized skeleton)",
                        details={"blocking": structural["blocking"]})
     pilot = _pilot_evidence(args, arms, identity["track"], box)
 
@@ -165,22 +184,27 @@ def cmd_campaign_publish(args, _sink):
         command.extend(("--meta-max-age", str(args.meta_max_age)))
     result = run_cli(root, *command, input_text=raw, timeout=args.max_wait_seconds + 15)
     if not result.ok:
-        raise CliError(result.code or "SERVICE_ERROR", result.detail, details=result.error_details)
+        raise CliError(result.code or "SERVICE_ERROR", result.detail,
+                       "inspect error.details or run `probe SPEC.json --check --strict-gate` directly",
+                       details=result.error_details)
     checked = result.data
     if not checked.get("preflight_complete") or checked.get("request_fingerprint") != identity["request_fingerprint"]:
         raise CliError("INVALID_INPUT", "exact probe preflight did not pass",
+                       "fix the failing preflight arm in error.details.preflight before publishing",
                        details={"preflight": checked.get("preflight", [])})
     checked_account = (checked.get("capability_snapshot", {}).get("account") or {}).get("fingerprint")
 
     def catalog_admission(session):
         account = simulation_capabilities.account_provenance(session)
         if not checked_account or account["fingerprint"] != checked_account:
-            raise CliError("AUTH_FAILED", "could not bind both checks to the same authenticated BRAIN account")
+            raise CliError("AUTH_FAILED", "could not bind both checks to the same authenticated BRAIN account",
+                           "verify credentials and retry without changing BRAIN account mid-flight")
         return _build_admission(arms, session, account)
 
     admission = with_session(args, catalog_admission)
     if not admission["ok"]:
         raise CliError("INVALID_INPUT", "verified dataset admission blocked",
+                       "ensure at least three actual signal datasets have current account-and-scope catalog evidence",
                        details={"blocking": admission["blocking"], "field_evidence": admission["field_evidence"]})
     try:
         with cache_store.file_lock(inbox / ".publish.lock"):
@@ -192,9 +216,11 @@ def cmd_campaign_publish(args, _sink):
                                "inspect the saved result before choosing a new name")
             location, state, listing = _publish(inbox, destination, payload)
     except (OSError, cache_store.CacheError) as exc:
-        raise CliError("SERVICE_ERROR", f"cannot publish {destination.name}: {exc}") from exc
+        raise CliError("SERVICE_ERROR", f"cannot publish {destination.name}: {exc}",
+                       "check directory permissions and lock state under the campaign inbox") from exc
     if state == "failed":
         raise CliError("SERVICE_ERROR", "worker archived the spec as failed immediately after publication",
+                       "run `research_cli.py campaign diagnose` to inspect the failure reason and receipt",
                        details={"location": location, "next": "campaign diagnose"})
     return {"destination": str(destination), "location": location, "state": state, "top_level_ls": listing,
             "arms": len(arms), "scope": structural["arms"][0]["scope"], "phase": args.phase, "pilot": pilot,

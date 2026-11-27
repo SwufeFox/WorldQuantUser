@@ -53,6 +53,7 @@ def _terminal_observation(payload, previous=None):
 
 
 def payload_digest(payload):
+    """Return a deterministic SHA-256 digest of a single simulation payload."""
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode()).hexdigest()
 

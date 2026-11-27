@@ -78,6 +78,7 @@ def shrink_factor(train_sharpe):
 
 
 def contribution_factor(delta, full_credit):
+    """Score book Sharpe delta in ``[0.0, 1.0]``; dilutive deltas receive zero."""
     if delta is None:
         return 0.5
     if delta <= 0:
@@ -86,6 +87,7 @@ def contribution_factor(delta, full_credit):
 
 
 def retention_factor(block_retention, baseline=0.85):
+    """Scale block retention relative to ``baseline``, clamped to ``[0.5, 1.2]``."""
     if block_retention is None:
         return 1.0
     return max(0.5, min(1.2, block_retention / baseline))
@@ -251,18 +253,27 @@ def benchmark_rows(ids=None, registry_path=None, pnl_dir=None, criteria=None,
 
 
 def cmd_benchmark(args, _sink):
-    criteria = (refine_criteria(args.criteria) if getattr(args, "criteria", None) else None)
-    ids = list(getattr(args, "ids", None) or [])
-    if getattr(args, "batch", None):
-        path = os.path.expanduser(args.batch)
-        try:
-            with open(path, encoding="utf-8") as handle:
-                document = json.load(handle)
-        except (OSError, ValueError) as exc:
-            raise ValueError("cannot read batch file %s: %s" % (path, exc))
-        ids.extend(row.get("alpha_id") for row in document.get("rows") or []
-                   if row.get("alpha_id"))
-    ids = [alpha_id for alpha_id in dict.fromkeys(ids) if alpha_id and alpha_id != "None"]
-    return benchmark_rows(ids, getattr(args, "registry", None), criteria=criteria,
-                          selection_path=getattr(args, "selection", None),
-                          cost_bps=getattr(args, "cost_bps", None))
+    """CLI handler for ``benchmark``: validate frozen selection and annotate candidates."""
+    from .runtime import CliError
+
+    try:
+        criteria = (refine_criteria(args.criteria) if getattr(args, "criteria", None) else None)
+        ids = list(getattr(args, "ids", None) or [])
+        if getattr(args, "batch", None):
+            path = os.path.expanduser(args.batch)
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    document = json.load(handle)
+            except (OSError, ValueError) as exc:
+                raise ValueError("cannot read batch file %s: %s" % (path, exc))
+            ids.extend(row.get("alpha_id") for row in document.get("rows") or []
+                       if row.get("alpha_id"))
+        ids = [alpha_id for alpha_id in dict.fromkeys(ids) if alpha_id and alpha_id != "None"]
+        return benchmark_rows(ids, getattr(args, "registry", None), criteria=criteria,
+                              selection_path=getattr(args, "selection", None),
+                              cost_bps=getattr(args, "cost_bps", None))
+    except ValueError as exc:
+        raise CliError(
+            "INVALID_INPUT", str(exc),
+            "pass --selection PATH from a training freeze (or see `python research_cli.py help benchmark`)",
+        ) from exc

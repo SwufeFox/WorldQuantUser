@@ -24,6 +24,7 @@ FILENAME = "submit-confirm.json"
 
 
 def stage_path(research_dir=None) -> Path:
+    """Return the path to the two-step submission confirmation state file."""
     root = Path(research_dir or research_paths.research_dir())
     return root / FILENAME
 
@@ -44,7 +45,8 @@ def require_double_call(kind: str, key: str, *, now: float | None = None,
                            "inspect the local confirmation state before retrying")
         bucket = data.setdefault(kind, {})
         if not isinstance(bucket, dict):
-            raise CliError("INVALID_INPUT", "submission confirmation group must be an object")
+            raise CliError("INVALID_INPUT", "submission confirmation group must be an object",
+                           "inspect or remove the corrupted entry in %s" % path)
         entry = bucket.get(key)
         staged_at = entry.get("at") if isinstance(entry, dict) else None
         valid = (type(staged_at) in (int, float) and math.isfinite(staged_at)

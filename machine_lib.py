@@ -67,17 +67,25 @@ def note(message):
 # machine-readable instead of leaking a traceback shape.
 # ---------------------------------------------------------------------------
 class BrainError(RuntimeError):
+    """Base exception raised by ``machine_lib`` with a stable CLI error code."""
+
     code = "BRAIN_ERROR"
     #: Optional actionable next step, surfaced verbatim by the CLI.
     hint = None
 
 
 class MissingCredentials(BrainError):
+    """Raised when ``BRAIN_USERNAME`` or ``BRAIN_PASSWORD`` is missing."""
+
     code = "AUTH_MISSING"
+    hint = "set BRAIN_USERNAME and BRAIN_PASSWORD in the environment, or copy .env.example to .env next to machine_lib.py"
 
 
 class AuthError(BrainError):
+    """Raised when BRAIN rejects the configured credentials or session."""
+
     code = "AUTH_FAILED"
+    hint = "check BRAIN_USERNAME/BRAIN_PASSWORD and retry with --relogin (or `auth check`)"
 
 
 class CaptchaRequired(AuthError):
@@ -89,11 +97,16 @@ class CaptchaRequired(AuthError):
 
 
 class NotFound(BrainError):
+    """Raised when a BRAIN endpoint or alpha/simulation ID is not found (HTTP 404)."""
+
     code = "NOT_FOUND"
 
 
 class RateLimited(BrainError):
+    """Raised when BRAIN returns HTTP 429 or an async read exceeds its wait budget."""
+
     code = "RATE_LIMITED"
+    hint = "respect Retry-After / retry_at before resuming or polling the existing task"
 
     def __init__(self, *args, retry_after=None):
         super().__init__(*args)
@@ -101,7 +114,10 @@ class RateLimited(BrainError):
 
 
 class SimulationError(BrainError):
+    """Raised when a BRAIN simulation fails or rejects its payload."""
+
     code = "SIMULATION_FAILED"
+    hint = "inspect the reported error/checks and run `lint` or `probe --dry-run` before retrying"
 
 
 SUBMIT_UNLOCK_ENV = "ALLOW_AGENT_SUBMIT"
@@ -136,13 +152,19 @@ class ServiceError(BrainError):
 class ReadInterrupted(ServiceError):
     """A read could not finish after transient transport or gateway errors."""
 
+    hint = "retry or recover the existing checkpoint/alpha ID; do not resubmit accepted tasks"
+
 
 class AuthenticationUnavailable(ServiceError):
     """A transient transport or server failure interrupted authentication."""
 
+    hint = "BRAIN authentication was temporarily unavailable; wait briefly and retry"
+
 
 class AuthenticationDeadline(ServiceError):
     """The caller's budget for starting or waiting for authentication expired."""
+
+    hint = "increase --max-wait-seconds or retry once authentication completes"
 
 
 class SessionBusy(ServiceError):
@@ -156,6 +178,7 @@ class PermissionDenied(ServiceError):
     """BRAIN denied access to an endpoint with HTTP 403."""
 
     code = "ACCESS_DENIED"
+    hint = "this account tier lacks access to the endpoint; verify permissions with `auth check` or `api probe`"
 
 
 # ---------------------------------------------------------------------------

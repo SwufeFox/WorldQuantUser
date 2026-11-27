@@ -60,7 +60,8 @@ def read_cached(args, kind, key, fetch):
     bypass = getattr(args, "no_cache", False)
     refresh = getattr(args, "refresh_meta", False) or getattr(args, "relogin", False)
     if offline and (refresh or bypass):
-        raise CliError("INVALID_INPUT", "--offline conflicts with --refresh-meta, --relogin and --no-cache")
+        raise CliError("INVALID_INPUT", "--offline conflicts with --refresh-meta, --relogin and --no-cache",
+                       "omit --offline to fetch live data, or omit refresh flags to read the local cache")
 
     policy = ml.metadata_cache_policy()
     max_age = getattr(args, "meta_max_age", None)

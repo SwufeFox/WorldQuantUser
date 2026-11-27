@@ -206,6 +206,7 @@ def campaign_paths(root, spec):
 def run_campaign(root, *, once=False, max_wait=600, interval=30, concurrency=None,
                  log_event=None, execute=None, validate=True, multi_size=None,
                  recover_only=False, strict_gate=False, launch_rank=None):
+    """Drain or recover the regular-alpha campaign backlog queue under *root*."""
     results = root / "backlog-results"
     results.mkdir(parents=True, exist_ok=True)
     report = partial(log, root / "campaign-log.jsonl", log_event=log_event)
@@ -221,6 +222,7 @@ def run_campaign(root, *, once=False, max_wait=600, interval=30, concurrency=Non
 
 
 def main(argv=None):
+    """CLI entry point for the compatibility regular-alpha campaign runner."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--research-dir", "--root", dest="root")
     parser.add_argument("--once", action="store_true")

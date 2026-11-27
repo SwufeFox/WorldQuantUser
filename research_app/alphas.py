@@ -64,19 +64,23 @@ def cmd_alpha_get(args, _sink):
     max_wait = getattr(args, "max_wait", 180.0)
     team_id, competition_id = getattr(args, "team_id", None), getattr(args, "competition_id", None)
     if detail is None and (team_id is not None or competition_id is not None):
-        raise CliError("INVALID_INPUT", "--team and --competition require --performance")
+        raise CliError("INVALID_INPUT", "--team and --competition require --performance",
+                       "add --performance summary or --performance full")
     if detail is not None:
         if detail not in {"summary", "full"}:
-            raise CliError("INVALID_INPUT", "performance detail must be summary or full")
+            raise CliError("INVALID_INPUT", "performance detail must be summary or full",
+                           "pass --performance summary or --performance full")
         try:
             ml._performance_request(args.alpha_id, team_id, competition_id)
         except ValueError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "check the Alpha ID and use at most one of --team or --competition") from exc
     if recordset_names is not None:
         try:
             ml._recordset_paths(args.alpha_id, recordset_names)
         except ValueError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "run `alpha get ALPHA_ID --recordsets` without names to list available recordsets") from exc
 
     def _read_correlations(session):
         fetchers = {
@@ -193,7 +197,8 @@ def cmd_alpha_near(args, _sink):
     alpha_id_arg = args.alpha_id
     expression_arg = args.expression
     if sum(bool(x) for x in (target, alpha_id_arg, expression_arg)) > 1:
-        raise CliError("USAGE", "pass one target (positional, --alpha-id, or --expression), not multiple")
+        raise CliError("USAGE", "pass one target (positional, --alpha-id, or --expression), not multiple",
+                       "provide a single Alpha ID or expression")
     registry = args.registry or alpha_registry.default_registry_path()
     entries = alpha_registry.load_entries(registry)
     latest = {}
@@ -214,7 +219,8 @@ def cmd_alpha_near(args, _sink):
     if alpha_id_arg:
         entry = latest.get(alpha_id_arg)
         if entry is None:
-            raise CliError("INVALID_INPUT", "%s is not in the ledger" % alpha_id_arg)
+            raise CliError("INVALID_INPUT", "%s is not in the ledger" % alpha_id_arg,
+                           "run `ledger record %s` or `ledger list` to inspect stored entries" % alpha_id_arg)
         if ml.is_python_language(alpha_registry.entry_language(entry)):
             raise CliError("INVALID_INPUT", "alpha near compares FastExpr structure",
                            "use alpha get to inspect the stored Python source")
@@ -224,7 +230,8 @@ def cmd_alpha_near(args, _sink):
     args.alpha_id = alpha_id_arg
     expression = " ".join(expression.split())
     if not expression:
-        raise CliError("INVALID_INPUT", "empty expression")
+        raise CliError("INVALID_INPUT", "empty expression",
+                       "pass a non-empty FASTEXPR expression or --alpha-id")
     try:
         program = fastexpr_ast.parse(expression)
     except Exception as exc:  # noqa: BLE001 - unparseable input is a usage error
@@ -332,7 +339,8 @@ def cmd_alpha_check(args, _sink):
         raise CliError("USAGE", "--max-wait must be finite and non-negative",
                        "pass a number of seconds, or omit the flag for the default")
     if args.workers not in (1, 2, 3):
-        raise CliError("USAGE", "--workers must be 1, 2 or 3")
+        raise CliError("USAGE", "--workers must be 1, 2 or 3",
+                       "choose --workers 1, 2, or 3")
     alpha_ids = list(dict.fromkeys(args.alpha_ids))
     results, auth_failed = {}, set()
     attempts = 0
@@ -395,7 +403,8 @@ def cmd_alpha_check(args, _sink):
 def cmd_alpha_submit(args, _sink):
     """Precheck, or submit and independently reconcile each local side effect."""
     if getattr(args, "max_wait", None) is not None and args.max_wait < 0:
-        raise CliError("USAGE", "--max-wait must be non-negative")
+        raise CliError("USAGE", "--max-wait must be non-negative",
+                       "pass 0 for a single probe or a positive wait budget in seconds")
     return with_session(args, lambda session: submit_workflow(session, args))
 
 
@@ -407,7 +416,8 @@ def _candidate_role(args, evidence=None):
         alpha_registry.require_candidate_eligible([supplied], entries=entries)
         return alpha_registry.evidence_role(supplied, *matching)
     except ValueError as exc:
-        raise CliError("INVALID_INPUT", str(exc)) from exc
+        raise CliError("INVALID_INPUT", str(exc),
+                       "diagnostic arms are retained for attribution and cannot be promoted or submitted") from exc
 
 
 def _reject_quick_simulation(args, payload):
@@ -524,7 +534,8 @@ def submit_workflow(session, args, shelf_entry=None):
     from . import costs
     max_wait = getattr(args, "max_wait", None)
     if max_wait is not None and max_wait < 0:
-        raise CliError("USAGE", "--max-wait must be non-negative")
+        raise CliError("USAGE", "--max-wait must be non-negative",
+                       "pass 0 for read-only check without waiting, or a positive wait budget in seconds")
     max_wait = 180 if max_wait is None else max_wait
     yes = bool(getattr(args, "yes", False))
     path = _submission_path(args.alpha_id)
@@ -536,7 +547,8 @@ def submit_workflow(session, args, shelf_entry=None):
                            "recover the journal before attempting a new submission")
         prior = prior or {}
         if not isinstance(prior, dict):
-            raise CliError("INVALID_INPUT", "submission journal must be an object")
+            raise CliError("INVALID_INPUT", "submission journal must be an object",
+                           "inspect or repair the submission journal file at %s" % path)
         readback_error = None
         try:
             current = ml.fetch_alpha_metrics(session, args.alpha_id)
@@ -550,7 +562,8 @@ def submit_workflow(session, args, shelf_entry=None):
                         "submitted": False, "post_attempted": False,
                         "reason": "read-back failed; no repeated POST", "error": str(exc)}
         if current.get("id") not in (None, args.alpha_id):
-            raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested submission")
+            raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested submission",
+                           "verify the Alpha ID and check `alpha get %s` before retrying" % args.alpha_id)
         result = {"alpha_id": args.alpha_id, "status": current.get("status"),
                   "post_attempted": False,
                   "costs": costs.evidence((ml.extract_split(current) or {}).get("train") or {},
@@ -753,7 +766,8 @@ def _alpha_list_page(session, args):
     """
     limit, offset = min(args.limit, 100), args.offset
     if limit < 1 or offset < 0:
-        raise CliError("USAGE", "--limit must be positive and --offset non-negative")
+        raise CliError("USAGE", "--limit must be positive and --offset non-negative",
+                       "pass --limit >= 1 and --offset >= 0")
     filters = dict(
         order=args.order, status=args.status, region=args.region,
         universe=args.universe, min_sharpe=args.min_sharpe,
@@ -1031,7 +1045,8 @@ def cmd_alpha_prod_corr(args, _sink):
     protect_output(args)
     max_wait = getattr(args, "max_wait", 60.0)
     if max_wait is not None and (not math.isfinite(max_wait) or max_wait < 0):
-        raise CliError("USAGE", "--max-wait must be finite and non-negative")
+        raise CliError("USAGE", "--max-wait must be finite and non-negative",
+                       "pass a finite number of seconds >= 0, or omit the flag for the default")
     capture = with_session(
         args,
         lambda s: ml.fetch_prod_correlation(
@@ -1074,7 +1089,8 @@ def cmd_alpha_pp_corr(args, _sink):
     """Fetch Power Pool correlation detail and evaluate the strict < 0.5 ceiling."""
     max_wait = getattr(args, "max_wait", 60.0)
     if max_wait is not None and (not math.isfinite(max_wait) or max_wait < 0):
-        raise CliError("USAGE", "--max-wait must be finite and non-negative")
+        raise CliError("USAGE", "--max-wait must be finite and non-negative",
+                       "pass a finite number of seconds >= 0, or omit the flag for the default")
     capture = with_session(
         args,
         lambda s: ml.fetch_power_pool_correlation(
@@ -1115,12 +1131,15 @@ def cmd_alpha_readiness(args, _sink):
     from . import capabilities, description, pp_budget, rules_snapshot
 
     if not ml.valid_simulation_id(args.alpha_id):
-        raise CliError("INVALID_INPUT", "invalid Alpha ID")
+        raise CliError("INVALID_INPUT", "invalid Alpha ID",
+                       "pass a valid alphanumeric Alpha ID (see `alpha list` or `ledger list`)")
     max_wait = getattr(args, "max_wait", 180.0)
     if max_wait is not None and (not math.isfinite(max_wait) or max_wait < 0):
-        raise CliError("USAGE", "--max-wait must be finite and non-negative")
+        raise CliError("USAGE", "--max-wait must be finite and non-negative",
+                       "pass a finite number of seconds >= 0, or omit the flag for the default")
     if getattr(args, "apply_description", False) and not getattr(args, "idea", None):
-        raise CliError("USAGE", "--apply-description requires --idea")
+        raise CliError("USAGE", "--apply-description requires --idea",
+                       "supply --idea \"...\" so the description can be composed from verified catalog metadata")
 
     def work(session):
         payload = ml.fetch_alpha_metrics(session, args.alpha_id)
@@ -1188,6 +1207,7 @@ def cmd_alpha_readiness(args, _sink):
                         "INVALID_INPUT",
                         "cannot apply incomplete description: "
                         + (draft.get("reason") or ", ".join((draft.get("check") or {}).get("errors") or [])),
+                        "ensure --idea is descriptive and field/operator notes are resolved, or supply --rationale / --operator-rationale",
                         details={"draft_description": draft},
                     )
                 payload = ml.set_alpha_metadata(session, args.alpha_id, description=draft["text"])

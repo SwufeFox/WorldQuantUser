@@ -72,6 +72,7 @@ def closed_families(explicit=None):
 
 
 def is_closed_family(family, explicit=None):
+    """Return True when ``family`` is marked closed in ``closed-families.json``."""
     return bool(family) and family in closed_families(explicit)
 
 

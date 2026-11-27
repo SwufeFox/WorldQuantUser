@@ -76,7 +76,10 @@ class JsonArgumentParser(argparse.ArgumentParser):
             suggestions = difflib.get_close_matches(token, self._option_string_actions,
                                                    n=3, cutoff=0.6)
         path = self.prog.split()[1:]
-        hint = "run `%s --help`" % self.prog
+        command_ref = " ".join(path)
+        help_cmd = f"python research_cli.py help {command_ref}".strip()
+        schema_cmd = f"python research_cli.py schema {command_ref}".strip()
+        hint = f"run `{self.prog} --help`, `{help_cmd}`, or `{schema_cmd}`"
         if suggestions:
             hint = "did you mean %s? %s" % (", ".join(suggestions), hint)
         error = CliError("USAGE", message, hint,

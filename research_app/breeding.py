@@ -134,6 +134,7 @@ def generation(batch, history, *, seed, limit, datasets=None):
         observed[scope].update(physical)
     if not contrasts:
         raise CliError("INVALID_INPUT", "no contrasting pair of novel children in the saved batch",
+                       "inspect `details.omitted` or pass a batch with completed FASTEXPR training arms",
                        details={"matched_pairs": len(comparisons), "omitted": dict(omitted)})
     return arms, {"scope": "train", "rank_metric": "train_fitness", "seed": seed, "limit_per_policy": limit,
                   "proposals_per_policy": len(comparisons), "contrasting_pairs": contrasts,

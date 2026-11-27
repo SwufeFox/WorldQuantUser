@@ -45,6 +45,7 @@ DEFAULTS = {
 
 
 def criteria_path(args=None):
+    """Resolve the prune criteria JSON file (``--criteria`` or research directory default)."""
     explicit = getattr(args, "criteria", None)
     if explicit:
         return explicit
@@ -136,16 +137,24 @@ def _is_protected(entry, criteria):
 
 def cmd_prune(args, _sink):
     """Report - or with ``--apply`` delete - cached results that fail the current bar."""
+    from .runtime import CliError
+
     path = criteria_path(args)
-    criteria, source = load_criteria(path)
+    try:
+        criteria, source = load_criteria(path)
+    except ValueError as exc:
+        raise CliError("INVALID_INPUT", str(exc),
+                       "fix the JSON file or pass --criteria PATH") from exc
     for pair in getattr(args, "set", None) or []:
         if "=" not in pair:
-            raise ValueError("--set expects key=value, got %r" % pair)
+            raise CliError("USAGE", "--set expects key=value, got %r" % pair,
+                           "pass e.g. --set min_fitness=1.2")
         key, value = pair.split("=", 1)
         key = key.strip()
         if key not in DEFAULTS:
-            raise ValueError("unknown criterion %r (known: %s)"
-                             % (key, ", ".join(sorted(DEFAULTS))))
+            raise CliError("INVALID_INPUT", "unknown criterion %r (known: %s)"
+                           % (key, ", ".join(sorted(DEFAULTS))),
+                           "run `python research_cli.py prune --show-criteria` to inspect valid keys")
         try:
             criteria[key] = json.loads(value)
         except ValueError:

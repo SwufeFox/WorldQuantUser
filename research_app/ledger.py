@@ -163,7 +163,8 @@ def cmd_ledger_label(args, _sink):
                 target, family=args.family, verdict=args.verdict,
                 mechanism=args.mechanism, idea=args.idea, note=args.note)
         except ValueError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "check --family, --verdict, and text arguments via `help ledger label`") from exc
         stored, written = append(updated)
     data = {
         "registry": path,
@@ -187,7 +188,8 @@ def cmd_ledger_impact(args, _sink):
     _path, entries = _ledger(args)
     target = alpha_registry.resolve(entries, args.alpha_id)
     if target is None:
-        raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id)
+        raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id,
+                       "run `ledger list` to inspect recorded keys or `ledger record %s` to fetch from BRAIN" % args.alpha_id)
     bodies = alpha_registry.leg_bodies(target)
     rows = alpha_registry.shared_legs(entries, args.alpha_id,
                                       min_shared=args.min_shared)
@@ -210,7 +212,8 @@ def cmd_ledger_lineage(args, _sink):
     _path, entries = _ledger(args)
     chain = alpha_registry.lineage(entries, args.alpha_id)
     if not chain:
-        raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id)
+        raise CliError("NOT_FOUND", "no ledger entry for %s" % args.alpha_id,
+                       "run `ledger list` to verify the Alpha ID or key")
     children = alpha_registry.descendants(entries, args.alpha_id)
     data = {
         "alpha_id": args.alpha_id,
@@ -260,9 +263,11 @@ def cmd_ledger_sync(args, _sink):
     record_limit = int(args.limit_record)
     max_wait = getattr(args, "max_wait_seconds", 300.0)
     if limit <= 0 or pages <= 0 or record_limit < 0:
-        raise CliError("USAGE", "page size/pages must be positive and record limit non-negative")
+        raise CliError("USAGE", "page size/pages must be positive and record limit non-negative",
+                       "pass --limit >= 1, --pages >= 1, and --limit-record >= 0")
     if not math.isfinite(max_wait) or max_wait <= 0:
-        raise CliError("USAGE", "--max-wait-seconds must be finite and positive")
+        raise CliError("USAGE", "--max-wait-seconds must be finite and positive",
+                       "pass a positive wait budget in seconds, e.g. --max-wait-seconds 300")
     deadline = time.monotonic() + max_wait
     page_size = min(limit, 100)
     wanted = {part.strip().upper() for part in str(args.status or "").split(",") if part.strip()}
@@ -466,7 +471,8 @@ def cmd_ledger_format(args, _sink):
     path, entries = _ledger(args)
     registry = Path(path)
     if not registry.exists():
-        raise CliError("INVALID_INPUT", "no ledger at %s" % registry)
+        raise CliError("INVALID_INPUT", "no ledger at %s" % registry,
+                       "check `brief` for the active research_dir or pass --registry PATH")
     changed = 0
     rewritten = []
     for entry in entries:
@@ -608,7 +614,8 @@ def cmd_ledger_cards(args, _sink):
         try:
             payload = json.loads(Path(args.add).read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
-            raise CliError("INVALID_INPUT", "cannot read card file: %s" % exc)
+            raise CliError("INVALID_INPUT", "cannot read card file: %s" % exc,
+                           "pass a valid JSON mechanism card file") from exc
         incoming = payload if isinstance(payload, list) else [payload]
         accepted, rejected = [], []
         for card in incoming:
@@ -637,7 +644,8 @@ def cmd_ledger_cards(args, _sink):
             if card.get("mechanism_id") == args.show:
                 return {"path": str(path), "card": card,
                         "validation": mechanisms.validate_card(card, known_fields=known)}
-        raise CliError("INVALID_INPUT", "no card %s" % args.show)
+        raise CliError("INVALID_INPUT", "no card %s" % args.show,
+                       "run `ledger cards` without --show to list available mechanism IDs")
     by_status = {}
     for card in cards:
         key = str(card.get("status") or "UNTESTED").upper()
@@ -887,7 +895,8 @@ def cmd_ledger_stability(args, _sink):
         cache_paths = (path, path.with_suffix(".json"), path.with_suffix(".lock"))
         protect_output(args, registry, *cache_paths)
         if registry and Path(registry).expanduser().resolve() in {item.resolve() for item in cache_paths}:
-            raise CliError("INVALID_INPUT", "--registry conflicts with the training PnL snapshot")
+            raise CliError("INVALID_INPUT", "--registry conflicts with the training PnL snapshot",
+                           "pass a ledger JSONL path distinct from the Parquet snapshot cache")
         cutoffs = {entry["alpha_id"]: _stability_cutoff(entry) for entry in entries
                    if ml.valid_simulation_id(entry.get("alpha_id"))}
         cutoffs.update({alpha_id: _stability_cutoff(entry) for alpha_id, entry in latest.items()

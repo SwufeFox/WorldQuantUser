@@ -92,6 +92,7 @@ _MORPH = {
 
 
 def normalize(words):
+    """Map surface inflections and simple plurals onto canonical concept tokens."""
     out = set()
     for word in words:
         if word in _MORPH:
@@ -121,6 +122,7 @@ def _load_cached_fields(directory=None):
 
 
 def tokens(text: str) -> frozenset:
+    """Extract normalized non-stopword concept tokens from a field description."""
     lowered = (text or "").lower()
     for pattern in _QUALIFIER_PATTERNS:
         lowered = pattern.sub(" ", lowered)
@@ -134,6 +136,7 @@ def core_tokens(text: str) -> frozenset:
 
 
 def jaccard(left: frozenset, right: frozenset) -> float:
+    """Compute Jaccard similarity between two token sets, or 0.0 if either is empty."""
     if not left or not right:
         return 0.0
     return len(left & right) / len(left | right)
@@ -156,6 +159,7 @@ def is_near(a: str, b: str, threshold: float = 0.5) -> tuple[bool, str]:
 
 
 def profile(field: dict) -> dict:
+    """Summarize raw catalog field metadata and extracted core tokens for matching."""
     return {
         "id": field.get("id"),
         "description": field.get("description") or "",
@@ -307,6 +311,7 @@ def sample(pooled, draws, seed):
 
 
 def main() -> int:
+    """CLI entry point for building and sampling matched-field placebo control pools."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--target", required=True)

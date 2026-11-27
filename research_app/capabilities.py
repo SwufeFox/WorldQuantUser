@@ -20,6 +20,7 @@ _FIELD_PROOF_SOURCE = "authenticated_field_search"
 
 
 def scope_settings(settings):
+    """Extract the four catalog-scoping keys with ``machine_lib`` defaults."""
     settings = settings or {}
     return {key: settings.get(key) if settings.get(key) is not None else ml.DEFAULT_SETTINGS[key]
             for key in ("region", "universe", "delay", "instrumentType")}
@@ -28,6 +29,7 @@ def scope_settings(settings):
 
 
 def snapshot_path(scope, account):
+    """Return the metadata cache path for one account-bound scope snapshot."""
     return ml.metadata_cache_path("capabilities", {"scope": scope, "account": account.get("fingerprint")})
 
 
@@ -43,6 +45,7 @@ def _identify_evidence(records, evidence):
 
 
 def field_scope(records, evidence):
+    """Build a normalized field-scope dictionary from catalog records and evidence."""
     verified = evidence.get("state") == "verified"
     evidence = dict(evidence)
     _identify_evidence(records, evidence)

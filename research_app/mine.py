@@ -41,6 +41,7 @@ LOCATION_LABEL = re.compile(
 
 
 def is_label(meta):
+    """Return True when field metadata describes an identifier, categorical or date-like label."""
     if (meta.get("type") or "").upper() in LABEL_TYPES:
         return True
     description = (meta.get("description") or "").lower()
@@ -209,6 +210,7 @@ SHAPES = {
 
 
 def apply_shape(shape, expression):
+    """Wrap *expression* in a named template from :data:`SHAPES`."""
     template = SHAPES.get(shape)
     if template is None:
         raise ValueError("unknown shape %r (known: %s)" % (shape, ", ".join(sorted(SHAPES))))
@@ -253,7 +255,8 @@ def cmd_mine(args, _sink):
     evidence = {}
     catalog = load_catalog(evidence)
     if not catalog:
-        raise CliError("INVALID_INPUT", "no cached field catalog; run `catalog fields` first")
+        raise CliError("INVALID_INPUT", "no cached field catalog; run `catalog fields` first",
+                       "run `python research_cli.py catalog fields <DATASET>` to cache fields for the active scope")
     entries = alpha_registry.load_entries(getattr(args, "registry", None))
     parsed = list(_parsed_ledger_fields(entries))
     used = set()
@@ -274,12 +277,15 @@ def cmd_mine(args, _sink):
     try:
         band = tuple(float(part) for part in args.turnover_band.split(","))
     except (TypeError, ValueError):
-        raise CliError("INVALID_INPUT", "--turnover-band wants finite MIN,MAX with 0 <= MIN <= MAX") from None
+        raise CliError("INVALID_INPUT", "--turnover-band wants finite MIN,MAX with 0 <= MIN <= MAX",
+                       "pass e.g. --turnover-band 0.08,0.25") from None
     if len(band) != 2 or not all(math.isfinite(value) for value in band) \
             or not 0 <= band[0] <= band[1]:
-        raise CliError("INVALID_INPUT", "--turnover-band wants finite MIN,MAX with 0 <= MIN <= MAX")
+        raise CliError("INVALID_INPUT", "--turnover-band wants finite MIN,MAX with 0 <= MIN <= MAX",
+                       "pass e.g. --turnover-band 0.08,0.25")
     if not 0 <= args.min_coverage <= 1 or args.smooth < 0 or args.arms < 1:
-        raise CliError("INVALID_INPUT", "--min-coverage must be in [0,1], --smooth >= 0 and --arms >= 1")
+        raise CliError("INVALID_INPUT", "--min-coverage must be in [0,1], --smooth >= 0 and --arms >= 1",
+                       "check --min-coverage, --smooth, and --arms values")
 
     descriptions = collections.defaultdict(list)
     for field_id, meta in catalog.items():
@@ -388,7 +394,8 @@ def cmd_mine(args, _sink):
                 break
         if not arms:
             raise CliError("INVALID_INPUT", "nothing to emit: no numeric-review fields matched; inspect "
-                           "needs_definition and use --expr for a reviewed reduction")
+                           "needs_definition and use --expr for a reviewed reduction",
+                           "review `needs_definition` in `mine` output and pass `--expr 'vec_avg(FIELD)'`")
         spec = {
             "name": args.name or "field-mine",
             "idea": "field review: exploratory draft, not a verified mechanism",
@@ -406,7 +413,8 @@ def cmd_mine(args, _sink):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         with cache_store.file_lock(path + ".lock"):
             if os.path.exists(path):
-                raise CliError("INVALID_INPUT", "refusing to overwrite an existing spec: %s" % path)
+                raise CliError("INVALID_INPUT", "refusing to overwrite an existing spec: %s" % path,
+                               "choose a new --emit path")
             cache_store.write_json_atomic(path, spec, indent=2)
         payload["spec"] = {"path": path, "arms": len(arms)}
 

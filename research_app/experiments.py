@@ -386,9 +386,11 @@ def cmd_ablate(args, _sink):
     expression = args.expr
     decay = args.decay
     if args.file and expression is not None:
-        raise CliError("INVALID_INPUT", "ablate accepts either a file or --expr, not both")
+        raise CliError("INVALID_INPUT", "ablate accepts either a file or --expr, not both",
+                       "pass either a research file, --expr, or --ids")
     if args.ids and (args.file or expression is not None):
-        raise CliError("INVALID_INPUT", "--ids cannot be combined with a file or --expr")
+        raise CliError("INVALID_INPUT", "--ids cannot be combined with a file or --expr",
+                       "pass --ids alone to generate per-alpha ablation files from the ledger")
     settings = {}
     settings_source = "defaults"
     alphas = None
@@ -396,11 +398,13 @@ def cmd_ablate(args, _sink):
         try:
             settings, alphas = config_io.load_research_file(args.file)
         except config_io.ResearchError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "pass a valid research file with one composite FASTEXPR expression") from exc
         settings_source = args.file
     resolved = merge_settings(settings, args)
     if ml.is_python_language(resolved.get("language")):
-        raise CliError("INVALID_INPUT", "ablate only supports FASTEXPR")
+        raise CliError("INVALID_INPUT", "ablate only supports FASTEXPR",
+                       "use a FASTEXPR expression or omit Python language settings")
     if any(getattr(args, flag, None) is not None for flag in (
             "region", "universe", "instrument_type", "neutralization", "decay",
             "delay", "truncation", "pasteurization", "nan_handling", "test_period")):
@@ -409,7 +413,8 @@ def cmd_ablate(args, _sink):
         try:
             _settings, pairs = config_io.build_config(resolved, alphas)
         except config_io.ResearchError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "fix the composite expression or settings in the research file") from exc
         if len(pairs) != 1:
             raise CliError("INVALID_INPUT",
                            "ablate takes exactly one composite expression, found %d" % len(pairs),
@@ -421,7 +426,8 @@ def cmd_ablate(args, _sink):
         try:
             _settings, pairs = config_io.build_config(resolved, [expression])
         except config_io.ResearchError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "check --expr syntax and settings against `python research_cli.py help ablate`") from exc
         expression, decay = pairs[0]
 
     if args.ids:
@@ -541,13 +547,17 @@ def _compare_inputs(args):
     patterns = list(getattr(args, "match", None) or [])
     latest = getattr(args, "latest", None)
     if not explicit and not patterns:
-        raise CliError("USAGE", "compare needs files or --match")
+        raise CliError("USAGE", "compare needs files or --match",
+                       "pass result JSON paths or --match 'GLOB' under the research directory")
     if explicit.count("-") > 1:
-        raise CliError("INVALID_INPUT", "stdin (-) may be read only once")
+        raise CliError("INVALID_INPUT", "stdin (-) may be read only once",
+                       "pass '-' at most once on the command line")
     if latest is not None and (not isinstance(latest, int) or latest < 1):
-        raise CliError("USAGE", "--latest must be a positive integer")
+        raise CliError("USAGE", "--latest must be a positive integer",
+                       "pass --latest 1 or greater (or omit N for 1)")
     if latest is not None and "-" in explicit:
-        raise CliError("USAGE", "--latest cannot select from stdin")
+        raise CliError("USAGE", "--latest cannot select from stdin",
+                       "pass file paths or --match globs when using --latest")
     root = Path(research_paths.research_dir()).resolve()
     candidates = {}
 
@@ -562,7 +572,8 @@ def _compare_inputs(args):
                         raise OSError("not a file")
                     modified = Path(resolved).stat().st_mtime_ns
                 except OSError as exc:
-                    raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc)) from exc
+                    raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc),
+                                   "verify the file path or use --match relative to the research directory") from exc
             candidates[resolved] = {"path": resolved, "sources": [], "mtime_ns": modified}
         if source not in candidates[resolved]["sources"]:
             candidates[resolved]["sources"].append(source)
@@ -623,7 +634,8 @@ def _compare_document(path, payload):
             raise CliError("INVALID_INPUT", "%s is not a simulate or probe result document" % path,
                            "expected results, raw records, or labelled probe rows with train fields")
     else:
-        raise CliError("INVALID_INPUT", "%s is not a simulate or probe result document" % path)
+        raise CliError("INVALID_INPUT", "%s is not a simulate or probe result document" % path,
+                       "pass a result file written by `simulate` or `probe`")
 
     if isinstance(payload, dict) and isinstance(payload.get("arms"), list) and len(payload["arms"]) == len(records):
         records = [{**record, "role": alpha_registry.evidence_role(record, arm)}
@@ -719,7 +731,8 @@ def _selection_call(function, *args, **kwargs):
     try:
         return function(*args, **kwargs)
     except (ValueError, OSError) as exc:
-        raise CliError("INVALID_INPUT", str(exc)) from exc
+        raise CliError("INVALID_INPUT", str(exc),
+                       "check the referenced selection, batch, or slot file before retrying") from exc
 
 
 
@@ -850,7 +863,8 @@ def _requested_concurrency(args, saved=None):
     if requested is None and saved:
         requested = saved.get("concurrency", saved.get("batch_size"))
     if requested is not None and (isinstance(requested, bool) or not isinstance(requested, int) or requested < 1):
-        raise CliError("INVALID_INPUT", "--batch-size must be a positive integer")
+        raise CliError("INVALID_INPUT", "--batch-size must be a positive integer",
+                       "pass an integer >= 1, e.g. --batch-size 4")
     return requested
 
 
@@ -859,7 +873,8 @@ def _multi_options(args, saved=None):
     if size is None:
         return {}
     if type(size) is not int or not 2 <= size <= simulation_multi.MAX_CHILDREN:
-        raise CliError("INVALID_INPUT", f"--multi-size must be an integer from 2 to {simulation_multi.MAX_CHILDREN}")
+        raise CliError("INVALID_INPUT", f"--multi-size must be an integer from 2 to {simulation_multi.MAX_CHILDREN}",
+                       f"pass --multi-size between 2 and {simulation_multi.MAX_CHILDREN}")
     return {"multi_size": size}
 
 
@@ -876,7 +891,8 @@ def _validate_saved_native_owner(session, document):
     account = simulation_capabilities.account_provenance(session)
     saved = ((document.get("capability_snapshot") or {}).get("account") or {}).get("fingerprint")
     if saved and saved != account.get("fingerprint"):
-        raise CliError("INVALID_INPUT", "native Multi checkpoint belongs to another or unidentified account")
+        raise CliError("INVALID_INPUT", "native Multi checkpoint belongs to another or unidentified account",
+                       "switch back to the account that created the checkpoint before resuming or recovering")
     for record in attempted:
         _selection_call(simulation_slots.validate_reservation_owner, record, account)
 
@@ -914,26 +930,33 @@ def cmd_compare(args, _sink):
     manifest = None
     if frozen:
         if not getattr(args, "selection", None):
-            raise CliError("USAGE", "--frozen requires --selection from a train --freeze")
+            raise CliError("USAGE", "--frozen requires --selection from a train --freeze",
+                           "freeze a training choice first with `compare ... --freeze choice.json`")
         if getattr(args, "freeze", None):
-            raise CliError("USAGE", "cannot freeze a validation view")
+            raise CliError("USAGE", "cannot freeze a validation view",
+                           "omit --freeze when running with --frozen")
         if getattr(args, "sort", None) is not None or getattr(args, "min_fitness", None) is not None:
-            raise CliError("USAGE", "frozen validation cannot change --sort or --min-fitness")
+            raise CliError("USAGE", "frozen validation cannot change --sort or --min-fitness",
+                           "omit --sort and --min-fitness so the frozen candidate set and order stay immutable")
         manifest = _selection_call(selection.load, args.selection, source="compare")
         saved_costs = manifest["criteria"].get("cost_bps", list(costs.DEFAULT_COST_BPS))
         if getattr(args, "cost_bps", None) is not None and cost_bps != saved_costs:
-            raise CliError("USAGE", "cost scenarios conflict with the frozen selection")
+            raise CliError("USAGE", "cost scenarios conflict with the frozen selection",
+                           "omit --cost-bps to reuse the frozen scenarios")
         cost_bps = saved_costs
         paths = list((manifest.get("inputs") or {}).get("files") or [])
         if not paths:
-            raise CliError("INVALID_INPUT", "selection has no saved compare input files")
+            raise CliError("INVALID_INPUT", "selection has no saved compare input files",
+                           "re-create the selection from durable result files")
         provenance = (manifest.get("inputs") or {}).get("provenance") or {}
         supplied = [str(Path(path).resolve()) for path in getattr(args, "files", [])]
         if supplied and supplied != paths or getattr(args, "match", None) or getattr(args, "latest", None):
-            raise CliError("USAGE", "frozen comparison reuses the saved input files")
+            raise CliError("USAGE", "frozen comparison reuses the saved input files",
+                           "omit positional files, --match, and --latest when passing --frozen")
     else:
         if getattr(args, "selection", None):
-            raise CliError("USAGE", "--selection requires --frozen")
+            raise CliError("USAGE", "--selection requires --frozen",
+                           "add --frozen to validate a saved selection")
         paths, provenance = _compare_inputs(args)
     records = []
     inputs = []
@@ -994,7 +1017,8 @@ def cmd_compare(args, _sink):
                 if any(row.get("train_" + key) is None for key in ("sharpe", "fitness", "turnover", "margin"))]}
     if getattr(args, "freeze", None):
         if "-" in paths:
-            raise CliError("USAGE", "freeze requires durable input files, not stdin")
+            raise CliError("USAGE", "freeze requires durable input files, not stdin",
+                           "save simulation output to a file before freezing with --freeze")
         manifest = _selection_call(selection.freeze, args.freeze, source="compare", rows=rows,
             criteria={"min_fitness": args.min_fitness, "sort": sort_key, "scope": "train", "cost_bps": cost_bps},
             inputs={"files": paths, "provenance": provenance}, window={"scope": "train"})
@@ -1083,7 +1107,8 @@ def _normalize_probe_spec(spec, path):
     try:
         route = research_route.normalize_route(spec)
     except ValueError as exc:
-        raise CliError("INVALID_INPUT", str(exc)) from exc
+        raise CliError("INVALID_INPUT", str(exc),
+                       "check spec track, settings, and schema via `python research_cli.py schema probe`") from exc
     if route["track"] == "SPC":
         raise CliError("INVALID_INPUT", "SPC uses recorded model outputs",
                        "use campaign preview or run with an SPC experiment spec")
@@ -1100,30 +1125,36 @@ def _normalize_probe_spec(spec, path):
         note("spec: ignoring unknown key(s) %s (known: %s)"
              % (", ".join(unknown), ", ".join(sorted(known))))
     if "settings" in spec and not isinstance(spec["settings"], dict):
-        raise CliError("INVALID_INPUT", "spec settings must be an object")
+        raise CliError("INVALID_INPUT", "spec settings must be an object",
+                       "set \"settings\": {...} in the Probe spec")
     if "settings" in spec:
         try:
             spec["settings"] = ml.normalize_setting_keys(spec["settings"])
         except ValueError as exc:
-            raise CliError("INVALID_INPUT", "spec settings: %s" % exc) from exc
+            raise CliError("INVALID_INPUT", "spec settings: %s" % exc,
+                           "run `python research_cli.py schema probe` for valid setting keys") from exc
     for index, arm in enumerate(arms, 1):
         if not isinstance(arm, dict):
             raise CliError("INVALID_INPUT", "arm %d has no expression" % index,
                            "an arm is {\"label\": ..., \"expression\": ..., "
                            "\"settings\": {...} (optional)}")
         if "track" in arm:
-            raise CliError("INVALID_INPUT", "declare the research track on the spec, not on individual arms")
+            raise CliError("INVALID_INPUT", "declare the research track on the spec, not on individual arms",
+                           "move \"track\" to the top level of the spec")
         if "expr" in arm:
             if "expression" in arm and arm["expression"] != arm["expr"]:
-                raise CliError("INVALID_INPUT", "arm %d has conflicting expr and expression" % index)
+                raise CliError("INVALID_INPUT", "arm %d has conflicting expr and expression" % index,
+                               "keep only \"expression\" on the arm")
             arm["expression"] = arm.pop("expr")
         _selection_call(alpha_registry.evidence_role, arm)
         if "source_file" in arm:
             if "expression" in arm:
-                raise CliError("INVALID_INPUT", "arm %d must choose expression or source_file" % index)
+                raise CliError("INVALID_INPUT", "arm %d must choose expression or source_file" % index,
+                               "provide either \"expression\" or \"source_file\", not both")
             if not isinstance(arm["source_file"], str) or not arm["source_file"].strip() \
                     or arm["source_file"] == "-":
-                raise CliError("INVALID_INPUT", "arm %d source_file must be a file path" % index)
+                raise CliError("INVALID_INPUT", "arm %d source_file must be a file path" % index,
+                               "set \"source_file\" to a .py path relative to the spec")
             if str(path) == "-":
                 raise CliError("INVALID_INPUT", "source_file requires a probe spec file",
                                "use inline expression when reading a spec from stdin")
@@ -1131,15 +1162,18 @@ def _normalize_probe_spec(spec, path):
             raise CliError("INVALID_INPUT", "arm %d has no expression" % index,
                            "provide expression or a Python source_file")
         if "settings" in arm and not isinstance(arm["settings"], dict):
-            raise CliError("INVALID_INPUT", "arm %d settings must be an object" % index)
+            raise CliError("INVALID_INPUT", "arm %d settings must be an object" % index,
+                           "set \"settings\": {...} on the arm")
         if "settings" in arm:
             try:
                 arm["settings"] = ml.normalize_setting_keys(arm["settings"])
             except ValueError as exc:
-                raise CliError("INVALID_INPUT", "arm %d settings: %s" % (index, exc)) from exc
+                raise CliError("INVALID_INPUT", "arm %d settings: %s" % (index, exc),
+                               "check setting keys against `python research_cli.py schema probe`") from exc
         arm.setdefault("label", "arm%d" % index)
         if not isinstance(arm["label"], str) or not arm["label"].strip():
-            raise CliError("INVALID_INPUT", "arm %d label must be a nonempty string" % index)
+            raise CliError("INVALID_INPUT", "arm %d label must be a nonempty string" % index,
+                           "give every arm a stable non-empty \"label\"")
     labels = [arm["label"] for arm in arms]
     duplicates = sorted({label for label in labels if labels.count(label) > 1})
     if duplicates:
@@ -1217,6 +1251,7 @@ def _probe_design(spec, settings):
 
 
 def validate_probe_design(spec, settings):
+    """Validate probe control/arm structure against spec and settings constraints."""
     return _probe_design(spec, settings)
 
 
@@ -1225,6 +1260,7 @@ def _finite_metric(value):
 
 
 def finite_metric(value):
+    """Return True when value is a finite real number (excluding booleans)."""
     return _finite_metric(value)
 
 
@@ -1527,9 +1563,11 @@ def _load_probe_batch(value, *, source_paths=None, within=None, observe_source=N
         except (OSError, RuntimeError) as exc:
             raise CliError("INVALID_INPUT", "cannot resolve probe response path %s" % alias, str(exc)) from exc
         if within is not None and not path.is_relative_to(within):
-            raise CliError("INVALID_INPUT", "probe response path is outside the research directory")
+            raise CliError("INVALID_INPUT", "probe response path is outside the research directory",
+                           "keep probe batches and responses inside the active research directory")
         if path in visited:
-            raise CliError("INVALID_INPUT", "cyclic probe response path")
+            raise CliError("INVALID_INPUT", "cyclic probe response path",
+                           "pass the canonical batch file path directly")
         visited.add(path)
         if source_paths is not None:
             source_paths.add(path)
@@ -1542,22 +1580,27 @@ def _load_probe_batch(value, *, source_paths=None, within=None, observe_source=N
         if isinstance(document, dict) and isinstance(document.get("data"), dict):
             document = document["data"]
         if not isinstance(document, dict):
-            raise CliError("INVALID_INPUT", "probe batch must be an object")
+            raise CliError("INVALID_INPUT", "probe batch must be an object",
+                           "pass a JSON batch or response saved by `probe`")
         if document.get("path") and not document.get("arms"):
             if not isinstance(document["path"], str):
-                raise CliError("INVALID_INPUT", "probe response path must be a string")
+                raise CliError("INVALID_INPUT", "probe response path must be a string",
+                               "inspect the saved probe response JSON")
             destination = Path(document["path"]).expanduser()
             alias = destination if destination.is_absolute() else path.parent / destination
             continue
         break
     rows = document.get("rows") or []
     if not rows:
-        raise CliError("INVALID_INPUT", "%s has no probe rows" % path.name)
+        raise CliError("INVALID_INPUT", "%s has no probe rows" % path.name,
+                       "verify this is a saved `probe` batch or response file")
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
-        raise CliError("INVALID_INPUT", "probe rows must be objects")
+        raise CliError("INVALID_INPUT", "probe rows must be objects",
+                       "verify this is a valid `probe` batch file")
     saved = document.get("records") or [{} for _ in rows]
     if not isinstance(saved, list) or len(saved) != len(rows) or not all(isinstance(record, dict) for record in saved):
-        raise CliError("INVALID_INPUT", "probe batch records do not align with rows")
+        raise CliError("INVALID_INPUT", "probe batch records do not align with rows",
+                       "recover from the intact batch file or check for partial edits")
     if not document.get("arms"):
         arms = []
         for index, (row, record) in enumerate(zip(rows, saved)):
@@ -1566,9 +1609,11 @@ def _load_probe_batch(value, *, source_paths=None, within=None, observe_source=N
                 try:
                     settings = json.loads(row["settings_signature"])
                 except (ValueError, TypeError) as exc:
-                    raise CliError("INVALID_INPUT", "legacy settings signature is not recoverable") from exc
+                    raise CliError("INVALID_INPUT", "legacy settings signature is not recoverable",
+                                   "supply a spec or batch with complete settings") from exc
             if settings is not None and not isinstance(settings, dict):
-                raise CliError("INVALID_INPUT", "probe arm settings must be an object")
+                raise CliError("INVALID_INPUT", "probe arm settings must be an object",
+                               "inspect the saved arm settings in the batch file")
             arms.append({"label": row.get("label", "arm%d" % (index + 1)),
                 "role": alpha_registry.evidence_role(row, record),
                 "expression": row.get("expression") or record.get("expression") or "",
@@ -1580,7 +1625,8 @@ def _load_probe_batch(value, *, source_paths=None, within=None, observe_source=N
             or not all(isinstance(arm, dict) and isinstance(arm.get("settings"), dict)
                        and isinstance(arm.get("expression"), str) and arm.get("label") for arm in arms)
             or len({arm["label"] for arm in arms}) != len(arms)):
-        raise CliError("INVALID_INPUT", "probe batch arm identities are inconsistent")
+        raise CliError("INVALID_INPUT", "probe batch arm identities are inconsistent",
+                       "restore the original saved batch checkpoint without editing arm labels or rows")
     records = []
     for index, (arm, row, record) in enumerate(zip(arms, rows, saved)):
         arm["arm_index"] = index
@@ -1606,10 +1652,12 @@ def _load_probe_batch(value, *, source_paths=None, within=None, observe_source=N
         records.append(record)
     document["records"] = records
     if any(record.get("multi_request_id") for record in records) and not _multi_options(None, document):
-        raise CliError("INVALID_INPUT", "native Multi batch lacks its saved request size")
+        raise CliError("INVALID_INPUT", "native Multi batch lacks its saved request size",
+                       "restore the original batch file with its saved multi_size field")
     fingerprint = _request_fingerprint(arms)
     if document.get("request_fingerprint") and document["request_fingerprint"] != fingerprint:
-        raise CliError("INVALID_INPUT", "saved probe request fingerprint does not match its arms")
+        raise CliError("INVALID_INPUT", "saved probe request fingerprint does not match its arms",
+                       "keep the original arms and settings fixed; create a new spec for a different experiment")
     document.setdefault("request_fingerprint", fingerprint)
     document.setdefault("arm_order", [arm["label"] for arm in arms])
     document.setdefault("run_id", None)
@@ -1624,6 +1672,7 @@ def _load_probe_batch(value, *, source_paths=None, within=None, observe_source=N
 
 
 def load_probe_batch(value, *, source_paths=None, within=None, observe_source=None):
+    """Load and validate a saved probe batch checkpoint from path or payload."""
     return _load_probe_batch(value, source_paths=source_paths, within=within,
                              observe_source=observe_source)
 
@@ -1658,7 +1707,8 @@ def _recover_probe_batch(args, path):
     path, document = _load_probe_batch(path)
     show_test = bool(getattr(args, "show_test", False))
     if show_test and not getattr(args, "selection", None):
-        raise CliError("USAGE", "--show-test requires --selection")
+        raise CliError("USAGE", "--show-test requires --selection",
+                       "pass --selection PATH from a training freeze before opening the test view")
     manifest = _selection_call(selection.load, args.selection) if show_test else None
     rows = document["rows"]
     multi = _multi_options(args, document)
@@ -1672,6 +1722,7 @@ def _recover_probe_batch(args, path):
         unknown_ids = pnl_alpha_ids - known_quick_ids
         if unknown_ids:
             raise CliError("INVALID_INPUT", "--pnl-alpha-id requires QUICK Alpha IDs in this batch",
+                           "choose QUICK Alpha IDs from `rows[].alpha_id` in this batch",
                            details={"unknown_quick_alpha_ids": sorted(unknown_ids)})
     native_indices = list(_native_probe_groups(document))
     if document.get("recording"):
@@ -1782,7 +1833,8 @@ def _format_fastexpr(expression, label):
     try:
         return expression_lint.format_fastexpr(expression, strict=True)
     except (ParseError, RecursionError) as exc:
-        raise CliError("INVALID_INPUT", f"{label}: {exc}") from exc
+        raise CliError("INVALID_INPUT", f"{label}: {exc}",
+                       "fix the FASTEXPR syntax error before formatting") from exc
 
 
 def _write_formatted_spec(path, source, document):
@@ -1799,10 +1851,12 @@ def _write_formatted_spec(path, source, document):
                                    "preview it or format a separate draft")
             locks.enter_context(cache_store.file_lock(str(path) + ".lock", timeout=0))
             if path.read_bytes() != source:
-                raise CliError("INVALID_INPUT", "the draft spec changed during formatting")
+                raise CliError("INVALID_INPUT", "the draft spec changed during formatting",
+                               "re-run `fmt` after the concurrent edit finishes")
             cache_store.write_json_atomic(path, document, mode=path.stat().st_mode & 0o777, indent=2)
     except cache_store.LockTimeout as exc:
-        raise CliError("SERVICE_ERROR", "this draft spec or its queue is already being updated") from exc
+        raise CliError("SERVICE_ERROR", "this draft spec or its queue is already being updated",
+                       "wait for the active queue/writer to finish before formatting") from exc
 
 
 def cmd_fmt(args, _sink):
@@ -1816,9 +1870,11 @@ def cmd_fmt(args, _sink):
             source = path.read_bytes()
             document = json.loads(source)
         except (OSError, ValueError) as exc:
-            raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc))
+            raise CliError("INVALID_INPUT", "cannot read %s: %s" % (path, exc),
+                           "pass a valid JSON draft spec path")
         if not isinstance(document, dict) or {"format", "records", "rows"} & document.keys():
-            raise CliError("INVALID_INPUT", "fmt expects a Probe draft spec")
+            raise CliError("INVALID_INPUT", "fmt expects a Probe draft spec",
+                           "pass a draft spec JSON (not a saved batch or checkpoint)")
         if args.write:
             spec, _, _, parsed_arms, _ = _probe_inputs(SimpleNamespace(spec=str(path)))
         else:
@@ -1850,7 +1906,8 @@ def cmd_fmt(args, _sink):
 
     if path.suffix.lower() == ".py" and path.exists():
         protect_output(args, path)
-        raise CliError("INVALID_INPUT", "fmt only formats FASTEXPR")
+        raise CliError("INVALID_INPUT", "fmt only formats FASTEXPR",
+                       "use `lint --file %s --offline` to check Python Alpha syntax" % path)
     if args.write:
         raise CliError("USAGE", "--write needs a spec file",
                        "pass the path to a JSON spec instead of a bare expression")
@@ -1884,6 +1941,7 @@ def _probe_identity(expression, settings):
 
 
 def probe_identity(expression, settings):
+    """Return ``(expression_hash, settings_signature)`` identifying a probe arm."""
     return _probe_identity(expression, settings)
 
 
@@ -2070,14 +2128,16 @@ def _probe_inputs(args, document=None):
                  if key not in {"settings", "design", "proxy_of", "source_file"}}
         source_file = original.get("source_file")
         if source_file and not ml.is_python_language(overrides.get("language")):
-            raise CliError("INVALID_INPUT", "arm %r source_file requires language PYTHON" % original["label"])
+            raise CliError("INVALID_INPUT", "arm %r source_file requires language PYTHON" % original["label"],
+                           "set \"language\": \"PYTHON\" in spec or arm settings")
         try:
             if source_file:
                 source_file = Path(args.spec).expanduser().resolve().parent / Path(source_file).expanduser()
                 entry["expression"] = config_io.read_input_text(source_file)
             resolved, pairs = config_io.build_config(overrides, [entry])
         except config_io.ResearchError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "check the arm expression, decay, and settings via `python research_cli.py schema probe`") from exc
         expression, decay = pairs[0]
         settings = {**resolved, "decay": decay}
         arm = {**original, "expression": expression, "settings": settings,
@@ -2156,7 +2216,8 @@ def _probe_routes(track, arms):
         routes = [research_route.normalize_route({"track": track}, settings=arm["settings"])
                   for arm in arms]
     except ValueError as exc:
-        raise CliError("INVALID_INPUT", str(exc)) from exc
+        raise CliError("INVALID_INPUT", str(exc),
+                       "check spec track and settings against `python research_cli.py schema probe`") from exc
     return list({(row["language"], row["simulation_mode"]): row for row in routes}.values())
 
 
@@ -2165,7 +2226,8 @@ def cmd_probe(args, sink):
     reference = getattr(args, "from_simulation", None)
     if getattr(args, "native_poll_once", False) and (reference is not None
             or getattr(args, "dry_run", False) or getattr(args, "check", False)):
-        raise CliError("USAGE", "--native-poll-once requires a live probe run, --resume or --recover")
+        raise CliError("USAGE", "--native-poll-once requires a live probe run, --resume or --recover",
+                       "omit --native-poll-once during --dry-run, --check, or --from-simulation")
     if reference is not None:
         from .simulation_import import read_existing_simulation
 
@@ -2175,7 +2237,8 @@ def cmd_probe(args, sink):
                         "allow_lint_errors", "strict_gate", "defer_quick_pnl", "pnl_alpha_id")
         if any(getattr(args, key, None) is not None and getattr(args, key) is not False
                for key in incompatible):
-            raise CliError("USAGE", "--from-simulation is a read-only operation on existing simulations")
+            raise CliError("USAGE", "--from-simulation is a read-only operation on existing simulations",
+                           "pass only `probe --from-simulation ID [--max-wait-seconds N]`")
         return read_existing_simulation(args, reference)
     _requested_concurrency(args)
     result = _cmd_probe(args, sink)
@@ -2225,13 +2288,16 @@ def _cmd_probe(args, _sink):
     check = bool(getattr(args, "check", False))
     dry_run = bool(getattr(args, "dry_run", False))
     if sum(bool(value) for value in (recover, resume, check)) > 1 or check and dry_run:
-        raise CliError("USAGE", "--check, --recover and --resume are exclusive; --check cannot use --dry-run")
+        raise CliError("USAGE", "--check, --recover and --resume are exclusive; --check cannot use --dry-run",
+                       "choose one mode: --dry-run (offline), --check (live preflight), --recover, or --resume")
     if getattr(args, "pnl_alpha_id", None) and (not recover or dry_run
             or getattr(args, "show_test", False) or getattr(args, "defer_quick_pnl", False)):
         raise CliError("USAGE", "--pnl-alpha-id requires --recover and cannot use "
-                       "--dry-run, --show-test or --defer-quick-pnl")
+                       "--dry-run, --show-test or --defer-quick-pnl",
+                       "use `probe --recover BATCH.json --pnl-alpha-id ALPHA_ID`")
     if getattr(args, "show_test", False) and (not recover or not getattr(args, "selection", None)):
-        raise CliError("USAGE", "--show-test requires --recover and --selection; it cannot start simulations")
+        raise CliError("USAGE", "--show-test requires --recover and --selection; it cannot start simulations",
+                       "use `probe --recover BATCH.json --show-test --selection CHOICE.json`")
     if recover:
         _reject_saved_overrides(args)
         return _cmd_probe_recover(args)
@@ -2242,7 +2308,8 @@ def _cmd_probe(args, _sink):
     target = Path(getattr(args, "batch_path", None) or research_paths.batch_path(name)).expanduser().resolve()
     source_paths = [Path(arm["source_file"]) for arm in arms if "source_file" in arm]
     if target in source_paths:
-        raise CliError("INVALID_INPUT", "batch path would overwrite an input source_file")
+        raise CliError("INVALID_INPUT", "batch path would overwrite an input source_file",
+                       "choose a --batch-path distinct from all Python source_file paths")
     protect_output(args, target, *source_paths)
     context = {key: spec[key] for key in _PROBE_CONTEXT_FIELDS if key in spec}
     base = {"name": name, **context, "path": str(target), "arms": len(arms),
@@ -2593,6 +2660,7 @@ def _matching_preflight_deferrals(document, account_fingerprint):
 
 
 def matching_preflight_deferrals(document, account_fingerprint):
+    """Return prior preflight deferrals in *document* matching *account_fingerprint*."""
     return _matching_preflight_deferrals(document, account_fingerprint)
 
 
@@ -2801,7 +2869,8 @@ def _reject_saved_overrides(args, mode="resume/recover"):
                 "decay", "delay", "truncation", "pasteurization", "nan_handling", "test_period", "multi_size")
     if (any(getattr(args, key, None) is not None for key in changing)
             or getattr(args, "quick_mode", False) or getattr(args, "full_mode", False)):
-        raise CliError("USAGE", f"{mode} uses saved settings; explicit overrides are not allowed")
+        raise CliError("USAGE", f"{mode} uses saved settings; explicit overrides are not allowed",
+                       "omit simulation settings flags; start a new spec if you need different settings")
 
 
 def _cmd_probe_resume(args):
@@ -2810,7 +2879,8 @@ def _cmd_probe_resume(args):
                 "instrument_type", "neutralization", "decay", "delay", "truncation",
                 "pasteurization", "nan_handling", "test_period", "force", "no_record")
     if any(getattr(args, key, None) is not None and getattr(args, key) is not False for key in changing):
-        raise CliError("USAGE", "--resume uses saved requests and recording policy; parameters cannot change")
+        raise CliError("USAGE", "--resume uses saved requests and recording policy; parameters cannot change",
+                       "pass only `probe --resume BATCH.json` (plus optional --batch-size / --max-wait-seconds / --dry-run)")
     path, document = _load_probe_batch(args.resume)
     protect_output(args, path)
 
@@ -2830,9 +2900,11 @@ def _cmd_probe_resume(args):
                 if state == "unknown_submission":
                     continue
             if not arm.get("settings") or not arm.get("expression"):
-                raise CliError("INVALID_INPUT", "legacy batch lacks exact requests; cannot resume")
+                raise CliError("INVALID_INPUT", "legacy batch lacks exact requests; cannot resume",
+                               "use `probe --recover` to read already-accepted jobs, or run a new spec")
             if state == "not_submitted" and ml.resolve_settings(arm["settings"]) != arm["settings"]:
-                raise CliError("INVALID_INPUT", "legacy batch lacks complete resolved settings; cannot start a new POST")
+                raise CliError("INVALID_INPUT", "legacy batch lacks complete resolved settings; cannot start a new POST",
+                               "use `probe --recover` for existing tasks or draft a new spec")
             group = groups.setdefault((_settings_signature(arm["settings"]), state),
                                       {"settings": arm["settings"], "arms": [], "pairs": []})
             group["arms"].append(arm)
@@ -2879,7 +2951,8 @@ def cmd_simulate(args, sink):
     try:
         settings, pairs = config_io.build_config(settings, alphas)
     except config_io.ResearchError as exc:
-        raise CliError("INVALID_INPUT", str(exc))
+        raise CliError("INVALID_INPUT", str(exc),
+                       "check expression syntax, decay, and settings via `python research_cli.py schema simulate`")
     labels = ml.alpha_labels(alphas, len(pairs))
     families = ml.alpha_families(alphas, len(pairs))
     candidates = ml.alpha_candidate_ids(alphas, len(pairs))
@@ -2996,11 +3069,13 @@ def _resume_simulation(args, sink, path):
         or checkpoint.get("version") != 1
         or not isinstance(checkpoint.get("records"), list)
     ):
-        raise CliError("INVALID_INPUT", "unsupported or malformed simulation checkpoint")
+        raise CliError("INVALID_INPUT", "unsupported or malformed simulation checkpoint",
+                       "pass a checkpoint created by `simulate` (or use `probe --resume` for Probe batches)")
 
     settings = checkpoint.get("settings")
     if not isinstance(settings, dict) or not settings:
-        raise CliError("INVALID_INPUT", "simulation checkpoint is missing saved settings")
+        raise CliError("INVALID_INPUT", "simulation checkpoint is missing saved settings",
+                       "restore the original checkpoint file or start a fresh simulation")
 
     records = checkpoint["records"]
     try:
@@ -3021,7 +3096,8 @@ def _resume_simulation(args, sink, path):
     ]
     multi = _multi_options(args, checkpoint)
     if not multi and any(record.get("multi_request_id") for record in records):
-        raise CliError("INVALID_INPUT", "native Multi checkpoint lacks its saved request size")
+        raise CliError("INVALID_INPUT", "native Multi checkpoint lacks its saved request size",
+                       "restore the original checkpoint file with its saved multi_size field")
     concurrency = _requested_concurrency(args, checkpoint)
     checkpoint["concurrency"] = concurrency
     policy = checkpoint.get("recording_policy")
@@ -3032,7 +3108,8 @@ def _resume_simulation(args, sink, path):
                 requested = str(Path(requested).expanduser().resolve())
                 value = str(Path(value).expanduser().resolve())
             if requested is not None and requested is not False and requested != value:
-                raise CliError("USAGE", "resume uses the saved recording policy; %s cannot change" % key)
+                raise CliError("USAGE", "resume uses the saved recording policy; %s cannot change" % key,
+                               "omit --%s when resuming this checkpoint" % key.replace("_", "-"))
             setattr(args, key, value)
     for record in records:
         if not record.get("multi_request_id"):

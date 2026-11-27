@@ -93,7 +93,8 @@ def _read_production_distribution(path, alpha_id, limit):
                 row["count"] for row in bins if row["lower"] >= limit)
         return diagnostic
     except (OSError, AttributeError, KeyError, TypeError, ValueError) as exc:
-        raise CliError("INVALID_INPUT", f"cannot review production distribution: {exc}") from exc
+        raise CliError("INVALID_INPUT", f"cannot review production distribution: {exc}",
+                       "pass a JSON archive created by `alpha prod-corr ALPHA_ID --save-archive PATH`") from exc
 
 
 def _review_receipt(args):
@@ -101,12 +102,14 @@ def _review_receipt(args):
     if (not args.selection or args.dry_run or any(getattr(args, key) is not None
             for key in ("freeze", "buffer", "note", "retention_floor", "cost_bps",
                         "max_self_correlation"))):
-        raise CliError("INVALID_INPUT", "--review-receipt requires --selection and cannot use live promotion options")
+        raise CliError("INVALID_INPUT", "--review-receipt requires --selection and cannot use live promotion options",
+                       "pass only --selection PATH and optional --pc-distribution PATH with --review-receipt")
     protect_output(args)
     manifest = _selection_call(selection.load, args.selection, source="triage")
     retention_floor = manifest["criteria"].get("retention_floor", selection.DEFAULT_PROMOTION_RETENTION)
     if not _finite(retention_floor):
-        raise CliError("INVALID_INPUT", "frozen retention floor must be finite")
+        raise CliError("INVALID_INPUT", "frozen retention floor must be finite",
+                       "re-freeze the selection with a finite --retention-floor")
     path = Path(args.review_receipt).expanduser().resolve()
     try:
         receipt = json.loads(path.read_text(encoding="utf-8"))
@@ -133,7 +136,8 @@ def _review_receipt(args):
         saved_pc = (checked.get("production_correlation_evidence") or {}).get("formal") or {}
         captured_at = saved_pc.get("captured_at")
     except (AttributeError, KeyError, OSError, TypeError, ValueError) as exc:
-        raise CliError("INVALID_INPUT", f"cannot review promotion receipt: {exc}") from exc
+        raise CliError("INVALID_INPUT", f"cannot review promotion receipt: {exc}",
+                       "pass the matching --selection PATH and a receipt saved by `promote --save`") from exc
 
     reasons = _validation_reasons(row, retention_floor)
     source_fields = ("source_expression", "source_settings")
@@ -209,7 +213,8 @@ def cmd_promote(args, sink):
     if getattr(args, "review_receipt", None):
         return _review_receipt(args)
     if getattr(args, "pc_distribution", None):
-        raise CliError("INVALID_INPUT", "--pc-distribution requires --review-receipt")
+        raise CliError("INVALID_INPUT", "--pc-distribution requires --review-receipt",
+                       "pass --review-receipt PATH --selection PATH when attaching --pc-distribution")
     alpha_id = args.alpha_id
     alphas._candidate_role(args)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -219,7 +224,8 @@ def cmd_promote(args, sink):
         "promote-freeze-%s-%s.json" % (safe_id, stamp))).expanduser().resolve()
     shelf = buffer_cmd.buffer_path(args).resolve()
     if freeze == shelf:
-        raise CliError("INVALID_INPUT", "--freeze and --buffer must use distinct paths")
+        raise CliError("INVALID_INPUT", "--freeze and --buffer must use distinct paths",
+                       "choose separate paths for the frozen selection and candidate shelf")
     shelf, seeds = buffer_cmd._seed_paths(args, selection_path=freeze)
     protect_output(args, freeze, shelf, seeds)
 
@@ -238,20 +244,24 @@ def cmd_promote(args, sink):
         retention_floor, cost_bps = args.retention_floor, args.cost_bps
         max_corr = getattr(args, "max_self_correlation", None)
         if max_corr is not None and (not _finite(max_corr) or not 0 <= max_corr <= 1):
-            raise CliError("INVALID_INPUT", "--max-self-correlation must be between 0 and 1")
+            raise CliError("INVALID_INPUT", "--max-self-correlation must be between 0 and 1",
+                           "pass a correlation ceiling in [0, 1], e.g. --max-self-correlation 0.7")
         if saved_choice:
             # Campaign already selected the candidate using training evidence.
             # Reuse its manifest to keep validation bound to that decision.
             manifest = _selection_call(selection.load, freeze, source="triage")
             if [row.get("alpha_id") for row in manifest["rows"]] != [alpha_id]:
-                raise CliError("INVALID_INPUT", "promotion selection must contain exactly this candidate")
+                raise CliError("INVALID_INPUT", "promotion selection must contain exactly this candidate",
+                               "pass the single-candidate --selection file created for %s" % alpha_id)
             frozen_shelf = manifest["inputs"].get("shelf")
             if frozen_shelf and Path(frozen_shelf["path"]).resolve() != shelf:
-                raise CliError("INVALID_INPUT", "--buffer conflicts with the frozen shelf")
+                raise CliError("INVALID_INPUT", "--buffer conflicts with the frozen shelf",
+                               "use the same --buffer path that was active when the selection was frozen")
             saved_criteria = manifest["criteria"]
             for key, provided in (("retention_floor", retention_floor), ("cost_bps", cost_bps)):
                 if provided is not None and provided != saved_criteria.get(key):
-                    raise CliError("INVALID_INPUT", f"{key} conflicts with the frozen selection")
+                    raise CliError("INVALID_INPUT", f"{key} conflicts with the frozen selection",
+                                   "omit the conflicting flag to reuse the criterion saved in the frozen selection")
             retention_floor = saved_criteria.get("retention_floor", selection.DEFAULT_PROMOTION_RETENTION)
             cost_bps = saved_criteria.get("cost_bps")
             frozen = {"selection_id": manifest["selection_id"], "rows": manifest["rows"],
@@ -260,7 +270,8 @@ def cmd_promote(args, sink):
             if retention_floor is None:
                 retention_floor = selection.DEFAULT_PROMOTION_RETENTION
         if not _finite(retention_floor):
-            raise CliError("INVALID_INPUT", "retention floor must be finite")
+            raise CliError("INVALID_INPUT", "retention floor must be finite",
+                           "pass a finite number for --retention-floor, e.g. 0.2")
         payload = with_session(args, lambda session: ml.fetch_alpha_metrics(session, alpha_id))
         alphas._reject_quick_simulation(args, payload)
         code, _expr_desc, operator_count = ml.regular_expression(payload)
@@ -397,9 +408,11 @@ def cmd_promote(args, sink):
             body = alphas._check_error(exc)
             error = CliError(body["code"], body["message"], body.get("hint"))
         elif isinstance(exc, KeyboardInterrupt):
-            error = CliError("INTERRUPTED", "cancelled")
+            error = CliError("INTERRUPTED", "cancelled",
+                             "completed steps remain saved under data.steps and the frozen selection")
         else:
-            error = CliError("SERVICE_ERROR", "%s: %s" % (type(exc).__name__, exc))
+            error = CliError("SERVICE_ERROR", "%s: %s" % (type(exc).__name__, exc),
+                             "inspect `data.failed_step` and `data.steps` for completed evidence before retrying")
         if error.code.startswith("AUTH") and ml.invalidate_session():
             note("session cache cleared after %s" % error.code)
         data["reasons"].append("%s: %s: %s" % (step, error.code, error.message))

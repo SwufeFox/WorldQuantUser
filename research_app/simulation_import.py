@@ -81,10 +81,12 @@ def read_existing_simulation(args, reference):
     try:
         simulation_id = ml.simulation_reference_id(reference)
     except ValueError as exc:
-        raise CliError("INVALID_INPUT", str(exc)) from exc
+        raise CliError("INVALID_INPUT", str(exc),
+                       "pass a simulation ID or https://api.worldquantbrain.com/simulations/<id> URL") from exc
     wait = getattr(args, "max_wait_seconds", 300.0)
     if type(wait) not in (int, float) or not math.isfinite(wait) or wait <= 0:
-        raise CliError("INVALID_INPUT", "simulation inspection wait must be positive and finite")
+        raise CliError("INVALID_INPUT", "simulation inspection wait must be positive and finite",
+                       "pass a positive number of seconds for --max-wait-seconds")
     deadline = time.monotonic() + wait
     run = session_reader(args, deadline=deadline)
 
@@ -98,7 +100,8 @@ def read_existing_simulation(args, reference):
     if parent.get("reason") != "simulation_id_mismatch" and retry_after is None:
         if isinstance(children, list) and children:
             if len(children) > _MAX_CHILDREN:
-                raise CliError("SERVICE_ERROR", "BRAIN listed more than ten child simulations")
+                raise CliError("SERVICE_ERROR", "BRAIN listed more than ten child simulations",
+                               "inspect the parent simulation directly on BRAIN before proceeding")
             kind, children_state = "multi", "available"
             rows = _read_children(read, children, simulation_id, deadline)
         elif children not in (None, []):

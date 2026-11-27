@@ -177,11 +177,17 @@ pattern-matching the string.
 | --- | --- |
 | [Tool map](docs/tooling.md) | Choose a CLI command, check its evidence, or recover a runner batch. |
 | [Batch research and ledger review](docs/ledger-workflow.md) | Queue QUICK probes, read the indexed report, and prepare a FULL follow-up. |
+| [Research campaign delivery](docs/research-campaign-queue.md) | Enumerate regional inventories, publish 16-arm QUICK pilots/expansions, and diagnose offline queue state. |
+| [Errors, status diagnosis and recovery](docs/errors.md) | Interpret `ERROR_CODES`, `campaign status` diagnoses, `probe` pauses, and safe recovery paths. |
 | [Fast backtesting (中文)](docs/fast-backtest.md) | Diagnose slow or stalled work and measure accepted jobs, finished results and complete evidence separately. |
 | [Expression pipeline](docs/ast-pipeline.md) | Understand FASTEXPR parsing, source identity, and structural analysis. |
 | [Unit compression](docs/unit-compression.md) | Inspect FASTEXPR construction coverage and reproduce the report. |
 | [Candidate gates and submission planning](docs/tool-absorption.md) | Understand Power Pool structural budgets, independent-subset planning, description checks and rule snapshots. |
 | [Backup and replay](docs/backup-replay.md) | Archive research state, restore a workspace, or check historical results. |
+
+For AI coding agents working in this repository, the workspace skill at
+[`.agents/skills/worldquant-research-cli/SKILL.md`](.agents/skills/worldquant-research-cli/SKILL.md)
+indexes these documents and encodes the pre-flight and error-recovery rules.
 
 ## Install
 

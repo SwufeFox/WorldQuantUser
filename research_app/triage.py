@@ -633,7 +633,8 @@ def cmd_triage(args, _sink):
     try:
         return _cmd_triage(args)
     except ValueError as exc:
-        raise CliError("INVALID_INPUT", str(exc)) from exc
+        raise CliError("INVALID_INPUT", str(exc),
+                       "run `python research_cli.py help triage` for valid targets, --freeze, and --selection usage") from exc
 
 
 def _cmd_triage(args):

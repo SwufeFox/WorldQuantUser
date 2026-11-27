@@ -893,7 +893,8 @@ def cmd_feed(args, _sink, *, _compact=True, _ledger_context=None):
     seen_path = os.path.realpath(_seen_path(args))
     draft_path = os.path.realpath(args.draft_cards) if args.draft_cards else None
     if draft_path and os.path.normcase(draft_path) == os.path.normcase(seen_path):
-        raise CliError("INVALID_INPUT", "Seen state and draft cards need different files.")
+        raise CliError("INVALID_INPUT", "Seen state and draft cards need different files.",
+                       "pass distinct paths to --seen and --draft-cards")
     register = closed_families.load()
     topics = list(args.topic or [])
     unresolved = []
@@ -928,11 +929,13 @@ def cmd_feed(args, _sink, *, _compact=True, _ledger_context=None):
             seeds.append(seed)
     relation = getattr(args, "follow", "references")
     if relation not in ("references", "citations"):
-        raise CliError("INVALID_INPUT", "Follow must be references or citations.")
+        raise CliError("INVALID_INPUT", "Follow must be references or citations.",
+                       "pass --follow references or --follow citations")
     jobs = _build_jobs(args, topics, seeds, relation)
     if not jobs and not unresolved:
         raise CliError("INVALID_INPUT",
-                       "nothing to search: pass --topic, --topics, --from-threads, --seed or an explicit fixed source/market")
+                       "nothing to search: pass --topic, --topics, --from-threads, --seed or an explicit fixed source/market",
+                       "see `python research_cli.py help feed` for supported source and topic options")
     selected = jobs[:max(0, args.max_topics)]
     outcomes = _search_topics(selected, args)
     try:

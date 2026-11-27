@@ -35,10 +35,12 @@ class SourceError(RuntimeError):
 
 
 def utc_now():
+    """Return the current UTC timestamp in ISO-8601 format."""
     return datetime.now(timezone.utc).isoformat()
 
 
 def validate_url(value):
+    """Validate that ``value`` is a clean HTTP(S) URL with no whitespace or credentials."""
     if not isinstance(value, str) or any(character.isspace() for character in value):
         raise SourceError("INVALID_INPUT", "Source URLs must be HTTP(S) URLs without whitespace.")
     try:
@@ -54,6 +56,7 @@ def validate_url(value):
 
 
 def canonical_url(value):
+    """Normalize scheme/host case and strip tracking query parameters."""
     parts = urllib.parse.urlsplit(validate_url(value))
     query = [(key, item) for key, item in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
              if not key.lower().startswith("utm_") and key.lower() not in _TRACKING_PARAMETERS]
@@ -62,6 +65,7 @@ def canonical_url(value):
 
 
 def public_url(value):
+    """Return ``canonical_url(value)`` with secret query parameter values redacted."""
     parts = urllib.parse.urlsplit(canonical_url(value))
     query = [(key, "[redacted]" if key.lower() in _SECRET_PARAMETERS else item)
              for key, item in urllib.parse.parse_qsl(parts.query, keep_blank_values=True)]
@@ -149,6 +153,7 @@ def _invalid_json_constant(value):
 
 
 def request_json(url, timeout=30, headers=None, max_bytes=MAX_RESPONSE_BYTES):
+    """Fetch and parse a bounded JSON response, rejecting non-finite floats."""
     body, evidence = request_bytes(url, timeout=timeout, headers=headers, max_bytes=max_bytes)
     try:
         payload = json.loads(body.decode("utf-8-sig"), parse_float=_finite_json_float,

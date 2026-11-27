@@ -174,6 +174,7 @@ def record_observed_checks(check, *, scope, path=None, observed_at=None):
 
 
 def load(path):
+    """Load all valid JSON rule snapshot records from ``path``, skipping blank or corrupt lines."""
     records = []
     if not os.path.exists(path):
         return records

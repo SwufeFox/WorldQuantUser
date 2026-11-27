@@ -339,7 +339,8 @@ def _collect_lint_pairs(args):
     try:
         return config_io.build_config(settings, alphas)
     except config_io.ResearchError as exc:
-        raise CliError("INVALID_INPUT", str(exc)) from exc
+        raise CliError("INVALID_INPUT", str(exc),
+                       "check expression syntax, decay, and settings via `python research_cli.py schema lint`") from exc
 
 
 def _operator_index_from_catalog(session):

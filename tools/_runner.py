@@ -34,6 +34,8 @@ _OFFLINE_BLOCKS = {"empty", "unbalanced_string", "unbalanced_parens", "reserved_
 
 @dataclass(frozen=True)
 class CliResult:
+    """Structured result returned by invoking ``research_cli.py`` in a subprocess."""
+
     ok: bool
     data: dict
     detail: str = ""
@@ -43,6 +45,8 @@ class CliResult:
 
 @dataclass(frozen=True)
 class ProbeRun:
+    """State and payload produced by executing or resuming one probe batch."""
+
     state: str
     data: dict
     detail: str = ""
@@ -68,6 +72,7 @@ def research_root(explicit=None):
 
 
 def run_cli(root, *args, timeout=None, input_text=None):
+    """Run ``research_cli.py`` for *root* and parse its stdout JSON envelope."""
     command = [sys.executable, str(REPO / "research_cli.py"), "--research-dir", str(root),
                "--quiet", *map(str, args)]
     try:

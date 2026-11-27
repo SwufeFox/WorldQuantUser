@@ -120,11 +120,13 @@ def member_digest(ids):
 
 
 def snapshot_path(registry_path=None):
+    """Return the path to the sidecar platform book snapshot JSON."""
     registry = registry_path or alpha_registry.default_registry_path()
     return Path(str(registry) + ".platform.json")
 
 
 def persist_snapshot(snapshot, registry_path=None):
+    """Atomically write the platform book snapshot under its file lock."""
     path = snapshot_path(registry_path)
     with cache_store.file_lock(str(path) + ".lock"):
         cache_store.write_json_atomic(path, snapshot)

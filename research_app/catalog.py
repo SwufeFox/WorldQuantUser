@@ -298,9 +298,11 @@ def cmd_catalog_find(args, sink):
         raise CliError("INVALID_INPUT", "provide a search query or a field filter",
                        "use --max-alpha-count, --min-coverage or --type to scan without a query")
     if max_alpha_count is not None and max_alpha_count < 0:
-        raise CliError("INVALID_INPUT", "--max-alpha-count must be zero or greater")
+        raise CliError("INVALID_INPUT", "--max-alpha-count must be zero or greater",
+                       "pass 0 for unmined fields or a positive integer")
     if args.min_coverage is not None and not 0 <= args.min_coverage <= 1:
-        raise CliError("INVALID_INPUT", "--min-coverage must be between 0 and 1")
+        raise CliError("INVALID_INPUT", "--min-coverage must be between 0 and 1",
+                       "pass a fraction between 0.0 and 1.0, e.g. 0.8")
 
     scope = {"region": args.region, "universe": args.universe, "delay": args.delay,
              "instrument_type": args.instrument_type}
@@ -315,7 +317,9 @@ def cmd_catalog_find(args, sink):
         not isinstance(row, dict) or not isinstance(row.get("id"), str) or not row["id"]
         for row in datasets
     ):
-        raise CliError("SERVICE_ERROR", "catalog returned an invalid dataset ID", details={"cache": cache_report})
+        raise CliError("SERVICE_ERROR", "catalog returned an invalid dataset ID",
+                       "retry with --refresh-meta to refresh the dataset catalog",
+                       details={"cache": cache_report})
     available = {row["id"] for row in datasets}
     missing = [dataset_id for dataset_id in wanted if dataset_id not in available]
     if wanted:
@@ -323,6 +327,7 @@ def cmd_catalog_find(args, sink):
     if not datasets and getattr(args, "subcommand", None) != "inventory":
         raise CliError("INVALID_INPUT", "no datasets for %s/%s/delay %s"
                        % (args.region, args.universe, args.delay),
+                       "verify region/universe/delay via `auth check` or `catalog datasets`",
                        details={"cache": cache_report, "missing_datasets": missing})
 
     rows, catalogs = [], []
@@ -513,7 +518,10 @@ def cmd_catalog_unused(args, _sink):
 
     fields = mine.load_catalog(all_scopes=True)
     if not fields:
-        raise ValueError("no cached catalog fields; run `catalog fields` first")
+        raise CliError(
+            "INVALID_INPUT", "no cached catalog fields; run `catalog fields` first",
+            "run `python research_cli.py catalog fields <DATASET>` to populate the local catalog cache",
+        )
     used_fields = mine.used_identifiers(getattr(args, "registry", None)) & fields.keys()
     bound_count = sum(row["source"]["account_state"] == "matched" for row in fields.values())
 
@@ -640,6 +648,7 @@ def _resolve_fields_by_id(session, args, field_ids):
 
 
 def cmd_catalog_field_audit(args, sink):
+    """Audit a field set's declared/inferred period, unit, and sign contract."""
     field_ids = [item.strip()
                  for item in (getattr(args, "fields", "") or "").split(",")
                  if item.strip()]

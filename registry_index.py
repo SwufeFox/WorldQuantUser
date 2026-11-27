@@ -92,6 +92,7 @@ class _UnindexableLedger(ValueError):
 
 
 def index_path(path):
+    """Return the rebuildable SQLite index path alongside a JSONL ledger file."""
     return os.fspath(path) + ".index.sqlite3"
 
 
@@ -166,6 +167,7 @@ def summary_fields(entry):
 
 
 def settings_signature(settings):
+    """Canonical compact JSON signature of resolved simulation settings."""
     settings = settings or {}
     if ml.is_python_language(settings.get("language")):
         settings = ml.regular_wire_settings(settings)
@@ -226,6 +228,8 @@ def _expression_structure(expression, language):
 
 
 class RegistryIndex:
+    """Locked SQLite projection supporting incremental replay and indexed queries."""
+
     def __init__(self, path, connection, stack):
         self.path = path
         self.connection = connection

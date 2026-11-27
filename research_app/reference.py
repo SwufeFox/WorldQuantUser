@@ -11,13 +11,15 @@ from .support_reader import support_get, support_pagination, with_support
 
 def _resource_id(value):
     if not re.fullmatch(r"[1-9][0-9]*", value):
-        raise CliError("INVALID_INPUT", "use the numeric ID from the BRAIN support link")
+        raise CliError("INVALID_INPUT", "use the numeric ID from the BRAIN support link",
+                       "pass the positive integer ID from the forum/Help Center URL or `docs articles` / `forum search`")
     return value
 
 
 def _check_limit(value, maximum):
     if not 1 <= value <= maximum:
-        raise CliError("INVALID_INPUT", f"--limit must be between 1 and {maximum}")
+        raise CliError("INVALID_INPUT", f"--limit must be between 1 and {maximum}",
+                       f"pass a value from 1 to {maximum}")
 
 
 def _cursor_params(args):
@@ -25,7 +27,8 @@ def _cursor_params(args):
     params = {"page[size]": args.limit}
     if args.cursor is not None:
         if not args.cursor.strip():
-            raise CliError("INVALID_INPUT", "--cursor must be a non-empty after_cursor value")
+            raise CliError("INVALID_INPUT", "--cursor must be a non-empty after_cursor value",
+                           "copy `pagination.after_cursor` from the previous response")
         params["page[after]"] = args.cursor
     return params
 
@@ -33,7 +36,8 @@ def _cursor_params(args):
 def _page_params(args, maximum):
     _check_limit(args.limit, maximum)
     if args.page < 1:
-        raise CliError("INVALID_INPUT", "--page must be one or greater")
+        raise CliError("INVALID_INPUT", "--page must be one or greater",
+                       "pass --page 1 or greater")
     return {"page": args.page, "per_page": args.limit}
 
 
@@ -49,7 +53,8 @@ def _read(args, path, params, project):
 def _records(payload, key, fields):
     rows = payload.get(key)
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-        raise CliError("SERVICE_ERROR", f"BRAIN support returned an invalid {key} list")
+        raise CliError("SERVICE_ERROR", f"BRAIN support returned an invalid {key} list",
+                       "retry with --refresh-meta or inspect the Support portal directly")
     return {key: [_project(row, fields) for row in rows], "count": payload.get("count"),
             "pagination": support_pagination(payload)}
 
@@ -57,7 +62,8 @@ def _records(payload, key, fields):
 def _record(payload, key, fields):
     row = payload.get(key)
     if not isinstance(row, dict) or row.get("id") is None:
-        raise CliError("SERVICE_ERROR", f"BRAIN support returned an invalid {key}")
+        raise CliError("SERVICE_ERROR", f"BRAIN support returned an invalid {key}",
+                       "verify the ID or retry with --refresh-meta")
     return {key: _project(row, fields)}
 
 
@@ -71,26 +77,31 @@ _ARTICLE_FIELDS = (*_TITLE_FIELDS, "section_id", "locale")
 
 
 def cmd_forum_topics(args, _sink):
+    """List BRAIN community forum topics visible to the authenticated account."""
     return _read(args, "/api/v2/community/topics.json", _cursor_params(args),
                  lambda payload: _records(payload, "topics", ("id", "name", "html_url", "description")))
 
 
 def cmd_forum_search(args, _sink):
+    """Search BRAIN community forum posts by query string."""
     query = args.query.strip()
     if not query:
-        raise CliError("INVALID_INPUT", "forum search needs a non-empty query")
+        raise CliError("INVALID_INPUT", "forum search needs a non-empty query",
+                       "pass search keywords, e.g. `forum search \"power pool\"`")
     params = {**_page_params(args, 25), "query": query}
     return _read(args, "/api/v2/help_center/community_posts/search.json", params,
                  lambda payload: {"query": query, **_records(payload, "results", (*_POST_FIELDS, "snippet"))})
 
 
 def cmd_forum_get(args, _sink):
+    """Fetch one BRAIN community forum post and its HTML body by numeric ID."""
     post_id = _resource_id(args.post_id)
     return _read(args, f"/api/v2/community/posts/{post_id}.json", None,
                  lambda payload: _record(payload, "post", (*_POST_FIELDS, "details")))
 
 
 def cmd_forum_comments(args, _sink):
+    """Fetch paginated comments for one BRAIN community forum post."""
     post_id = _resource_id(args.post_id)
     fields = ("id", "post_id", "html_url", "body", "official", "created_at", "updated_at")
     return _read(args, f"/api/v2/community/posts/{post_id}/comments.json", _cursor_params(args),
@@ -98,6 +109,7 @@ def cmd_forum_comments(args, _sink):
 
 
 def cmd_docs_articles(args, _sink):
+    """List English Help Center articles in a BRAIN Help Center category."""
     category_id = _resource_id(args.category_id)
     path = f"/api/v2/help_center/en-us/categories/{category_id}/articles.json"
     return _read(args, path, _page_params(args, 100),
@@ -105,6 +117,7 @@ def cmd_docs_articles(args, _sink):
 
 
 def cmd_docs_article(args, _sink):
+    """Fetch one English Help Center article and its HTML body by numeric ID."""
     article_id = _resource_id(args.article_id)
     return _read(args, f"/api/v2/help_center/en-us/articles/{article_id}.json", None,
                  lambda payload: _record(payload, "article", (*_ARTICLE_FIELDS, "body")))

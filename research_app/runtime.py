@@ -64,7 +64,8 @@ def parse_tags(raw):
         return None
     items = [raw] if isinstance(raw, str) else raw
     if not isinstance(items, (list, tuple)) or any(not isinstance(tag, str) for tag in items):
-        raise CliError("INVALID_INPUT", "tags must be text")
+        raise CliError("INVALID_INPUT", "tags must be text",
+                       "pass one or more string tags, e.g. --tags quality cashflow")
     tags = []
     for chunk in items:
         for part in chunk.replace(",", " ").split():
@@ -96,6 +97,7 @@ class OutputConflict(CliError):
 
 
 def protect_output(args, *paths):
+    """Reject ``--save`` when it targets durable state such as batches, shelves, or seeds."""
     target = getattr(args, "save", None)
     if not target or target == "-":
         return
@@ -216,13 +218,15 @@ def collect_alphas(args, metadata=None):
     paths = ([raw_file] if raw_file and inline_file_expr is None else [])
     paths.extend(getattr(args, "files", None) or [])
     if sum(str(path) == "-" for path in paths) > 1:
-        raise CliError("INVALID_INPUT", "stdin (-) may be read only once")
+        raise CliError("INVALID_INPUT", "stdin (-) may be read only once",
+                       "pass '-' at most once across positional, --file, and --files inputs")
     for path in paths:
         try:
             text = config_io.read_input_text(path)
             settings, entries = config_io.parse_research_text(text, source=str(path))
         except config_io.ResearchError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "run `python research_cli.py schema` for the accepted research file shapes") from exc
         if metadata is not None and Path(path).suffix.lower() != ".py" and text.lstrip().startswith("{"):
             payload = json.loads(text)
             for key in ("legs", "legend", "note"):
@@ -248,7 +252,8 @@ def merge_settings(file_settings, args):
     try:
         overrides = ml.normalize_setting_keys(file_settings)
     except ValueError as exc:
-        raise CliError("INVALID_INPUT", str(exc)) from exc
+        raise CliError("INVALID_INPUT", str(exc),
+                       "run `python research_cli.py schema` for valid simulation setting keys") from exc
     named = {
         "region": getattr(args, "region", None),
         "universe": getattr(args, "universe", None),
@@ -270,7 +275,8 @@ def merge_settings(file_settings, args):
         try:
             normalized = ml.normalize_setting_keys({key: value})
         except ValueError as exc:
-            raise CliError("INVALID_INPUT", str(exc)) from exc
+            raise CliError("INVALID_INPUT", str(exc),
+                           "pass --setting NAME=VALUE without conflicting aliases") from exc
         for canonical, item in normalized.items():
             if canonical in explicit and json.dumps(explicit[canonical], sort_keys=True) != json.dumps(item, sort_keys=True):
                 raise CliError("INVALID_INPUT", "conflicting explicit values for setting %r" % canonical,
@@ -280,7 +286,8 @@ def merge_settings(file_settings, args):
     try:
         return ml.resolve_settings(overrides)
     except ValueError as exc:
-        raise CliError("INVALID_INPUT", str(exc))
+        raise CliError("INVALID_INPUT", str(exc),
+                       "check setting types and values against `python research_cli.py schema`")
 
 
 def _prepare_output(target):

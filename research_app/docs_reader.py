@@ -36,15 +36,18 @@ def _fetch_catalog(session):
     for batch in ml._catalog_pages(session, _CATALOG, params={"limit": 50}):
         for section in batch:
             if not isinstance(section, dict):
-                raise CliError("SERVICE_ERROR", "BRAIN returned an invalid tutorial category")
+                raise CliError("SERVICE_ERROR", "BRAIN returned an invalid tutorial category",
+                               "retry with --refresh-meta or inspect `docs list` later")
             section_id = section.get("id")
             pages = section.get("pages")
             if not _valid_slug(section_id) or not isinstance(pages, list):
-                raise CliError("SERVICE_ERROR", "BRAIN returned an invalid tutorial category")
+                raise CliError("SERVICE_ERROR", "BRAIN returned an invalid tutorial category",
+                               "retry with --refresh-meta or inspect `docs list` later")
             linked_pages = []
             for page in pages:
                 if not isinstance(page, dict) or not _valid_slug(page.get("id")):
-                    raise CliError("SERVICE_ERROR", "BRAIN returned an invalid tutorial page")
+                    raise CliError("SERVICE_ERROR", "BRAIN returned an invalid tutorial page",
+                                   "retry with --refresh-meta")
                 linked_pages.append({**page, "url": _page_url(section_id, page["id"])})
             categories.append({**section, "pages": linked_pages})
     return {"categories": categories}
@@ -57,7 +60,8 @@ def _cached_catalog(args, read=None):
         try:
             return read(_fetch_catalog)
         except requests.RequestException as exc:
-            raise CliError("SERVICE_ERROR", "BRAIN tutorial catalog request failed") from exc
+            raise CliError("SERVICE_ERROR", "BRAIN tutorial catalog request failed",
+                           "check network connectivity and retry, or pass --offline if cached") from exc
 
     return read_cached(args, "brain-tutorial-catalog", {}, fetch)
 
@@ -66,7 +70,8 @@ def _query(query):
     if query is not None:
         query = query.strip()
         if not query:
-            raise CliError("INVALID_INPUT", "documentation query must not be empty")
+            raise CliError("INVALID_INPUT", "documentation query must not be empty",
+                           "pass a non-empty keyword, or omit --query to list all categories")
     return query
 
 
@@ -146,7 +151,8 @@ def cmd_docs_get(args, _sink):
         document = ml.request_json(session, "GET", endpoint)
         if (not isinstance(document, dict) or document.get("id") != slug
                 or not isinstance(document.get("content"), list)):
-            raise CliError("SERVICE_ERROR", "BRAIN returned an invalid tutorial document")
+            raise CliError("SERVICE_ERROR", "BRAIN returned an invalid tutorial document",
+                           "check the page ID with `docs list --summary` or retry with --refresh-meta")
         url = page["url"] if page is not None else _document_url(args, session, slug)
         return {**document, "url": url,
                 "api_url": ml.BRAIN_API_URL + endpoint}
@@ -155,7 +161,8 @@ def cmd_docs_get(args, _sink):
         try:
             return read(work)
         except requests.RequestException as exc:
-            raise CliError("SERVICE_ERROR", "BRAIN tutorial document request failed") from exc
+            raise CliError("SERVICE_ERROR", "BRAIN tutorial document request failed",
+                           "check network connectivity and retry, or pass --offline if cached") from exc
 
     document = read_cached(args, "brain-tutorial-page", {"slug": slug}, fetch)
     if page is not None and document.get("url") != page["url"]:

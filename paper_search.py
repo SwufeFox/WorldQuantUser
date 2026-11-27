@@ -501,6 +501,7 @@ def search_papers(query, limit=10, from_year=None, min_citations=None, timeout=3
 
 
 def main(argv=None):
+    """CLI entry point for querying OpenAlex and printing matching papers."""
     import argparse
     parser = argparse.ArgumentParser(description="Search OpenAlex for papers.")
     parser.add_argument("query")

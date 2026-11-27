@@ -210,9 +210,27 @@ def independence_report(registry_path=None, pnl_dir=None, threshold=0.7):
 
 
 def cmd_marginal(args, _sink):
-    return marginal_report(args.alpha_id, getattr(args, "registry", None))
+    """CLI handler for ``marginal``: compare theoretical vs actual book Sharpe change."""
+    from .runtime import CliError
+
+    try:
+        return marginal_report(args.alpha_id, getattr(args, "registry", None))
+    except ValueError as exc:
+        raise CliError(
+            "INVALID_INPUT", str(exc),
+            "ensure the alpha and book have cached daily PnL (run `ledger sync --pnl` or `alpha get ID`)",
+        ) from exc
 
 
 def cmd_independence(args, _sink):
-    return independence_report(getattr(args, "registry", None),
-                               threshold=getattr(args, "threshold", 0.7))
+    """CLI handler for ``independence``: calm vs stressed book correlation summary."""
+    from .runtime import CliError
+
+    try:
+        return independence_report(getattr(args, "registry", None),
+                                   threshold=getattr(args, "threshold", 0.7))
+    except ValueError as exc:
+        raise CliError(
+            "INVALID_INPUT", str(exc),
+            "warm cached daily PnL for ACTIVE book alphas with `ledger sync --pnl` first",
+        ) from exc

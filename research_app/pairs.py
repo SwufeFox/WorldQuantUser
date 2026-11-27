@@ -56,6 +56,9 @@ def _sharpe(matrix):
 
 
 def cmd_pairs(args, _sink):
+    """Screen non-book cached PnL pairs for equal-weight composites under the book gate."""
+    from .runtime import CliError
+
     directory = os.path.join(research_paths.ensure_dir(), "pnl")
     latest = _ledger(getattr(args, "registry", None))
 
@@ -79,7 +82,10 @@ def cmd_pairs(args, _sink):
     pool = [aid for aid in pool if aid in pool_series]
     book = [aid for aid in book if aid in book_series]
     if len(pool) < 2:
-        raise ValueError("fewer than two pool alphas have cached PnL")
+        raise CliError(
+            "INVALID_INPUT", "fewer than two pool alphas have cached PnL",
+            "adjust --min-leg-sharpe/--max-leg-sharpe or recover PnL via `probe --recover` / `ledger sync --pnl`",
+        )
 
     dates = set(pool_series[pool[0]])
     for values in pool_series.values():
@@ -88,7 +94,10 @@ def cmd_pairs(args, _sink):
         dates &= set(values)
     dates = sorted(dates)
     if len(dates) < 120:
-        raise ValueError("only %d shared days across the pool" % len(dates))
+        raise CliError(
+            "INVALID_INPUT", "only %d shared days across the pool" % len(dates),
+            "refresh missing PnL caches with `ledger sync --pnl` or inspect individual series",
+        )
 
     pool_matrix = np.array([[pool_series[a][d] for d in dates] for a in pool], dtype=float)
     book_matrix = np.array([[book_series[a][d] for d in dates] for a in book], dtype=float)

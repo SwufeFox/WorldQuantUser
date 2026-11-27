@@ -7,8 +7,7 @@
 
 批量研究沿一条主路径推进：`campaign preview` 检查规格，`campaign run` 调度和恢复，
 `ledger analyze` 复盘证据，`triage --freeze` / `promote --selection` 冻结并验证候选。
-操作步骤集中在 [批量回测与台账复盘](ledger-workflow.md)，吞吐量的测量口径见
-[快速回测方法论](fast-backtest.md)。下文是按需查询的命令参考。
+操作步骤集中在 [批量回测与台账复盘](ledger-workflow.md)，批量发布与队列诊断见 [研究队列发布与诊断](research-campaign-queue.md)，错误码、状态诊断与安全恢复见 [错误码与恢复指南](errors.md)，吞吐量的测量口径见 [快速回测方法论](fast-backtest.md)。AI Agent 可直接读取仓库内技能 [`.agents/skills/worldquant-research-cli/SKILL.md`](../.agents/skills/worldquant-research-cli/SKILL.md) 对齐工作链。下文是按需查询的命令参考。
 
 ```bash
 python3 research_cli.py brief                 # 当前状态、证据摘要和来源路径
@@ -650,8 +649,14 @@ Windows 使用系统字节锁，POSIX 使用 flock；进程退出后系统释放
 ### 字段挖掘：先看缺什么定义
 
 `catalog find` 的每条命中分别保留平台目录的 `coverage` 和 `dateCoverage`，后者在
-输出中为 `date_coverage`，缺失时为 `null`。先对照截面覆盖和日期覆盖，再决定是否
-需要查具体日期的数据。排序和 `--min-coverage` 仍使用 `coverage`。
+输出中为 `date_coverage`，缺失时为 `null`。若要枚举整个 `(region, universe, instrumentType, delay)`
+作用域内的全部数据集与字段并保留缺失/缓存状态，可直接用无过滤条件的全量盘点：
+
+```bash
+python3 research_cli.py catalog inventory --region KOR --universe TOP600 --stream --save kor-fields.json
+```
+
+先对照截面覆盖和日期覆盖，再决定是否需要查具体日期的数据。排序和 `--min-coverage` 仍使用 `coverage`。
 
 可以省略关键词，按报告的字段使用量、覆盖或类型筛选多个数据集。
 
@@ -1405,13 +1410,18 @@ python3 research_cli.py ledger sync --pnl
 ```bash
 python research_cli.py fmt DRAFT.json
 python research_cli.py campaign preview SPEC.json --multi-size 4
+python research_cli.py campaign publish PILOT.json --campaign-dir DIR --multi-size 10
+python research_cli.py campaign publish EXPANSION.json --campaign-dir DIR --multi-size 10 --phase expansion --pilot-batch PILOT-BATCH.json
 python research_cli.py campaign prepare-full QUICK-BATCH.json --out FULL-SPEC.json --limit 8
 python research_cli.py campaign status
+python research_cli.py campaign diagnose --campaign-dir DIR
 python research_cli.py campaign run --recover-only
 python research_cli.py campaign run --watch --batch-size 4 --multi-size 4 --stream
 python research_cli.py campaign run --watch --defer-quick-pnl
 python research_cli.py campaign recover-pnl --watch --stream
 ```
+
+批量 QUICK 试点（16 臂）或晋级扩展（`--phase expansion --pilot-batch`）使用 `campaign publish` 做严格字节预检、同账号三数据集准入和原子入队，并用 `campaign diagnose` 离线核对顶层队列、已保存检查点、失败原因（`backlog/failed/.reasons/`）与储备深度，详见 [研究队列发布与诊断](research-campaign-queue.md)。
 
 所有新 FASTEXPR 回测请求默认先经过 `fmt` 的语法树等价检查。`simulate --dry-run` 和 `campaign preview` 的 `payload.regular` 显示实际发送的源码。单条、原生 Multi、兼容 QUICK/FULL 入口都走同一规则。含注释或无法确认改写安全的表达式保留原文。Python 源码和 SPC prompt 保持各自的校验规则。
 

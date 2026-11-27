@@ -45,6 +45,7 @@ def sharpe_of(series):
 
 
 def correlation(a, b):
+    """Return Pearson correlation between two aligned numeric series."""
     return stats.correlation(a, b)
 
 
@@ -75,24 +76,33 @@ def cmd_legs(args, _sink):
     the legs' own Sharpe and the pairwise correlations, which is enough to see whether the
     arithmetic promises anything before spending a simulation on the composite.
     """
+    from .runtime import CliError
+
     legs = {}
-    for spec in args.leg:
+    for spec in args.leg or ():
         if ":" in spec:
             alpha_id, weight = spec.split(":", 1)
-            legs[alpha_id] = float(weight)
+            try:
+                legs[alpha_id] = float(weight)
+            except ValueError as exc:
+                raise CliError("INVALID_INPUT", "invalid leg weight in %r" % spec,
+                               "pass ID or ID:WEIGHT, e.g. --leg ABC123:0.5") from exc
         else:
             legs[spec] = 1.0
     if not legs:
-        raise ValueError("--leg is required, e.g. --leg ABC123:0.5")
+        raise CliError("USAGE", "--leg is required, e.g. --leg ABC123:0.5",
+                       "pass two or more --leg ALPHA_ID[:WEIGHT] arguments")
     total = sum(legs.values())
     if total <= 0:
-        raise ValueError("the weights sum to %s" % total)
+        raise CliError("INVALID_INPUT", "the weights sum to %s" % total,
+                       "pass positive leg weights")
     legs = {k: v / total for k, v in legs.items()}
 
     pnl_dir = os.path.join(research_paths.ensure_dir(), "pnl")
     dates, aligned, summed = combine(legs, pnl_dir)
     if not dates:
-        raise ValueError("no cached PnL overlaps; simulate the legs first")
+        raise CliError("INVALID_INPUT", "no cached PnL overlaps; simulate the legs first",
+                       "run `alpha corr` or `probe --recover` to fetch daily PnL into the cache")
 
     per_leg = {}
     insufficient = []
@@ -131,7 +141,13 @@ def cmd_legs(args, _sink):
 
     composite = getattr(args, "composite", None)
     if composite and getattr(args, "residual", False):
-        return residual_report(composite, legs, pnl_dir)
+        try:
+            return residual_report(composite, legs, pnl_dir)
+        except ValueError as exc:
+            raise CliError(
+                "INVALID_INPUT", str(exc),
+                "ensure the composite and every leg have cached daily PnL over the same window",
+            ) from exc
     if composite:
         actual_series = load_pnl(composite, pnl_dir)
         actual = None

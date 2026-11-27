@@ -656,6 +656,8 @@ class Kind:
 
 @dataclass
 class Corpus:
+    """Grouped FASTEXPR corpus indexed by points, normalized units and assembly kinds."""
+
     points: list
     units: dict
     kinds: dict

@@ -179,6 +179,7 @@ def _checks_summary(checks):
 
 
 def seeds_path(args=None):
+    """Resolve the validated submission-seed metadata store path."""
     explicit = getattr(args, "seeds", None) if args is not None else None
     if explicit:
         return Path(explicit).expanduser()
@@ -243,11 +244,13 @@ def _seed_paths(args, *, selection_path=None):
         protected["selection"] = Path(selected).expanduser().resolve()
     protect_output(args, shelf, seeds, *protected.values())
     if shelf == seeds:
-        raise CliError("INVALID_INPUT", "--buffer and --seeds must use distinct paths")
+        raise CliError("INVALID_INPUT", "--buffer and --seeds must use distinct paths",
+                       "pass separate file paths for --buffer and --seeds")
     for name, target in (("buffer", shelf), ("seeds", seeds)):
         for kind, source in protected.items():
             if target == source:
-                raise CliError("INVALID_INPUT", "--%s would overwrite the %s" % (name, kind))
+                raise CliError("INVALID_INPUT", "--%s would overwrite the %s" % (name, kind),
+                               "choose a path distinct from the %s" % kind)
     return shelf, seeds
 
 
@@ -268,15 +271,18 @@ def submission_seed(args, current):
         raise CliError("INVALID_INPUT", "stored seed missing or invalid: " + ", ".join(problems),
                        "refresh it with buffer add and complete seed metadata")
     if current.get("id") not in (None, args.alpha_id):
-        raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested seed")
+        raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested seed",
+                       "verify the Alpha ID with `alpha get %s`" % args.alpha_id)
     if seed.get("expression") is not None and not isinstance(seed["expression"], str):
-        raise CliError("INVALID_INPUT", "stored seed expression must be text")
+        raise CliError("INVALID_INPUT", "stored seed expression must be text",
+                       "refresh the seed entry with `buffer add`")
     expression, live_description, _ops = ml.regular_expression(current)
     if seed.get("expression") and expression:
         import alpha_registry
         language = ml.alpha_language(current)
         if alpha_registry.expression_hash(seed["expression"], language) != alpha_registry.expression_hash(expression, language):
-            raise CliError("INVALID_INPUT", "stored seed expression differs from this Alpha ID")
+            raise CliError("INVALID_INPUT", "stored seed expression differs from this Alpha ID",
+                           "verify you are using the matching Alpha ID and seed store")
     if _normalized_description(seed.get("description")) != _normalized_description(live_description):
         raise CliError(
             "INVALID_INPUT",
@@ -285,10 +291,12 @@ def submission_seed(args, current):
         )
     saved_settings, observed_settings = seed.get("settings"), current.get("settings")
     if saved_settings is not None and not isinstance(saved_settings, dict):
-        raise CliError("INVALID_INPUT", "stored seed settings must be an object")
+        raise CliError("INVALID_INPUT", "stored seed settings must be an object",
+                       "refresh the seed entry with `buffer add`")
     if isinstance(saved_settings, dict) and isinstance(observed_settings, dict):
         if any(saved_settings[key] != observed_settings[key] for key in saved_settings.keys() & observed_settings.keys()):
-            raise CliError("INVALID_INPUT", "stored seed settings differ from this Alpha ID")
+            raise CliError("INVALID_INPUT", "stored seed settings differ from this Alpha ID",
+                           "verify you are using the matching Alpha ID and seed store")
     return seed
 
 
@@ -322,7 +330,8 @@ def cmd_buffer_add(args, _sink, *, checked=None):
     """Run the checks on a finished alpha and put it on the shelf without submitting."""
     from .alphas import _candidate_role, _reject_quick_simulation, _selection_id
     if not ml.valid_simulation_id(args.alpha_id):
-        raise CliError("INVALID_INPUT", "invalid Alpha ID")
+        raise CliError("INVALID_INPUT", "invalid Alpha ID",
+                       "pass a valid alphanumeric Alpha ID")
     role = _candidate_role(args)
     tags = parse_tags(getattr(args, "tags", None))
     args.tags = tags
@@ -337,7 +346,8 @@ def cmd_buffer_add(args, _sink, *, checked=None):
     def work(session):
         payload = ml.fetch_alpha_metrics(session, args.alpha_id)
         if payload.get("id") not in (None, args.alpha_id):
-            raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested seed")
+            raise CliError("SERVICE_ERROR", "platform Alpha identity differs from the requested seed",
+                           "verify the Alpha ID with `alpha get %s`" % args.alpha_id)
         if str(payload.get("status") or "").upper() in {"ACTIVE", "SUBMITTED"}:
             raise CliError("INVALID_INPUT", "submitted alphas cannot enter the shelf",
                            "use alpha submit --yes to repair their local records")
@@ -356,7 +366,8 @@ def cmd_buffer_add(args, _sink, *, checked=None):
         computed = checked if checked is not None else ml.fetch_alpha_checks(
             session, args.alpha_id, max_wait_seconds=60 if wait is None else wait)
         if computed.get("alpha_id") not in (None, args.alpha_id):
-            raise CliError("SERVICE_ERROR", "checks belong to a different Alpha ID")
+            raise CliError("SERVICE_ERROR", "checks belong to a different Alpha ID",
+                           "retry `alpha check %s`" % args.alpha_id)
         checks = normalize_checks(computed.get("checks"))
         split = ml.extract_split(payload) or {}
         train = split.get("train") or {}
@@ -572,7 +583,8 @@ def cmd_buffer_submit(args, _sink):
     """Use the same durable submit/reconciliation path as alpha submit."""
     from .alphas import submit_workflow
     if getattr(args, "max_wait", None) is not None and args.max_wait < 0:
-        raise CliError("USAGE", "--max-wait must be non-negative")
+        raise CliError("USAGE", "--max-wait must be non-negative",
+                       "pass 0 for read-only check without waiting, or a positive wait budget in seconds")
     entry = shelf_state(read_events(buffer_path(args))).get(args.alpha_id)
     if entry is None:
         raise CliError("INVALID_INPUT", "%s has no shelf history" % args.alpha_id,

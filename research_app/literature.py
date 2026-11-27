@@ -23,17 +23,22 @@ def cmd_paper(args, _sink):
         raise CliError("USAGE", "provide either a keyword query or --id ID",
                        'use paper "analyst revisions" or paper --id W2741809807')
     if query is not None and not query.strip():
-        raise CliError("INVALID_INPUT", "query must not be empty")
+        raise CliError("INVALID_INPUT", "query must not be empty",
+                       "pass non-empty search keywords or --id ID")
     if (relation or full_text) and identifier is None:
-        raise CliError("INVALID_INPUT", "--related and --full-text require --id")
+        raise CliError("INVALID_INPUT", "--related and --full-text require --id",
+                       "pass --id with an OpenAlex W ID or DOI")
     if relation and full_text:
-        raise CliError("INVALID_INPUT", "choose --related or --full-text for this invocation")
+        raise CliError("INVALID_INPUT", "choose --related or --full-text for this invocation",
+                       "run separate commands for citation graph expansion and full-text reading")
     if not full_text and (offset is not None or max_chars is not None):
-        raise CliError("INVALID_INPUT", "--offset and --max-chars apply only to --full-text")
+        raise CliError("INVALID_INPUT", "--offset and --max-chars apply only to --full-text",
+                       "add --full-text to read a character window of the extracted paper")
     if identifier is not None and not relation and any(
         getattr(args, name, None) is not None for name in ("from_year", "min_citations")
     ):
-        raise CliError("INVALID_INPUT", "year/citation filters apply to search or --related")
+        raise CliError("INVALID_INPUT", "year/citation filters apply to search or --related",
+                       "omit --from-year/--min-citations when looking up a single --id")
     try:
         if full_text:
             data = paper_search.read_content(identifier, timeout=timeout,
@@ -50,9 +55,11 @@ def cmd_paper(args, _sink):
     except paper_search.PaperError as exc:
         raise CliError(exc.code, str(exc), getattr(exc, "hint", None)) from None
     except json.JSONDecodeError:
-        raise CliError("SERVICE_ERROR", "OpenAlex returned invalid JSON") from None
+        raise CliError("SERVICE_ERROR", "OpenAlex returned invalid JSON",
+                       "retry the paper request shortly") from None
     except ValueError:
-        raise CliError("INVALID_INPUT", "invalid paper query, identifier or reading window") from None
+        raise CliError("INVALID_INPUT", "invalid paper query, identifier or reading window",
+                       "check --id (OpenAlex W ID or DOI), --offset (>=0), and --max-chars (<=100000)") from None
     except Exception as exc:
         raise CliError("SERVICE_ERROR", "Paper retrieval failed.",
                        "Check connectivity and the provider's current access requirements.",

@@ -52,12 +52,17 @@ def main(argv=None):
     code = EXIT_CODES["OK"]
     try:
         try:
-            # Read only common options first, so errors honour --save/--compact too.
+            # Read only common options first into a scratch namespace so errors honour
+            # --save/--compact without shadowing the main parser's `_parser` default.
             common = JsonArgumentParser(prog="research_cli.py", add_help=False, common=False)
             _add_common_args(common)
             for name in runtime._PROTECTED_OUTPUT_ARGS:
                 common.add_argument("--" + name.replace("_", "-"), default=argparse.SUPPRESS)
-            common.parse_known_args(arguments, namespace=options)
+            common_options = argparse.Namespace(save=None, compact=False, quiet=False, research_dir=None)
+            common.parse_known_args(arguments, namespace=common_options)
+            for key in ("save", "compact", "quiet", "research_dir", *runtime._PROTECTED_OUTPUT_ARGS):
+                if hasattr(common_options, key):
+                    setattr(options, key, getattr(common_options, key))
             runtime._QUIET = options.quiet
             if options.research_dir is not None:
                 os.environ[research_paths.ENV_VAR] = str(Path(options.research_dir).expanduser().resolve())

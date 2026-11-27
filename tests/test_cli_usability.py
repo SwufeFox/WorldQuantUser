@@ -113,3 +113,96 @@ def test_seed_rationale_rejects_plain_prose_even_when_long_enough():
     problems = buffer_cmd.validate_seed("Seed", "SENTIMENT", ["signal"], "x" * 100)
     assert len(problems) == 1
     assert "official Power Pool template" in problems[0]
+
+
+def _invoke_cli_in_process(monkeypatch, tmp_path, argv):
+    from io import StringIO
+    from research_app import app
+
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path / "research"))
+    buf = StringIO()
+    monkeypatch.setattr("sys.stdout", buf)
+    code = app.main(argv)
+    return code, json.loads(buf.getvalue())
+
+
+def test_bare_cli_invocation_returns_top_level_help(monkeypatch, tmp_path):
+    code, payload = _invoke_cli_in_process(monkeypatch, tmp_path, [])
+    assert code == 0
+    assert payload["ok"] is True
+    assert payload["command"] == "help"
+    assert "commands" in payload["data"]
+    assert "campaign" in payload["data"]["commands"]
+    assert "schema" in payload["data"]["commands"]
+
+
+@pytest.mark.parametrize("argv", (
+    ["pairs"],
+    ["legs"],
+    ["benchmark"],
+    ["marginal", "--target", "close"],
+    ["independence", "--target", "close", "--against", "open"],
+    ["prune", "--set", "unknown_key=1"],
+))
+def test_validation_commands_emit_structured_errors_with_hints(monkeypatch, tmp_path, argv):
+    code, payload = _invoke_cli_in_process(monkeypatch, tmp_path, argv)
+    assert code == 2
+    assert payload["ok"] is False
+    error = payload["error"]
+    assert error["code"] in {"INVALID_INPUT", "USAGE"}
+    assert error["hint"]
+    assert isinstance(error["hint"], str) and error["hint"].strip()
+
+
+def test_every_cli_error_and_actionable_brain_error_provides_a_hint():
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    missing = []
+    for path in sorted((root / "research_app").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "CliError":
+                if len(node.args) < 3 and not any(kw.arg == "hint" for kw in node.keywords):
+                    missing.append((path.name, node.lineno))
+    assert missing == []
+
+    for err in (
+        ml.MissingCredentials("missing"),
+        ml.AuthError("rejected"),
+        ml.RateLimited("slow down"),
+        ml.SimulationError("failed"),
+        ml.ReadInterrupted("interrupted"),
+        ml.AuthenticationUnavailable("unavailable"),
+        ml.AuthenticationDeadline("deadline"),
+        ml.PermissionDenied("denied"),
+    ):
+        assert err.hint and err.hint.strip()
+    assert ml.NotFound("unknown").hint is None
+    assert ml.ServiceError("bad gateway").hint is None
+
+
+def test_workspace_skill_and_docs_links_resolve():
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    skill = root / ".agents" / "skills" / "worldquant-research-cli" / "SKILL.md"
+    assert skill.is_file()
+    skill_text = skill.read_text(encoding="utf-8")
+    assert skill_text.startswith("---\nname: worldquant-research-cli\ndescription:")
+    assert "docs/errors.md" in skill_text
+
+    doc_files = [skill, root / "README.md", root / "AGENTS.md", *sorted((root / "docs").glob("*.md"))]
+    link_re = re.compile(r"\[[^\]]+\]\(([^)#]+)(?:#[^)]+)?\)")
+    broken = []
+    for doc in doc_files:
+        text = doc.read_text(encoding="utf-8")
+        for target in link_re.findall(text):
+            if target.startswith(("http://", "https://", "mailto:")):
+                continue
+            resolved = (doc.parent / target).resolve()
+            if not resolved.exists():
+                broken.append((str(doc.relative_to(root)), target))
+    assert broken == []
