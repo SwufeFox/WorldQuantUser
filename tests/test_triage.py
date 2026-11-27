@@ -174,19 +174,21 @@ class TriageEvidenceBoundaryTests(unittest.TestCase):
         from pathlib import Path
 
         root = Path(__file__).resolve().parent.parent
-        command = [sys.executable, str(root / "research_cli.py"), "triage", "--ids", "C1",
+        batch_path = self.root / "batch.json"
+        batch_path.write_text(json.dumps([self.rows[-1]]), encoding="utf-8")
+        command = [sys.executable, str(root / "research_cli.py"), "compare", str(batch_path),
                    "--research-dir", str(self.root)]
         frozen_path = self.root / "cli-selection.json"
         selected = subprocess.run(command + ["--freeze", str(frozen_path)], capture_output=True, encoding="utf-8")
         self.assertEqual(selected.returncode, 0, selected.stdout + selected.stderr)
         self.assertFalse((self.root / "views.jsonl").exists())
-        validated = subprocess.run(command + ["--show-test", "--selection", str(frozen_path)], capture_output=True, encoding="utf-8")
+        validated = subprocess.run(command + ["--frozen", "--selection", str(frozen_path)], capture_output=True, encoding="utf-8")
         self.assertEqual(validated.returncode, 0, validated.stdout + validated.stderr)
         self.assertIn("test_sharpe", json.loads(validated.stdout)["data"]["rows"][0])
         logged = [json.loads(line) for line in (self.root / "views.jsonl").read_text(
             encoding="utf-8").splitlines()]
         self.assertEqual([(item["tool"], item["view"], item["alpha_ids"]) for item in logged],
-                         [("triage", "test", ["C1"])])
+                         [("compare", "frozen", ["C1"])])
         self.assertEqual(logged[0]["note"]["selection_id"], json.loads(validated.stdout)["data"]["selection_id"])
 
     def test_validation_requires_selection_and_rejects_input_scope_conflicts(self):

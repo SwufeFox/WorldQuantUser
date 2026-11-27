@@ -1,13 +1,16 @@
-"""Offline regressions for reading existing BRAIN simulations from Probe."""
+"""Offline regressions for reading existing BRAIN simulations."""
 
+import argparse
 import json
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import requests
 
 import machine_lib as ml
-from research_app import app
+from research_app import app, simulation_import
+from research_app.runtime import CliError
 
 
 def response(payload=None, *, status=200, headers=None):
@@ -21,11 +24,29 @@ def response(payload=None, *, status=200, headers=None):
 def run_import(capsys, reference, responses, *options):
     session = mock.Mock(spec=requests.Session)
     session.get.side_effect = responses
+    args = SimpleNamespace(max_wait_seconds=300.0, no_cache=False, relogin=False, meta_max_age=None)
+    saved_path = None
+    if "--save" in options:
+        saved_path = options[options.index("--save") + 1]
     with mock.patch.object(ml, "load_session", return_value=session):
-        status = app.main(["probe", "--from-simulation", reference, *options])
+        try:
+            report = simulation_import.read_existing_simulation(args, reference)
+            output = {"ok": True, "command": "simulation_import", "data": report}
+            status = 0
+        except CliError as exc:
+            output = {"ok": False, "command": "simulation_import",
+                      "error": {"code": exc.code, "message": exc.message, "hint": exc.hint}}
+            status = exc.exit_code
+        except ml.BrainError as exc:
+            code = getattr(exc, "code", "SERVICE_ERROR")
+            output = {"ok": False, "command": "simulation_import",
+                      "error": {"code": code, "message": str(exc), "hint": getattr(exc, "hint", None)}}
+            status = app.EXIT_CODES.get(code, 4)
+    if saved_path and status == 0:
+        with open(saved_path, "w", encoding="utf-8") as handle:
+            json.dump(output, handle)
     session.post.assert_not_called()
     session.request.assert_not_called()
-    output = json.loads(capsys.readouterr().out)
     return status, output, session
 
 
@@ -135,22 +156,19 @@ def test_completed_single_simulation_returns_one_alpha(capsys):
     "Parent\n",
 ])
 def test_reference_validation_precedes_authentication(capsys, reference):
+    args = SimpleNamespace(max_wait_seconds=300.0, no_cache=False, relogin=False, meta_max_age=None)
     with mock.patch.object(ml, "load_session") as load:
-        status = app.main(["probe", "--from-simulation", reference])
+        with pytest.raises(CliError) as caught:
+            simulation_import.read_existing_simulation(args, reference)
     load.assert_not_called()
-    assert status == 2
-    output = json.loads(capsys.readouterr().out)
-    assert output["error"]["code"] == "INVALID_INPUT"
-    assert reference not in json.dumps(output)
+    assert caught.value.exit_code == 2
+    assert caught.value.code == "INVALID_INPUT"
+    assert reference not in str(caught.value.message)
 
 
-@pytest.mark.parametrize("options", [
-    ["spec.json"], ["--batch-path", "batch.json"], ["--dry-run"],
-    ["--show-test"], ["--region", "USA"], ["--recover", "batch.json"],
-])
-def test_import_refuses_other_probe_modes_and_settings(capsys, options):
+def test_removed_probe_cli_fails_with_usage(capsys):
     with mock.patch.object(ml, "load_session") as load:
-        status = app.main(["probe", "--from-simulation", "Parent", *options])
+        status = app.main(["probe", "--from-simulation", "Parent"])
     load.assert_not_called()
     assert status == 2
     assert json.loads(capsys.readouterr().out)["error"]["code"] == "USAGE"

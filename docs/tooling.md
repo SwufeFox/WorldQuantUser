@@ -5,49 +5,36 @@
 
 ## 先从统一 CLI 进入
 
-批量研究沿一条主路径推进：`campaign preview` 检查规格，`campaign run` 调度和恢复，
-`ledger analyze` 复盘证据，`triage --freeze` / `promote --selection` 冻结并验证候选。
-操作步骤集中在 [批量回测与台账复盘](ledger-workflow.md)，批量发布与队列诊断见 [研究队列发布与诊断](research-campaign-queue.md)，错误码、状态诊断与安全恢复见 [错误码与恢复指南](errors.md)，吞吐量的测量口径见 [快速回测方法论](fast-backtest.md)。AI Agent 可直接读取仓库内技能 [`.agents/skills/worldquant-research-cli/SKILL.md`](../.agents/skills/worldquant-research-cli/SKILL.md) 对齐工作链。下文是按需查询的命令参考。
+研究工作沿单一状态机主路径推进：`daemon start` 启动单写入者后台进程，`propose` 提交非阻塞实验规格，`wait` / `inbox` 接收门禁事件，`inspect` 在冻结前仅看训练期证据，`act` 在四个交互门禁推进或丢弃，`ledger analyze` 复盘台账，`shelf` 规划候选提交。
+操作步骤集中在 [状态机实验流程与台账复盘](ledger-workflow.md)，错误码、状态诊断与安全恢复见 [错误码与恢复指南](errors.md)，吞吐量的测量口径见 [快速回测方法论](fast-backtest.md)。AI Agent 可直接读取仓库内技能 [`.agents/skills/worldquant-research-cli/SKILL.md`](../.agents/skills/worldquant-research-cli/SKILL.md) 对齐工作链。下文是按需查询的命令参考。
 
 ```bash
-python3 research_cli.py brief                 # 当前状态、证据摘要和来源路径
-python3 research_cli.py help                  # 不熟悉命令时才读导航
-python3 research_cli.py help catalog fields   # 具体任务的参数和例子
-python3 research_cli.py schema alpha get      # 单个命令的机器契约
+python3 research_cli.py brief                 # 当前状态、待审 GATE_* 与活跃 AUTO_* 计数
+python3 research_cli.py help                  # 命令总览
+python3 research_cli.py help catalog fields   # 具体命令的参数与示例
+python3 research_cli.py schema propose        # 单个命令的机器契约
 ```
 
-常用简写直接减少样板参数：
-- **账户与竞赛**：`auth profile --consultant`（读取 `/users/self` 与顾问/Pyramid 端面）、`auth competitions [--all | --id ID]`、`auth logout --remote`（同时发送 `DELETE /authentication` 吊销服务端会话）。
+常用工作命令与简写：
+- **常驻守护与状态机**：`daemon start|status|config|stop`、`propose SPEC.json`、`inbox [--gate GATE_*]`、`runs [--state ...]`、`inspect RUN_ID [--arm LABEL]`、`act RUN_ID ACTION`、`wait [--run-id ID] [--max-wait 30]`、`cancel RUN_ID`、`breed SOURCE --out SPEC --seed N --limit K`、`migrate-workspace [--dry-run]`、`shelf list|plan`。
+- **账户与竞赛**：`auth profile --consultant`（读取 `/users/self` 与顾问/Pyramid 端面）、`auth competitions [--all | --id ID]`、`auth logout --remote`（发送 `DELETE /authentication` 吊销服务端会话）。
 - **目录直查**：`catalog fields fundamental6`（位置参数直传数据集）、`catalog dataset DATASET_ID`、`catalog field FIELD_ID`（单次请求返回字段元数据与可直接粘贴的 FASTEXPR 包装）。
-- **模拟与取消**：`simulate "rank(close)" --quick --dry-run`（位置参数直传单条表达式，`--quick` / `--full` 快捷切换 `simulationMode`，`probe` 同样支持）、`alpha cancel-sim SIM_ID`（调用 `DELETE /simulations/{id}`，收到终态回执后释放本地共享槽位）。
-- **筛选与相关性**：`triage BATCH.json` 或 `triage A1 A2`、`alpha near "rank(close)"`、`alpha get ID --correlations`、`alpha prod-corr ID --save-archive pc.json`、`alpha pp-corr ID`。
-- **一站式就绪检查与描述生成**：`alpha readiness ID [--track POWER_POOL] [--idea "..." --apply-description]` 自动拉取实时检查、字段/算子目录释义、核验 Power Pool 预算并合成官方三段式描述；标题逐字为 `Idea:`、`Rationale for data used:`、`Rationale for operators used:`，每段后跟 `-` 列表。
+- **静态检查与格式化**：`lint`、`fmt`、`ablate`。
+- **平台 Alpha 与相关性**：`alpha get ID --correlations`、`alpha near "rank(close)"`、`alpha prod-corr ID --save-archive pc.json`、`alpha pp-corr ID`。
 - **Python 调用门面**：脚本或 Notebook 直接使用 `with machine_lib.BrainClient() as brain:`，按需加载缓存会话并在遇到过期 401 时自动重登一次。
 
-常用路径是 `catalog` 找数据、`lint` 检查表达式、`simulate` / `probe`
-先 `--dry-run` 再运行、`compare` 看结果。平台 alpha 读写在 `alpha`；本地台账
-统一在 `ledger`：`list`、`record`、`label`、`coverage`、`impact`、`lineage`。
+常用路径是 `catalog` 找数据、`lint` 检查表达式、`propose` 提交状态机、`wait` / `inbox` / `inspect` / `act` 推进、用 `compare` 和 `ledger analyze` 复盘证据。平台 alpha 读写在 `alpha`；本地台账统一在 `ledger`：`list`、`record`、`label`、`coverage`、`impact`、`lineage`。
 `ledger list` 同时支持标签、字段、机制和指标筛选。
 
 所有 CLI 命令共用 `--save PATH`、`--compact`、`--quiet`、`--research-dir PATH`，
 参数放在哪一级都有效。`--save` 原子保存与 stdout 完全相同的 JSON envelope，
-也保存结构化错误；写入路径在执行命令前检查。下表的辅助工具继续使用自己的
-`--json` 报告接口。
+也保存结构化错误，但会拦截写入 `runs/`、`daemon/`、`alpha-registry.jsonl`、`submit-buffer.jsonl` 和 `seeds.jsonl`。
 
-`lint` / `simulate` 共用可重复的 `--file`、`--expr`；后文件覆盖前文件设置，
-CLI 参数最后覆盖，每条表达式的 decay 单独保留。需要文件的命令用 `-`
-读取 stdin，每次调用只能读一次。`probe` 同样接受模拟设置和会话参数。
-
-JSON `settings` 也接受 `test_period`、`nan_handling`、`instrument_type` 等已知键的
-CLI 拼法；预览、缓存指纹和发出的载荷统一使用 `testPeriod`、`nanHandling`、
-`instrumentType`。先逐层归一，再按 CLI、arm、文件、默认值的顺序覆盖；同一对象
-里两种拼法给出不同的明确值才报错。未知的平台扩展键保持原样透传。
-
-实现位置也按用途固定：参数、帮助和 schema 在 `research_app/parser.py`；
-执行边界在 `app.py`，公共 CLI 约定在 `runtime.py`。目录查询、表达式检查、
-实验、平台 alpha、本地台账分别在 `catalog.py`、`validation.py`、
-`experiments.py`、`alphas.py`、`ledger.py`。账户与缓存、研究摘要与查看记录、
-文献检索分别在 `account.py`、`campaign.py`、`literature.py`。
+实现位置按职责固定：参数、帮助和 schema 在 `research_app/parser.py`；
+执行边界在 `app.py`，公共 CLI 约定在 `runtime.py`。状态机与常驻守护在
+`state_machine.py`、`sm_workers.py`、`daemon.py`、`brief.py`。目录查询、
+表达式检查、实验对比、平台 alpha、本地台账分别在 `catalog.py`、`validation.py`、
+`experiments.py`、`alphas.py`、`ledger.py`。账户与缓存、文献检索在 `account.py`、`literature.py`。
 这些是内部模块，入口仍是 `research_cli.py`；改命令时直接修改、测试所属模块。
 
 检查状态由 `check_evidence.py` 统一归一和汇总；台账写入、历史回放共用
@@ -1401,135 +1388,39 @@ python3 research_cli.py ledger sync --pnl
 * 仓库（`/data/src/magix/WorldQuantUser`）放**工具**：任何能把函数跑两次的东西。
 * 研究目录（`/data/worldquant-research`）放**结果**：台账、缓存、一次性脚本、报告。一次性脚本不进 git。
 
-## 长程研究队列
+## 常驻状态机队列（v4）
 
-队列状态、检查点路径和 QUICK 分析的串联用法见[批量回测与台账复盘](ledger-workflow.md)。
-
-把待研究的规格放入研究目录的 `backlog/`。先预览输入，再推进队列。已受理的任务、已确认未开始的臂、结果不明的请求都由 Probe 检查点记录。
+完整状态转换图、Train/Test 隔离保证、Power Pool 元数据模板与迁移细则见 [状态机实验流程与台账复盘](ledger-workflow.md)。
 
 ```bash
-python research_cli.py fmt DRAFT.json
-python research_cli.py campaign preview SPEC.json --multi-size 4
-python research_cli.py campaign publish PILOT.json --campaign-dir DIR --multi-size 10
-python research_cli.py campaign publish EXPANSION.json --campaign-dir DIR --multi-size 10 --phase expansion --pilot-batch PILOT-BATCH.json
-python research_cli.py campaign prepare-full QUICK-BATCH.json --out FULL-SPEC.json --limit 8
-python research_cli.py campaign status
-python research_cli.py campaign diagnose --campaign-dir DIR
-python research_cli.py campaign run --recover-only
-python research_cli.py campaign run --watch --batch-size 4 --multi-size 4 --stream
-python research_cli.py campaign run --watch --defer-quick-pnl
-python research_cli.py campaign recover-pnl --watch --stream
+python research_cli.py daemon start
+python research_cli.py daemon config --quota-floor 20 --concurrency 8 --multi-size 10
+python research_cli.py propose SPEC.json
+python research_cli.py wait --max-wait 30
+python research_cli.py inbox
+python research_cli.py inspect RUN_ID
+python research_cli.py act RUN_ID hydrate-pnl --top 3
+python research_cli.py act RUN_ID approve-full
+python research_cli.py act RUN_ID describe --name "..." --category ANALYST --tags t1 --description "..."
+python research_cli.py act RUN_ID hold
+python research_cli.py act RUN_ID submit --yes
+python research_cli.py breed runs/PARENT.json --out offspring.spec.json --seed 17 --limit 4
+python research_cli.py shelf list
+python research_cli.py shelf plan
+python research_cli.py migrate-workspace --dry-run
 ```
 
-批量 QUICK 试点（16 臂）或晋级扩展（`--phase expansion --pilot-batch`）使用 `campaign publish` 做严格字节预检、同账号三数据集准入和原子入队，并用 `campaign diagnose` 离线核对顶层队列、已保存检查点、失败原因（`backlog/failed/.reasons/`）与储备深度，详见 [研究队列发布与诊断](research-campaign-queue.md)。
+- **离线预检与指纹去重**：`propose` 在本地解析 FASTEXPR AST 或 Python `@alpha(data=[...])`、验证 `idea` 与设置键，并拦截与活跃运行完全一致的 `request_fingerprint`。
+- **后台配额与熔断**：`AUTO_PREFLIGHT` 连续 3 次无进展且无 `Retry-After` 时自动切至 `GATE_PREFLIGHT_BLOCKED`；`AUTO_QUICK_SIM` 遵循 `quota_floor`，而 `AUTO_FULL_VALIDATE` 仅在平台配额完全耗尽（`blocked=true`）时暂停，并在校验通过后计算 5 / 10 / 20 bps 成本审计。
+- **繁殖 (`breed`)**：从已完成运行 ID 或批次文件中的训练 Fitness 与随机种子各配对生成一个后代规格，保留来源谱系 `breeding_source`，可直接交给 `propose`。
+- **孤儿槽位回收**：Daemon 按 `reconcile_interval_seconds` 周期性扫盘释放已完成槽位并把漏收结果补录进 `alpha-registry.jsonl`。
 
-所有新 FASTEXPR 回测请求默认先经过 `fmt` 的语法树等价检查。`simulate --dry-run` 和 `campaign preview` 的 `payload.regular` 显示实际发送的源码。单条、原生 Multi、兼容 QUICK/FULL 入口都走同一规则。含注释或无法确认改写安全的表达式保留原文。Python 源码和 SPC prompt 保持各自的校验规则。
-
-单独运行 `fmt` 可以审阅排版。在入队前使用 `--write` 才会改写草稿。检查点保留原始规格身份，已受理的任务按原请求回收。历史生成脚本可以用 `alpha_sugar.fs()` 生成原生表达式，正式规格保留展开后的源码。
-
-Campaign 开跑前复用 Probe 的离线扫描，确定的语法错误在联网前拦截，字段和设置仍由账号范围内的在线预检核对。`batch_quick.py` 和 `pipeline_pc.py` 仍是兼容入口。
-
-`prepare-full` 仅读取已保存的 QUICK 训练证据。它按训练 Sharpe 排序，生成带原始 Alpha ID、批次和训练分数的 FULL 草稿。`--limit` 是 FULL 臂的总数上限，对照实验的原对照计入上限。预览并确认草稿后再放入 `backlog/`。生成草稿在本地完成。
-
-ASI 候选经过同样本对照、训练稳健性和成本筛选后，用 `prepare-full` 生成草稿。它会为 ASI 的 FULL 臂启用 `visualization`，方便使用 `alpha get ID --recordsets` 查询国家分项。先读正式日本与稳健宇宙检查，再用国家图表归因。通过硬检查的候选才进入会请求平台相关性的验证流程。
-
-| 规格 | 研究证据 |
+| 路线 | 说明 |
 | --- | --- |
-| `track: REGULAR`，也可省略 | Probe 保存请求与训练对照。符合训练门的 FULL 候选冻结选择。 |
-| `track: POWER_POOL` 或 `track: ATOM` | 共用 Probe 请求、回测和训练证据。平台分类与资格以实时检查为准。 |
-| `settings.language: PYTHON` | 可与上述模拟研究路线组合。用 `lookback`、内联源码或相对规格的 `source_file`。预检只解析源码。 |
-| `track: SPC` | 用 SPC 规格加 `runs` 文件列表和可选 `reference`。文件路径相对规格，比较已有输出，保留哈希与逐次对照。 |
-
-研究路线记录在回执和批次中。原生请求类型、语言和 QUICK/FULL 设置仍按各自的平台协议处理。
-平台原始分类随结果保存，可用 `alpha get` 或冻结后的验证视图核对。
-
-```bash
-python3 research_cli.py campaign breed parent-batch.json --out offspring.spec.json --seed 17 --limit 4
-python3 research_cli.py probe offspring.spec.json --dry-run --strict-gate
-```
-
-`campaign breed` 从已保存的 FastExpr 批次离线生成下一代。每组使用同一机制、设置和已记录训练窗口，
-从拥有新子代的同一父代池中比较训练 Fitness 最高的父代和按种子抽出的父代。
-两边各取一个子代，复用 `alpha_unit` 的单槽替换和兼容信号腿交叉。相同子代在一组只模拟一次，
-两种策略共享结果。文件保存候选父代、训练指标、抽签种子、父代与供体 ID、操作和子代标签。
-已完成的同设置 AST 及本次重复子代会去重。至少有一对不同子代时写出规格。
-
-输出沿用父代的模拟模式，使用不同文件名保存后续世代。父代选择只读取训练指标。
-产生的规格可交给普通 Probe，后续验证继续使用冻结选择。档案回放可检查谱系和预检，
-比较父代选择的收益需要测量两组实际子代。
-
-`run` 默认推进一份当前可运行的规格，返回 JSON 的 `data.state`。需要长期运行时用 `--watch`。有其他规格可运行时，已受理批次的恢复可以先用短轮次；若仍待处理且没有下次轮询时间，下轮用完整等待预算。首次启动沿用命令设置的等待预算。同一队列有相同请求尚待平台核对时，后来的规格等待原检查点。队列先处理可回收的检查点。剩余任务均已受理且尚未到轮询时间时，该批次让出本轮。原生 Multi 使用已登记槽位的父任务轮询时间，`status` 显示这些批次的 `next_poll_at`。同一队列只有一个写入者，Probe 按共享槽位和账号能力执行并发。同一账号和研究目录共用平台的模拟 POST 退避时间，退避期间仍可回收已受理任务。新的 Probe 会推迟相关字段预检，等退避期过后再发起。
-
-批量 QUICK 初筛可用 `run --watch --defer-quick-pnl`，让队列在保存训练汇总后继续推进。
-`campaign status` 的 `archived_quick_pnl` 显示已归档批次还欠的日收益。归档进度按文件版本缓存，热查询检查版本并只重读有变化的检查点。
-`campaign recover-pnl` 从原检查点补读，每轮用 `--limit` 控制批次数。
-大规模初筛时，分析报告先用汇总指标筛出 Alpha ID，再用
-`probe --recover BATCH.json --pnl-alpha-id ID` 补读候选的日收益。
-加 `--watch` 后持续补读。补读复用 `probe --recover`，会写回原批次；先交接该批次的写入权，
-不要与另一个 runner 同时推进同一检查点。
-
-先用 `--recover-only` 回收已有检查点。需要验证 FULL Regular 候选时启用 `--validate`，或对保存的训练冻结选择单独运行 `promote --selection`。
-`--validate` 没有候选入库说明时停在 `metadata_required`，保留冻结选择、验证回执和补填动作；补齐四项元数据后使用同一 `promote --selection` 完成入库。
-已冻结的选择和终态验证回执可以复用。QUICK、Power Pool 与 ATOM 保留各自研究证据，SPC 结果在本地完成。Alpha 和 SPC 的平台提交仍走各自授权入口。
-
-### 兼容入口
-
-| 工具 | 职责 |
-| --- | --- |
-| `tools/sim_queue.py` | 消费 `queue/` 中的 Probe spec，保存批次与回执 |
-| `tools/campaign_runner.py` | 使用同一 `backlog/` 队列，按旧入口的默认行为冻结并验证 FULL Regular 候选 |
-| `tools/atom_runner.py` | 把 `label / expr / settings` 列表交给 `probe`，用可恢复批次保存进度，把全 IS 指标和 checks 写成 `atom-results.jsonl` |
-| `tools/atom_screen.py` | 从 ATOM 账本按平台子宇宙检查初筛，同一 Alpha 分数相同时采用最新记录 |
-| `tools/spc_client.py` | SPC 表单、提交列表、样例校验和离线输出对比 |
-
-队列与 ATOM 共用 `probe` 的预检与调度。研究目录的优先级依次为 `--research-dir`、
-`BRAIN_RESEARCH_DIR`、兼容的 `WQ_RESEARCH_DIR`、CLI 默认目录。
-两个队列都接受 `--root` 作为 `--research-dir` 的别名。
-
-```bash
-python3 tools/sim_queue.py --research-dir RESEARCH_DIR --once
-python3 tools/campaign_runner.py --research-dir RESEARCH_DIR --once
-python3 tools/atom_runner.py arms.json --research-dir RESEARCH_DIR --dry-run
-python3 tools/atom_runner.py --recover BATCH --research-dir RESEARCH_DIR
-python3 tools/atom_runner.py --resume BATCH --research-dir RESEARCH_DIR
-python3 tools/atom_screen.py --research-dir RESEARCH_DIR
-```
-
-把 `.json` Probe spec 放到所选队列的入口目录。下面的路径都相对于研究目录，`NAME` 是
-spec 去掉扩展名后的文件名。
-
-| 队列 | 入口 | 批次 | CLI 回执 | 日志 |
-| --- | --- | --- | --- | --- |
-| Simulation queue | `queue/NAME.json` | `queue/batches/NAME-batch.json` | `NAME-result.json` | `queue/queue.log` |
-| Campaign | `backlog/NAME.json` | `backlog-results/NAME-batch.json` | `backlog-results/NAME-result.json` | `campaign-log.jsonl` |
-
-两个队列的 `--once` 每次最多处理一份 spec。Campaign 优先处理到期的检查点，再处理未开始的规格。省略该选项时，worker 会持续轮询。
-已知终态才归档到对应的 `done/` 或 `failed/`。需要补证据、重新轮询或只读恢复时，原 spec
-保留在入口目录。恢复前核对源码与设置指纹以及实验角色，旧批次指向多个可能结果时要求显式恢复。
-归档会移动 spec。回读已发出的请求时，使用保存了完整源码的批次文件。
-
-| `--once` 退出码 | 含义 |
-| --- | --- |
-| 0 | 队列为空或本次完成 |
-| 1 | 本次终态失败 |
-| 3 | 仍待恢复、训练证据待补，或已有另一个 worker |
-
-Campaign 先过滤诊断臂，再按下表筛选候选。`triage` 在同一训练窗核对组合边际与候选架去重。
-通过后把冻结选择交给 `promote --selection`。测试期读取、实时自相关和候选入架都发生在此之后。
-
-| 步骤 | 当前条件 |
-| --- | --- |
-| 训练指标初筛 | Sharpe ≥ 1.25，Fitness ≥ 1.0，训练期前后两半的 Sharpe 均大于 0 |
-| `triage` 冻结 | 训练边际为正，未被组合判为重复，有完整测量证据，候选架最大绝对相关低于 0.70 |
-| `promote` 验证 | test Sharpe 为正，达到冻结的留存门槛，实时平台 checks 通过，实时自相关低于 0.70 |
-
-Campaign 的 `campaign-freeze-ALPHA_ID.json` 和 `promote-ALPHA_ID.json` 回执也放在 `backlog-results/`。
-
-ATOM 的默认批次路径在 `checkpoints/`，以臂清单内容生成名称。已有同名批次时使用
-`--recover` 或 `--resume`。`--recover` 回读已知任务，`--resume` 也可继续已知未提交的臂。
-`--dry-run` 可用于新扫描和续跑预览，跳过结果账本写入。
-`atom-results.jsonl` 保存带 `metrics_scope: full_is` 的指标、平台检查快照及 `pp_budget` 结构预算摘要，供子宇宙与 Power Pool 初筛。
-常规训练筛选使用训练期回执，提交资格仍需实时平台 checks。
+| `track: REGULAR`（默认） | QUICK 初筛 -> 逐年训练 PnL 补水 -> 冻结并运行 FULL / 成本审计 -> 入架与可选提交。 |
+| `track: POWER_POOL` | 共用状态机流程，并在 `AUTO_FULL_VALIDATE` 额外校核 8 算子 / 3 数据字段预算与 `< 0.5` 相关性门禁。 |
+| `settings.language: PYTHON` | 通过 `lookback` 与 `@alpha(data=[...])` 在 `propose` 阶段静态验证后进入统一状态机。 |
+| `track: SPC` | 由 `propose` 直接调用本地 SPC 预测对比并生成终态运行记录 `COMPLETED` / `FAILED`。 |
 
 ### 做 SPC 提示词实验
 

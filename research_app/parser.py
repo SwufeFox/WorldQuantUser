@@ -17,8 +17,7 @@ import research_config as config_io
 import research_paths
 import simulation_multi
 
-from .selection import DEFAULT_PROMOTION_RETENTION
-from .runtime import VERSION, EXIT_CODES, ERROR_CODES, METRIC_KEYS, CliError
+from .runtime import VERSION, EXIT_CODES, ERROR_CODES, CliError
 from .stats import MIN_PORTFOLIO_OVERLAP
 
 
@@ -484,89 +483,6 @@ def build_parser():
     _add_selection_args(bench_parser, freeze=False)
     _add_cost_args(bench_parser)
 
-    triage_parser = sub.add_parser(
-        "triage",
-        help="Train-only candidate screening; explicit test view after design freeze.",
-        description="Compare candidates or book members using train metrics, costs and PnL. "
-                    "Save a choice with --freeze; --show-test requires --selection and "
-                    "cannot change the frozen candidates or their order.")
-    triage_parser.add_argument("targets", nargs="*", metavar="ID_OR_BATCH",
-                               help="Positional alpha ids or a batch .json file (shorthand for --ids / --batch).")
-    triage_parser.add_argument("--batch", default=None, metavar="BATCH_JSON",
-                               help="Triage every alpha id in this batch file.")
-    triage_parser.add_argument("--ids", nargs="+", default=None, metavar="ID")
-    triage_parser.add_argument("--book", action="store_true",
-                               help="Score every book member instead of candidates "
-                                    "(this is what `health` did).")
-    triage_parser.add_argument("--internal", action="store_true",
-                               help="Report test-calibrated internal fitness; requires --show-test.")
-    triage_parser.add_argument("--show-test", action="store_true",
-                               help="Validate --selection using full-window and test evidence; logs the view.")
-    triage_parser.add_argument("--train-end", metavar="YYYY-MM-DD",
-                               help="Exclusive train end; cannot extend past recorded test starts. "
-                                    "Default: earliest recorded test start, else 2023-01-01. "
-                                    "Shelf screening requires known test starts for the compared alphas.")
-    triage_parser.add_argument("--min-delta", type=float, default=None, dest="min_delta",
-                               help="Minimum train delta; validation retains the frozen criterion.")
-    triage_parser.add_argument("--retention-floor", type=float, default=None,
-                               dest="retention_floor",
-                               help="Validation test/train floor; retained in the frozen choice.")
-    triage_parser.add_argument("--registry", default=None)
-    triage_parser.add_argument("--against-shelf", action="store_true",
-                               help="Compare candidates against the shelf on the same training window.")
-    triage_parser.add_argument("--max-shelf-correlation", type=float, default=None, metavar="RHO",
-                               help="With --against-shelf, require positive train contribution and a "
-                                    "maximum absolute shelf correlation below this ceiling "
-                                    "before writing a requested freeze.")
-    triage_parser.add_argument("--buffer", default=None, metavar="PATH",
-                               help="Candidate shelf used by --against-shelf.")
-    _add_selection_args(triage_parser)
-    _add_cost_args(triage_parser)
-    triage_parser.bind_handler("triage.cmd_triage")
-
-    promote_parser = sub.add_parser(
-        "promote", help="Freeze, validate, check and shelve one candidate.",
-        description="Freeze the candidate or reuse --selection, then validate, check and add to the shelf. "
-                    "Keep every completed step's evidence; stop on an operational failure. "
-                    "Dry runs still open the test view and perform platform checks. "
-                    "Shelving needs name, category, tags and description. An eligible result without "
-                    "them returns metadata_required and a concrete next action. The alpha must already "
-                    "carry the same official-template description written by alpha describe.")
-    promote_parser.add_argument("alpha_id", metavar="ALPHA_ID")
-    promote_parser.add_argument("--note", default=None)
-    retention_option = promote_parser.add_argument(
-        "--retention-floor", type=float, default=None,
-        help=f"Minimum test/train Sharpe retention (new selections default to {DEFAULT_PROMOTION_RETENTION}).")
-    retention_option.documented_default = DEFAULT_PROMOTION_RETENTION
-    promote_parser.add_argument("--max-self-correlation", type=float, default=None, metavar="RHO",
-                                help="Require a measured live self-correlation below this value.")
-    promote_source = promote_parser.add_mutually_exclusive_group()
-    promote_source.add_argument("--freeze", default=None, metavar="PATH",
-                                help="Frozen selection path (default: promote-freeze-ID-timestamp.json in research dir).")
-    promote_source.add_argument("--selection", default=None, metavar="PATH",
-                                help="Validate an existing single-candidate training selection.")
-    promote_parser.add_argument("--buffer", default=None, metavar="PATH",
-                                help="Shelf file (default: in research dir).")
-    promote_parser.add_argument("--seeds", default=None, metavar="PATH",
-                                help="Validated seed metadata store (default: seeds.jsonl in research dir).")
-    promote_parser.add_argument("--dry-run", action="store_true",
-                                help="Run validation and platform checks. Report would_buffer without "
-                                     "writing the shelf if eligible.")
-    promote_parser.add_argument("--review-receipt", metavar="PATH",
-                                help="Review a saved Regular promotion receipt offline. Requires --selection.")
-    promote_parser.add_argument("--pc-distribution", metavar="PATH",
-                                help="Attach the candidate's saved production histogram to an offline receipt review.")
-    promote_parser.add_argument("--name", default=None, help="Seed name (required to buffer).")
-    promote_parser.add_argument("--category", default=None,
-                                help="Seed category: ANALYST, FUNDAMENTAL, PRICE_VOLUME, SENTIMENT, VOLUME.")
-    promote_parser.add_argument("--tags", nargs="+", default=None, help="At least one seed tag.")
-    promote_parser.add_argument("--description", default=None,
-                                help="Official Power Pool description, at least 100 characters; exact "
-                                     "Idea: / Rationale for data used: / Rationale for operators used: "
-                                     "headings with '-' bullet lists.")
-    _add_cost_args(promote_parser)
-    promote_parser.bind_handler("promote.cmd_promote")
-
     feed_parser = sub.add_parser(
         "feed",
         help="A bounded research digest across papers, news, social sources, forums and market observations.",
@@ -901,71 +817,107 @@ def build_parser():
 
     papers.bind_handler("literature.cmd_paper")
 
-    sim = sub.add_parser(
-        "simulate", help="Simulate alphas; preview with --dry-run before using platform capacity.")
-    sim.add_argument("file", nargs="?",
-                     help="Research file (.json/.py/.txt), - for stdin, or a single inline FASTEXPR "
-                          "expression such as 'rank(close)'.")
-    sim.add_argument("--expr", action="append", default=[], metavar="EXPRESSION",
-                     help="Inline expression; repeat for several.")
-    sim.add_argument("--file", dest="files", action="append", default=[],
-                     help="Additional research file or - for stdin; repeat to merge expressions. "
-                          "Later file settings override earlier files.")
-    _add_settings_args(sim)
-    _add_concurrency_args(sim)
-    _add_multi_size_arg(sim)
-    sim.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=300.0,
-                     help="Shared wait budget for login, preflight and simulation. Longer Retry-After "
-                          "waits are saved for resume (default: 300).")
-    sim.add_argument("--checkpoint", default=None,
-                     help="Checkpoint path; pending work is saved automatically if omitted.")
-    sim.add_argument("--dry-run", action="store_true",
-                     help="Validate and print payloads without contacting BRAIN.")
-    sim.add_argument("--record", dest="record", action="store_true", default=True,
-                     help="Append every finished result to the alpha registry "
-                          "(outside the git work tree) with an automatic verdict. "
-                          "On by default so results are never lost when a caller "
-                          "forgets the flag.")
-    sim.add_argument("--no-record", dest="record", action="store_false",
-                     help="Skip writing results to the alpha registry.")
-    sim.add_argument("--idea", default=None,
-                     help="Idea label recorded in the registry, e.g. 'Idea 47'.")
-    sim.add_argument("--mechanism", default=None,
-                     help="One-line economic mechanism for the registry.")
-    sim.add_argument("--note", default=None,
-                     help="Free-text note stored with each registry entry.")
-    sim.add_argument("--registry", default=None,
-                     help="Override the alpha registry path.")
-    sim.add_argument("--allow-lint-errors", action="store_true",
-                     help="Permit a FASTEXPR launch with lint findings. Python preflight and "
-                          "unsupported setting errors still block.")
-    sim.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
-                     help="Sort results by this metric, best first.")
-    sim.add_argument("--top", type=int, default=None,
-                     help="Keep only the first N results after sorting.")
-    sim.add_argument("--stream", action="store_true",
-                     help="Emit JSON Lines progress events on stderr.")
-    sim.add_argument("--verbose", action="store_true",
-                     help="With --stream, also emit per-poll events.")
-    _add_session_args(sim)
-    sim.bind_handler("experiments.cmd_simulate")
+    propose_p = sub.add_parser(
+        "propose",
+        help="Validate a spec offline and enqueue it into the daemon's AUTO_PREFLIGHT state (non-blocking).",
+        description="Synchronously checks FASTEXPR/Python syntax, experiment design, `idea` presence, "
+                    "and active request duplicates, then persists the run and wakes the daemon.")
+    propose_p.add_argument("spec", nargs="?", default=None,
+                           help="Path to SPEC.json or '-' for stdin.")
+    propose_p.add_argument("--stdin", action="store_true", help="Read SPEC JSON from stdin.")
+    propose_p.add_argument("--name", default=None, help="Optional override name for the run.")
+    propose_p.bind_handler("daemon.cmd_propose")
 
-    resume = sub.add_parser(
-        "resume", help="Resume pending/queued simulations from a checkpoint.")
-    resume.add_argument("checkpoint", help="Checkpoint JSON produced by simulate/resume.")
-    _add_concurrency_args(resume)
-    resume.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=300.0,
-                        help="Shared wait budget for login and resumed simulations (default: 300).")
-    resume.add_argument("--sort", choices=["none", *METRIC_KEYS], default="none",
-                        help="Sort results by this metric, best first.")
-    resume.add_argument("--top", type=int, default=None,
-                        help="Keep only the first N results after sorting.")
-    resume.add_argument("--stream", action="store_true",
-                        help="Emit JSON Lines progress events on stderr.")
-    resume.add_argument("--verbose", action="store_true",
-                        help="With --stream, also emit per-poll events.")
-    _add_session_args(resume)
-    resume.bind_handler("experiments.cmd_resume")
+    inbox_p = sub.add_parser(
+        "inbox",
+        help="List runs paused at interaction gates (GATE_*) and active background AUTO_* counts.")
+    inbox_p.add_argument("--gate", default=None,
+                         choices=["GATE_PREFLIGHT_BLOCKED", "GATE_TRIAGE", "GATE_APPROVE_FULL",
+                                  "GATE_DESCRIBE", "GATE_CONFIRM_SUBMIT"],
+                         help="Filter actionable items to a specific gate state.")
+    inbox_p.add_argument("--limit", type=_positive_count, default=20)
+    inbox_p.bind_handler("daemon.cmd_inbox")
+
+    runs_p = sub.add_parser("runs", help="List state-machine runs under the research directory.")
+    runs_p.add_argument("--state", default=None, help="Filter runs by exact state name.")
+    runs_p.add_argument("--limit", type=_positive_count, default=50)
+    runs_p.bind_handler("daemon.cmd_runs")
+
+    inspect_p = sub.add_parser(
+        "inspect",
+        help="Inspect one run, enforcing the protocol-level Train/Test firewall before freeze.")
+    inspect_p.add_argument("run_id", metavar="RUN_ID")
+    inspect_p.add_argument("--arm", default=None, help="Filter output to one arm label.")
+    inspect_p.bind_handler("daemon.cmd_inspect")
+
+    act_p = sub.add_parser(
+        "act",
+        help="Apply a decision transition to a run paused at a GATE_* interaction point.")
+    act_p.add_argument("run_id", metavar="RUN_ID")
+    act_p.add_argument("action", choices=["retry-preflight", "hydrate-pnl", "approve-full",
+                                          "back-to-triage", "describe", "submit", "hold", "drop"])
+    act_p.add_argument("--arms", default=None, help="Comma-separated arm labels for hydrate-pnl or approve-full.")
+    act_p.add_argument("--top", type=_positive_count, default=None, help="Top N positive QUICK arms for hydrate-pnl.")
+    act_p.add_argument("--verdict", choices=["rejected", "falsified", "no_go"], default=None,
+                       help="Ledger verdict applied by `drop`.")
+    act_p.add_argument("--reason", default=None, help="Decision rationale saved on the run/ledger.")
+    act_p.add_argument("--name", default=None, help="Candidate name for `describe`.")
+    act_p.add_argument("--category", default=None, choices=list(ml.ALPHA_CATEGORIES), type=str.upper,
+                       help="Candidate category for `describe`.")
+    act_p.add_argument("--tags", nargs="+", default=None, help="Candidate tags for `describe`.")
+    act_p.add_argument("--description", default=None,
+                       help="Official Power Pool template description (>=100 chars) for `describe`.")
+    act_p.add_argument("--yes", action="store_true", help="Explicit irreversible authorization for `submit`.")
+    act_p.bind_handler("daemon.cmd_act")
+
+    cancel_p = sub.add_parser("cancel", help="Cancel an active run and revoke any live platform simulations.")
+    cancel_p.add_argument("run_id", metavar="RUN_ID")
+    cancel_p.add_argument("--reason", default=None)
+    cancel_p.bind_handler("daemon.cmd_cancel")
+
+    wait_p = sub.add_parser(
+        "wait",
+        help="Wait efficiently on the daemon condition variable until an interaction gate arrives.")
+    wait_p.add_argument("--run-id", default=None, help="Optional specific run ID to wait for.")
+    wait_p.add_argument("--gate", default=None, help="Optional target gate name.")
+    wait_p.add_argument("--max-wait-seconds", "--max-wait", dest="max_wait",
+                        type=_non_negative_seconds, default=30.0,
+                        help="Bounded wait timeout in seconds (capped at 60s).")
+    wait_p.bind_handler("daemon.cmd_wait")
+
+    breed_p = sub.add_parser(
+        "breed",
+        help="Draft a paired offspring spec JSON from a completed run ID or batch file.")
+    breed_p.add_argument("source", metavar="RUN_ID_OR_FILE")
+    breed_p.add_argument("--out", required=True, metavar="SPEC", help="Output path for the draft spec.")
+    breed_p.add_argument("--seed", required=True, type=int, help="Random seed for parent pairing.")
+    breed_p.add_argument("--limit", required=True, type=_positive_count, help="Max offspring per stratum.")
+    breed_p.bind_handler("brief.cmd_breed")
+
+    migrate_p = sub.add_parser(
+        "migrate-workspace",
+        help="Import legacy v3 backlog/ and backlog-results/ state into v4 runs/.")
+    migrate_p.add_argument("--dry-run", action="store_true", help="Preview migration without writing runs/ or moving backlog.")
+    migrate_p.bind_handler("daemon.cmd_migrate_workspace")
+
+    daemon_p = sub.add_parser("daemon", help="Manage the resident single-writer daemon for this workspace.")
+    daemon_sub = daemon_p.add_subparsers(dest="daemon_command", required=True, parser_class=JsonArgumentParser)
+    d_start = daemon_sub.add_parser("start", help="Start the resident daemon if not already running.")
+    d_start.bind_handler("daemon.cmd_daemon_start")
+    d_stop = daemon_sub.add_parser("stop", help="Stop the resident daemon cleanly.")
+    d_stop.bind_handler("daemon.cmd_daemon_stop")
+    d_status = daemon_sub.add_parser("status", help="Show daemon status, active run counts, and config.")
+    d_status.bind_handler("daemon.cmd_daemon_status")
+    d_cfg = daemon_sub.add_parser("config", help="Read or update daemon scheduling parameters.")
+    d_cfg.add_argument("--quota-floor", type=_non_negative_integer, default=None, dest="quota_floor")
+    d_cfg.add_argument("--concurrency", type=_positive_count, default=None)
+    d_cfg.add_argument("--multi-size", type=_positive_count, default=None, dest="multi_size")
+    d_cfg.add_argument("--max-unchanged-defers", type=_positive_count, default=None, dest="max_unchanged_defers")
+    d_cfg.add_argument("--reconcile-interval-seconds", type=_non_negative_integer, default=None,
+                       dest="reconcile_interval_seconds")
+    d_cfg.bind_handler("daemon.cmd_daemon_config")
+    d_serve = daemon_sub.add_parser("_serve", help="Internal foreground daemon server loop.")
+    d_serve.bind_handler("daemon.cmd_daemon_serve")
 
     abl = sub.add_parser(
         "ablate",
@@ -1033,7 +985,7 @@ def build_parser():
                        help="Maximum items per list: scores, setbacks, write-ups, and each thread state (at least 1).")
     brief.add_argument("--registry", default=None)
 
-    brief.bind_handler("campaign.cmd_brief")
+    brief.bind_handler("brief.cmd_brief")
 
     ask = sub.add_parser(
         "ask",
@@ -1080,149 +1032,6 @@ def build_parser():
     ask.add_argument("--registry", default=None)
     ask.bind_handler("ledger.cmd_ask")
 
-    probe = sub.add_parser(
-        "probe",
-        help="Run a batch of arms from a spec file (lint, simulate, table, record).",
-        description="Prepare, check, run and recover labelled experiments from the same spec. "
-                    "--dry-run is offline; --check verifies live metadata without simulations. "
-                    "Results include durable path, run identity, per-arm outcomes and next actions. "
-                    "--recover and --from-simulation only read platform jobs; "
-                    "--resume explicitly starts unsubmitted work.")
-    probe.add_argument("--allow-lint-errors", action="store_true", dest="allow_lint_errors",
-                       help="Permit a FASTEXPR launch with lint findings. Python preflight and "
-                            "unsupported setting errors still block.")
-    probe.add_argument("--strict-gate", action="store_true", dest="strict_gate",
-                       help="Refuse a finished prior result with the same expression and "
-                            "effective settings. Dry-run previews the blocking evidence.")
-    probe_source = probe.add_mutually_exclusive_group()
-    probe_source.add_argument("--recover", default=None, metavar="BATCH_JSON",
-                              help="Refresh accepted jobs and reconcile local evidence without new simulations.")
-    probe_source.add_argument("--resume", default=None, metavar="BATCH_JSON",
-                              help="Continue a saved batch, including definitely unsubmitted arms; "
-                                   "use --dry-run to preview first.")
-    probe_source.add_argument("--from-simulation", metavar="ID_OR_LINK",
-                              help="Read an existing BRAIN multi-simulation and list its Alpha IDs.")
-    probe.add_argument("spec", nargs="?", default=None,
-                       help="JSON experiment spec. Arms take an inline expression or a relative Python "
-                            "source_file. Use design=explore for scans or mixed-language batches. "
-                            "Omitted with --recover, --resume or --from-simulation.")
-    _add_settings_args(probe)
-    _add_session_args(probe)
-    _add_concurrency_args(probe)
-    _add_multi_size_arg(probe)
-    probe.add_argument("--name", default=None,
-                       help="Batch name for the output file (default: the spec's name).")
-    probe_mode = probe.add_mutually_exclusive_group()
-    probe_mode.add_argument("--dry-run", action="store_true",
-                            help="Offline request preview; unchecked catalogs remain explicit.")
-    probe_mode.add_argument("--check", action="store_true",
-                            help="Validate this spec against live scoped metadata without simulating.")
-    probe.add_argument("--batch-path", default=None, metavar="PATH",
-                       help="Durable batch/checkpoint path; distinct from the final --save response.")
-    probe.add_argument("--summary", action="store_true",
-                       help="Return a bounded train summary with a table, execution state and saved evidence paths.")
-    probe.add_argument("--defer-quick-pnl", action="store_true",
-                       help="Save QUICK results before fetching daily PnL. Run --recover without this flag to fetch it.")
-    probe.add_argument("--native-poll-once", action="store_true",
-                       help="For live probe runs, read each due native Multi parent once and save its next poll time.")
-    probe.add_argument("--pnl-alpha-id", action="append", metavar="ID",
-                       help="With --recover, fetch daily PnL only for these saved QUICK Alpha IDs. Repeatable.")
-    probe.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=300.0,
-                       help="Shared wait budget for login, preflight, simulation and recovery reads; "
-                            "accepted jobs remain recoverable (default: 300).")
-    probe.add_argument("--show-test", action="store_true",
-                       help="Validate --selection while recovering saved results; never run new simulations.")
-    probe.add_argument("--force", action="store_true",
-                       help="Overwrite an existing batch file of the same name.")
-    probe.add_argument("--no-record", action="store_true",
-                       help="Do not append the arms to the ledger.")
-    probe.add_argument("--registry", default=None)
-    _add_selection_args(probe, freeze=False)
-    _add_cost_args(probe)
-
-    probe.bind_handler("experiments.cmd_probe")
-
-    campaign = sub.add_parser("campaign", help="Preview, inspect and advance the durable research queue.")
-    campaign_sub = campaign.add_subparsers(dest="subcommand", metavar="<action>",
-                                           parser_class=JsonArgumentParser)
-    campaign_preview = campaign_sub.add_parser(
-        "preview", help="Inspect BRAIN arms or compare recorded SPC outputs without starting simulations.")
-    campaign_preview.add_argument("spec", metavar="SPEC")
-    _add_multi_size_arg(campaign_preview)
-    campaign_preview.bind_handler("campaign.cmd_campaign_preview")
-
-    campaign_publish = campaign_sub.add_parser(
-        "publish", help="Strictly preflight one QUICK spec and publish it to the campaign backlog.")
-    campaign_publish.add_argument("spec", metavar="SPEC")
-    campaign_publish.add_argument("--campaign-dir", metavar="DIR", help="Directory containing backlog.")
-    campaign_publish.add_argument("--phase", choices=["pilot", "expansion"], default="pilot")
-    campaign_publish.add_argument("--pilot-batch", metavar="BATCH", help="Completed QUICK pilot for expansion.")
-    campaign_publish.add_argument("--max-wait-seconds", type=_positive_seconds, default=180)
-    _add_multi_size_arg(campaign_publish)
-    _add_session_args(campaign_publish)
-    campaign_publish.bind_handler("campaign_delivery.cmd_campaign_publish")
-
-    campaign_diagnose = campaign_sub.add_parser(
-        "diagnose", help="Explain ready work, saved checkpoints, failed deliveries, and reserve depth offline.")
-    campaign_diagnose.add_argument("--campaign-dir", metavar="DIR", help="Directory containing backlog.")
-    campaign_diagnose.add_argument("--limit", type=_positive_count, default=20)
-    campaign_diagnose.bind_handler("campaign_delivery.cmd_campaign_diagnose")
-
-    campaign_prepare = campaign_sub.add_parser(
-        "prepare-full", help="Draft bounded FULL simulations from a saved QUICK batch's training results.")
-    campaign_prepare.add_argument("batch", metavar="BATCH")
-    campaign_prepare.add_argument("--out", required=True, metavar="SPEC", help="Path for the raw Probe spec.")
-    campaign_prepare.add_argument("--limit", required=True, type=_positive_count,
-                                  help="Maximum FULL arms, including the control in a controlled experiment.")
-    campaign_prepare.bind_handler("campaign.cmd_campaign_prepare_full")
-
-    campaign_breed = campaign_sub.add_parser(
-        "breed", help="Draft a paired offspring generation from saved Probe training results.")
-    campaign_breed.add_argument("batch", metavar="BATCH")
-    campaign_breed.add_argument("--out", required=True, metavar="SPEC",
-                                help="Path for the raw offspring Probe spec.")
-    campaign_breed.add_argument("--seed", required=True, type=int, help="Seed for the parent lottery and child sampling.")
-    campaign_breed.add_argument("--limit", required=True, type=_positive_count,
-                                help="Maximum offspring per policy, one per mechanism and settings stratum.")
-    campaign_breed.bind_handler("campaign.cmd_campaign_breed")
-
-    campaign_status = campaign_sub.add_parser("status", help="Read queued specs and their saved progress offline.")
-    campaign_status.add_argument("--limit", type=_non_negative_integer, default=20,
-                                 help="Maximum queued specs and archived PnL batches to display in each list.")
-    campaign_status.bind_handler("campaign.cmd_campaign_status")
-
-    campaign_pnl = campaign_sub.add_parser(
-        "recover-pnl", help="Fill missing daily PnL for archived QUICK batches without starting simulations.")
-    campaign_pnl.add_argument("--limit", type=_positive_count, default=10,
-                              help="Maximum batches to attempt per pass.")
-    campaign_pnl.add_argument("--watch", action="store_true", help="Revisit pending evidence in successive passes.")
-    campaign_pnl.add_argument("--interval", type=_positive_seconds, default=30,
-                              help="Seconds between passes in watch mode.")
-    campaign_pnl.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=60,
-                              help="Maximum wait budget for each Probe recovery.")
-    campaign_pnl.add_argument("--stream", action="store_true", help="Emit recovery events on stderr.")
-    campaign_pnl.bind_handler("campaign.cmd_campaign_recover_pnl")
-
-    campaign_run = campaign_sub.add_parser(
-        "run", help="Advance one queued experiment or keep watching the same inbox.")
-    campaign_run.add_argument("--watch", action="store_true", help="Keep consuming the research inbox.")
-    campaign_run.add_argument("--interval", type=_positive_seconds, default=30,
-                              help="Seconds between passes in watch mode.")
-    campaign_run.add_argument("--max-wait-seconds", "--max-wait", type=_positive_seconds, default=600,
-                              help="Maximum wait budget for each Probe invocation.")
-    campaign_run.add_argument("--recover-only", action="store_true",
-                              help="Recover existing simulation tasks without posting unstarted arms.")
-    campaign_run.add_argument("--prefer", action="append", metavar="SPEC.json",
-                              help="Prioritize an unstarted BRAIN inbox spec by filename. Repeat in priority order.")
-    campaign_run.add_argument("--defer-quick-pnl", action="store_true",
-                              help="Let QUICK batches finish before fetching their daily PnL.")
-    campaign_run.add_argument("--validate", action="store_true",
-                              help="Validate eligible Regular FULL candidates after freezing training evidence.")
-    campaign_run.add_argument("--stream", action="store_true", help="Emit campaign events on stderr.")
-    _add_concurrency_args(campaign_run)
-    _add_multi_size_arg(campaign_run)
-    campaign_run.bind_handler("campaign.cmd_campaign_run")
-
     views = sub.add_parser(
         "views",
         help="Who looked at test-period numbers, when, and for which alphas.",
@@ -1230,7 +1039,7 @@ def build_parser():
     views.add_argument("--alpha", default=None, help="Only entries naming this alpha id.")
     views.add_argument("--limit", type=int, default=50)
 
-    views.bind_handler("campaign.cmd_views")
+    views.bind_handler("brief.cmd_views")
 
     alpha = sub.add_parser("alpha", help="Inspect the account's alphas (quota-free).")
     alpha_sub = alpha.add_subparsers(dest="subcommand", metavar="<action>",
@@ -1325,14 +1134,6 @@ def build_parser():
     _add_session_args(a_pp)
     a_pp.bind_handler("alphas.cmd_alpha_pp_corr")
 
-    a_cancel = alpha_sub.add_parser(
-        "cancel-sim",
-        help="Cancel a running simulation and release its local slot once cancellation is confirmed.")
-    a_cancel.add_argument("reference", metavar="SIM_REFERENCE",
-                          help="Simulation ID or https://api.worldquantbrain.com/simulations/<id> URL.")
-    _add_session_args(a_cancel)
-    a_cancel.bind_handler("alphas.cmd_alpha_cancel_sim")
-
     a_ready = alpha_sub.add_parser(
         "readiness",
         help="One-shot submission readiness check, Power Pool budget and catalog-backed description builder.",
@@ -1358,51 +1159,6 @@ def build_parser():
                          help="Wait budget for live platform checks (default 180).")
     _add_session_args(a_ready)
     a_ready.bind_handler("alphas.cmd_alpha_readiness")
-
-    a_desc = alpha_sub.add_parser(
-        "describe",
-        help="Set an alpha's writable metadata (name, category, tags, description, color, hidden).",
-        description="Updates top-level metadata (`name`, `category`, `tags`, `color`, `hidden`) and/or "
-                    "nested `regular.description`, then reads back the alpha to verify every field stuck.")
-    a_desc.add_argument("alpha_id")
-    a_desc.add_argument("--name", default=None)
-    a_desc.add_argument("--category", default=None, choices=list(ml.ALPHA_CATEGORIES), type=str.upper)
-    a_desc.add_argument("--tags", nargs="+", default=None,
-                        help="Comma- or space-separated tags.")
-    a_desc.add_argument("--description", default=None,
-                        help="Official Power Pool description under `regular.description`; exact "
-                             "Idea: / Rationale for data used: / Rationale for operators used: "
-                             "headings and '-' bullet lists are required.")
-    a_desc.add_argument("--color", default=None, type=str.upper,
-                        choices=[*ml.ALPHA_COLORS, "NONE"],
-                        help="Color tag (RED, YELLOW, GREEN, BLUE, PURPLE, or NONE to clear).")
-    a_desc_vis = a_desc.add_mutually_exclusive_group()
-    a_desc_vis.add_argument("--hide", action="store_true", help="Mark the alpha hidden on the platform.")
-    a_desc_vis.add_argument("--unhide", action="store_true", help="Mark the alpha visible on the platform.")
-
-    _add_session_args(a_desc)
-    a_desc.bind_handler("alphas.cmd_alpha_describe")
-
-    a_sub = alpha_sub.add_parser(
-        "submit",
-        help="Submit one alpha to its competition (dry-run unless --yes).")
-    a_sub.add_argument("alpha_id")
-    a_sub.add_argument("--yes", action="store_true",
-                       help="Execute the saved workflow: submit a new eligible attempt or reconcile "
-                            "an unresolved one. Without it, preview and read-only checks only.")
-    a_sub.add_argument("--max-wait-seconds", "--max-wait", dest="max_wait", type=float, default=180.0,
-                       help="Local submission/reconciliation wait budget in seconds; expiry does not "
-                            "prove that an earlier POST failed.")
-    a_sub.add_argument("--registry", default=None)
-    a_sub.add_argument("--buffer", default=None,
-                       help="Shelf to reconcile after a confirmed submission.")
-    a_sub.add_argument("--seeds", default=None,
-                       help="Validated seed metadata store used when shelving this alpha.")
-    _add_selection_args(a_sub, freeze=False)
-    _add_cost_args(a_sub)
-    _add_session_args(a_sub)
-
-    a_sub.bind_handler("alphas.cmd_alpha_submit")
 
     a_expl = alpha_sub.add_parser(
         "explain",
@@ -1694,60 +1450,19 @@ def build_parser():
                        help="Also list the level-only alphas in full.")
     l_sty.bind_handler("ledger.cmd_ledger_styles")
 
-    buf = sub.add_parser(
-        "buffer", help="Hold alphas that passed every check but were not submitted.",
-        description="A shelf for finished work. The platform's self-correlation is "
-                    "measured against a snapshot, so a held alpha's value decays as the "
-                    "book grows; each entry records the book size at shelving time and "
-                    "`buffer submit` re-checks before spending the irreversible step.")
-    buf_sub = buf.add_subparsers(dest="buffer_command", required=True,
-                                 parser_class=JsonArgumentParser)
-
-    b_add = buf_sub.add_parser("add", help="Run the checks and shelve the alpha.")
-    b_add.add_argument("alpha_id")
-    b_add.add_argument("--note", default=None)
-    b_add.add_argument("--name", default=None, help="Seed name (required).")
-    b_add.add_argument("--category", default=None,
-                       help="Seed category: ANALYST, FUNDAMENTAL, PRICE_VOLUME, SENTIMENT, VOLUME.")
-    b_add.add_argument("--tags", nargs="+", default=None, help="At least one tag.")
-    b_add.add_argument("--description", default=None,
-                       help="Official Power Pool description, at least 100 characters; exact "
-                            "Idea: / Rationale for data used: / Rationale for operators used: "
-                            "headings with '-' bullet lists. Must already match the platform description.")
-    b_add.add_argument("--seeds", default=None, help="Seed store path (default: seeds.jsonl).")
-    b_add.add_argument("--max-wait-seconds", "--max-wait", type=int, default=None, dest="max_wait")
-    b_add.add_argument("--buffer", default=None, help="Shelf file (default: in research dir).")
-    b_add.add_argument("--registry", default=None)
-    _add_selection_args(b_add, freeze=False)
-    _add_cost_args(b_add)
-    b_add.bind_handler("buffer_cmd.cmd_buffer_add")
-
-    b_list = buf_sub.add_parser("list", help="Show the shelf and how stale it is.")
-    b_list.add_argument("--buffer", default=None)
-    b_list.add_argument("--registry", default=None)
-    _add_cost_args(b_list)
-    b_list.bind_handler("buffer_cmd.cmd_buffer_list")
-
-    b_drop = buf_sub.add_parser("drop", help="Take an alpha off the shelf.")
-    b_drop.add_argument("alpha_id")
-    b_drop.add_argument("--note", default=None)
-    b_drop.add_argument("--buffer", default=None)
-    b_drop.add_argument("--registry", default=None)
-    b_drop.bind_handler("buffer_cmd.cmd_buffer_drop")
-
-    b_sub = buf_sub.add_parser("submit", help="Submit a shelved alpha (irreversible).")
-    b_sub.add_argument("alpha_id")
-    b_sub.add_argument("--yes", action="store_true")
-    b_sub.add_argument("--force", action="store_true",
-                       help="Submit even if the fresh self-correlation is above the gate.")
-    b_sub.add_argument("--max-wait-seconds", "--max-wait", type=int, default=None, dest="max_wait")
-    b_sub.add_argument("--buffer", default=None)
-    b_sub.add_argument("--seeds", default=None,
-                       help="Validated seed metadata store used when shelving this alpha.")
-    b_sub.add_argument("--registry", default=None)
-    _add_selection_args(b_sub, freeze=False)
-    _add_cost_args(b_sub)
-    b_sub.bind_handler("buffer_cmd.cmd_buffer_submit")
+    shelf_p = sub.add_parser("shelf", help="Inspect shelved candidates and plan independent submissions.")
+    shelf_sub = shelf_p.add_subparsers(dest="subcommand", required=True, parser_class=JsonArgumentParser)
+    s_list = shelf_sub.add_parser("list", help="Show shelved candidates and staleness.")
+    s_list.add_argument("--buffer", default=None)
+    s_list.add_argument("--registry", default=None)
+    _add_cost_args(s_list)
+    s_list.bind_handler("daemon.cmd_shelf_list")
+    s_plan = shelf_sub.add_parser("plan", help="Plan a maximum-weight independent submission subset.")
+    s_plan.add_argument("--buffer", default=None)
+    s_plan.add_argument("--registry", default=None)
+    s_plan.add_argument("--max-correlation", type=float, default=0.70, dest="max_correlation")
+    _add_cost_args(s_plan)
+    s_plan.bind_handler("daemon.cmd_shelf_plan")
 
     fmt = sub.add_parser(
         "fmt", help="Preview review-friendly formatting of native FASTEXPR.",
@@ -1782,7 +1497,7 @@ def build_parser():
     health.add_argument("--limit", type=int, default=8)
     health.add_argument("--min-overlap", type=int, default=MIN_PORTFOLIO_OVERLAP, dest="min_overlap")
     health.add_argument("--registry", default=None)
-    health.bind_handler("campaign.cmd_health")
+    health.bind_handler("brief.cmd_health")
 
     br = sub.choices["brief"]
     br.add_argument("--drift", action="store_true",
@@ -1866,10 +1581,26 @@ def build_parser():
 
 
 _COMMAND_EXAMPLES = {
-    "": ["brief", "catalog fields fundamental6 --expressions --limit 10",
-         'simulate "rank(close)" --quick --dry-run', "ledger list --family quality"],
-    "help": ["help catalog fields"],
-    "schema": ["schema alpha get"],
+    "": ["brief", "inbox", "propose SPEC.json", "catalog fields fundamental6 --expressions --limit 10",
+         "ledger list --family quality"],
+    "help": ["help catalog fields", "help act"],
+    "schema": ["schema propose", "schema act"],
+    "propose": ["propose SPEC.json", "cat SPEC.json | research_cli.py propose --stdin"],
+    "inbox": ["inbox", "inbox --gate GATE_TRIAGE"],
+    "inspect": ["inspect RUN_ID", "inspect RUN_ID --arm arm_1"],
+    "runs": ["runs --limit 20", "runs --state GATE_TRIAGE"],
+    "act": [
+        "act RUN_ID hydrate-pnl --top 3",
+        "act RUN_ID approve-full",
+        'act RUN_ID describe --name "Signal" --category ANALYST --tags rev --description "..."',
+        "act RUN_ID submit --yes",
+    ],
+    "cancel": ["cancel RUN_ID --reason \"superseded\""],
+    "wait": ["wait --max-wait 30", "wait --run-id RUN_ID --max-wait 60"],
+    "breed": ["breed RUN_ID --out offspring.json --seed 17 --limit 4"],
+    "shelf": ["shelf list", "shelf plan --max-correlation 0.70"],
+    "migrate-workspace": ["migrate-workspace --dry-run", "migrate-workspace"],
+    "daemon": ["daemon start", "daemon status", "daemon config --quota-floor 200", "daemon stop"],
     "auth": ["auth check", "auth profile --consultant", "auth competitions"],
     "auth check": ["auth check"],
     "auth logout": ["auth logout", "auth logout --remote"],
@@ -1918,36 +1649,13 @@ _COMMAND_EXAMPLES = {
              'feed --source all --topic "earnings guidance" --max-topics 12 --summary --dry-run',
              'feed --sources-file radar-sources.json --summary --dry-run',
              'feed --market coinbase:BTC-USD --book-depth 10 --summary --dry-run'],
-    "simulate": ['simulate "rank(close)" --quick --dry-run',
-                 'simulate --expr "rank(close)" --dry-run',
-                 "simulate reversal.py --setting lookback=0 --dry-run",
-                 "simulate research.json --sort fitness --save results.json"],
-    "resume": ["resume CHECKPOINT.json --save results.json"],
     "ablate": ['ablate --expr "a = rank(close); b = rank(volume); a + b" --out variants.json'],
     "compare": ["compare results.json --cost-bps 5 10 20 --freeze choice.json --summary",
                 "compare --frozen --selection choice.json --summary",
                 'compare --match "sample-batch*.json" --latest --sort none'],
-    "triage": ["triage BATCH.json --freeze choice.json",
-               "triage ALPHA_ID --against-shelf --max-shelf-correlation 0.7 --freeze choice.json",
-               "triage --show-test --selection choice.json"],
-    "promote": ['promote ALPHA_ID --note "candidate validation" --cost-bps 5 10 20',
-                "promote ALPHA_ID --selection choice.json --max-self-correlation 0.7",
-                "promote ALPHA_ID --selection choice.json --review-receipt receipt.json",
-                "promote ALPHA_ID --dry-run"],
     "brief": ["brief", "brief --days 7 --top 5"],
     "ask": ["ask --by neutralization --stat n,median:sharpe,floor_share",
             "ask --where status=ACTIVE --list"],
-    "probe": ["probe batch.spec.json --dry-run", "probe batch.spec.json --quick --check",
-              "probe python.spec.json --batch-path PYTHON_BATCH.json --dry-run",
-              "probe batch.spec.json --batch-path BATCH.json --save response.json",
-              "probe --recover BATCH.json --max-wait-seconds 60",
-              "probe --resume BATCH.json --dry-run", "probe --from-simulation SIMULATION_ID"],
-    "campaign": ["campaign status", "campaign diagnose", "campaign publish pilot.json",
-                 "campaign preview batch.spec.json",
-                 "campaign prepare-full quick-batch.json --out full.spec.json --limit 4",
-                 "campaign breed batch.json --out offspring.spec.json --seed 17 --limit 4",
-                 "campaign run --recover-only", "campaign run --watch --defer-quick-pnl --stream",
-                 "campaign recover-pnl --watch --stream"],
     "views": ["views --limit 10"],
     "alpha": ["alpha list --limit 10", "alpha get ALPHA_ID", "alpha readiness ALPHA_ID"],
     "alpha get": ["alpha get ALPHA_ID", "alpha get ALPHA_ID --performance",
@@ -1958,12 +1666,8 @@ _COMMAND_EXAMPLES = {
     "alpha self-corr": ["alpha self-corr ALPHA_ID"],
     "alpha prod-corr": ["alpha prod-corr ALPHA_ID", "alpha prod-corr ALPHA_ID --save-archive pc.json"],
     "alpha pp-corr": ["alpha pp-corr ALPHA_ID"],
-    "alpha cancel-sim": ["alpha cancel-sim SIMULATION_ID"],
     "alpha readiness": ["alpha readiness ALPHA_ID",
                         'alpha readiness ALPHA_ID --track POWER_POOL --idea "Hypothesis..." --apply-description'],
-    "alpha describe": ['alpha describe ALPHA_ID --name "quality signal" --category FUNDAMENTAL --color GREEN'],
-    "alpha submit": ["alpha submit ALPHA_ID", "alpha submit ALPHA_ID --yes --selection choice.json"],
-    "buffer submit": ["buffer submit ALPHA_ID --yes --selection choice.json"],
     "alpha explain": ["alpha explain ALPHA_ID --no-corr"],
     "alpha list": ["alpha list --limit 10 --min-fitness 1", "alpha list --delay 1 --color GREEN"],
     "alpha self-check": ["alpha self-check ALPHA_ID"],
@@ -2084,17 +1788,17 @@ def cmd_schema(parser, args, _sink):
         selected = _find_command_parser(parser, args.name)
         return {"tool": "research_cli.py", "version": VERSION,
                 "exit_codes": EXIT_CODES, "error_codes": ERROR_CODES,
-                **({"campaign_spec": SPEC_CONTRACT} if args.name[0] in {"campaign", "probe"} else {}),
+                **({"campaign_spec": SPEC_CONTRACT} if args.name[0] in {"propose", "breed"} else {}),
                 "command": describe_parser(selected, " ".join(selected.prog.split()[1:]))}
     described = describe_parser(parser)
     contract = {
         "tool": "research_cli.py",
         "version": VERSION,
         "stdout_contract": "exactly one JSON document, success or failure",
-        "success_envelope": {"ok": True, "command": "simulate", "data": "..."},
+        "success_envelope": {"ok": True, "command": "propose", "data": "..."},
         "error_envelope": {
             "ok": False,
-            "command": "simulate",
+            "command": "propose",
             "error": {"code": "INVALID_INPUT", "message": "...", "hint": "..."},
         },
         "exit_codes": EXIT_CODES,

@@ -12,7 +12,7 @@ import machine_lib as ml
 import research_config as config_io
 
 
-VERSION = "3.0.0"
+VERSION = "4.0.0"
 
 
 EXIT_CODES = {
@@ -97,25 +97,34 @@ class OutputConflict(CliError):
 
 
 def protect_output(args, *paths):
-    """Reject ``--save`` when it targets durable state such as batches, shelves, or seeds."""
+    """Reject ``--save`` when it targets durable state such as runs, daemon files, shelves, or seeds."""
     target = getattr(args, "save", None)
     if not target or target == "-":
         return
     destination = Path(target).expanduser().resolve()
-    protected = (*paths, *(getattr(args, name, None) for name in _PROTECTED_OUTPUT_ARGS))
-    if (getattr(args, "command", None) == "promote"
-            or (getattr(args, "command", None) == "triage" and getattr(args, "against_shelf", False))):
-        from .buffer_cmd import buffer_path
-        protected = (*protected, buffer_path(args))
-    if (getattr(args, "command", None) in {"promote", "buffer"}
-            or (getattr(args, "command", None) == "alpha" and getattr(args, "subcommand", None) == "submit")):
-        from .buffer_cmd import buffer_path, seeds_path
-        protected = (*protected, buffer_path(args), seeds_path(args))
+    import research_paths
+    root = Path(getattr(args, "research_dir", None) or research_paths.research_dir()).expanduser().resolve()
+    for state_dir in (root / "runs", root / "daemon"):
+        if destination == state_dir or state_dir in destination.parents:
+            raise OutputConflict(
+                "INVALID_INPUT", "--save would overwrite durable state-machine or daemon state",
+                "choose a response path outside <research_dir>/runs and <research_dir>/daemon",
+                details={"protected_path": str(destination)},
+            )
+    from .buffer_cmd import buffer_path, seeds_path
+    import alpha_registry
+    protected = (
+        *paths,
+        *(getattr(args, name, None) for name in _PROTECTED_OUTPUT_ARGS),
+        root / alpha_registry.DEFAULT_FILENAME if hasattr(alpha_registry, "DEFAULT_FILENAME") else root / "alpha-registry.jsonl",
+        buffer_path(args),
+        seeds_path(args),
+    )
     for path in protected:
         if path and destination == Path(path).expanduser().resolve():
             raise OutputConflict(
                 "INVALID_INPUT", "--save would overwrite durable research state",
-                "choose a response path distinct from the batch, checkpoint, selection, shelf and seed metadata",
+                "choose a response path distinct from the checkpoint, selection, shelf and seed metadata",
                 details={"protected_path": str(destination)})
 
 

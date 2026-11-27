@@ -80,7 +80,7 @@ class SnapshotTests(unittest.TestCase):
         import tempfile
         from unittest import mock
         import research_paths
-        from research_app import campaign as cli_campaign
+        from research_app import brief as cli_campaign
 
         tmp = tempfile.mkdtemp()
         with mock.patch.object(research_paths, "ensure_dir", lambda: tmp):
@@ -93,7 +93,7 @@ class SnapshotTests(unittest.TestCase):
         from datetime import datetime, timezone
         from unittest import mock
         import research_paths
-        from research_app import campaign as cli_campaign
+        from research_app import brief as cli_campaign
 
         tmp = tempfile.mkdtemp()
         with open(os.path.join(tmp, "convergence.json"), "w") as handle:

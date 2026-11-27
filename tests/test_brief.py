@@ -23,7 +23,7 @@ sys.path.insert(0, ROOT)
 
 import alpha_registry  # noqa: E402
 import research_paths
-from research_app import campaign as cli_campaign
+from research_app import brief as cli_campaign
 
 
 def entry(alpha_id, status, sharpe, source="manual", family="quality"):
@@ -301,6 +301,20 @@ class BriefTests(unittest.TestCase):
                       encoding="utf-8") as handle:
                 handle.write("# Result %s\n" % index)
         self.assertEqual(len(self._run(top=2)["documents"]), 2)
+
+    def test_brief_summarizes_state_machine_runs(self):
+        runs_dir = os.path.join(self.research, "runs")
+        os.makedirs(runs_dir, exist_ok=True)
+        with open(os.path.join(runs_dir, "demo-run.json"), "w", encoding="utf-8") as handle:
+            json.dump({"run_id": "demo-run", "name": "demo", "state": "GATE_TRIAGE",
+                       "track": "REGULAR", "updated_at": "2026-11-27T00:00:00Z"}, handle)
+        with open(os.path.join(runs_dir, "auto-run.json"), "w", encoding="utf-8") as handle:
+            json.dump({"run_id": "auto-run", "name": "auto", "state": "AUTO_QUICK_SIM",
+                       "track": "REGULAR", "updated_at": "2026-11-27T00:00:00Z"}, handle)
+        sm = self._run()["state_machine"]
+        self.assertEqual(sm["active_auto_count"], 1)
+        self.assertEqual(len(sm["actionable_gates"]), 1)
+        self.assertEqual(sm["actionable_gates"][0]["run_id"], "demo-run")
 
 
 if __name__ == "__main__":

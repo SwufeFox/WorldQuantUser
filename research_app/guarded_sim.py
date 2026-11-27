@@ -5,7 +5,7 @@ Probe supplies its scoped preflight report. This wrapper checks that the report
 matches the resolved settings and normalized source submitted to the client.
 Direct callers can let the wrapper check the inputs:
 
-    from guarded_sim import simulate
+    from research_app.guarded_sim import simulate
     records = simulate(["rank(close)"], {"universe": "TOP500"})
 
 Direct FASTEXPR checks use operator and field catalogs. Python also requires

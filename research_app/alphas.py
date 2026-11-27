@@ -667,15 +667,8 @@ def submit_workflow(session, args, shelf_entry=None):
                 if fresh is not None and fresh >= GATE and not getattr(args, "force", False):
                     raise CliError("INVALID_INPUT", "fresh self-correlation exceeds the shelf gate",
                                    "pass --force to attempt the platform gate anyway")
-            # A submission cannot be undone, so one invocation must never be enough.
-            # Every read-only validation above still runs on the staging call; only
-            # the POST is held back until the same command is issued again.
-            from .confirm import require_double_call
-            require_double_call("alpha_submit", args.alpha_id, context={
-                "selection_id": selection_id,
-                "entrypoint": "buffer" if shelf_entry is not None else "alpha",
-                "force": bool(getattr(args, "force", False)),
-            })
+            # Explicit state-machine confirmation (--yes) already authorized the
+            # submission gate; record durable INTENT before opening POST.
             journal = {"alpha_id": args.alpha_id, "state": "INTENT",
                        "selection_id": selection_id,
                        "post_phase": "PREPARING",

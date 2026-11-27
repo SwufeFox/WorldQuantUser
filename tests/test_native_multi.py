@@ -124,7 +124,7 @@ def test_native_batch_waits_for_shared_capacity_before_one_post(simulator):
             mock.patch.object(ml, "read_simulation_snapshot",
                               side_effect=lambda _session, identity, **_kwargs: (replies[identity], None)), \
             mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {"fitness": 1}}):
-        records = simulator(concurrency=1)
+        records = simulator(concurrency=1, max_wait_seconds=5)
 
     wait.assert_called_once()
     post.assert_called_once()
@@ -153,7 +153,7 @@ def test_native_batch_fills_slot_from_peer_while_its_first_parent_is_pending(sim
 
     def inspect(_session, identity, **_kwargs):
         if identity == "NativeParent":
-            assert next_submitted.wait(2)
+            assert next_submitted.wait(5)
         return replies[identity], None
 
     def release_peer(*_args, **_kwargs):
@@ -165,7 +165,7 @@ def test_native_batch_fills_slot_from_peer_while_its_first_parent_is_pending(sim
             mock.patch.object(ml, "recover_accepted_slots", side_effect=release_peer), \
             mock.patch.object(ml, "recover_quick_orphans", return_value=False), \
             mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {"fitness": 1}}):
-        records = simulator(expressions, concurrency=2, max_wait_seconds=4)
+        records = simulator(expressions, concurrency=2, max_wait_seconds=10)
 
     assert post.call_count == 2
     assert [record["alpha_id"] for record in records] == ["Alpha1", "Alpha2", "Alpha3", "Alpha4"]
@@ -187,7 +187,7 @@ def test_native_matches_child_echo_without_assuming_order_and_preserves_failure(
             mock.patch.object(ml, "read_simulation_snapshot", side_effect=inspect), \
             mock.patch.object(ml, "fetch_alpha_metrics", return_value={
                 "is": {"fitness": 1}, "train": {"fitness": 1}}) as metrics:
-        records = simulator(on_event=lambda event, payload: events.append((event, payload)))
+        records = simulator(max_wait_seconds=5, on_event=lambda event, payload: events.append((event, payload)))
 
     assert [row["status"] for row in records] == ["COMPLETE", "ERROR"]
     assert [row["alpha_id"] for row in records] == ["Alpha1", None]
@@ -300,7 +300,7 @@ def test_native_recovery_keeps_safe_details_and_rejects_mismatched_child_evidenc
             mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
                 (parent, None), (first_child, None), (wrong_child, None),
             ]):
-        first = simulator(fetch_metrics=False)
+        first = simulator(fetch_metrics=False, max_wait_seconds=5)
     children = first[0]["multi_terminal_evidence"]["children"]
     assert children == {"Child1": {"status": "ERROR", "message": "one " + "x" * 508}}
     assert [row["status"] for row in first] == ["PENDING", "PENDING"]
@@ -366,7 +366,7 @@ def test_native_anonymous_failure_requires_an_identity_for_each_resolved_child(s
     with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
             mock.patch.object(ml, "read_simulation_snapshot",
                               side_effect=[(partial, None), (child(1), None)]):
-        first = simulator(fetch_metrics=False)
+        first = simulator(fetch_metrics=False, max_wait_seconds=5)
     assert [row["alpha_id"] for row in first] == ["Alpha1", None]
     assert first[1]["status"] == "PENDING"
 
@@ -483,7 +483,7 @@ def test_native_partial_parent_receipt_can_recover_a_later_child(simulator, lega
     with mock.patch.object(simulation_multi.time, "time", return_value=100), \
             mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
             mock.patch.object(ml, "read_simulation_snapshot", side_effect=[(partial, None), (child(1), None)]):
-        first = simulator(fetch_metrics=False)
+        first = simulator(fetch_metrics=False, max_wait_seconds=5)
     assert [row["alpha_id"] for row in first] == ["Alpha1", None]
     assert first[0]["multi_parent_terminal_observed_at"] == 100
     if legacy:

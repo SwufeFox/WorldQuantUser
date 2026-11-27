@@ -151,20 +151,19 @@ def test_fmt_cannot_save_over_its_input(tmp_path, capsys):
 
 
 def test_fmt_keeps_a_published_campaign_spec_byte_exact(tmp_path, capsys):
-    path = tmp_path / "backlog" / "draft.json"
-    path.parent.mkdir()
+    path = tmp_path / "draft.json"
     original = '{"design": "explore", "arms": [{"expression": "x = close; rank(x)"}]}'
     path.write_text(original, encoding="utf-8")
-    batch = tmp_path / "backlog-results" / "draft-batch.json"
-    batch.parent.mkdir()
-    batch.write_text("{}", encoding="utf-8")
+    run_file = tmp_path / "runs" / "demo-run.json"
+    run_file.parent.mkdir()
+    run_file.write_text(json.dumps({"run_id": "demo-run", "source_spec": str(path.resolve()), "state": "AUTO_QUICK_SIM"}), encoding="utf-8")
 
     code, preview = fmt_result(capsys, tmp_path, path)
     assert code == 0 and preview["data"]["changed"] == 1
     code, result = fmt_result(capsys, tmp_path, path, "--write")
     assert code != 0 and result["error"]["code"] == "INVALID_INPUT"
     assert path.read_text(encoding="utf-8") == original
-    assert batch.read_text(encoding="utf-8") == "{}"
+    assert json.loads(run_file.read_text(encoding="utf-8"))["run_id"] == "demo-run"
 
 
 def test_fmt_rejects_and_protects_standalone_python_source(tmp_path, capsys):

@@ -20,7 +20,7 @@ import paper_search
 import research_paths
 from research_app import alphas as cli_alphas
 from research_app import app as cli_app
-from research_app import campaign as cli_campaign
+from research_app import brief as cli_campaign
 from research_app import experiments as cli_experiments
 from research_app import runtime as cli_runtime
 
@@ -44,9 +44,9 @@ class PaperSaveTests(unittest.TestCase):
 class DiagnosticLifecycleTests(unittest.TestCase):
     def test_library_diagnostics_survive_successful_and_failed_cli_calls(self):
         cases = [
-            (["schema", "resume"], 0),
-            (["schema", "resume", "--unknown-architecture-option"], 2),
-            (["simulate", "--expr", "rank(close)", "--batch-size", "0"], 2),
+            (["schema", "propose"], 0),
+            (["schema", "propose", "--unknown-architecture-option"], 2),
+            (["propose"], 2),
         ]
         for arguments, expected_code in cases:
             with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as directory:

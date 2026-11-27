@@ -13,7 +13,7 @@ import requests
 import alpha_registry
 import cache_store
 import machine_lib as ml
-from research_app import alphas, buffer_cmd, confirm, selection
+from research_app import alphas, buffer_cmd, selection
 from research_app.runtime import CliError
 
 SEED_DESCRIPTION = (
@@ -84,19 +84,12 @@ class SubmissionWorkflowTests(unittest.TestCase):
         return {str(path.relative_to(self.root)): path.read_bytes()
                 for path in self.root.rglob("*") if path.is_file()}
 
-    def stage(self, command, args, post):
-        with self.assertRaises(CliError) as caught:
-            command(args, None)
-        self.assertEqual(caught.exception.code, "CONFIRM_REQUIRED")
-        post.assert_not_called()
-
     def test_quick_mode_blocks_both_entrypoints_before_confirmation(self):
         self.shelve()
         quick = {**platform_alpha(), "settings": {"simulationMode": "QUICK"}}
         with mock.patch.object(ml, "fetch_alpha_metrics", return_value=quick), \
                 mock.patch.object(ml, "fetch_alpha_checks") as checks, \
-                mock.patch.object(ml, "submit_alpha") as post, \
-                mock.patch.object(confirm, "require_double_call") as confirm_intent:
+                mock.patch.object(ml, "submit_alpha") as post:
             for command in (alphas.cmd_alpha_submit, buffer_cmd.cmd_buffer_submit):
                 for yes in (False, True):
                     with self.subTest(command=command.__name__, yes=yes):
@@ -106,7 +99,6 @@ class SubmissionWorkflowTests(unittest.TestCase):
                         self.assertIn("Full Mode", caught.exception.hint)
         checks.assert_not_called()
         post.assert_not_called()
-        confirm_intent.assert_not_called()
         self.assertFalse(alphas._submission_path("CANDIDATE").exists())
 
     def test_mode_omitted_from_platform_uses_exact_saved_quick_evidence(self):
@@ -122,9 +114,11 @@ class SubmissionWorkflowTests(unittest.TestCase):
 
         full_mode = {**platform_alpha(), "settings": {"simulationMode": "FULL"}}
         with mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[platform_alpha("OTHER"), full_mode]), \
-                mock.patch.object(ml, "submit_alpha") as post:
-            self.stage(alphas.cmd_alpha_submit, self.args(alpha_id="OTHER"), post)
-            self.stage(alphas.cmd_alpha_submit, self.args(), post)
+                mock.patch.object(ml, "submit_alpha", return_value={"submission": "NOT_SENT", "submitted": False}) as post:
+            alphas.cmd_alpha_submit(self.args(alpha_id="OTHER", yes=False), None)
+            alphas.cmd_alpha_submit(self.args(yes=False), None)
+            self.assertEqual(post.call_count, 2)
+            self.assertTrue(all(call.kwargs.get("confirm") is False for call in post.call_args_list))
 
     def test_quick_mode_found_on_final_read_records_no_post(self):
         session = mock.Mock()
@@ -132,8 +126,7 @@ class SubmissionWorkflowTests(unittest.TestCase):
         quick = {**legacy, "settings": {"simulationMode": "QUICK"}}
         with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
                 mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
-                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[legacy, legacy, quick, quick]):
-            self.stage(alphas.cmd_alpha_submit, self.args(), session.post)
+                mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[legacy, quick, quick]):
             result = alphas.cmd_alpha_submit(self.args(), None)
         session.post.assert_not_called()
         self.assertFalse(result["post_attempted"])
@@ -166,7 +159,6 @@ class SubmissionWorkflowTests(unittest.TestCase):
                     mock.patch.object(ml, "submit_alpha", side_effect=submit) as post, \
                     mock.patch.object(ml, "fetch_daily_pnl", side_effect=complete_pnl):
                 args = self.args(alpha_id=alpha_id)
-                self.stage(command, args, post)
                 result = command(args, None)
             post.assert_called_once()
             self.assertTrue(result["reconciled"])
@@ -186,14 +178,13 @@ class SubmissionWorkflowTests(unittest.TestCase):
 
         with mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()) as reads, \
                 mock.patch.object(ml, "submit_alpha", side_effect=timeout_after_post_boundary) as post:
-            self.stage(alphas.cmd_alpha_submit, self.args(), post)
             first = alphas.cmd_alpha_submit(self.args(), None)
             second = alphas.cmd_alpha_submit(self.args(selection=None), None)
         self.assertEqual(first["submission"], "UNKNOWN")
         self.assertEqual(second["submission"], "UNKNOWN")
         self.assertFalse(second["post_attempted"])
         self.assertEqual(post.call_count, 1)
-        self.assertEqual(reads.call_count, 4)
+        self.assertEqual(reads.call_count, 3)
 
     def test_new_attempt_requires_valid_seed_in_read_only_and_write_modes(self):
         path = buffer_cmd.seeds_path()
@@ -257,7 +248,6 @@ class SubmissionWorkflowTests(unittest.TestCase):
     def test_pre_post_metrics_failure_is_not_sent_and_does_not_poison_the_journal(self):
         session = mock.Mock()
         with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
-                mock.patch.object(confirm, "require_double_call"), \
                 mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
                 mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[
                     platform_alpha(), ml.ServiceError("pre-POST GET unavailable"), platform_alpha()]):
@@ -286,7 +276,6 @@ class SubmissionWorkflowTests(unittest.TestCase):
         session.post.side_effect = interrupted
         unsubmitted = platform_alpha(status="UNSUBMITTED")
         with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
-                mock.patch.object(confirm, "require_double_call"), \
                 mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
                 mock.patch.object(ml, "fetch_alpha_metrics", return_value=unsubmitted):
             first = alphas.cmd_alpha_submit(self.args(), None)
@@ -367,7 +356,6 @@ class SubmissionWorkflowTests(unittest.TestCase):
             return write(path, document, **kwargs)
 
         with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
-                mock.patch.object(confirm, "require_double_call"), \
                 mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
                 mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()), \
                 mock.patch.object(cache_store, "write_json_atomic", side_effect=fail_boundary):
@@ -387,7 +375,6 @@ class SubmissionWorkflowTests(unittest.TestCase):
         with mock.patch.object(alphas, "with_session", lambda args, work: work(session)), \
                 mock.patch.object(ml, "agent_submit_allowed", return_value=True), \
                 mock.patch.object(ml, "fetch_alpha_metrics", return_value=platform_alpha()):
-            self.stage(alphas.cmd_alpha_submit, args, session.post)
             first = alphas.cmd_alpha_submit(args, None)
             second = alphas.cmd_alpha_submit(self.args(selection=None), None)
         self.assertEqual(first["submission"], "UNCERTAIN")
@@ -542,7 +529,6 @@ class SubmissionWorkflowTests(unittest.TestCase):
                 mock.patch.object(ml, "submit_alpha", side_effect=submit) as post, \
                 mock.patch.object(ml, "fetch_daily_pnl", side_effect=complete_pnl), \
                 ThreadPoolExecutor(max_workers=2) as pool:
-            self.stage(alphas.cmd_alpha_submit, self.args(), post)
             one = pool.submit(alphas.cmd_alpha_submit, self.args(), None)
             two = pool.submit(second)
             self.assertTrue(one.result(timeout=10)["submitted"])

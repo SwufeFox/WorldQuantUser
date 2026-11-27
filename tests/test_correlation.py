@@ -61,7 +61,7 @@ class PearsonTests(unittest.TestCase):
 
 
 def test_book_correlator_reuses_equal_date_series_and_aligns_different_dates():
-    from research_app.campaign import _book_correlator
+    from research_app.brief import _book_correlator
 
     a = series([2, -1, 3, 0, 7])
     b = series([1, 4, 2, -1, 6])

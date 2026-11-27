@@ -24,7 +24,6 @@ from research_app import (
     submission_planner,
     triage,
 )
-from tools import _runner, atom_runner
 
 
 class PpBudgetTests(unittest.TestCase):
@@ -276,22 +275,23 @@ class ModuleWiringTests(unittest.TestCase):
         env.start()
         self.addCleanup(env.stop)
 
-    def test_campaign_preview_runs_in_process_without_spawning_cli(self):
+    def test_propose_runs_in_process_without_spawning_daemon(self):
         spec = self.root / "preview.spec.json"
         spec.write_text(json.dumps({
             "track": "POWER_POOL",
             "design": "explore",
+            "idea": "Cross-sectional liquidity factor",
             "settings": {"simulationMode": "QUICK"},
             "arms": [{"label": "one", "expression": "rank(close)"}],
         }), encoding="utf-8")
         stdout = io.StringIO()
-        with mock.patch.object(_runner, "run_cli", side_effect=AssertionError("spawned subprocess")), \
-                mock.patch("sys.stdout", stdout):
-            code = app.main(["--research-dir", str(self.root), "--quiet", "campaign", "preview", str(spec)])
+        with mock.patch("sys.stdout", stdout):
+            code = app.main(["--research-dir", str(self.root), "--quiet", "propose", str(spec)])
         self.assertEqual(code, 0)
         payload = json.loads(stdout.getvalue())
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["data"]["track"], "POWER_POOL")
+        self.assertEqual(payload["data"]["state"], "AUTO_PREFLIGHT")
 
     def test_alpha_get_and_buffer_add_attach_budget_description_and_rule_snapshots(self):
         alpha_payload = {
@@ -395,19 +395,6 @@ class ModuleWiringTests(unittest.TestCase):
             p.write_text(json.dumps(updated), encoding="utf-8")
         second = triage.triage(["C1", "C2", "C3"], registry_path=str(registry), pnl_dir=str(pnl_dir))
         self.assertEqual(second["submission_plan"], plan)
-
-    def test_atom_runner_attaches_pp_budget_to_projected_rows(self):
-        row = atom_runner._result_row(
-            {"run_id": "r1"},
-            0,
-            {"label": "1: demo", "expression": "group_rank(ts_backfill(close, 5), industry)"},
-            {"alpha_id": "A1", "status": "COMPLETE", "metrics": {"sharpe": 1.5, "turnover": 0.2},
-             "checks": {"LOW_SHARPE": {"result": "PASS", "value": 1.5}}},
-        )
-        self.assertIn("pp_budget", row)
-        self.assertEqual(row["pp_budget"]["budget"]["operators"], 1)
-        self.assertEqual(row["pp_budget"]["budget"]["free_operators"], 1)
-        self.assertEqual(row["pp_budget"]["gates"]["gates"]["sharpe"]["state"], "pass")
 
 
 if __name__ == "__main__":

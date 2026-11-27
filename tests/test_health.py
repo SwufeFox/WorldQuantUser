@@ -23,7 +23,7 @@ sys.path.insert(0, ROOT)
 
 import alpha_registry
 import research_paths
-from research_app import campaign as cli_campaign
+from research_app import brief as cli_campaign
 
 
 def _series(kind, days=600):

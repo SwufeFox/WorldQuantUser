@@ -30,7 +30,7 @@ import correlation
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import expression_lint
 import field_index
-import guarded_sim
+from research_app import guarded_sim
 import paper_search
 import expression_types
 import expression_units

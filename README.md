@@ -11,36 +11,30 @@ runners and the separate SPC client sit under `tools/`.
 
 ## Start here
 
-Use one research directory and one execution owner. The normal batch workflow is:
+v4 runs experiments through a **resident single-writer daemon** (`daemon`) and a
+**persistent 4-gate state machine**. Every model command is short and non-blocking:
 
 | Step | Command |
 | --- | --- |
-| Read the current workspace and existing jobs | `python research_cli.py brief` and `python research_cli.py campaign status --limit 10` |
-| Review a new spec with its question, mechanism and stable arm labels | `python research_cli.py campaign preview SPEC.json` |
-| Preflight and queue a 16-arm QUICK pilot, then let one runner advance it | `python research_cli.py campaign publish SPEC.json`, then `python research_cli.py campaign run --watch --defer-quick-pnl --stream` |
-| Review results and failure evidence | `python research_cli.py ledger analyze --group-by scope --limit 8` |
-| Validate a chosen FULL candidate and preserve its metadata | Use the saved training selection with the [promotion command below](#screen-a-campaign-candidate-before-promotion). |
+| Ensure resident daemon & read bounded workspace state | `python research_cli.py daemon start`, `python research_cli.py brief`, `python research_cli.py inbox` |
+| Validate a spec offline and enqueue into `AUTO_PREFLIGHT` | `python research_cli.py propose SPEC.json` |
+| Block efficiently on condition variable until a `GATE_*` arrives | `python research_cli.py wait --max-wait 30` |
+| Inspect train-only screening results (Test firewall enforced before freeze) | `python research_cli.py inspect RUN_ID` |
+| Advance through the 4 interaction gates (`hydrate-pnl`, `approve-full`, `describe`, `hold`/`submit --yes`) | `python research_cli.py act RUN_ID <action> ...` |
+| Review ledger results & plan independent shelved submissions | `python research_cli.py ledger analyze --group-by scope --limit 8` and `python research_cli.py shelf plan` |
 
-See [research campaign delivery](docs/research-campaign-queue.md) for regional field
-inventory, pilot expansion and offline queue diagnosis.
+Keep one resident daemon per `--research-dir`. Subagents can safely draft specs,
+call `propose` for independent hypotheses, call `inspect` / `inbox` / `runs`, and
+query `ledger analyze` while the daemon serializes state writes under
+`daemon/state.lock`. Before `act RUN_ID approve-full` freezes
+`runs/<run_id>-selection.json`, `inspect RUN_ID` hides test-period metrics and
+live checks at the protocol level.
 
-Keep a running spec and its canonical checkpoint unchanged. Campaign owns both
-new launches and recovery; subagents can prepare separate drafts and inspect
-results while that owner runs. If a command returns `deferred`, a saved batch's
-`jobs[].diagnosis` in `campaign status` gives its current reason, `next_action.argv`
-and retry/poll time. Fresh specs without a saved batch have `state: queued`.
-`last_attempt.progress` reports unchanged turns and a stalled
-observation; `last_attempt` is historical, with `matches_current_progress` marking
-whether it still matches the saved batch. Repeating a command or starting a
-second writer is not evidence of progress.
-
-[Batch execution and recovery](docs/ledger-workflow.md) is the operating guide,
-including the state-to-next-action table. [Fast backtesting](docs/fast-backtest.md)
-is the Chinese guide to throughput, wait budgets and concurrency measurements.
-[Tooling](docs/tooling.md) is a reference
-for a specific question; `help COMMAND` and `schema COMMAND` expose that command's
-options and machine contract. `simulate`, direct `probe` and older runners remain
-available for their specific uses.
+[State-machine workflow and ledger review](docs/ledger-workflow.md) is the operating
+guide with the full state diagram. [Fast backtesting](docs/fast-backtest.md) covers
+throughput, wait budgets and concurrency measurements. [Tooling](docs/tooling.md)
+is the per-command reference; `help COMMAND` and `schema COMMAND` expose live
+options and the JSON contract.
 
 ## Layout
 
@@ -49,29 +43,31 @@ available for their specific uses.
 | `research_cli.py` | Thin executable entry point. stdout is always one JSON document. |
 | `research_app/app.py` | Command execution, workspace selection, error envelopes and exit codes. |
 | `research_app/parser.py` | Argument declarations, terminal help and the schema derived from the live parser. |
-| `research_app/runtime.py` | Shared CLI contract, JSON output, input settings and authenticated sessions. |
+| `research_app/runtime.py` | Shared CLI contract, JSON output, protected state paths and authenticated sessions. |
+| `research_app/state_machine.py` | Persistent 4-gate state machine, Train/Test protocol firewall and `migrate-workspace`. |
+| `research_app/sm_workers.py` | Autonomous worker transitions (`AUTO_*`), cost audit and orphan slot harvesting. |
+| `research_app/daemon.py` | Resident single-writer HTTP loopback server, bearer-auth IPC and non-blocking CLI handlers. |
+| `research_app/brief.py` | Bounded workspace brief, book health, out-of-sample views log and `breed` offspring generator. |
 | `research_app/account.py` | Account access and local cache commands. |
 | `research_app/catalog.py` | Dataset, datafield and operator discovery. |
 | `research_app/validation.py` | FASTEXPR lint, Python Alpha static checks and simulation preflight. |
-| `research_app/experiments.py`, `research_app/exp_*.py` | Simulation, resumption, labelled probes, ablation and comparison (`exp_compare`, `exp_sim`, `exp_probe_spec`, `exp_probe_recovery`). |
-| `research_app/alphas.py` | Platform alpha inspection, native recordsets, submission and correlation. |
+| `research_app/experiments.py`, `research_app/exp_*.py` | Labelled spec normalization, comparisons and ablation helpers. |
+| `research_app/alphas.py` | Platform alpha inspection, native recordsets, correlations and submission reconciliation. |
 | `research_app/simulation_import.py` | Read existing BRAIN simulations and recover their Alpha IDs. |
-| `research_app/triage.py` | Train-only candidate screening, book leave-one-out health and frozen validation. |
-| `research_app/promote.py` | Freeze, validate, run live checks and shelve a FULL candidate in one workflow. |
+| `research_app/triage.py`, `research_app/promote.py` | Internal train-only screening and FULL validation helpers backing state transitions. |
 | `research_app/selection.py` | Immutable training selection manifests and drift verification. |
-| `research_app/buffer_cmd.py` | Append-only candidate shelf (`submit-buffer.jsonl`) and submission seed store. |
+| `research_app/buffer_cmd.py` | Append-only candidate shelf (`submit-buffer.jsonl`), seed store (`seeds.jsonl`) and `shelf` queries. |
 | `research_app/pp_budget.py` | Structural Power Pool operator/field/dataset budget and gate summary. |
 | `research_app/submission_planner.py` | Maximum-weight independent subset and submission ordering from train PnL correlations. |
 | `research_app/description.py` | Evidence-bound Power Pool description assembly and near-duplicate checks. |
 | `research_app/rules_snapshot.py` | Scoped, provenance-tagged snapshots of platform thresholds, quotas and themes. |
 | `research_app/ledger.py` | Local ledger recording, labels, lineage, coverage, shared legs and offline queries. |
 | `research_app/ledger_analysis.py` | Indexed funnel, failure-driver and cohort summaries over the local ledger. |
-| `research_app/campaign.py` | Research campaigns, bounded briefs and train/test view history. |
 | `research_app/feed.py` | Multi-source research leads (papers, news, forum, market snapshots) with seen tracking. |
 | `research_app/literature.py` | OpenAlex paper discovery and reading. |
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and research scripts. |
 | `machine_lib.py`, `brain_core/` | Public facade, canonical defaults and cohesive core submodules (`errors`, `auth`, `catalog`, `transport`, `simulations`, `alphas`, `client`). |
-| `batch_policy.py`, `spc_experiment.py` | Pure QUICK structural/dataset admission policy and offline SPC prediction comparison shared with `research_app` and `tools`. |
+| `batch_policy.py`, `spc_experiment.py` | Pure QUICK structural/dataset admission policy and offline SPC prediction comparison. |
 | `check_evidence.py` | Shared normalization and status classification for platform check payloads. |
 | `simulation_capabilities.py` | Account identity and current settings evidence; unknown capabilities remain explicit. |
 | `simulation_slots.py` | Durable simulation reservations shared by the same account and research workspace. |
@@ -96,15 +92,11 @@ available for their specific uses.
 | `alpha_unit.py` | Compress the ledger into constructions: template, grid, derivation. |
 | `expression_units.py` | Field units, harvested from the simulator's rejections. |
 | `rejection_reasons.py` | Why a rejection happened: the cause, not just the gate. |
-| `research_app/guarded_sim.py` | Bind simulation launches to preflight for the exact source and settings (`tools/guarded_sim.py` is a compatibility alias). |
-| `research_app/queue_runner.py` | Shared workspace and durable Probe handling for research queues (`tools/_runner.py` is a compatibility alias). |
-| `research_app/campaign_runner.py` | Screen completed experiments on training evidence before candidate promotion (`tools/campaign_runner.py` is a compatibility wrapper/alias). |
-| `research_app/batch_admission.py` | Account-and-scope QUICK exploration admission checks shared by `campaign_delivery` and `batch_quick`. |
-| `tools/atom_runner.py` | Run ATOM / Power Pool exploration scans through the durable Probe lifecycle. |
-| `tools/atom_screen.py` | Screen saved ATOM results by sub-universe check margins and Sharpe. |
-| `tools/pipeline/batch_quick.py` | Compatibility Quick exploration batch runner with skeleton and dataset admission gates (`tools/pipeline/batch_policy.py` and `tools/spc_experiment.py` are compatibility aliases). |
+| `research_app/guarded_sim.py` | Bind simulation launches to preflight for the exact source and settings. |
+| `research_app/batch_admission.py` | Account-and-scope QUICK exploration admission checks. |
 | `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
-| `research_app/substitution.py` | Whole-token field substitution: the "change exactly one input" batch. Exact and identifier-bounded, because `replace("sales", ...)` also rewrote `sales_growth`. |
+| `research_app/substitution.py` | Whole-token field substitution: exact, identifier-bounded input replacement. |
+| `tools/spc_client.py` | SPC prompt validation, forms and offline output comparison. |
 | `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |
 | `tools/dedupe_ledger.py` | Find identical-PnL entries that are one alpha filed twice. |
 | `tools/degenerate_batch.py` | Flag a batch whose different expressions produced the same result. |
@@ -112,7 +104,7 @@ available for their specific uses.
 | `tools/unit_report.py` | How few constructions the ledger is, and what each has not tried. |
 | `tools/parts_catalogue.py` | Reusable parts, screened by how many book families they serve. |
 | `tools/backup_replay.py` | Snapshot the research directory; replay it as of a date; diff drift. |
-| `tests/` | Offline contract tests. No account required. |
+| `tests/` | Offline contract, state-machine, and daemon IPC tests. No account required. |
 
 `docs/tooling.md` maps these tools to the questions they answer.
 
@@ -162,10 +154,10 @@ application. Add a command in its owning module, declare its arguments in
 `research_app/parser.py`, and test the implementation module or the executable
 contract. The entry point exports no command handlers or compatibility aliases.
 
-`research_app` owns internal command and orchestration modules (`guarded_sim`, `queue_runner`,
-`campaign_runner`, `batch_admission`) with a one-way dependency DAG
-(`core` / `brain_core` ← `research_app` ← `tools`). Probes import `research_app.guarded_sim`
-directly without modifying `sys.path`, while legacy paths under `tools/` remain compatibility aliases.
+`research_app` owns internal command and orchestration modules (`state_machine`,
+`sm_workers`, `daemon`, `brief`, `guarded_sim`, `batch_admission`) with a strict
+one-way dependency DAG (`core` / `brain_core` ← `research_app` ← `tools`). No
+legacy v3 runner compatibility shims remain.
 
 ## The expression tree
 
@@ -178,10 +170,9 @@ pattern-matching the string.
 
 | Page | Read it when |
 | --- | --- |
-| [Tool map](docs/tooling.md) | Choose a CLI command, check its evidence, or recover a runner batch. |
-| [Batch research and ledger review](docs/ledger-workflow.md) | Queue QUICK probes, read the indexed report, and prepare a FULL follow-up. |
-| [Research campaign delivery](docs/research-campaign-queue.md) | Enumerate regional inventories, publish 16-arm QUICK pilots/expansions, and diagnose offline queue state. |
-| [Errors, status diagnosis and recovery](docs/errors.md) | Interpret `ERROR_CODES`, `campaign status` diagnoses, `probe` pauses, and safe recovery paths. |
+| [Tool map](docs/tooling.md) | Choose a CLI command, inspect state-machine runs, or run companion scripts. |
+| [State-machine workflow and ledger review](docs/ledger-workflow.md) | Operate `daemon` / `propose` / `inbox` / `act`, analyze the ledger, and manage the candidate shelf. |
+| [Errors, status diagnosis and recovery](docs/errors.md) | Interpret `ERROR_CODES`, `GATE_PREFLIGHT_BLOCKED`, `stalled`, and `UNCERTAIN` recovery paths. |
 | [Fast backtesting (中文)](docs/fast-backtest.md) | Diagnose slow or stalled work and measure accepted jobs, finished results and complete evidence separately. |
 | [Expression pipeline](docs/ast-pipeline.md) | Understand FASTEXPR parsing, source identity, and structural analysis. |
 | [Unit compression](docs/unit-compression.md) | Inspect FASTEXPR construction coverage and reproduce the report. |
@@ -1784,8 +1775,8 @@ accuracy without that experiment's data and configuration.
 | --- | --- |
 | CLI schema, error envelopes and file inputs | [`test_contract.py`](tests/test_contract.py), [`test_contract_v2.py`](tests/test_contract_v2.py) |
 | Check states, missing refreshes and ledger provenance | [`test_check_evidence.py`](tests/test_check_evidence.py), [`test_ledger_evidence.py`](tests/test_ledger_evidence.py), [`test_registry_index.py`](tests/test_registry_index.py) |
-| Account budgets, worker limits and accepted-job recovery | [`test_concurrency_policy.py`](tests/test_concurrency_policy.py), [`test_quick_slots.py`](tests/test_quick_slots.py), [`test_native_multi.py`](tests/test_native_multi.py) |
-| Slow field catalog, durable proofs and preflight retry scheduling | [`test_preflight_recovery.py`](tests/test_preflight_recovery.py), [`test_capabilities.py`](tests/test_capabilities.py), [`test_probe_workflow.py`](tests/test_probe_workflow.py) |
+| Account budgets, worker limits and slot recovery | [`test_quick_slots.py`](tests/test_quick_slots.py), [`test_native_multi.py`](tests/test_native_multi.py) |
+| Slow field catalog, durable proofs and capabilities | [`test_capabilities.py`](tests/test_capabilities.py), [`test_batch_policy.py`](tests/test_batch_policy.py) |
 | Python source, account preflight and payload | [`test_python_preflight.py`](tests/test_python_preflight.py), [`test_regular_settings_payload.py`](tests/test_regular_settings_payload.py), [`test_expression_identity.py`](tests/test_expression_identity.py) |
-| Probe reuse, queue recovery and Campaign | [`test_probe.py`](tests/test_probe.py), [`test_research_runners.py`](tests/test_research_runners.py) |
-| Training freeze and candidate validation | [`test_triage_modes.py`](tests/test_triage_modes.py), [`test_promote.py`](tests/test_promote.py) |
+| 4-gate state machine, Train/Test firewall and workspace migration | [`test_state_machine.py`](tests/test_state_machine.py), [`test_daemon_ipc.py`](tests/test_daemon_ipc.py) |
+| Training freeze, shelf and submission reconciliation | [`test_triage_modes.py`](tests/test_triage_modes.py), [`test_submission_workflow.py`](tests/test_submission_workflow.py), [`test_buffer.py`](tests/test_buffer.py) |

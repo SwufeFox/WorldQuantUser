@@ -646,25 +646,31 @@ def _format_fastexpr(expression, label):
                        "fix the FASTEXPR syntax error before formatting") from exc
 
 def _write_formatted_spec(path, source, document):
-    from .campaign_runner import campaign_paths
-
     root = Path(_exp.research_paths.research_dir()).resolve()
-    inbox = root / "backlog"
+    runs_dir = root / "runs"
+    resolved = path.resolve()
     try:
         with ExitStack() as locks:
-            if path.parent in (inbox, inbox / "done", inbox / "failed"):
-                locks.enter_context(_exp.cache_store.file_lock(inbox / ".runner.lock", timeout=0))
-                if any(saved.exists() for saved in campaign_paths(root, path)):
-                    raise CliError("INVALID_INPUT", "this campaign spec already has saved execution evidence",
-                                   "preview it or format a separate draft")
             locks.enter_context(_exp.cache_store.file_lock(str(path) + ".lock", timeout=0))
+            if path.parent == runs_dir:
+                raise CliError("INVALID_INPUT", "live state-machine run files cannot be formatted in place",
+                               "format a draft spec outside runs/ before calling `propose`")
+            if runs_dir.is_dir():
+                for run_file in sorted(runs_dir.glob("*.json")):
+                    if run_file.name.endswith("-selection.json") or run_file.name.startswith("."):
+                        continue
+                    run_doc, err = _exp.cache_store.load_json(run_file)
+                    src_spec = run_doc.get("source_spec") if isinstance(run_doc, dict) else None
+                    if not err and src_spec and src_spec != "-" and Path(src_spec).expanduser().resolve() == resolved:
+                        raise CliError("INVALID_INPUT", "proposed run specs must remain byte-exact",
+                                       f"draft a new copy instead of modifying source spec for run {run_doc.get('run_id')}")
             if path.read_bytes() != source:
                 raise CliError("INVALID_INPUT", "the draft spec changed during formatting",
                                "re-run `fmt` after the concurrent edit finishes")
             _exp.cache_store.write_json_atomic(path, document, mode=path.stat().st_mode & 0o777, indent=2)
     except _exp.cache_store.LockTimeout as exc:
-        raise CliError("SERVICE_ERROR", "this draft spec or its queue is already being updated",
-                       "wait for the active queue/writer to finish before formatting") from exc
+        raise CliError("SERVICE_ERROR", "this draft spec is already being updated",
+                       "wait for the active writer to finish before formatting") from exc
 
 def cmd_fmt(args, _sink):
     """Preview FASTEXPR formatting and write only a verified draft spec."""

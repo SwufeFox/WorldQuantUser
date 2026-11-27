@@ -9,9 +9,8 @@ from unittest import TestCase, mock
 
 import machine_lib as ml
 import simulation_capabilities
-from research_app import capabilities, experiments, validation
+from research_app import capabilities, experiments, guarded_sim, validation
 from research_app.runtime import CliError
-from tools import guarded_sim
 
 
 SOURCE = """from brain.alphas import alpha as signal

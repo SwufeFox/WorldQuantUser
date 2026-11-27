@@ -36,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import machine_lib  # noqa: E402
-from tools.spc_experiment import experiment, parse_predictions  # noqa: E402
+from spc_experiment import experiment, parse_predictions  # noqa: E402
 
 BASE = "https://api.worldquantbrain.com"
 SPC = f"{BASE}/competitions/spc/submissions"

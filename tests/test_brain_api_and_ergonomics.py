@@ -305,12 +305,15 @@ def test_cancel_simulation_releases_local_slot(tmp_path):
         assert simulation_slots.confirmed_accepted_count(account) == 1
 
         session.routes[("DELETE", "/simulations/SIM999")] = FakeResponse(204)
-        with mock.patch.object(ml, "load_session", return_value=session):
-            code, doc, _ = invoke_cli("alpha", "cancel-sim", "SIM999", "--research-dir", str(tmp_path))
-        assert code == 0
-        assert doc["data"]["state"] == "cancelled"
-        assert doc["data"]["cancelled"] is True
-        assert identity["id"] in doc["data"]["released_reservations"]
+        with mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(tmp_path)}), \
+                mock.patch.object(ml, "load_session", return_value=session):
+            canceled = alphas.cmd_alpha_cancel_sim(
+                SimpleNamespace(reference="SIM999", no_cache=False, relogin=False, meta_max_age=None),
+                None,
+            )
+        assert canceled["state"] == "cancelled"
+        assert canceled["cancelled"] is True
+        assert identity["id"] in canceled["released_reservations"]
         assert simulation_slots.confirmed_accepted_count(account) == 0
 
 
@@ -449,17 +452,27 @@ def test_alpha_list_filters_and_describe_color_hide_tags(tmp_path):
         assert sent_params["is.turnover<"] == 0.4
         assert sent_params["dateCreated>="] == "2026-01-01"
 
-        code, desc_doc, _ = invoke_cli(
-            "alpha", "describe", "A55",
-            "--tags", "alpha,beta", "gamma",
-            "--color", "GREEN",
-            "--hide",
-            "--research-dir", str(tmp_path),
-        )
-        assert code == 0
-        assert desc_doc["data"]["tags"] == ["alpha", "beta", "gamma"]
-        assert desc_doc["data"]["color"] == "GREEN"
-        assert desc_doc["data"]["hidden"] is True
+        with mock.patch.dict(os.environ, {"BRAIN_RESEARCH_DIR": str(tmp_path)}), \
+                mock.patch.object(ml, "load_session", return_value=session):
+            desc_data = alphas.cmd_alpha_describe(
+                SimpleNamespace(
+                    alpha_id="A55",
+                    name=None,
+                    category=None,
+                    tags=["alpha,beta", "gamma"],
+                    description=None,
+                    color="GREEN",
+                    hide=True,
+                    unhide=False,
+                    no_cache=False,
+                    relogin=False,
+                    meta_max_age=None,
+                ),
+                None,
+            )
+        assert desc_data["tags"] == ["alpha", "beta", "gamma"]
+        assert desc_data["color"] == "GREEN"
+        assert desc_data["hidden"] is True
 
 
 def test_alpha_describe_rejects_old_template_before_the_remote_write():
@@ -481,39 +494,27 @@ def test_alpha_describe_rejects_old_template_before_the_remote_write():
     session.assert_not_called()
 
 
-def test_ergonomic_cli_shortcuts_simulate_probe_triage_and_near(tmp_path):
-    # 1. Inline expression + --quick / --full on simulate
-    code, sim_quick, _ = invoke_cli("simulate", "rank(close)", "--quick", "--dry-run", "--research-dir", str(tmp_path))
-    assert code == 0
-    payload = sim_quick["data"]["results"][0]["payload"]
-    assert payload["regular"] == "rank(close)"
-    assert payload["settings"]["simulationMode"] == "QUICK"
+def test_ergonomic_cli_shortcuts_propose_triage_and_near(tmp_path):
+    # 1. Removed v3 simulation/triage CLI entrypoints fail cleanly with USAGE
+    for removed in (["simulate", "rank(close)", "--quick"], ["probe", "x.json"], ["triage", "CAND1"]):
+        code, err_doc, _ = invoke_cli(*removed, "--research-dir", str(tmp_path))
+        assert code == 2
+        assert err_doc["error"]["code"] == "USAGE"
 
-    code, sim_full, _ = invoke_cli("simulate", "rank(liabilities/assets)-0.5", "--full", "--dry-run", "--research-dir", str(tmp_path))
-    assert code == 0, sim_full
-    assert sim_full["data"]["results"][0]["payload"]["regular"] == "rank(liabilities/assets)-0.5"
-    assert sim_full["data"]["results"][0]["payload"]["settings"]["simulationMode"] == "FULL"
-
-    # Conflict between --quick and --setting simulationMode=FULL fails cleanly
-    code, conflict_doc, _ = invoke_cli(
-        "simulate", "rank(close)", "--quick", "--setting", "simulationMode=FULL", "--dry-run",
-        "--research-dir", str(tmp_path),
-    )
-    assert code == 2
-    assert conflict_doc["error"]["code"] == "INVALID_INPUT"
-
-    # 2. --quick on probe
+    # 2. `propose` supports non-blocking spec submission with --name override
     spec = tmp_path / "quick.spec.json"
     spec.write_text(json.dumps({
         "name": "ergonomic-probe",
+        "idea": "Cross-sectional liquidity",
         "design": "explore",
         "arms": [{"label": "c1", "expression": "rank(close)"}],
     }), encoding="utf-8")
-    code, probe_doc, _ = invoke_cli("probe", str(spec), "--quick", "--dry-run", "--research-dir", str(tmp_path))
-    assert code == 0
-    assert probe_doc["data"]["results"][0]["settings"]["simulationMode"] == "QUICK"
+    code, proposed, _ = invoke_cli("propose", str(spec), "--name", "custom-run", "--research-dir", str(tmp_path))
+    assert code == 0, proposed
+    assert proposed["data"]["name"] == "custom-run"
+    assert proposed["data"]["state"] == "AUTO_PREFLIGHT"
 
-    # 3. Positional target on `alpha near` and `triage`
+    # 3. Positional target on `alpha near` and internal `triage` scorer
     registry = tmp_path / "alpha-registry.jsonl"
     entry = alpha_registry.build_entry(
         {
@@ -530,8 +531,6 @@ def test_ergonomic_cli_shortcuts_simulate_probe_triage_and_near(tmp_path):
         },
         verdict="candidate",
     )
-    # `triage` scores against the book, so the book needs cached daily PnL, and a
-    # Sharpe needs at least `stats.MIN_POINTS` days before the train cutoff.
     book_days = [(date(2022, 1, 3) + timedelta(days=index)).isoformat()
                  for index in range(120)]
     (tmp_path / "pnl").mkdir(exist_ok=True)
@@ -546,8 +545,6 @@ def test_ergonomic_cli_shortcuts_simulate_probe_triage_and_near(tmp_path):
     book_entry = alpha_registry.build_entry(
         {
             "alpha_id": "BOOK1",
-            # Deliberately a different skeleton from rank(volume)/rank(close) so the
-            # `alpha near` assertions below stay about the candidate only.
             "expression": "ts_delta(cash, 5)",
             "settings": ml.resolve_settings({"testPeriod": "P1Y"}),
             "status": "ACTIVE",
@@ -572,9 +569,9 @@ def test_ergonomic_cli_shortcuts_simulate_probe_triage_and_near(tmp_path):
     assert code == 0
     assert near_id["data"]["fields"] == ["volume"]
 
-    code, triage_doc, _ = invoke_cli("triage", "CAND1", "--registry", str(registry), "--research-dir", str(tmp_path))
-    assert code == 0
-    assert [row["alpha_id"] for row in triage_doc["data"]["rows"]] == ["CAND1"]
+    from research_app import triage
+    triage_doc = triage.triage(["CAND1"], registry_path=str(registry), pnl_dir=str(tmp_path / "pnl"))
+    assert [row["alpha_id"] for row in triage_doc["rows"]] == ["CAND1"]
 
 
 def test_brain_client_lazy_session_offline_preview_and_auto_refresh(tmp_path):

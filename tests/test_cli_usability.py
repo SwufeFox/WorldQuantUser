@@ -9,32 +9,31 @@ import machine_lib as ml
 from research_app import buffer_cmd, experiments, parser
 
 
-def test_probe_actions_preserve_the_workspace_when_copied(monkeypatch, tmp_path):
-    research_dir = tmp_path / "research with spaces"
-    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(research_dir))
-    target = research_dir / "batches" / "saved experiment.json"
-    settings = ml.resolve_settings({})
-    document = {
-        "arms": [{"label": label, "expression": expression, "settings": settings, "ops": 1}
-                 for label, expression in (("queued", "rank(close)"), ("accepted", "rank(volume)"))],
-        "records": [
-            {"status": "QUEUED", "submission_attempted": False, "settings": settings},
-            {"status": "PENDING", "submission_attempted": True, "settings": settings,
-             "progress_url": "https://example.invalid/simulations/synthetic"},
-        ],
-    }
-    experiments._probe_document_update(document, target)
-    assert {action["action"] for action in document["next_actions"]} == {"recover", "resume"}
+def test_state_machine_actions_and_workspace_routing(monkeypatch, tmp_path):
+    from research_app import state_machine
 
-    # A later shell may have a different default; the copied command must keep its own workspace.
-    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path / "different workspace"))
+    research_dir = tmp_path / "research with spaces"
+    spec = tmp_path / "demo.json"
+    spec.write_text(json.dumps({
+        "name": "demo",
+        "idea": "Cross-sectional volume rank",
+        "design": "explore",
+        "arms": [{"label": "a1", "expression": "rank(close)"},
+                 {"label": "a2", "expression": "rank(volume)"}],
+    }), encoding="utf-8")
+
+    engine = state_machine.StateMachineEngine(research_dir)
+    proposed = engine.propose(json.loads(spec.read_text(encoding="utf-8")), source_path=str(spec))
     cli = parser.build_parser()
-    for action in document["next_actions"]:
-        parsed = cli.parse_args(action["argv"][2:])
-        assert parsed.command == "probe"
-        assert parsed.research_dir == str(research_dir)
-        assert getattr(parsed, action["action"]) == str(target)
-        assert action["batch_path"] == str(target)
+    for action in proposed["allowed_actions"]:
+        tokens = action["command"].split()[1:]
+        parsed = cli.parse_args(tokens)
+        assert parsed.run_id == proposed["run_id"]
+        assert parsed.command == "cancel"
+
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(research_dir))
+    assert parser.build_parser().parse_args(["propose", str(spec)]).spec == str(spec)
+    assert parser.build_parser().parse_args(["act", proposed["run_id"], "approve-full"]).action == "approve-full"
 
 
 def test_probe_summary_reports_omitted_items_and_existing_complete_evidence(tmp_path):
@@ -132,7 +131,10 @@ def test_bare_cli_invocation_returns_top_level_help(monkeypatch, tmp_path):
     assert payload["ok"] is True
     assert payload["command"] == "help"
     assert "commands" in payload["data"]
-    assert "campaign" in payload["data"]["commands"]
+    assert "propose" in payload["data"]["commands"]
+    assert "inbox" in payload["data"]["commands"]
+    assert "daemon" in payload["data"]["commands"]
+    assert "campaign" not in payload["data"]["commands"]
     assert "schema" in payload["data"]["commands"]
 
 
@@ -243,16 +245,35 @@ def test_layered_architecture_has_no_reverse_imports():
     assert app_violations == []
 
 
-def test_compatibility_tool_aliases_resolve_to_canonical_modules():
-    import batch_policy
-    import spc_experiment
-    from research_app import campaign_runner, guarded_sim, queue_runner
-    from tools import _runner, campaign_runner as legacy_campaign_runner, guarded_sim as legacy_guarded_sim
-    from tools import spc_experiment as legacy_spc_experiment
-    from tools.pipeline import batch_policy as legacy_batch_policy
+def test_legacy_v3_runner_modules_stay_removed_and_public_docstrings_exist():
+    import ast
+    from pathlib import Path
 
-    assert _runner is queue_runner
-    assert legacy_campaign_runner is campaign_runner
-    assert legacy_guarded_sim is guarded_sim
-    assert legacy_spc_experiment is spc_experiment
-    assert legacy_batch_policy is batch_policy
+    root = Path(__file__).resolve().parent.parent
+    removed = [
+        root / "tools" / "_runner.py",
+        root / "tools" / "campaign_runner.py",
+        root / "tools" / "guarded_sim.py",
+        root / "tools" / "spc_experiment.py",
+        root / "tools" / "sim_queue.py",
+        root / "tools" / "atom_runner.py",
+        root / "tools" / "atom_screen.py",
+        root / "tools" / "pipeline",
+        root / "research_app" / "campaign.py",
+        root / "research_app" / "campaign_delivery.py",
+        root / "research_app" / "campaign_runner.py",
+        root / "research_app" / "queue_runner.py",
+        root / "research_app" / "confirm.py",
+    ]
+    assert [str(p.relative_to(root)) for p in removed if p.exists()] == []
+
+    missing_docs = []
+    for path in sorted((root / "research_app").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        if not ast.get_docstring(tree):
+            missing_docs.append((path.name, "<module>"))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not node.name.startswith("_"):
+                if not ast.get_docstring(node):
+                    missing_docs.append((path.name, node.name))
+    assert missing_docs == []

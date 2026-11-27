@@ -10,7 +10,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import machine_lib as ml
-from tools.pipeline import batch_policy as policy
+import batch_policy as policy
 
 
 def arm(expression="rank(close)", **extra):
