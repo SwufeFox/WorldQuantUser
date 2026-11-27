@@ -8,6 +8,8 @@ import simulation_slots as slots
 
 ACCOUNT = {"fingerprint": "quick-test"}
 URL = "https://api.worldquantbrain.com/simulations/first"
+# Allow Windows spawn and SQLite initialization before the child signals readiness.
+CHILD_READY_SECONDS = 30
 
 
 def _hold_slot(ready, release, location, prepare=False):
@@ -15,7 +17,7 @@ def _hold_slot(ready, release, location, prepare=False):
     if location:
         slots.quick_update(ACCOUNT, reservation["id"], "accepted", progress_url=location)
     ready.set()
-    release.wait(10)
+    release.wait(2 * CHILD_READY_SECONDS)
 
 
 @pytest.mark.parametrize("location", [URL, None])
@@ -26,7 +28,7 @@ def test_cross_process_capacity_and_recovery_after_holder_exits(tmp_path, monkey
     process = context.Process(target=_hold_slot, args=(ready, release, location))
     process.start()
     try:
-        assert ready.wait(5)
+        assert ready.wait(CHILD_READY_SECONDS)
         assert slots.quick_orphans(ACCOUNT) == []
         assert slots.quick_acquire(ACCOUNT, 2, "another") is None
         assert slots.quick_acquire(ACCOUNT, 1, "first") is None
@@ -79,7 +81,7 @@ def test_killed_preparation_frees_slot_before_any_post(tmp_path, monkeypatch):
     process = context.Process(target=_hold_slot, args=(ready, release, None, True))
     process.start()
     try:
-        assert ready.wait(5)
+        assert ready.wait(CHILD_READY_SECONDS)
         assert slots.quick_acquire(ACCOUNT, 1, "another", prepare=True) is None
     finally:
         process.kill()
@@ -233,7 +235,7 @@ def test_quick_owner_liveness_checks_start_token_and_invalid_pids():
     child = context.Process(target=_sleep_briefly, args=(ready, release))
     child.start()
     try:
-        assert ready.wait(5)
+        assert ready.wait(CHILD_READY_SECONDS)
         state, child_start = slots._process_stat(child.pid)
         child_owner = {"pid": child.pid, "start": child_start}
         assert slots._quick_owner_is_live(child_owner) is True
