@@ -1,8 +1,8 @@
 # 状态机实验流程与台账复盘（v4）
 
-v4 版本采用**常驻单写入者 Daemon + 非阻塞 CLI + 持久化四门禁状态机**替代旧版文件队列与阻塞式长命令。所有研究状态持久化在 `<research_dir>/runs/<run_id>.json`，台账证据与失败记录持久化在 `<research_dir>/alpha-registry.jsonl`。
+v4 版本采用**常驻单写入者 Daemon + 非阻塞 CLI + SQLite WAL/Delta-Parquet 三层存储 + 持久化门禁状态机**替代旧版文件队列与阻塞式长命令。运行状态、槽位日志与 BRAIN Labs 工单持久化在 `<research_dir>/workspace.db`（SQLite WAL），日度 PnL 主存储使用 `<research_dir>/pnl/` 下的不可变 `base-*.parquet` 和 `deltas/*.parquet`，由 `meta.sqlite` 发布生效的版本，不可变冻结凭证保留在 `runs/<run_id>-selection.json`，台账证据与失败记录持久化在 `<research_dir>/alpha-registry.jsonl`。
 
-> 在仓库根目录执行命令；若有多个研究目录，请始终传递同一个 `--research-dir PATH`。先运行 `python research_cli.py brief` 核对 `data.research_dir` 与工作区状态。
+> 在仓库根目录执行命令；若有多个研究目录，请始终传递同一个 `--research-dir PATH`。先运行 `python research_cli.py brief` 核对 `data.research_dir` 与工作区状态；当遇到连续逻辑合理但模拟异常、字段分布/覆盖不确定或多字段共线性检验需求时，通过 `python research_cli.py labs open`（或在门禁态执行 `act RUN_ID request-labs`）向人类协作者委派 BRAIN Labs 诊断工单，停止盲试。
 
 ## 1. 常驻 Daemon 与短命令工作链
 
@@ -16,11 +16,12 @@ python research_cli.py inspect RUN_ID
 ```
 
 - `propose SPEC.json` 进行离线 AST / Python `@alpha(data=[...])` / 重复请求指纹校验，并立即创建处于 `AUTO_PREFLIGHT` 的运行文档返回，**不等待模拟或网络请求**；若 daemon 尚未启动且未在测试禁用模式下，CLI 会按需拉起或使用 `daemon start`。
-- 后台 worker 按单一写入者锁 `daemon/state.lock` 调度优先级执行：
+- 后台 worker 只在读取快照、记录回执与合并写回时持有 `daemon/state.lock`。平台 I/O 和本地 SPC 计算在锁外运行，CLI 可同时响应 `propose`、`cancel` 和配置更新。调度优先级如下。
   1. 主动取消 (`AUTO_CANCELLING`) 与提交核实 (`AUTO_SUBMITTING`)
   2. 入架写描述 (`AUTO_BUFFER`)
   3. 进行中/待启动 FULL 验证 (`AUTO_FULL_VALIDATE`)
   4. 进行中 QUICK (`AUTO_QUICK_SIM`)、PnL 补水 (`AUTO_HYDRATE_PNL`)、预检 (`AUTO_PREFLIGHT`)、未发送新 QUICK (`AUTO_QUICK_SIM`)
+  5. 本地 SPC 对比 (`AUTO_SPC`)，不需要 BRAIN 会话。
 - 所有需要智能体做出研究/风控决断的节点均自动暂停在 `GATE_*` 态，通过 `wait` 的条件变量即时唤醒或 `inbox` 查询。
 - 调度配额护栏可通过 `python research_cli.py daemon config --quota-floor 20 --concurrency 8` 配置：`quota_floor` 仅暂停未启动的新 QUICK 臂；FULL 验证与已受理任务回读仅在平台 `blocked=true` 时暂停。
 
@@ -29,6 +30,11 @@ python research_cli.py inspect RUN_ID
 ```mermaid
 stateDiagram-v2
     [*] --> AUTO_PREFLIGHT: propose
+    [*] --> AUTO_SPC: propose SPC
+    AUTO_SPC --> COMPLETED: local comparison complete
+    GATE_PREFLIGHT_BLOCKED --> GATE_LABS: act request-labs
+    GATE_TRIAGE --> GATE_LABS: act request-labs
+    GATE_APPROVE_FULL --> GATE_LABS: act request-labs
     AUTO_PREFLIGHT --> GATE_PREFLIGHT_BLOCKED: preflight failed or 3x unchanged defers
     GATE_PREFLIGHT_BLOCKED --> AUTO_PREFLIGHT: act retry-preflight
     GATE_PREFLIGHT_BLOCKED --> DROPPED: act drop
@@ -41,7 +47,7 @@ stateDiagram-v2
     GATE_APPROVE_FULL --> GATE_TRIAGE: act back-to-triage
     GATE_APPROVE_FULL --> ARCHIVED: act drop --verdict ...
     GATE_APPROVE_FULL --> AUTO_FULL_VALIDATE: act approve-full (freezes selection, opens test view)
-    AUTO_FULL_VALIDATE --> REJECTED_AT_VALIDATION: checks FAIL / self_corr / test_sharpe<=0 / pp_budget
+    AUTO_FULL_VALIDATE --> REJECTED_AT_VALIDATION: failed checks, self-correlation, test Sharpe or Power Pool budget
     AUTO_FULL_VALIDATE --> GATE_DESCRIBE: validation passed
     GATE_DESCRIBE --> AUTO_BUFFER: act describe --name --category --tags --description
     GATE_DESCRIBE --> ARCHIVED: act drop --verdict ...
@@ -59,17 +65,21 @@ stateDiagram-v2
 | `AUTO_QUICK_SIM` | 自动 | 执行 QUICK（遵守 `quota_floor`），将已完成/终态失败写入 `alpha-registry.jsonl` | 等待 `wait` / `inbox` |
 | `GATE_TRIAGE` | 门禁 | 仅暴露训练期指标；`inspect` 强制隐藏测试期及验证字段 | `act RUN_ID hydrate-pnl --top 3`（或 `--arms a,b`）或 `drop` |
 | `AUTO_HYDRATE_PNL` | 自动 | 对选中候选拉取日频 PnL 并评估训练窗口逐年 Sharpe | 等待 `wait` |
-| `GATE_APPROVE_FULL` | 门禁 | 训练期与逐年证据齐全，**测试窗口仍然关闭** | `act RUN_ID approve-full`（冻结 `runs/<id>-selection.json`） / `back-to-triage` / `drop` |
-| `AUTO_FULL_VALIDATE` | 自动 | 跑 FULL、实时检查、自相关与 5/10/20 bps 成本审计；任意失败自动转 `REJECTED_AT_VALIDATION` | `inspect RUN_ID` 查看含 `train+test` 与 `cost_audit` 完整结果 |
+| `GATE_APPROVE_FULL` | 门禁 | **测试窗口仍关闭**。只能批准一条有明确训练期逐年通过证据的 arm。 | `act RUN_ID approve-full [--arms LABEL]` / `back-to-triage` / `drop` |
+| `AUTO_FULL_VALIDATE` | 自动 | 按冻结身份跑一条 FULL，要求有效正值 test Sharpe、完整检查与通过的自相关证据。成本审计覆盖 5/10/20 bps，数据缺失时结果为空。 | `inspect RUN_ID` 查看含 `train+test` 与 `cost_audit` 完整结果 |
 | `GATE_DESCRIBE` | 门禁 | 验证通过；等待填写候选元数据与官方三段式模板说明 | `act RUN_ID describe --name ... --category ... --tags ... --description ...` |
 | `AUTO_BUFFER` | 自动 | `set_alpha_metadata` 写入平台并回读校验一致，再写入 `seeds.jsonl` 与 `submit-buffer.jsonl` | `shelf list` / `shelf plan` |
 | `GATE_CONFIRM_SUBMIT` | 门禁 | 候选已安全入架；**可选择直接提交或暂存候补** | `act RUN_ID hold`（转 `SHELVED`）或 `act RUN_ID submit --yes`（需 `BRAIN_ALLOW_AGENT_SUBMIT=true`） |
+| `GATE_LABS` | 门禁 | 等待人类协作者回传汇总统计。工单处于 `OPEN` 时，拦截同 Region/Universe/Delay 且字段重叠的提案。 | `labs show TICKET_ID` / `labs resolve TICKET_ID --summary ...` |
+| `AUTO_CANCELLING` | 自动 | 等待平台确认取消、已不存在或进入终态。有未决平台回执时继续退避。 | `inspect RUN_ID` |
+| `AUTO_SPC` | 自动 | 对指定本地结果文件运行 SPC 对比。 | `wait --run-id RUN_ID` |
 | `AUTO_SUBMITTING` | 自动 | 持久化发送 `POST /alphas/{id}/submit`；遇 `UNCERTAIN` 仅走只读回查，绝不重发 `POST` | 等待终态 `SUBMITTED` 或 `REJECTED_AT_SUBMIT` |
 
 ## 3. 协议级训练/测试隔离（Train/Test Firewall）
 
 - `public_run_view`（被 `inspect`、`inbox`、`wait`、`propose`、`act` 共用）在 `PRE_FREEZE_STATES`（`AUTO_PREFLIGHT` 至 `GATE_APPROVE_FULL`）或 `selection_frozen == false` 时，协议层自动剔除行内的 `test`、`test_sharpe`、`test_fitness`、`test_turnover`、`retention`、`checks`、`cost_audit`、`validation` 与 `out_of_sample.test`。
-- 只有在 `act RUN_ID approve-full` 不可逆地冻结 `runs/<run_id>-selection.json` 并置 `selection_frozen = true` 后，`inspect RUN_ID` 才打开 `test_view_open: true` 并暴露测试期留存、平台实时 checks 与成本净 Sharpe。
+- 提案中的所有 arm 必须使用相同的有效模拟设置。不同中性化、衰减或范围配置分开提案。QUICK 的训练指标只取显式训练分段。
+- 只有在 `act RUN_ID approve-full` 不可逆地冻结 `runs/<run_id>-selection.json` 并置 `selection_frozen = true` 后，`inspect RUN_ID` 才打开 `test_view_open: true` 并暴露测试期留存、平台实时 checks 与成本净 Sharpe。批准动作和显式查看测试窗口写入 `views.jsonl`。
 
 ## 4. Power Pool 官方说明模板与 `GATE_DESCRIBE`
 
@@ -97,4 +107,4 @@ python research_cli.py ledger analyze --region ASI --delay 1 --mode QUICK --grou
   python research_cli.py migrate-workspace --dry-run
   python research_cli.py migrate-workspace
   ```
-  旧文件将被导入为 `runs/<run_id>.json` 对应状态（已有训练指标的 QUICK 批直接进入 `GATE_TRIAGE`），原目录整洁归档至 `legacy-v3-archive/`。
+  预览不写入存储。正式迁移把旧批次和旧版 `runs/*.json` 导入 `workspace.db`。已有训练证据的 QUICK 批可进入 `GATE_TRIAGE`，缺少冻结证据的旧 FULL 批保留在 `ARCHIVED`。旧 run JSON 保留，经过验证的数据缓存和原队列目录可归档至 `legacy-v3-archive/`。迁移统计包含 run、PnL、槽位和 datafields。

@@ -28,7 +28,7 @@ python3 research_cli.py schema propose        # 单个命令的机器契约
 
 所有 CLI 命令共用 `--save PATH`、`--compact`、`--quiet`、`--research-dir PATH`，
 参数放在哪一级都有效。`--save` 原子保存与 stdout 完全相同的 JSON envelope，
-也保存结构化错误，但会拦截写入 `runs/`、`daemon/`、`alpha-registry.jsonl`、`submit-buffer.jsonl` 和 `seeds.jsonl`。
+也保存结构化错误，但会拦截写入 `runs/`、`daemon/`、`workspace.db` 及其日志、PnL 和 catalog 缓存、`alpha-registry.jsonl`、`submit-buffer.jsonl` 与 `seeds.jsonl`。
 
 实现位置按职责固定：参数、帮助和 schema 在 `research_app/parser.py`；
 执行边界在 `app.py`，公共 CLI 约定在 `runtime.py`。状态机与常驻守护在
@@ -216,6 +216,24 @@ BRAIN Labs 的覆盖、典型值、换手和收益相关分析可作补充证据
 文档将 SLOW_AND_FAST 对应到 risk-handled、MaxTrade ON 对应到 investability-constrained；
 这提供设置语义，不能单独证明 ON 的结果总与 OFF 的某个返回分块完全一致。合法设置仍查
 当前账户的 OPTIONS 元数据，STATISTICAL 等不同风险处理需要单独提出解释与对照。
+
+### BRAIN Labs 诊断工单
+
+当同一字段的训练期高换手、子样本或集中度检查反复异常，或需要核实更新频率、覆盖率、极值与字段交互时，
+先通过 `labs suggest` 检查台账信号，再用 `labs open` 委派诊断。比如：
+
+```powershell
+python research_cli.py labs open --trigger distribution --region USA --universe TOP3000 --delay 1 --fields close --question "What share of adjacent valid observations changes daily?" --expect "Median daily update rate and coverage" --branch "Update rate below 0.1 -> compare event-time and calendar-time treatments"
+python research_cli.py labs show TICKET_ID
+python research_cli.py labs resolve TICKET_ID --summary "Daily update rate was 0.04 and coverage was 95%."
+```
+
+同一 Region、Universe、Delay 中引用工单字段的新提案会在本地被拦截。使用 `act RUN_ID request-labs`
+将处于预检、训练筛选或全量验证审批门禁的运行暂停于 `GATE_LABS`。关闭对应工单后，运行恢复原门禁。
+`labs open --run-id` 只记录工单的关联来源。`labs list`、`brief` 和 `inbox` 提供摘要，
+`labs show` 显示完整工单和需要接入 Labs In-Sample 数据加载器的 Python 片段。
+通过 `labs resolve` 回传文字摘要和可选的聚合 JSON 指标，保留原始数据在 Labs 内。
+`labs cancel` 用于明确撤销诊断工单。
 
 ### Pyramid theme multipliers：平台激励维度
 
@@ -668,6 +686,8 @@ python3 research_cli.py catalog fields --dataset analyst45 --region USA --univer
 `alpha_count_unknown`。`--sort pyramid-multiplier` 对全部匹配排序，缺失倍率排在最后，`--limit` 只限制输出。
 字段目录完整分页后按账户、数据集和范围缓存，换本地筛选条件时可重用。`--type MATRIX` 优先复用匹配缓存，
 冷读时直接向平台请求 MATRIX 分页。使用目录倍率来找线索时，仍需核对字段定义。
+字段快照以 Parquet 保存到 `<research_dir>/cache/metadata/datafields/`，包含原始字段记录和有效期。
+旧 JSON 快照仍可读取。`migrate-workspace --dry-run` 预览可迁移数量，正式迁移验证 Parquet 后归档原 JSON。
 
 `--stream` 将扫描进度写到 stderr。`discovery.complete` 表示请求范围的目录是否完整读取或命中新鲜缓存。
 每个数据集报告扫描行数、匹配数和错误。`matches: null` 表示未取得可筛选的记录，`matches: 0` 表示在读到的记录中没有匹配。
@@ -1266,6 +1286,8 @@ Location/Alpha ID 后只读恢复，不重跑整份 spec。直接 runner 的日�
 | 2026-10-25 那天的台账是什么样 | `python3 tools/backup_replay.py asof --at ...` |
 | 平台数字漂了没有 | `python3 tools/backup_replay.py replay --run` |
 
+`state` 和 `full` 使用 SQLite 快照保留 WAL 中已提交的事务，并在 PnL 发布锁内备份清单及其引用的 Parquet 文件。恢复此类归档时，请使用新的研究目录。详见 [备份与重放](backup-replay.md)。
+
 ## 每个工具的输出约定
 
 `research_cli.py` 有一条契约：stdout 恰好一个 JSON 文档。工具现在跟它对齐，用同一个开关：
@@ -1403,7 +1425,7 @@ python research_cli.py act RUN_ID approve-full
 python research_cli.py act RUN_ID describe --name "..." --category ANALYST --tags t1 --description "..."
 python research_cli.py act RUN_ID hold
 python research_cli.py act RUN_ID submit --yes
-python research_cli.py breed runs/PARENT.json --out offspring.spec.json --seed 17 --limit 4
+python research_cli.py breed RUN_ID --out offspring.spec.json --seed 17 --limit 4
 python research_cli.py shelf list
 python research_cli.py shelf plan
 python research_cli.py migrate-workspace --dry-run
@@ -1412,14 +1434,15 @@ python research_cli.py migrate-workspace --dry-run
 - **离线预检与指纹去重**：`propose` 在本地解析 FASTEXPR AST 或 Python `@alpha(data=[...])`、验证 `idea` 与设置键，并拦截与活跃运行完全一致的 `request_fingerprint`。
 - **后台配额与熔断**：`AUTO_PREFLIGHT` 连续 3 次无进展且无 `Retry-After` 时自动切至 `GATE_PREFLIGHT_BLOCKED`；`AUTO_QUICK_SIM` 遵循 `quota_floor`，而 `AUTO_FULL_VALIDATE` 仅在平台配额完全耗尽（`blocked=true`）时暂停，并在校验通过后计算 5 / 10 / 20 bps 成本审计。
 - **繁殖 (`breed`)**：从已完成运行 ID 或批次文件中的训练 Fitness 与随机种子各配对生成一个后代规格，保留来源谱系 `breeding_source`，可直接交给 `propose`。
-- **孤儿槽位回收**：Daemon 按 `reconcile_interval_seconds` 周期性扫盘释放已完成槽位并把漏收结果补录进 `alpha-registry.jsonl`。
+- **孤儿槽位回收**：Daemon 按 `reconcile_interval_seconds` 检查当前认证账户的 SQLite 槽位日志（兼容旧版 JSON）。确认模拟进入终态或普通模拟返回 HTTP 404 后释放对应槽位，并将可取得的 Alpha 结果补录到 `alpha-registry.jsonl`。
+- **停止 Daemon**：`daemon stop` 请求后台停止调度。若当前步骤仍在退出，返回 `stopping: true` 和 `stopped: false`，Daemon 保留工作区锁直到步骤结束。
 
 | 路线 | 说明 |
 | --- | --- |
 | `track: REGULAR`（默认） | QUICK 初筛 -> 逐年训练 PnL 补水 -> 冻结并运行 FULL / 成本审计 -> 入架与可选提交。 |
 | `track: POWER_POOL` | 共用状态机流程，并在 `AUTO_FULL_VALIDATE` 额外校核 8 算子 / 3 数据字段预算与 `< 0.5` 相关性门禁。 |
 | `settings.language: PYTHON` | 通过 `lookback` 与 `@alpha(data=[...])` 在 `propose` 阶段静态验证后进入统一状态机。 |
-| `track: SPC` | 由 `propose` 直接调用本地 SPC 预测对比并生成终态运行记录 `COMPLETED` / `FAILED`。 |
+| `track: SPC` | `propose` 将本地 SPC 预测对比加入 `AUTO_SPC`，后台完成后进入 `COMPLETED` 或 `FAILED`。 |
 
 ### 做 SPC 提示词实验
 

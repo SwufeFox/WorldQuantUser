@@ -16,12 +16,17 @@ failure would be silent:
 
 from __future__ import annotations
 
+from contextlib import closing
 import json
 import os
+from pathlib import Path
+import sqlite3
 import sys
 import tarfile
 import tempfile
 import unittest
+
+import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -197,6 +202,62 @@ class Restore(unittest.TestCase):
         outcome = br.restore(self.archive, self.target, dry_run=True)
         self.assertTrue(outcome["written"])
         self.assertFalse(os.path.exists(os.path.join(self.target, "alpha-registry.jsonl")))
+
+
+@pytest.mark.parametrize("profile", ["state", "full"])
+def test_cli_backup_and_restore_snapshots_wal_and_pnl(tmp_path, profile):
+    pytest.importorskip("polars")
+    root = tmp_path / "source"
+    pnl = root / "pnl"
+    output = tmp_path / "archives"
+    restored = tmp_path / "restored"
+    write(root, "alpha-registry.jsonl", json.dumps(ledger_row("a")) + "\n")
+    write(root, "daemon/endpoint.json", '{"token": "private-bearer"}')
+    write(root, "pnl/legacy.json", '{"2026-10-20": 0.2}')
+    write(root, "pnl/deltas/orphan.parquet", "uncommitted content")
+    receipt = br.pnl_store.write_pnl(pnl, "base", {"2026-10-20": 0.1}, {"complete": True})
+    base_path = pnl / "base-test.parquet"
+    Path(receipt["path"]).rename(base_path)
+    with closing(sqlite3.connect(root / "workspace.db")) as workspace, \
+         closing(sqlite3.connect(pnl / "meta.sqlite")) as manifest:
+        manifest.execute("UPDATE pnl_evidence SET delta_file = ?", (base_path.name,))
+        manifest.commit()
+        workspace.execute("PRAGMA journal_mode=WAL")
+        workspace.execute("CREATE TABLE sample (value TEXT)")
+        workspace.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        workspace.execute("INSERT INTO sample VALUES ('committed to WAL')")
+        workspace.commit()
+        manifest.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        br.pnl_store.write_pnl(pnl, "delta", {"2026-10-21": 0.4}, {"complete": True})
+        assert (root / "workspace.db-wal").stat().st_size > 0
+        assert (pnl / "meta.sqlite-wal").stat().st_size > 0
+        assert br.main(["backup", "--root", str(root), "--out", str(output), "--profile", profile]) == 0
+    archive, = output.glob("*.tar.gz")
+    metadata = br.load_manifest(archive)
+    assert metadata["excluded_secrets"] == ["daemon/endpoint.json"]
+    names = {item["path"] for item in metadata["files"]}
+    assert {"workspace.db", "pnl/meta.sqlite", "pnl/legacy.json"} <= names
+    assert any(name.startswith("pnl/base-") for name in names)
+    assert any(name.startswith("pnl/deltas/") for name in names)
+    assert {"daemon/endpoint.json", "pnl/deltas/orphan.parquet"}.isdisjoint(names)
+    assert not any(name.endswith(br.SQLITE_SIDECARS) for name in names)
+    assert br.verify_archive(archive) == []
+    assert br.restore(archive, restored)["ok"]
+    with closing(sqlite3.connect(restored / "workspace.db")) as workspace:
+        assert workspace.execute("SELECT value FROM sample").fetchall() == [("committed to WAL",)]
+    assert br.pnl_store.read_pnl(restored / "pnl", "base") == {"2026-10-20": 0.1}
+    assert br.pnl_store.read_pnl(restored / "pnl", "delta") == {"2026-10-21": 0.4}
+    assert not br.restore(archive, restored, force=True)["ok"]
+
+
+def test_cli_backup_rejects_a_missing_committed_pnl_file(tmp_path):
+    pytest.importorskip("polars")
+    root = tmp_path / "source"
+    output = tmp_path / "archives"
+    receipt = br.pnl_store.write_pnl(root / "pnl", "delta", {"2026-10-21": 0.4}, {})
+    Path(receipt["path"]).unlink()
+    assert br.main(["backup", "--root", str(root), "--out", str(output)]) == 1
+    assert list(output.iterdir()) == []
 
 
 class Prune(unittest.TestCase):

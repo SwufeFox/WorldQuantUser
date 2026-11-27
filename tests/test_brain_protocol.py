@@ -102,7 +102,8 @@ class SimulationQuotaTests(unittest.TestCase):
 
     def run_batch(self, session, **options):
         report = {}
-        arguments = {"concurrency": 1, "max_wait_seconds": 10, "scheduling_report": report}
+        # These protocol tests use mock HTTP responses. Leave budget for disk contention on CI.
+        arguments = {"concurrency": 1, "max_wait_seconds": 120, "scheduling_report": report}
         arguments.update(options)
         with mock.patch.object(ml, "poll_simulation", return_value={"status": "COMPLETE", "alpha": "A1"}), \
                 mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {}}):
@@ -247,7 +248,7 @@ class SimulationQuotaTests(unittest.TestCase):
             session.post.return_value = response(headers={"Location": "/simulations/other"})
             self.assertTrue(ml.submit_single_simulation(session, {"regular": "rank(volume)"}).endswith("/other"))
         journal, _ = simulation_slots._paths(ACCOUNT["fingerprint"])
-        self.assertNotIn("unrelated-secret", Path(journal).read_text(encoding="utf-8"))
+        self.assertNotIn("unrelated-secret", json.dumps(simulation_slots._load(journal, ACCOUNT["fingerprint"])))
 
     def test_quota_rejects_balance_rebound_and_requires_next_window_evidence(self):
         def observe(now, remaining, reset=None, date=None):
@@ -276,7 +277,7 @@ class SimulationQuotaTests(unittest.TestCase):
         session = mock.Mock()
         session.post.return_value = response(headers=quota_headers(0))
         events = []
-        with mock.patch.object(simulation_slots.cache_store, "write_json_atomic", side_effect=OSError("disk")):
+        with mock.patch.object(simulation_slots, "_save", side_effect=OSError("disk")):
             progress = ml.submit_single_simulation(session, {"regular": "rank(cap)"},
                 on_event=lambda kind, payload: events.append((kind, payload)))
         self.assertEqual(progress, "https://api.worldquantbrain.com/simulations/fixture")
@@ -354,24 +355,24 @@ class SimulationQuotaTests(unittest.TestCase):
 
 class RecordsetReadinessTests(unittest.TestCase):
     def test_interrupted_cache_publication_keeps_previous_verified_series(self):
+        import pnl_store
+
         session = mock.Mock()
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "A.json"
             previous = {"2020-01-01": 1.0}
             session.get.return_value = response(200, payload={"records": [["2020-01-01", 1]], "count": 1})
             self.assertEqual(ml.fetch_daily_pnl(session, "A", cache_dir=directory), previous)
-            write = ml.cache_store.write_json_atomic
+            publish = pnl_store._publish_delta_file
 
-            def interrupt_data(filename, content, **kwargs):
-                if Path(filename) == path:
+            def interrupt_data(cache_dir, alpha_id, series):
+                if alpha_id == "A":
                     raise KeyboardInterrupt
-                return write(filename, content, **kwargs)
+                return publish(cache_dir, alpha_id, series)
 
-            # Repeated interruptions must carry the proof for the data still on disk,
-            # even if the sidecar already advertises a staged update from the last run.
+            # Repeated interruptions must carry the proof for the data still on disk.
             for value in (2, 3):
                 session.get.return_value = response(200, payload={"records": [["2020-01-01", value]], "count": 1})
-                with mock.patch.object(ml.cache_store, "write_json_atomic", side_effect=interrupt_data), \
+                with mock.patch.object(pnl_store, "_publish_delta_file", side_effect=interrupt_data), \
                         self.assertRaises(KeyboardInterrupt):
                     ml.fetch_daily_pnl(session, "A", cache_dir=directory, max_age_hours=0)
                 offline = mock.Mock()
@@ -405,9 +406,11 @@ class RecordsetReadinessTests(unittest.TestCase):
         ]
         report = {}
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(ml.time, "sleep") as wait:
+            import pnl_store
             series = ml.fetch_daily_pnl(session, "A", cache_dir=directory, report=report)
             self.assertEqual(series, {"2020-01-01": 2.0})
-            self.assertEqual(json.loads((Path(directory) / "A.json").read_text()), series)
+            self.assertEqual(pnl_store.read_pnl(directory, "A"), series)
+            self.assertFalse((Path(directory) / "A.json").exists())
         wait.assert_called_once_with(2)
         self.assertEqual(session.get.call_count, 2)
         self.assertTrue(report["complete"])

@@ -48,6 +48,49 @@ def invoke(*args):
     return code, stdout.getvalue(), stderr.getvalue()
 
 
+def test_labs_ticket_cli_round_trip(tmp_path):
+    prefix = ("--research-dir", str(tmp_path), "labs")
+
+    def call(*args):
+        code, stdout, stderr = invoke(*prefix, *args)
+        assert code == 0, (stdout, stderr)
+        payload = json.loads(stdout)
+        assert payload["ok"] is True
+        return payload["data"]
+
+    ticket = call("open", "--trigger", "distribution", "--region", "USA", "--universe", "TOP3000",
+                  "--delay", "1", "--fields", "close", "--question", "How often does close update?",
+                  "--expect", "daily update rate", "--branch", "sparse -> examine events")
+    ticket_id = ticket["ticket_id"]
+    projection = call("list", "--status", "open", "--field", "close")["tickets"][0]
+    assert projection["ticket_id"] == ticket_id
+    assert "notebook_snippet" not in projection
+    assert call("show", ticket_id)["notebook_snippet"]
+    assert call("resolve", ticket_id, "--summary", "The daily update rate is 0.02.")["status"] == "RESOLVED"
+    assert call("list", "--status", "open")["count"] == 0
+
+
+def test_breed_loads_database_run_by_id(tmp_path, monkeypatch):
+    import workspace_db
+    from research_app import breeding
+
+    source = {"run_id": "db-source", "state": "GATE_TRIAGE", "track": "REGULAR",
+              "arms": [], "rows": [], "records": [], "request_fingerprint": "source-fingerprint"}
+    workspace_db.upsert_run(source, research_dir=tmp_path)
+
+    def generation(batch, history, *, seed, limit):
+        assert batch == source
+        assert (seed, limit) == (17, 2)
+        return [{"label": "offspring", "expression": "rank(close)"}], {}
+
+    monkeypatch.setattr(breeding, "generation", generation)
+    output = tmp_path / "offspring.json"
+    code, stdout, stderr = invoke("--research-dir", str(tmp_path), "breed", "db-source",
+                                  "--out", str(output), "--seed", "17", "--limit", "2")
+    assert code == 0, (stdout, stderr)
+    assert json.loads(output.read_text(encoding="utf-8"))["breeding_source"]["run_id"] == "db-source"
+
+
 class SchemaAndCliContractTests(unittest.TestCase):
     def test_schema_is_v4_single_json_document(self):
         proc = run_cli("schema")
@@ -79,6 +122,8 @@ class SchemaAndCliContractTests(unittest.TestCase):
             ("daemon", "config"),
             ("shelf", "list"),
             ("shelf", "plan"),
+            ("labs", "list"),
+            ("labs", "suggest", "--limit", "5"),
         )
         schema_doc = json.loads(run_cli("schema").stdout)["data"]
         listed = set(schema_doc["commands"]["subcommands"])

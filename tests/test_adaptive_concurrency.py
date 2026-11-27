@@ -403,7 +403,7 @@ class AdaptiveConcurrencyTests(unittest.TestCase):
         path, lock = simulation_slots._paths(ACCOUNT["fingerprint"])
         journal = simulation_slots._load(path, ACCOUNT["fingerprint"])
         journal["reservations"][identity["id"]]["state"] = "preparing"
-        cache_store.write_json_atomic(path, journal)
+        simulation_slots._save(path, journal)
         saved = {"slot_reservation": identity, "status": "UNKNOWN_SUBMISSION", "submission_attempted": True}
         with cache_store.file_lock(lock + ".prepare"):
             self.assertFalse(simulation_slots.restore_record(saved, ACCOUNT))

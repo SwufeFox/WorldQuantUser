@@ -15,28 +15,20 @@ and the shape of the legs (level transforms, autocorrelations, ranks) is visible
 expression.
 """
 
-import json
-import math
 import os
 
 import alpha_registry
+import pnl_store
 import research_paths
 
 from . import stats
 
 
 def load_pnl(alpha_id, pnl_dir=None):
-    """``{date: pnl}`` for one alpha, or ``{}`` when it was never cached."""
+    """``{date: pnl}`` for one alpha from Delta-Parquet or legacy JSON, or ``{}`` when absent."""
     directory = pnl_dir or os.path.join(research_paths.ensure_dir(), "pnl")
-    path = os.path.join(directory, "%s.json" % alpha_id)
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, ValueError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
+    series = pnl_store.read_pnl(directory, alpha_id)
+    return series if isinstance(series, dict) else {}
 
 
 def sharpe_of(series):

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 import json
 from pathlib import Path
+from threading import Event
+import time
 from types import SimpleNamespace
 from unittest import mock
 
@@ -15,7 +18,8 @@ import alpha_registry
 import cache_store
 import machine_lib as ml
 import simulation_capabilities
-from research_app import buffer_cmd, experiments, sm_workers, state_machine, validation
+import workspace_db
+from research_app import buffer_cmd, experiments, pnl_snapshot, sm_workers, state_machine, validation
 from research_app.runtime import CliError
 
 OFFICIAL_DESCRIPTION = (
@@ -102,6 +106,7 @@ def test_full_four_gate_happy_path_and_train_test_firewall(tmp_path, monkeypatch
             mock.patch.object(validation, "_preflight_lint", return_value={"ok": True}), \
             mock.patch.object(ml, "simulate_alphas", side_effect=[quick_res, full_res]), \
             mock.patch.object(ml, "fetch_daily_pnl", return_value=days_pnl), \
+            mock.patch.object(pnl_snapshot, "yearly_train_batch", return_value=[{"state": "pass"}]), \
             mock.patch.object(ml, "fetch_alpha_metrics", side_effect=[
                 full_payload,
                 {**full_payload, "regular": {"code": "rank(close)", "description": OFFICIAL_DESCRIPTION}},
@@ -150,6 +155,8 @@ def test_full_four_gate_happy_path_and_train_test_firewall(tmp_path, monkeypatch
         assert view_post["metrics_scope"] == "train+test"
         assert view_post["validation"]["test_sharpe"] == 1.4
         assert len(view_post["cost_audit"]["scenarios"]) == 3
+        views = [json.loads(line) for line in (tmp_path / "views.jsonl").read_text().splitlines()]
+        assert [event["tool"] for event in views] == ["approve-full", "inspect"]
 
         # Gate 3: Reject short prose; accept official Power Pool template -> AUTO_BUFFER -> GATE_CONFIRM_SUBMIT
         with pytest.raises(CliError) as bad_meta:
@@ -187,6 +194,17 @@ def test_full_four_gate_happy_path_and_train_test_firewall(tmp_path, monkeypatch
         assert d6["state"] == "SUBMITTED"
 
 
+def _approve_fixture(engine, run_id):
+    doc = engine.load_run_raw(run_id)
+    doc.update(
+        state="GATE_APPROVE_FULL",
+        selected_arms=[{"label": "c1", "alpha_id": "Q1"}],
+        hydration={"by_label": {"c1": {"alpha_id": "Q1", "gate_pass": True}}},
+    )
+    engine.save_run(doc)
+    engine.act(run_id, "approve-full")
+
+
 def test_quota_floor_pauses_quick_sim_but_not_full_validate(tmp_path, monkeypatch):
     import simulation_slots
 
@@ -214,10 +232,7 @@ def test_quota_floor_pauses_quick_sim_but_not_full_validate(tmp_path, monkeypatc
     assert after_q["next_wake_at"] is not None
 
     # AUTO_FULL_VALIDATE ignores soft quota_floor unless blocked=True.
-    doc = engine.load_run_raw(run_id)
-    doc["state"] = "AUTO_FULL_VALIDATE"
-    doc["approved_arms"] = [{"label": "c1", "alpha_id": "Q1"}]
-    engine.save_run(doc)
+    _approve_fixture(engine, run_id)
 
     full_res = [{"index": 0, "label": "c1", "status": "COMPLETE", "alpha_id": "F1", "submission_attempted": True}]
     full_payload = {
@@ -264,11 +279,7 @@ def test_validation_auto_rejects_failing_candidates(tmp_path, case):
         spec["arms"] = [{"label": "c1", "expression": "rank(a) + rank(b) + rank(c) + rank(d)", "idea": "4 fields"}]
     run_id = engine.propose(spec)["run_id"]
 
-    doc = engine.load_run_raw(run_id)
-    doc["state"] = "AUTO_FULL_VALIDATE"
-    doc["selection_frozen"] = True
-    doc["approved_arms"] = [{"label": "c1", "alpha_id": "Q1"}]
-    engine.save_run(doc)
+    _approve_fixture(engine, run_id)
 
     full_res = [{"index": 0, "label": "c1", "status": "COMPLETE", "alpha_id": "F1", "submission_attempted": True}]
     test_sharpe = -0.2 if case == "negative_test_sharpe" else 1.5
@@ -333,13 +344,12 @@ def test_uncertain_submit_reconciles_without_reposting(tmp_path):
 def test_reconcile_orphan_slots_harvests_completed_alpha(tmp_path, monkeypatch):
     import simulation_slots
 
-    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
     engine = state_machine.StateMachineEngine(tmp_path)
-    journal_path, _lock_path = simulation_slots._paths("fp-orphan")
-    Path(journal_path).parent.mkdir(parents=True, exist_ok=True)
-    cache_store.write_json_atomic(journal_path, {
+    account = {"fingerprint": "fp-orphan"}
+    journal_path, _lock_path = simulation_slots._paths(account["fingerprint"], tmp_path)
+    simulation_slots._save(journal_path, {
         "version": 1,
-        "account_fingerprint": "fp-orphan",
+        "account_fingerprint": account["fingerprint"],
         "reservations": {
             "slot-1": {
                 "state": "accepted",
@@ -347,7 +357,16 @@ def test_reconcile_orphan_slots_harvests_completed_alpha(tmp_path, monkeypatch):
                 "created_at": 1.0,
             }
         },
-    })
+    }, research_dir=tmp_path)
+    assert not Path(journal_path).exists()
+    other = {"fingerprint": "fp-other"}
+    other_journal, _ = simulation_slots._paths(other["fingerprint"], tmp_path)
+    simulation_slots._save(other_journal, {
+        "version": 1,
+        "account_fingerprint": other["fingerprint"],
+        "reservations": {"slot-2": {"state": "accepted", "progress_url":
+                                     "https://api.worldquantbrain.com/simulations/other1"}},
+    }, research_dir=tmp_path)
     alpha_payload = {
         "id": "ORPHAN1",
         "status": "COMPLETE",
@@ -355,12 +374,50 @@ def test_reconcile_orphan_slots_harvests_completed_alpha(tmp_path, monkeypatch):
         "settings": {"region": "USA", "universe": "TOP3000"},
         "is": {"sharpe": 2.0, "fitness": 1.4},
     }
-    with mock.patch.object(ml, "poll_simulation", return_value={"status": "COMPLETE", "alpha": "ORPHAN1"}), \
+    with mock.patch.object(simulation_capabilities, "account_provenance", return_value=account), \
+            mock.patch.object(ml, "_read_simulation_snapshot",
+                              return_value=({"status": "COMPLETE", "alpha": "ORPHAN1"}, None)) as poll, \
             mock.patch.object(ml, "fetch_alpha_metrics", return_value=alpha_payload):
         res = sm_workers.reconcile_orphan_slots(engine, _dummy_session, max_age_min=0.0)
+    poll.assert_called_once_with(mock.ANY, "https://api.worldquantbrain.com/simulations/orphan1", "orphan1", deadline=mock.ANY)
     assert res["harvested"] == ["ORPHAN1"]
     entries = alpha_registry.load_entries(str(tmp_path / "alpha-registry.jsonl"))
     assert [e["alpha_id"] for e in entries] == ["ORPHAN1"]
+    assert "slot-2" in simulation_slots._load(other_journal, other["fingerprint"], research_dir=tmp_path)["reservations"]
+
+
+def test_slot_migration_preserves_newer_sqlite_journal(tmp_path):
+    import simulation_slots
+
+    path, _ = simulation_slots._paths("fp-migration", tmp_path)
+    legacy = {"version": 1, "account_fingerprint": "fp-migration",
+              "reservations": {"old": {"state": "accepted"}}}
+    cache_store.write_json_atomic(path, legacy)
+    assert simulation_slots._load(path, "fp-migration", research_dir=tmp_path) == legacy
+
+    current = {**legacy, "reservations": {"current": {"state": "accepted"}}}
+    simulation_slots._save(path, current, research_dir=tmp_path)
+    assert Path(path).is_file()
+    assert simulation_slots._load(path, "fp-migration", research_dir=tmp_path) == current
+    archive = tmp_path / "archived-slots.json"
+    assert simulation_slots.import_legacy_journal(path, research_dir=tmp_path, archive_path=archive)
+    assert archive.is_file()
+    assert simulation_slots._load(path, "fp-migration", research_dir=tmp_path) == current
+
+
+def test_latest_quota_uses_legacy_accounts_until_migrated(tmp_path):
+    import simulation_slots
+    import workspace_db
+
+    path, _ = simulation_slots._paths("current", tmp_path)
+    current = {"version": 1, "account_fingerprint": "current", "reservations": {},
+               "quota": {"observed_at": 10}}
+    simulation_slots._save(path, current, research_dir=tmp_path)
+    cache_store.write_json_atomic(path, {**current, "quota": {"observed_at": 30}})
+    other_path, _ = simulation_slots._paths("legacy", tmp_path)
+    cache_store.write_json_atomic(other_path, {**current, "account_fingerprint": "legacy",
+                                               "quota": {"observed_at": 20}})
+    assert workspace_db.latest_quota_snapshot(research_dir=tmp_path) == {"observed_at": 20}
 
 
 def test_cancel_and_migrate_workspace(tmp_path):
@@ -373,9 +430,9 @@ def test_cancel_and_migrate_workspace(tmp_path):
 
     cancelling = engine.cancel(run_id, reason="superseded")
     assert cancelling["state"] == "AUTO_CANCELLING"
-    with mock.patch.object(ml, "cancel_simulation") as cancel_mock:
+    with mock.patch.object(ml, "cancel_simulation", return_value={"state": "cancelled", "http_status": 204}) as cancel_mock:
         cancelled = sm_workers.advance_run_once(engine, run_id, _dummy_session)
-    cancel_mock.assert_called_once_with(mock.ANY, "https://api.worldquantbrain.com/simulations/live1")
+    cancel_mock.assert_called_once_with(mock.ANY, "https://api.worldquantbrain.com/simulations/live1", deadline=mock.ANY)
     assert cancelled["state"] == "CANCELLED"
 
     # Legacy workspace migration (--dry-run and live archive)
@@ -408,3 +465,143 @@ def test_cancel_and_migrate_workspace(tmp_path):
     assert len(live["migrated"]) == 2
     assert not backlog.exists() and not results.exists()
     assert (tmp_path / "legacy-v3-archive").is_dir()
+
+
+def test_platform_wait_does_not_block_cli_or_overwrite_cancel(tmp_path, monkeypatch):
+    engine = state_machine.StateMachineEngine(tmp_path)
+    run_id = engine.propose(_explore_spec())["run_id"]
+    doc = engine.load_run_raw(run_id)
+    doc["state"] = "AUTO_QUICK_SIM"
+    engine.save_run(doc)
+    started = Event()
+    release = Event()
+    url = "https://api.worldquantbrain.com/simulations/live1"
+
+    def step(engine, doc, _session, _cfg):
+        started.set()
+        assert release.wait(timeout=45)
+        doc["records"][0].update(progress_url=url, status="PENDING")
+        sm_workers._persist_worker_progress(engine, doc, "AUTO_QUICK_SIM", ("records",))
+        raise AssertionError("superseded step must exit before advancing")
+
+    monkeypatch.setitem(sm_workers._HANDLERS, "AUTO_QUICK_SIM", step)
+    with ThreadPoolExecutor(2) as workers:
+        advance = workers.submit(sm_workers.advance_run_once, engine, run_id, _dummy_session)
+        try:
+            assert started.wait(timeout=12)
+            assert workers.submit(engine.update_config, {"concurrency": 2}).result(timeout=12)["concurrency"] == 2
+            proposed = workers.submit(engine.propose, {**_explore_spec(), "arms": [
+                {"label": "other", "expression": "rank(open)"},
+            ]}).result(timeout=12)
+            assert proposed["state"] == "AUTO_PREFLIGHT"
+            cancelled = workers.submit(engine.cancel, run_id).result(timeout=12)
+            assert cancelled["state"] == "AUTO_CANCELLING"
+        finally:
+            release.set()
+        assert advance.result(timeout=12)["records"][0]["progress_url"] == url
+    pending = ml.RateLimited("wait before cancel", retry_after=60)
+    with mock.patch.object(ml, "cancel_simulation", side_effect=pending):
+        after = sm_workers.advance_run_once(engine, run_id, _dummy_session)
+    assert after["state"] == "AUTO_CANCELLING"
+    assert after["next_wake_at"] > time.time() + 50
+    assert after["last_error"]["code"] == "RATE_LIMITED"
+
+
+def test_approval_rejects_failed_and_multiple_arms(tmp_path):
+    engine = state_machine.StateMachineEngine(tmp_path)
+    spec = _explore_spec()
+    spec["arms"][1].pop("role")
+    run_id = engine.propose(spec)["run_id"]
+    doc = engine.load_run_raw(run_id)
+    doc.update(state="GATE_APPROVE_FULL", selected_arms=[
+        {"label": "c1", "alpha_id": "Q1"}, {"label": "d1", "alpha_id": "Q2"},
+    ], hydration={"by_label": {"c1": {"gate_pass": False}}})
+    engine.save_run(doc)
+    for params in ({}, {"arms": ["c1"]}, {"arms": ["c1", "d1"]}):
+        with pytest.raises(CliError, match="passed|exactly one"):
+            engine.act(run_id, "approve-full", params)
+    assert not list(engine.runs_dir.glob("*-selection.json"))
+    doc["hydration"]["by_label"]["d1"] = {"alpha_id": "Q2", "gate_pass": True}
+    engine.save_run(doc)
+    assert engine.act(run_id, "approve-full")["approved_arms"] == [{"label": "d1", "alpha_id": "Q2"}]
+
+
+def test_propose_rejects_different_settings_without_writing_a_run(tmp_path):
+    engine = state_machine.StateMachineEngine(tmp_path)
+    spec = _explore_spec()
+    spec["arms"][1]["settings"] = {"decay": 17}
+    with pytest.raises(CliError, match="share simulation settings"):
+        engine.propose(spec)
+    assert engine.list_runs()["count"] == 0
+
+
+def test_run_and_event_roll_back_together(tmp_path):
+    engine = state_machine.StateMachineEngine(tmp_path)
+    run_id = engine.propose(_explore_spec())["run_id"]
+    doc = engine.load_run_raw(run_id)
+    doc["state"] = "AUTO_QUICK_SIM"
+    with pytest.raises(TypeError):
+        engine.save_run(doc, from_state="AUTO_PREFLIGHT", trigger="test", detail=object())
+    assert engine.load_run_raw(run_id)["state"] == "AUTO_PREFLIGHT"
+    with workspace_db.connect(tmp_path) as conn:
+        assert [tuple(row) for row in conn.execute("SELECT to_state, trigger FROM run_events")] == [("AUTO_PREFLIGHT", "propose")]
+
+
+def test_spc_runs_off_request_thread_without_a_platform_session(tmp_path, monkeypatch):
+    engine = state_machine.StateMachineEngine(tmp_path)
+    calls = []
+    monkeypatch.setattr(sm_workers.spc_experiment, "experiment", lambda *args, **kw: calls.append(args) or {"ok": True})
+    predictions = [{"company_name": "Apple Inc.", "ticker": "AAPL", "isin": "US0378331005",
+                    "mic": "XNAS", "confidence_score": 0.82, "investment_horizon": 22,
+                    "return_prediction": 0.045}]
+    spec = {"track": "SPC", "name": "Offline test", "prompt": "Predict return",
+            "sampleOutput": json.dumps(predictions), "modelFamily": "local",
+            "weight": 1.0, "updateFrequency": "daily", "runs": ["model.json"]}
+    proposed = engine.propose(spec, source_path=tmp_path / "spec.json")
+    assert proposed["state"] == "AUTO_SPC"
+    assert calls == []
+    done = sm_workers.advance_run_once(engine, proposed["run_id"], lambda: pytest.fail("SPC is local"))
+    assert done["state"] == "COMPLETED"
+    assert len(calls) == 1
+
+
+def test_dry_run_leaves_sqlite_absent_and_archives_unfrozen_legacy_full(tmp_path):
+    engine = state_machine.StateMachineEngine(tmp_path)
+    existing = engine.runs_dir / "old.json"
+    existing.write_text(json.dumps({"run_id": "old", "state": "COMPLETED"}), encoding="utf-8")
+    results = tmp_path / "backlog-results"
+    results.mkdir()
+    (results / "full-batch.json").write_text(json.dumps({
+        "complete": True, "records": [{"settings": {"simulationMode": "FULL"}, "alpha_id": "F1"}],
+        "rows": [{"alpha_id": "F1", "metrics": {"sharpe": 2.0}}],
+    }), encoding="utf-8")
+    preview = engine.migrate_workspace(dry_run=True)
+    assert preview["runs_json_migrated"] == 1
+    assert not workspace_db.db_path(tmp_path).exists()
+    migrated = engine.migrate_workspace()["migrated"][0]
+    assert migrated["state"] == "ARCHIVED"
+    assert engine.inspect_run(migrated["run_id"])["test_view_open"] is False
+    assert existing.is_file()
+
+
+def test_cancellation_recovers_accepted_url_from_slot_journal(tmp_path, monkeypatch):
+    import simulation_slots
+
+    monkeypatch.setenv("BRAIN_RESEARCH_DIR", str(tmp_path))
+    engine = state_machine.StateMachineEngine(tmp_path)
+    run_id = engine.propose(_explore_spec())["run_id"]
+    url = "https://api.worldquantbrain.com/simulations/accepted1"
+    fingerprint = "account-test"
+    doc = engine.load_run_raw(run_id)
+    doc["state"] = "AUTO_CANCELLING"
+    doc["records"][0].update(status="UNKNOWN_SUBMISSION", slot_reservation={
+        "workspace": simulation_slots._workspace(), "account_fingerprint": fingerprint, "id": "slot-1",
+    })
+    engine.save_run(doc)
+    workspace_db.save_slot_journal(fingerprint, {"version": 1, "account_fingerprint": fingerprint,
+        "reservations": {"slot-1": {"state": "accepted", "progress_url": url}}}, research_dir=tmp_path)
+    with mock.patch.object(simulation_capabilities, "account_provenance", return_value={"fingerprint": fingerprint}), \
+            mock.patch.object(ml, "cancel_simulation", return_value={"state": "cancelled"}) as cancel:
+        cancelled = sm_workers.advance_run_once(engine, run_id, _dummy_session)
+    cancel.assert_called_once_with(mock.ANY, url, deadline=mock.ANY)
+    assert cancelled["state"] == "CANCELLED"

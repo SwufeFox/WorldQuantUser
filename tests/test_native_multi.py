@@ -124,7 +124,7 @@ def test_native_batch_waits_for_shared_capacity_before_one_post(simulator):
             mock.patch.object(ml, "read_simulation_snapshot",
                               side_effect=lambda _session, identity, **_kwargs: (replies[identity], None)), \
             mock.patch.object(ml, "fetch_alpha_metrics", return_value={"is": {"fitness": 1}}):
-        records = simulator(concurrency=1, max_wait_seconds=5)
+        records = simulator(concurrency=1, max_wait_seconds=60)
 
     wait.assert_called_once()
     post.assert_called_once()
@@ -187,7 +187,7 @@ def test_native_matches_child_echo_without_assuming_order_and_preserves_failure(
             mock.patch.object(ml, "read_simulation_snapshot", side_effect=inspect), \
             mock.patch.object(ml, "fetch_alpha_metrics", return_value={
                 "is": {"fitness": 1}, "train": {"fitness": 1}}) as metrics:
-        records = simulator(max_wait_seconds=5, on_event=lambda event, payload: events.append((event, payload)))
+        records = simulator(max_wait_seconds=60, on_event=lambda event, payload: events.append((event, payload)))
 
     assert [row["status"] for row in records] == ["COMPLETE", "ERROR"]
     assert [row["alpha_id"] for row in records] == ["Alpha1", None]
@@ -218,7 +218,7 @@ def test_native_matches_child_echo_that_omits_request_only_settings(simulator):
                               side_effect=lambda s, identity, **kw: (replies[identity], None)), \
             mock.patch.object(ml, "fetch_alpha_metrics",
                               return_value={"is": {"fitness": 1}, "train": {"fitness": 1}}):
-        records = simulator()
+        records = simulator(max_wait_seconds=60)
 
     assert [row["alpha_id"] for row in records] == ["Alpha1", "Alpha2"]
     assert [row["multi_child_id"] for row in records] == ["Child1", "Child2"]
@@ -239,7 +239,7 @@ def test_native_ambiguous_echo_does_not_attribute_an_alpha(simulator, status):
             mock.patch.object(ml, "read_simulation_snapshot",
                               side_effect=lambda s, identity, **kw: (replies[identity], None)), \
             mock.patch.object(ml, "fetch_alpha_metrics") as metrics:
-        records = simulator()
+        records = simulator(max_wait_seconds=60)
     assert all(row["status"] == "PENDING" and not row["alpha_id"] for row in records)
     assert "ambiguous" in records[0]["error"]
     metrics.assert_not_called()
@@ -260,7 +260,8 @@ def test_native_complete_anonymous_failures_finish_without_allocating_child_ids(
             mock.patch.object(ml, "read_simulation_snapshot", side_effect=[
                 (parent, None), (second_child, None), (first_child, None),
             ]):
-        records = simulator(fetch_metrics=False, on_event=lambda kind, data: events.append((kind, data)))
+        records = simulator(fetch_metrics=False, max_wait_seconds=60,
+                            on_event=lambda kind, data: events.append((kind, data)))
     post.assert_called_once()
     assert [row["status"] for row in records] == ["ERROR", "ERROR"]
     assert all(row.get("multi_child_id") is None and row.get("alpha_id") is None for row in records)

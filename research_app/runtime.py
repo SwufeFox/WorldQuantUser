@@ -104,11 +104,12 @@ def protect_output(args, *paths):
     destination = Path(target).expanduser().resolve()
     import research_paths
     root = Path(getattr(args, "research_dir", None) or research_paths.research_dir()).expanduser().resolve()
-    for state_dir in (root / "runs", root / "daemon"):
+    for state_dir in (root / "runs", root / "daemon", root / "pnl", root / "simulation-slots",
+                      root / "cache" / "metadata"):
         if destination == state_dir or state_dir in destination.parents:
             raise OutputConflict(
-                "INVALID_INPUT", "--save would overwrite durable state-machine or daemon state",
-                "choose a response path outside <research_dir>/runs and <research_dir>/daemon",
+                "INVALID_INPUT", "--save would overwrite durable workspace state or cache",
+                "choose a response path outside the managed workspace directories",
                 details={"protected_path": str(destination)},
             )
     from .buffer_cmd import buffer_path, seeds_path
@@ -116,6 +117,11 @@ def protect_output(args, *paths):
     protected = (
         *paths,
         *(getattr(args, name, None) for name in _PROTECTED_OUTPUT_ARGS),
+        root / "workspace.db",
+        root / "workspace.db-wal",
+        root / "workspace.db-shm",
+        root / "workspace.db-journal",
+        root / "views.jsonl",
         root / alpha_registry.DEFAULT_FILENAME if hasattr(alpha_registry, "DEFAULT_FILENAME") else root / "alpha-registry.jsonl",
         buffer_path(args),
         seeds_path(args),

@@ -52,6 +52,7 @@ __all__ = [
     "cache_stats",
     "clear_dir",
     "confirm_top_level_entry",
+    "describe_entry",
     "file_lock",
     "fsync_directory",
     "link_bytes_exclusive",
@@ -279,6 +280,11 @@ def read_entry(path, now=None):
     than raising, so an upgrade degrades into a cache miss.
     """
     data, error = load_json(path)
+    return describe_entry(path, data, error=error, now=now)
+
+
+def describe_entry(path, data, *, error=None, now=None):
+    """Apply the cache envelope and TTL rules to an already-decoded entry."""
     result = {
         "path": os.path.abspath(path),
         "payload": None,

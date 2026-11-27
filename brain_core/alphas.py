@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
 import random
 import re
 import sys
@@ -372,6 +371,12 @@ def _matching_pnl_evidence(metadata, alpha_id, digest):
 
 def pnl_cache_status(cache_dir, alpha_id, series=None):
     """Describe cache evidence without assuming a legacy file was fully fetched."""
+    import pnl_store
+
+    store_evidence = pnl_store.pnl_evidence_status(cache_dir, alpha_id, series=series)
+    if store_evidence is not None:
+        return store_evidence
+
     path = Path(cache_dir) / (alpha_id + ".json")
     metadata_path = Path(cache_dir) / ".meta" / (alpha_id + ".json")
     evidence = {"source": "cache", "path": str(path), "metadata_path": str(metadata_path),
@@ -416,32 +421,22 @@ def pnl_cache_status(cache_dir, alpha_id, series=None):
 
 
 def _write_pnl_cache(path, metadata_path, series, metadata, deadline):
-    """Stage the next digest while retaining proof for the still-visible data file."""
+    """Persist daily PnL atomically to Delta-Parquet + SQLite WAL (with lock protection)."""
+    import pnl_store
+
+    cache_dir = Path(path).parent
+    alpha_id = metadata.get("alpha_id") or Path(path).stem
     lock_timeout = max(0, min(1, deadline - _ml.time.monotonic()))
-    with _ml.cache_store.file_lock(metadata_path.with_suffix(".lock"), timeout=lock_timeout):
-        prior, _ = _ml.cache_store.load_json(metadata_path)
-        if isinstance(prior, dict) and prior.get("format") == _ml._PNL_EVIDENCE_FORMAT:
-            current, _ = _ml.cache_store.load_json(path)
-            if isinstance(current, dict):
-                try:
-                    match = _ml._matching_pnl_evidence(prior, metadata["alpha_id"], _ml._pnl_digest(current))
-                except (TypeError, ValueError):
-                    match = None
-                if match is not None and match["data_sha256"] != metadata["data_sha256"]:
-                    metadata = {**metadata, "previous": {key: value for key, value in match.items()
-                                                         if key != "previous"}}
-        _ml.cache_store.write_json_atomic(metadata_path, metadata)
-        _ml.cache_store.write_json_atomic(path, series)
+    return pnl_store.write_pnl(cache_dir, alpha_id, series, metadata, timeout=lock_timeout)
 
 
 def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
                     page_limit=10000, attempts=3, report=None, max_wait_seconds=180.0, *, deadline=None):
     """Read daily PnL; never return or cache a silently truncated recordset.
 
-    Raw cache files remain date/value maps. A hash-bound metadata sidecar records
-    successful pagination; older cache files have unknown completeness until refreshed.
-    Retry-After takes precedence over a nonempty body. The total wait is bounded;
-    pending pages raise RateLimited without replacing complete cached evidence.
+    Data lives primarily in Delta-Parquet + SQLite ``meta.sqlite`` (with transparent
+    legacy JSON fallback). A hash-bound metadata record records successful pagination.
+    Retry-After takes precedence over a nonempty body.
     """
     if not isinstance(page_limit, int) or isinstance(page_limit, bool) or page_limit < 1:
         raise ValueError("page_limit must be a positive integer")
@@ -459,20 +454,16 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
             report.update(evidence)
 
     if cache_dir and max_age_hours > 0:
-        path = Path(cache_dir) / (alpha_id + ".json")
+        import pnl_store
+
         try:
-            with path.open(encoding="utf-8") as handle:
-                age = _ml.time.time() - os.fstat(handle.fileno()).st_mtime
-                cached = json.load(handle) if age < max_age_hours * 3600 else None
-            if isinstance(cached, dict) and cached and all(
-                isinstance(value, (int, float)) and not isinstance(value, bool)
-                and math.isfinite(value) for value in cached.values()
-            ):
+            cached = pnl_store.read_pnl(cache_dir, alpha_id, max_age_hours=max_age_hours)
+            if isinstance(cached, dict) and cached:
                 evidence = _ml.pnl_cache_status(cache_dir, alpha_id, cached)
                 if evidence["complete"] is True:
                     publish()
                     return {key: float(value) for key, value in cached.items()}
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, _ml.cache_store.CacheError):
             pass
 
     evidence = {"source": "platform", "complete": False, "pages": 0,
@@ -586,8 +577,8 @@ def fetch_daily_pnl(s, alpha_id, cache_dir=None, max_age_hours=24.0,
         metadata = {**evidence, "format": _ml._PNL_EVIDENCE_FORMAT, "version": 1,
                     "alpha_id": alpha_id, "data_sha256": _ml._pnl_digest(out)}
         try:
-            _ml._write_pnl_cache(path, metadata_path, out, metadata, deadline)
-            evidence.update(path=str(path), metadata_path=str(metadata_path), cached=True)
+            receipt = _ml._write_pnl_cache(path, metadata_path, out, metadata, deadline)
+            evidence.update(path=receipt["path"], metadata_path=receipt["metadata_path"], cached=True)
         except (OSError, _ml.cache_store.CacheError) as exc:
             evidence.update(cached=False, cache_error=type(exc).__name__)
     publish()

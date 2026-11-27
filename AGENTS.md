@@ -69,6 +69,17 @@ For throughput, shared budgets and concurrency measurements, read
   `- [closed] **question** — conclusion; evidence; reopening condition`
   per line.
 
+## 人类协作者的 BRAIN Labs 沙盒能力
+
+用户随时可在隔离环境 BRAIN Labs 中执行 Python 分析（pandas/numpy/sklearn/xgboost），直接检查 In-Sample 原始 Datafield 的分布、缺失结构、覆盖率、极值、字段间相关性及滚动 ML 交互，但无法导出原始数据。
+
+**触发委派规则**：当你遇到以下情况时，**停止继续生成盲试表达式消耗模拟额度**，改为通过 `research_cli.py labs open`（或在状态机门禁下通过 `act RUN_ID request-labs`）向用户下发一份简洁的“Labs 诊断工单”：
+1. 同一数据集或字段连续多次逻辑合理但模拟结果异常（高换手、收益极端集中、子样本骤降）——可用 `labs suggest` 核查。
+2. 不确定字段的真实更新频率、覆盖率、长尾极值或行业缺失特征。
+3. 需要验证多字段共线性、去冗余或探索非线性/条件分段交互结构。
+
+**工单格式**：注明 `Region/Universe/Delay`、`目标字段`、`待验证的具体定量问题`、`期望用户回传的汇总统计指标`（禁止导出原始数据），以及基于诊断结果的下一步分支方案。在 `OPEN` 工单未通过 `labs resolve` 回传统计摘要前，`propose` 会本地拦截对同作用域目标字段的盲试模拟。
+
 ## Execution invariants
 
 1. `propose` validates syntax and spec structure locally with zero BRAIN quota
@@ -98,6 +109,9 @@ For throughput, shared budgets and concurrency measurements, read
 | Arguments, help, generated schema | `research_app/parser.py` |
 | Shared errors, output, settings, sessions | `research_app/runtime.py` |
 | Persistent 4-gate state machine, firewall, workspace migration | `research_app/state_machine.py` |
+| SQLite WAL workspace store (`runs`, `slot_journals`, `labs_tickets`) | `workspace_db.py` |
+| Delta-Parquet + SQLite WAL primary PnL store | `pnl_store.py`, `research_app/pnl_snapshot.py` |
+| BRAIN Labs diagnostic tickets & blind-sim guardrails | `research_app/labs.py` |
 | State-machine autonomous step workers, cost audit, slot reconciliation | `research_app/sm_workers.py` |
 | Resident single-writer HTTP loopback daemon & non-blocking CLI handlers | `research_app/daemon.py` |
 | Bounded workspace brief, book health, views log, breeding | `research_app/brief.py`, `research_app/breeding.py` |

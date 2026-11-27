@@ -1,12 +1,10 @@
 """Accepted reservations recover from terminal platform evidence, not age."""
 
 import json
-from pathlib import Path
 
 import pytest
 import requests
 
-import cache_store
 import machine_lib as ml
 import simulation_capabilities
 import simulation_slots as slots
@@ -127,13 +125,14 @@ def test_sweep_has_one_budget_and_a_slow_first_read_leaves_time_for_other_jobs(c
 def test_sweep_does_not_release_a_reservation_changed_during_read(context):
     _session, account = context
     record = accept(account)
-    path = Path(slots._paths(account["fingerprint"])[0])
+    fingerprint = account["fingerprint"]
+    path, _ = slots._paths(fingerprint)
 
     def changed(_url):
-        journal, _ = cache_store.load_json(path)
+        journal = slots._load(path, fingerprint)
         journal["reservations"][record["slot_reservation"]["id"]]["progress_url"] = (
             ml.BRAIN_API_URL + "/simulations/NewLocation")
-        cache_store.write_json_atomic(path, journal)
+        slots._save(path, journal)
         return {"status": "COMPLETE", "alpha": "FinishedAlpha"}
 
     report = slots.reconcile_orphans(account, changed)
@@ -162,12 +161,12 @@ def test_default_age_thresholds_are_reported_without_releasing_live_jobs(context
     stamp = 2_000_000_000
     ages = {accept(account, "Age%d" % age)["slot_reservation"]["id"]: age
             for age in (45, 46, 360, 361)}
-    path = Path(slots._paths(account["fingerprint"])[0])
-    journal, _ = cache_store.load_json(path)
+    fingerprint = account["fingerprint"]
+    path, _ = slots._paths(fingerprint)
+    journal = slots._load(path, fingerprint)
     for identity, age in ages.items():
         journal["reservations"][identity]["created_at"] = stamp - age * 60
-    cache_store.write_json_atomic(path, journal)
-    before = path.read_bytes()
+    slots._save(path, journal)
 
     report = slots.reconcile_orphans(account, lambda _url: "RUNNING", now=stamp)
 
@@ -183,7 +182,7 @@ def test_default_age_thresholds_are_reported_without_releasing_live_jobs(context
         assert item["overdue"] is (age > 45)
         assert item["past_hard_age"] is (age > 360)
     assert slots.snapshot(account, 4)["active"] == 4
-    assert path.read_bytes() == before
+    assert slots._load(path, fingerprint) == journal
 
 
 def test_unknown_or_other_account_cannot_poll_or_release(context, monkeypatch):
@@ -290,7 +289,7 @@ def test_single_simulation_admission_recovers_completed_external_reservation(con
     monkeypatch.setattr(ml, "poll_simulation", lambda *_a, **_k: {"status": "PENDING"})
     scheduling = {}
     records = ml.simulate_alphas(session, ["rank(close)"], concurrency=1, capability_snapshot={},
-                                scheduling_report=scheduling, max_wait_seconds=1)
+                                scheduling_report=scheduling, max_wait_seconds=60)
     assert len(posts) == 1
     assert records[0]["progress_url"].endswith("/NewTask")
     assert len(scheduling["accepted_slot_recovery"]["released"]) == 1

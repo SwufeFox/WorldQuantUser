@@ -82,7 +82,6 @@ _RULES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unit-rules.js
 
 #: Where the cached BRAIN field catalogue lives. Only used to answer "which dataset
 #: does this field belong to"; absent is fine, every field then reads ``unknown``.
-_FIELDS_CACHE = "/data/worldquant-research/cache/metadata/datafields"
 
 
 # --------------------------------------------------------------------------- slots
@@ -305,23 +304,17 @@ def load_field_datasets(cache_dir=None):
     grouping, and a grouping key is not worth a request, let alone one per field.
     A missing cache returns ``{}`` -- callers then see ``unknown`` and say so.
     """
+    import machine_lib as ml
+
     out = {}
-    directory = cache_dir or _FIELDS_CACHE
-    try:
-        names = sorted(os.listdir(directory))
-    except OSError:
-        return out
-    for name in names:
-        if not name.endswith(".json"):
+    for path, _ in ml.catalog_field_cache_paths(cache_dir):
+        payload, _ = ml.read_cached_field_snapshot(path)
+        if not isinstance(payload, list):
             continue
-        try:
-            with open(os.path.join(directory, name)) as handle:
-                payload = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        for record in payload.get("payload") or []:
+        for record in payload:
             if isinstance(record, dict) and record.get("id"):
-                out[record["id"]] = (record.get("dataset") or {}).get("id")
+                dataset = record.get("dataset")
+                out[record["id"]] = dataset.get("id") if isinstance(dataset, dict) else dataset
     return out
 
 

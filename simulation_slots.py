@@ -9,6 +9,7 @@ unidentifiable accounts are not covered.
 import hashlib
 import math
 import os
+import sqlite3
 import time
 import uuid
 from collections.abc import Mapping
@@ -20,6 +21,7 @@ from urllib.parse import urlsplit
 
 import cache_store
 import research_paths
+import workspace_db
 
 
 TERMINAL_FAILURE_STATUSES = frozenset({"ERROR", "FAIL", "TIMEOUT", "CANCELLED", "CANCELED"})
@@ -57,18 +59,15 @@ def quick_single_slot_limit(requested):
     return _configured_slot_limit(requested, "quick-single-slot-limit")
 
 
-def _paths(fingerprint):
+def _paths(fingerprint, research_dir=None):
     key = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()
-    root = research_paths.resolve("simulation-slots")
+    root = Path(research_dir or research_paths.research_dir()) / "simulation-slots"
     # Keep the lock beside the durable journal, outside the disposable cache.
     return os.path.join(root, key + ".json"), os.path.join(root, key + ".lock")
 
 
-def _load(path, fingerprint):
-    journal, error = cache_store.load_json(path)
-    if error == "missing":
-        return {"version": 1, "account_fingerprint": fingerprint, "reservations": {}}
-    if error or not isinstance(journal, dict) or journal.get("version") != 1 or (
+def _validate_journal(journal, fingerprint, path):
+    if not isinstance(journal, dict) or journal.get("version") != 1 or (
         journal.get("account_fingerprint") != fingerprint
         or not isinstance(journal.get("reservations"), dict)
         or any(not isinstance(value, dict) for value in journal.get("reservations", {}).values())
@@ -82,8 +81,58 @@ def _load(path, fingerprint):
         or not isinstance(journal.get("cancelled", {}), dict)
         or any(not isinstance(value, dict) for value in journal.get("cancelled", {}).values())
     ):
-        raise cache_store.CacheError("simulation slot journal cannot be read safely: %s" % (error or path))
+        raise cache_store.CacheError("simulation slot journal cannot be read safely: %s" % path)
     return journal
+
+
+def _load(path, fingerprint, *, research_dir=None):
+    try:
+        journal = workspace_db.load_slot_journal(fingerprint, research_dir=research_dir, legacy_path=path)
+    except sqlite3.Error as exc:
+        raise cache_store.CacheError("could not read the SQLite simulation slot journal") from exc
+    return _validate_journal(journal, fingerprint, path)
+
+
+def _save(path, journal, *, research_dir=None):
+    try:
+        workspace_db.save_slot_journal(journal["account_fingerprint"], journal,
+                                       research_dir=research_dir)
+    except sqlite3.Error as exc:
+        raise cache_store.CacheError("could not save the SQLite simulation slot journal") from exc
+
+
+def has_slot_reservations(research_dir):
+    """Check for SQLite reservations or legacy journals that may need reconciliation."""
+    if workspace_db.has_slot_reservations(research_dir=research_dir):
+        return True
+    return any((Path(research_dir) / "simulation-slots").glob("*.json"))
+
+
+def import_legacy_journal(path, *, research_dir, archive_path):
+    """Archive a valid legacy journal after preserving any newer SQLite state."""
+    path = Path(path)
+    raw, error = cache_store.load_json(path)
+    fingerprint = raw.get("account_fingerprint") if isinstance(raw, dict) else None
+    if error or not isinstance(fingerprint, str) or not fingerprint:
+        return False
+    expected_path, lock = _paths(fingerprint, research_dir)
+    if path.resolve() != Path(expected_path).resolve():
+        return False
+    with cache_store.file_lock(lock):
+        raw, error = cache_store.load_json(path)
+        if error:
+            return False
+        _validate_journal(raw, fingerprint, path)
+        workspace_db.save_slot_journal(fingerprint, raw, research_dir=research_dir, import_only=True)
+        archived = Path(archive_path)
+        snapshot = path.read_bytes()
+        try:
+            cache_store.link_bytes_exclusive(archived.parent, archived, snapshot)
+        except FileExistsError:
+            if archived.read_bytes() != snapshot:
+                return False
+        path.unlink()
+    return True
 
 
 def _report(account, limit, active=None):
@@ -154,7 +203,7 @@ def reserve(account, limit):
         pruned = _prune_quick_preparations(journal)
         identity, state = _reserve(journal, account, limit, "submitting")
         if identity or pruned:
-            cache_store.write_json_atomic(path, journal)
+            _save(path, journal)
         return identity, state
 
 
@@ -163,7 +212,7 @@ ORPHAN_RELEASE_STATUSES = TERMINAL_STATUSES
 
 def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0,
                       now=None, deadline=None, ordinary_only=False, stuck_after_min=None,
-                      cancel=None):
+                      cancel=None, research_dir=None):
     """Release only observed terminal acceptances, retaining their receipts.
 
     ``poll(url)`` supplies an authenticated observation for that exact URL.
@@ -183,7 +232,7 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
     if not fingerprint:
         return {"released": [], "cancelled": [], "kept": [], "state": "account_unknown",
                 "age_diagnostics": age_diagnostics}
-    path, lock = _paths(fingerprint)
+    path, lock = _paths(fingerprint, research_dir)
     stamp = time.time() if now is None else now
 
     def lock_options():
@@ -192,7 +241,7 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
     # Snapshot under the lock, then poll outside it. Holding the lock across
     # network reads made every other writer time out at 60s.
     with cache_store.file_lock(lock, **lock_options()):
-        snapshot = dict((_load(path, fingerprint).get("reservations") or {}))
+        snapshot = dict(_load(path, fingerprint, research_dir=research_dir)["reservations"])
 
     decisions, kept, observations = [], [], {}
     for key, entry in snapshot.items():
@@ -212,6 +261,9 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
             continue
         if deadline is not None and time.monotonic() >= deadline:
             kept.append({**item, "status": None, "reason": "recovery_budget_exhausted"})
+            continue
+        if (_quota_number(entry.get("next_poll_at")) or 0) > stamp:
+            kept.append({**item, "status": None, "reason": "poll_deferred"})
             continue
         answer = poll(url)
         if isinstance(answer, dict):
@@ -301,7 +353,7 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
     cancelled = []
     if decisions or observations:
         with cache_store.file_lock(lock, **lock_options()):
-            journal = _load(path, fingerprint)
+            journal = _load(path, fingerprint, research_dir=research_dir)
             reservations = journal.get("reservations") or {}
             for item in decisions:
                 key = item["id"]
@@ -331,7 +383,7 @@ def reconcile_orphans(account, poll, *, max_age_min=45.0, hard_max_age_min=360.0
                 if key in reservations and reservations.get(key) == snapshot.get(key):
                     reservations[key].update(observed)
             if decisions or observations:
-                cache_store.write_json_atomic(path, journal)
+                _save(path, journal, research_dir=research_dir)
     return {"released": released, "cancelled": cancelled, "kept": kept,
             "age_diagnostics": age_diagnostics}
 
@@ -365,7 +417,7 @@ def cancel_reservation_by_url(account, progress_url, *, state="cancelled", statu
             journal.setdefault("cancelled", {})[key] = entry
             released_ids.append(key)
         if released_ids:
-            cache_store.write_json_atomic(path, journal)
+            _save(path, journal)
     return released_ids
 
 
@@ -522,7 +574,7 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False,
     owner = _quick_owner()
     with _locked_quick_journal(account) as (journal, path):
         if _prune_quick_preparations(journal):
-            cache_store.write_json_atomic(path, journal)
+            _save(path, journal)
         resolved = next(((key, entry) for key, entry in journal.get("quick_resolved", {}).items()
                          if entry.get("quick_job_key") == job_key), None)
         if resolved:
@@ -547,7 +599,7 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False,
                 # No POST has begun. A later zero budget revokes this owner's
                 # preparation instead of allowing its old limit to authorize work.
                 del reservations[key]
-                cache_store.write_json_atomic(path, journal)
+                _save(path, journal)
                 return None
             elif entry.get("state") != "quick_preparing" or existing_url:
                 # An existing unknown POST cannot inherit an unverified legacy address.
@@ -574,7 +626,7 @@ def quick_acquire(account, limit, job_key, *, existing_url=None, prepare=False,
                 key = identity["id"]
                 entry = reservations[key]
             entry.update(quick_job_key=job_key, quick_limit=limit, quick_owner=owner)
-        cache_store.write_json_atomic(path, journal)
+        _save(path, journal)
         return {"id": key, **entry}
 
 
@@ -606,7 +658,7 @@ def quick_update(account, identity, outcome, *, progress_url=None, retain=False,
             resolved = journal.get("quick_resolved", {})
             if outcome == "terminal" and not retain and identity in resolved:
                 resolved.pop(identity)
-                cache_store.write_json_atomic(path, journal)
+                _save(path, journal)
                 return True
             return False
         if retain and (entry.get("state") != "accepted" or entry.get("manual_location")
@@ -639,7 +691,7 @@ def quick_update(account, identity, outcome, *, progress_url=None, retain=False,
                     **entry, "quick_owner": None, "terminal_result": receipt,
                 }
             reservations.pop(identity)
-        cache_store.write_json_atomic(path, journal)
+        _save(path, journal)
         return True
 
 
@@ -674,7 +726,7 @@ def quick_defer(account, identity, next_poll_at, *, deadline=None):
             return False
         if (_quota_number(entry.get("next_poll_at")) or 0) < next_poll_at:
             entry["next_poll_at"] = next_poll_at
-            cache_store.write_json_atomic(path, journal)
+            _save(path, journal)
         return True
 
 
@@ -719,7 +771,7 @@ def quick_attach_location(account, job_key, progress_url, *, terminal_failure=No
             entry.update(identity_unverified=True, manual_location=True)
             if next_poll_at is not None:
                 entry["next_poll_at"] = next_poll_at
-        cache_store.write_json_atomic(path, journal)
+        _save(path, journal)
         return {"id": key, **entry}
 
 
@@ -784,7 +836,7 @@ def prepare_submission(account, limit, checkpoint, *, quick_native=False):
                 identity, state = None, _report(account, limit, len(journal["reservations"]))
                 state.update(available=0, lane="quick_native")
             if identity or abandoned or pruned:
-                cache_store.write_json_atomic(path, journal)
+                _save(path, journal)
         if identity is None:
             return identity, state
 
@@ -800,14 +852,15 @@ def prepare_submission(account, limit, checkpoint, *, quick_native=False):
                     entry["state"] = "submitting"
                 else:
                     _record_unposted(journal, identity["id"])
-                cache_store.write_json_atomic(path, journal)
+                _save(path, journal)
         return identity, state
 
 
-def _reservation_identity(record, account):
+def _reservation_identity(record, account, research_dir=None):
     identity = record.get("slot_reservation")
     if identity:
-        if identity.get("workspace") != _workspace():
+        workspace = os.path.normcase(os.path.abspath(research_dir)) if research_dir is not None else _workspace()
+        if identity.get("workspace") != workspace:
             raise ValueError("simulation reservation belongs to another research workspace")
         fingerprint = identity.get("account_fingerprint")
         if not fingerprint or not identity.get("id"):
@@ -817,9 +870,9 @@ def _reservation_identity(record, account):
     return identity
 
 
-def validate_reservation_owner(record, account):
+def validate_reservation_owner(record, account, *, research_dir=None):
     """Verify a saved reservation belongs to the current account and workspace."""
-    _reservation_identity(record, account)
+    _reservation_identity(record, account, research_dir)
 
 
 def _has_terminal_result(record):
@@ -864,7 +917,7 @@ def _restore_terminal(record, entry):
     return True
 
 
-def restore_record(record, account=None):
+def restore_record(record, account=None, *, research_dir=None):
     """Restore a missing progress URL or a definitely unposted attempt.
 
     Return whether the in-memory record changed. Local inspection can read
@@ -874,13 +927,13 @@ def restore_record(record, account=None):
     terminal = _has_terminal_result(record)
     if terminal and account is None:
         return False
-    identity = _reservation_identity(record, account)
+    identity = _reservation_identity(record, account, research_dir)
     if not identity or terminal:
         return False
     fingerprint = identity["account_fingerprint"]
-    path, lock = _paths(fingerprint)
+    path, lock = _paths(fingerprint, research_dir)
     # Writers replace the complete journal atomically.
-    journal = _load(path, fingerprint)
+    journal = _load(path, fingerprint, research_dir=research_dir)
     attempt = identity["id"]
     resolved = journal.get("resolved", {}).get(attempt)
     if resolved and _restore_terminal(record, resolved):
@@ -903,7 +956,7 @@ def restore_record(record, account=None):
     if entry.get("state") == "preparing":
         try:
             with cache_store.file_lock(lock + ".prepare", timeout=0, poll=0):
-                journal = _load(path, fingerprint)
+                journal = _load(path, fingerprint, research_dir=research_dir)
                 entry = journal["reservations"].get(attempt, {})
                 if attempt in journal.get("not_submitted", {}) or entry.get("state") == "preparing":
                     return _restore_unposted(record)
@@ -970,7 +1023,7 @@ def reconcile_record(record, account=None, *, outcome=None, progress_url=None, a
                                  progress_url=effective_url)
                     journal["reservations"][identity["id"]] = entry
             if outcome or unresolved:
-                cache_store.write_json_atomic(path, journal)
+                _save(path, journal)
     if outcome == "accepted" and effective_url:
         record["progress_url"] = effective_url
     elif progress_url:
@@ -1031,7 +1084,7 @@ def defer_submission(account, wait_seconds, *, deadline=None):
                 if previous >= retry_at:
                     return previous
                 journal["submit_not_before"] = retry_at
-                cache_store.write_json_atomic(path, journal)
+                _save(path, journal)
         except (OSError, cache_store.CacheError):
             # The caller still honors the observed delay if it cannot be shared.
             pass
@@ -1122,7 +1175,7 @@ def observe_quota(account, headers):
                 observation = _merge_quota(previous, observation)
                 if observation != previous:
                     journal["quota"] = observation
-                    cache_store.write_json_atomic(path, journal)
+                    _save(path, journal)
         except (OSError, cache_store.CacheError) as error:
             # Losing telemetry must not lose an already accepted progress URL.
             observation["storage_error"] = type(error).__name__

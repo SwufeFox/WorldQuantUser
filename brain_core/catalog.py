@@ -17,6 +17,8 @@ from os import environ
 from pathlib import Path
 from urllib.parse import quote, urljoin, urlsplit
 
+import tempfile
+
 import cache_store
 from check_evidence import normalize_checks, platform_check_names
 import machine_lib as _ml
@@ -53,6 +55,150 @@ def metadata_cache_path(kind, params):
     return Path(_ml.research_paths.metadata_root()) / label / (digest + ".json")
 
 
+_FIELD_CACHE_HEADER = "__catalog_cache"
+_FIELD_CACHE_JSON = "__catalog_row_json"
+
+
+def _read_datafield_parquet(path):
+    try:
+        if not path.is_file():
+            return None
+        import polars as pl
+
+        frame = pl.read_parquet(path)
+        header = json.loads(frame.get_column(_FIELD_CACHE_HEADER)[0])
+        count = header["row_count"]
+        if type(count) is not int or count < 0 or frame.height != max(count, 1):
+            return None
+        if _FIELD_CACHE_JSON in frame.columns:
+            rows = [json.loads(row) for row in frame.get_column(_FIELD_CACHE_JSON).head(count)]
+        else:
+            rows = frame.drop(_FIELD_CACHE_HEADER).head(count).to_dicts()
+        if len(rows) != count or any(not isinstance(row, dict) for row in rows):
+            return None
+        return {"_cache": header["_cache"], "payload": rows}
+    except Exception:  # A broken optional cache entry must not prevent JSON or API fallback.
+        return None
+
+
+def _field_json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _write_datafield_parquet(path, document):
+    import polars as pl
+
+    rows = document["payload"]
+    header = _field_json({"_cache": document.get("_cache", {}), "row_count": len(rows)})
+    frame = pl.DataFrame({_FIELD_CACHE_HEADER: [header] + [None] * (len(rows) - 1)})
+    if rows:
+        # The round trip guards optional keys, nested shapes, and scalar types
+        # against Polars schema inference. JSON cells retain rows that vary in shape.
+        try:
+            typed = pl.DataFrame(rows, infer_schema_length=None, strict=False)
+            native = (typed.width > 0
+                      and not {_FIELD_CACHE_HEADER, _FIELD_CACHE_JSON}.intersection(typed.columns)
+                      and _field_json(typed.to_dicts()) == _field_json(rows))
+        except (ValueError, TypeError, OverflowError, pl.exceptions.PolarsError):
+            native = False
+        if native:
+            frame = frame.hstack(typed)
+        else:
+            frame = frame.with_columns(pl.Series(_FIELD_CACHE_JSON, [_field_json(row) for row in rows]))
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=path.parent)
+    try:
+        os.close(fd)
+        frame.write_parquet(tmp)
+        with open(tmp, "rb+") as handle:
+            os.fsync(handle.fileno())
+        restored = _read_datafield_parquet(Path(tmp))
+        if _field_json(restored) != _field_json(document):
+            raise ValueError("field cache Parquet round trip changed its contents")
+        os.replace(tmp, path)
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _field_snapshot(path):
+    parquet = path.with_suffix(".parquet")
+    legacy = path.with_suffix(".json")
+    parquet_document = _read_datafield_parquet(parquet)
+    legacy_document, error = _ml.cache_store.load_json(legacy)
+    now = _ml.cache_store.utc_now()
+    existing = _ml.cache_store.describe_entry(legacy, legacy_document, error=error, now=now)
+    if parquet_document is not None:
+        current = _ml.cache_store.describe_entry(parquet, parquet_document, now=now)
+        if current["present"] and current["kind"] == "datafields" and (
+            not existing["present"] or existing["kind"] != "datafields"
+            or current["age_seconds"] <= existing["age_seconds"]
+        ):
+            return current, parquet_document
+        if not isinstance(legacy_document, dict):
+            return current, parquet_document
+    return existing, legacy_document
+
+
+def read_cached_field_snapshot(path, *, report=None):
+    """Return the field payload and envelope, optionally reporting the chosen storage path."""
+    entry, document = _field_snapshot(Path(path))
+    if report is not None:
+        report["path"] = entry["path"]
+    if not isinstance(document, dict):
+        return None, {}
+    envelope = document.get("_cache")
+    return document.get("payload"), envelope if isinstance(envelope, dict) else {}
+
+
+def migrate_legacy_datafield_cache(metadata_root, *, archive_dir=None, dry_run=False):
+    """Convert legacy field snapshots, archiving JSON only after a usable Parquet copy exists."""
+    directory = Path(metadata_root) / "datafields"
+    result = {"migrated": 0, "skipped": 0}
+    for legacy in sorted(directory.glob("*.json")):
+        if legacy.name.startswith(".") or legacy.name.endswith(".meta.json"):
+            continue
+        try:
+            if dry_run:
+                migrated = _migrate_field_snapshot(legacy, archive_dir, dry_run=True)
+            else:
+                with _ml.cache_store.file_lock(legacy.with_suffix(".lock")):
+                    migrated = _migrate_field_snapshot(legacy, archive_dir, dry_run=False)
+        except (OSError, _ml.cache_store.CacheError):
+            migrated = False
+        result["migrated" if migrated else "skipped"] += 1
+    return result
+
+
+def _migrate_field_snapshot(legacy, archive_dir, *, dry_run):
+    document, error = _ml.cache_store.load_json(legacy)
+    now = _ml.cache_store.utc_now()
+    entry = _ml.cache_store.describe_entry(legacy, document, error=error, now=now)
+    rows = entry["payload"]
+    if not entry["present"] or entry["kind"] != "datafields" or not isinstance(rows, list):
+        return False
+    if any(not isinstance(row, dict) for row in rows):
+        return False
+    archive = Path(archive_dir) / legacy.name if archive_dir is not None else None
+    if archive is not None and archive.exists():
+        return False
+    parquet = legacy.with_suffix(".parquet")
+    current = _ml.cache_store.describe_entry(parquet, _read_datafield_parquet(parquet), now=now)
+    replace = (not current["present"] or current["kind"] != "datafields"
+               or entry["age_seconds"] < current["age_seconds"])
+    if dry_run:
+        return replace or archive is not None
+    if replace:
+        try:
+            _write_datafield_parquet(parquet, document)
+        except Exception:
+            return False
+    if archive is not None:
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(legacy, archive)
+    return replace or archive is not None
+
+
 def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None, *,
                     use_cache=True, account=None, derive_from=None):
     """Read catalog data and return it with cache evidence.
@@ -70,6 +216,11 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
     def cache_path(query):
         path = _ml.metadata_cache_path(kind, query)
         return path.with_name(f"{account}-{path.name}") if account is not None else path
+
+    def read_snapshot(target_path):
+        if kind == "datafields":
+            return _field_snapshot(target_path)[0]
+        return _ml.cache_store.read_entry(target_path)
 
     path = cache_path(params) if use_cache else None
     status = {
@@ -99,12 +250,12 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
         status["refreshed_at"] = datetime.now(timezone.utc).isoformat()
         return done(data)
 
-    entry = _ml.cache_store.read_entry(path)
+    entry = read_snapshot(path)
     usable = entry["present"] and entry["kind"] == kind
 
     def cached_result(source, data, error=None):
         remaining = source["expires_in"]
-        status.update(hit=True, stale=error is not None, degraded=error is not None,
+        status.update(path=source["path"], hit=True, stale=error is not None, degraded=error is not None,
                       age_seconds=round(source["age_seconds"], 1), refreshed_at=source["created_at"],
                       expires_in_seconds=None if remaining is None else round(remaining, 1),
                       error=error)
@@ -115,12 +266,12 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
     if not do_refresh and derive_from is not None:
         source_params, derive = derive_from
         source_path = cache_path(source_params)
-        source = _ml.cache_store.read_entry(source_path)
+        source = read_snapshot(source_path)
         if (source["present"] and source["kind"] == kind and source["fresh"]
                 and source["age_seconds"] <= ttl):
             derived = derive(source["payload"])
             if derived is not None:
-                status.update(path=str(source_path), derived_from_complete=True)
+                status["derived_from_complete"] = True
                 return cached_result(source, derived)
     if entry.get("error") not in (None, "missing"):
         _ml.cache_store.quarantine(path)
@@ -134,8 +285,18 @@ def cached_metadata(kind, params, fetch, max_age=None, refresh=None, report=None
         raise
     entry = _ml.cache_store.build_entry(kind, data, ttl=ttl, source="brain-api")
     try:
-        _ml.cache_store.write_json_atomic(path, entry)
-    except OSError as exc:
+        if kind == "datafields" and isinstance(data, list) and all(isinstance(row, dict) for row in data):
+            with _ml.cache_store.file_lock(path.with_suffix(".lock")):
+                try:
+                    parquet = path.with_suffix(".parquet")
+                    _write_datafield_parquet(parquet, entry)
+                except Exception:  # The response remains usable when columnar storage fails.
+                    _ml.cache_store.write_json_atomic(path, entry)
+                else:
+                    status["path"] = str(parquet)
+        else:
+            _ml.cache_store.write_json_atomic(path, entry)
+    except (OSError, _ml.cache_store.CacheError) as exc:
         _ml.note("metadata cache: could not write %s (%s)" % (path, exc))
     status.update(refreshed_at=entry["_cache"]["created_at"], age_seconds=0.0,
                   expires_in_seconds=ttl)
@@ -155,13 +316,15 @@ def _catalog_account(username):
     return hashlib.sha256(name.encode()).hexdigest() if name else None
 
 
-def catalog_field_cache_paths():
-    """Yield (path, account_bound) for current-account and legacy field snapshots."""
+def catalog_field_cache_paths(directory=None):
+    """Yield one path per cached field query for the current account and legacy snapshots."""
     account = _ml._catalog_account(_ml.configured_username())
-    directory = Path(_ml.research_paths.metadata_root()) / "datafields"
-    for path in sorted(directory.glob("*.json")):
-        namespace, separator, _ = path.stem.partition("-")
-        if not separator or namespace == account:
+    root = Path(directory) if directory is not None else Path(_ml.research_paths.metadata_root()) / "datafields"
+    paths = {path.stem: path for path in root.glob("*.json") if not path.name.endswith(".meta.json")}
+    paths.update((path.stem, path) for path in root.glob("*.parquet"))
+    for stem, path in sorted(paths.items()):
+        namespace, separator, _ = stem.partition("-")
+        if not stem.startswith(".") and (not separator or namespace == account):
             yield path, bool(separator)
 
 

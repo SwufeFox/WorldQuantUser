@@ -8,6 +8,7 @@ import tempfile
 from pathlib import Path
 
 import cache_store
+import pnl_store
 
 from .runtime import CliError
 
@@ -42,8 +43,9 @@ def _stamp(path):
 
 def _sources(pnl_dir, cutoffs):
     rows = {}
+    committed = pnl_store.committed_stamps(pnl_dir, cutoffs)
     for alpha_id, cutoff in sorted(cutoffs.items()):
-        stamp = _stamp(pnl_dir / f"{alpha_id}.json")
+        stamp = committed.get(alpha_id) or _stamp(pnl_dir / f"{alpha_id}.json")
         if stamp is not None:
             rows[alpha_id] = [cutoff, stamp]
     return rows, _source_signature(pnl_dir, rows)
@@ -99,11 +101,18 @@ def _rebuild(pl, path, manifest, pnl_dir, cutoffs, sources, signature, previous)
         alpha_id: pair for alpha_id, pair in previous["half_sharpes"].items() if alpha_id not in changed
     }
     alpha_ids, dates, pnls = [], [], []
+    primary_ids = [alpha_id for alpha_id in changed & sources.keys()
+                   if sources[alpha_id][1][0] == "parquet"]
+    primary, _ = pnl_store.read_committed(pnl_dir, primary_ids) if primary_ids else ({}, set())
+    if len(primary) != len(primary_ids):
+        return None, "source_unavailable"
     for alpha_id, (cutoff, _) in sources.items():
         if alpha_id not in changed:
             continue
         try:
-            series = read_series(pnl_dir / f"{alpha_id}.json", raise_io_errors=True)
+            series = primary[alpha_id] if alpha_id in primary else read_series(
+                pnl_dir / f"{alpha_id}.json", raise_io_errors=True,
+            )
         except OSError:
             # A failed read has not established that this source is missing or malformed.
             return None, "source_unavailable"
@@ -379,7 +388,8 @@ def _filter_series(series, start_day=None, end_day=None, cutoff=None):
 
 
 def load_series_map(pnl_dir, alpha_ids=None, *, start_day=None, end_day=None, cutoffs=None):
-    """Load ``{alpha_id: {day: float}}`` from incremental Parquet cache with optional date slicing."""
+    """Load ``{alpha_id: {day: float}}`` from the committed store and legacy JSON cache."""
+
     pnl_path = Path(pnl_dir)
     if alpha_ids is not None:
         target_ids = list(dict.fromkeys(aid for aid in alpha_ids if isinstance(aid, str) and aid))
@@ -391,16 +401,38 @@ def load_series_map(pnl_dir, alpha_ids=None, *, start_day=None, end_day=None, cu
     if not pnl_path.is_dir():
         return {}
 
-    pl = _import_polars()
-    sync = sync_pnl_parquet(pnl_path, alpha_ids=target_ids) if pl is not None else {"parquet_path": None}
-    parquet_path = sync.get("parquet_path")
     cutoff_map = {str(k): str(v) for k, v in (cutoffs or {}).items() if isinstance(k, str) and v}
+    primary_series, primary_ids = pnl_store.read_committed(pnl_path, target_ids)
+    primary_map = {}
+    for aid, series in primary_series.items():
+        filtered = _filter_series(series, start_day=start_day, end_day=end_day, cutoff=cutoff_map.get(aid))
+        if filtered:
+            primary_map[aid] = filtered
+
+    # Identify which IDs still exist only as legacy top-level *.json files.
+    if target_ids is not None:
+        legacy_ids = [
+            aid for aid in target_ids
+            if aid not in primary_ids and (pnl_path / f"{aid}.json").is_file()
+        ]
+        if not legacy_ids:
+            return {aid: primary_map[aid] for aid in target_ids if aid in primary_map}
+    else:
+        json_stems = sorted(
+            p.stem for p in pnl_path.glob("*.json") if not p.name.startswith(".") and p.is_file()
+        )
+        legacy_ids = [aid for aid in json_stems if aid not in primary_ids]
+        if not legacy_ids:
+            return primary_map
+
+    pl = _import_polars()
+    sync = sync_pnl_parquet(pnl_path, alpha_ids=legacy_ids) if pl is not None else {"parquet_path": None}
+    parquet_path = sync.get("parquet_path")
+    legacy_out = {}
 
     if pl is not None and parquet_path is not None and Path(parquet_path).exists():
         try:
-            lf = pl.scan_parquet(parquet_path)
-            if target_ids is not None:
-                lf = lf.filter(pl.col("alpha_id").is_in(target_ids))
+            lf = pl.scan_parquet(parquet_path).filter(pl.col("alpha_id").is_in(legacy_ids))
             if start_day:
                 lf = lf.filter(pl.col("day") >= str(start_day))
             if end_day:
@@ -416,183 +448,90 @@ def load_series_map(pnl_dir, alpha_ids=None, *, start_day=None, end_day=None, cu
                     .drop("_cutoff")
                 )
             df = lf.collect()
-            if df.is_empty():
-                return {}
-            out = {}
-            partitions = df.partition_by("alpha_id", as_dict=True, maintain_order=True)
-            for key, sub in partitions.items():
-                aid = key[0] if isinstance(key, tuple) else key
-                days = sub.get_column("day").to_list()
-                pnls = sub.get_column("pnl").to_list()
-                if days:
-                    out[aid] = dict(zip(days, pnls))
-            if target_ids is not None:
-                return {aid: out[aid] for aid in target_ids if aid in out}
-            return out
+            if not df.is_empty():
+                partitions = df.partition_by("alpha_id", as_dict=True, maintain_order=True)
+                for key, sub in partitions.items():
+                    aid = key[0] if isinstance(key, tuple) else key
+                    days = sub.get_column("day").to_list()
+                    pnls = sub.get_column("pnl").to_list()
+                    if days:
+                        legacy_out[aid] = dict(zip(days, pnls))
         except Exception:  # noqa: BLE001 - fall back to direct JSON reads on transient Parquet error
-            pass
+            legacy_out = {}
+            for aid in legacy_ids:
+                series = read_series(pnl_path / f"{aid}.json")
+                if not series:
+                    continue
+                filtered = _filter_series(series, start_day=start_day, end_day=end_day, cutoff=cutoff_map.get(aid))
+                if filtered:
+                    legacy_out[aid] = filtered
+    else:
+        for aid in legacy_ids:
+            series = read_series(pnl_path / f"{aid}.json")
+            if not series:
+                continue
+            filtered = _filter_series(series, start_day=start_day, end_day=end_day, cutoff=cutoff_map.get(aid))
+            if filtered:
+                legacy_out[aid] = filtered
 
-    fallback_ids = (
-        target_ids
-        if target_ids is not None
-        else sorted(p.stem for p in pnl_path.glob("*.json") if not p.name.startswith(".") and p.is_file())
-    )
-    out = {}
-    for aid in fallback_ids:
-        series = read_series(pnl_path / f"{aid}.json")
-        if not series:
-            continue
-        filtered = _filter_series(series, start_day=start_day, end_day=end_day, cutoff=cutoff_map.get(aid))
-        if filtered:
-            out[aid] = filtered
-    return out
+    combined = {**legacy_out, **primary_map}
+    if target_ids is not None:
+        return {aid: combined[aid] for aid in target_ids if aid in combined}
+    return combined
 
 
 def yearly_train_batch(rows, pnl_dir):
-    """Evaluate yearly train Sharpe breakdown for multiple ledger rows via unified Parquet + Polars."""
+    """Evaluate yearly train Sharpe from the same series used to verify completeness."""
     import machine_lib as ml
     from datetime import date as _date
     from .stats import sharpe as _sharpe
 
     row_list = list(rows)
-    if not row_list:
-        return []
-
     pnl_path = Path(pnl_dir)
     results = [None] * len(row_list)
     valid_indices = []
     proofs = {}
-
-    candidate_aids = sorted({
-        row["alpha_id"]
-        for row in row_list
-        if row.get("alpha_id") and ml.valid_simulation_id(row["alpha_id"])
-        and row.get("train_start") and row.get("test_start")
-    })
-    series_map = load_series_map(pnl_path, candidate_aids) if candidate_aids else {}
+    candidate_ids = {row["alpha_id"] for row in row_list
+                     if ml.valid_simulation_id(row.get("alpha_id"))
+                     and row.get("train_start") and row.get("test_start")}
+    series_map = load_series_map(pnl_path, candidate_ids) if candidate_ids else {}
 
     for idx, row in enumerate(row_list):
         alpha_id = row.get("alpha_id")
-        if not alpha_id or not ml.valid_simulation_id(alpha_id):
+        if not ml.valid_simulation_id(alpha_id):
             results[idx] = {"state": "unavailable", "reason": "invalid_alpha_id"}
             continue
-        if not row.get("train_start") or not row.get("test_start"):
+        try:
+            start = _date.fromisoformat(str(row.get("train_start"))[:10])
+            cutoff = _date.fromisoformat(str(row.get("test_start"))[:10])
+            if start >= cutoff:
+                raise ValueError("empty train window")
+        except ValueError:
             results[idx] = {"state": "unavailable", "reason": "train_window_not_verified"}
             continue
-        proof = proofs.get(alpha_id)
-        if proof is None:
-            if alpha_id in series_map:
-                proof = ml.pnl_cache_status(pnl_path, alpha_id, series_map[alpha_id])
-            else:
-                raw_series, err = cache_store.load_json(pnl_path / f"{alpha_id}.json")
-                if err:
-                    proofs[alpha_id] = {"error_state": "cache_missing" if err == "missing" else "cache_unreadable"}
-                    results[idx] = {"state": "unavailable", "reason": proofs[alpha_id]["error_state"]}
-                    continue
-                proof = ml.pnl_cache_status(pnl_path, alpha_id, raw_series)
+        if alpha_id not in proofs:
+            series = series_map.get(alpha_id)
+            if series is None:
+                series = pnl_store.read_pnl(pnl_path, alpha_id)
+            proof = ml.pnl_cache_status(pnl_path, alpha_id, series)
+            if series is not None:
+                series_map[alpha_id] = series
             proofs[alpha_id] = proof
-        if "error_state" in proof:
-            results[idx] = {"state": "unavailable", "reason": proof["error_state"]}
+        else:
+            proof = proofs[alpha_id]
+        if alpha_id not in series_map:
+            reason = "cache_missing" if proof["error"] == "missing" else "cache_unreadable"
+            results[idx] = {"state": "unavailable", "reason": reason}
             continue
         if proof["complete"] is not True:
             results[idx] = {"state": "unavailable", "reason": "cache_completeness_unverified"}
             continue
         valid_indices.append(idx)
 
-    if not valid_indices:
-        return results
-
-    pl = _import_polars()
-    valid_aids = sorted({row_list[idx]["alpha_id"] for idx in valid_indices})
-    sync = sync_pnl_parquet(pnl_path, alpha_ids=valid_aids) if pl is not None else {"parquet_path": None}
-    parquet_path = sync.get("parquet_path")
-
-    if pl is not None and parquet_path is not None and Path(parquet_path).exists():
-        try:
-            meta_rows = []
-            for idx in valid_indices:
-                row = row_list[idx]
-                meta_rows.append({
-                    "_row_idx": idx,
-                    "alpha_id": row["alpha_id"],
-                    "_start": str(row["train_start"])[:10],
-                    "_cutoff": str(row["test_start"])[:10],
-                })
-            meta_df = pl.DataFrame(meta_rows).lazy()
-            lf = (
-                pl.scan_parquet(parquet_path)
-                .filter(pl.col("alpha_id").is_in(valid_aids))
-                .join(meta_df, on="alpha_id", how="inner")
-                .filter(
-                    (pl.col("day") >= pl.col("_start"))
-                    & (pl.col("day") < pl.col("_cutoff"))
-                    & pl.col("day").str.contains(r"^\d{4}-\d{2}-\d{2}$")
-                )
-                .with_columns(
-                    _year=pl.col("day").str.slice(0, 4).cast(pl.Int32),
-                    _month=pl.col("day").str.slice(5, 2).cast(pl.Int32),
-                )
-                .sort(["_row_idx", "day"])
-                .group_by(["_row_idx", "_year"])
-                .agg(
-                    points=pl.len(),
-                    first_month=pl.col("_month").first(),
-                    last_month=pl.col("_month").last(),
-                    mean=pl.col("pnl").mean(),
-                    std=pl.col("pnl").std(ddof=0),
-                )
-                .sort(["_row_idx", "_year"])
-            )
-            agg_df = lf.collect()
-            grouped = {}
-            for rec in agg_df.to_dicts():
-                grouped.setdefault(rec["_row_idx"], {})[rec["_year"]] = rec
-
-            scale = math.sqrt(252.0)
-            for idx in valid_indices:
-                row = row_list[idx]
-                start, cutoff = str(row["train_start"])[:10], str(row["test_start"])[:10]
-                first, last = _date.fromisoformat(start), _date.fromisoformat(cutoff)
-                by_year = grouped.get(idx, {})
-                years = []
-                for year in range(first.year + (first.month != 1 or first.day != 1), last.year):
-                    info = by_year.get(year)
-                    points = int(info["points"]) if info else 0
-                    score = None
-                    if (
-                        info
-                        and points >= _MIN_COMPLETE_YEAR_POINTS
-                        and info["first_month"] == 1
-                        and info["last_month"] == 12
-                        and info["std"] is not None
-                        and info["std"] > 0
-                    ):
-                        score = float(info["mean"] / info["std"] * scale)
-                    years.append({"year": year, "points": points, "sharpe": score})
-                output = {"years": years, "as_of": proofs[row["alpha_id"]]["as_of"], "state": "insufficient_full_train_years"}
-                if len(years) >= 3 and all(item["sharpe"] is not None for item in years):
-                    scores = [item["sharpe"] for item in years]
-                    worst = min(scores)
-                    recent = sum(scores[-3:]) / 3
-                    weak_run = any(max(scores[i:i + 3]) < 0.3 for i in range(len(scores) - 2))
-                    output.update(
-                        state="pass" if worst > 0 and recent >= 1.0 and not weak_run else "fail",
-                        worst_sharpe=worst,
-                        recent_three_mean=recent,
-                        three_weak_years=weak_run,
-                    )
-                results[idx] = output
-            return results
-        except Exception:  # noqa: BLE001 - fall back to exact Python computation on error
-            pass
-
     for idx in valid_indices:
         row = row_list[idx]
         alpha_id = row["alpha_id"]
-        series, error = cache_store.load_json(pnl_path / f"{alpha_id}.json")
-        if error:
-            results[idx] = {"state": "unavailable", "reason": "cache_missing" if error == "missing" else "cache_unreadable"}
-            continue
+        series = series_map[alpha_id]
         start, cutoff = str(row["train_start"])[:10], str(row["test_start"])[:10]
         by_year = {}
         for day, value in sorted(series.items()):

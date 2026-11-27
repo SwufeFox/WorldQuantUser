@@ -40,11 +40,12 @@ Read only the document needed for the current task (all links are relative to th
   1. `daemon start` -> `brief` / `inbox` -> `propose SPEC.json` (offline AST/Python validation; enters `AUTO_PREFLIGHT`).
   2. `wait --max-wait 30` (wakes on condition variable when a run hits `GATE_*`) -> `inspect RUN_ID`.
   3. **Gate 1 (`GATE_TRIAGE`)**: `inspect` shows train-only metrics (protocol firewall). Call `act RUN_ID hydrate-pnl --top 3` (or `--arms ...`, excluding diagnostic/control arms) -> `AUTO_HYDRATE_PNL`.
-  4. **Gate 2 (`GATE_APPROVE_FULL`)**: Review yearly train Sharpe, then call `act RUN_ID approve-full` (freezes `runs/<run_id>-selection.json` and opens `test_view_open`), `back-to-triage`, or `drop --verdict rejected|falsified|no_go`.
+  4. **Gate 2 (`GATE_APPROVE_FULL`)**: Require explicit passing yearly train evidence, then call `act RUN_ID approve-full [--arms LABEL]` for one arm (freezes `runs/<run_id>-selection.json` and opens `test_view_open`), `back-to-triage`, or `drop --verdict rejected|falsified|no_go`.
   5. `AUTO_FULL_VALIDATE` runs FULL sim, live checks, self-correlation, and 5/10/20 bps cost audit; failing candidates automatically transition to `REJECTED_AT_VALIDATION`.
   6. **Gate 3 (`GATE_DESCRIBE`)**: Call `act RUN_ID describe --name ... --category ... --tags ... --description ...` with exact headings `Idea:`, `Rationale for data used:`, `Rationale for operators used:`, each followed by `- ` bullets, >= 100 trimmed characters.
   7. **Gate 4 (`GATE_CONFIRM_SUBMIT`)**: Candidate is already shelved in `submit-buffer.jsonl` and `seeds.jsonl`. Call `act RUN_ID hold` (-> `SHELVED`) or `act RUN_ID submit --yes` (requires `BRAIN_ALLOW_AGENT_SUBMIT=true`).
-- **Single-writer daemon**: Never spawn duplicate `daemon _serve` instances or delete `daemon/*.lock` / `runs/*.json`. Legacy v3 `backlog/` and `backlog-results/` directories can be imported via `migrate-workspace`.
+- **Single-writer daemon**: Never spawn duplicate `daemon _serve` instances or manually edit `workspace.db`, `daemon/*.lock`, or frozen selections. Legacy v3 `backlog/` and `backlog-results/` directories can be imported via `migrate-workspace`.
+- **BRAIN Labs**: For repeated simulation anomalies, uncertain field coverage or distribution, and cross-field interactions, open `labs open` or `act RUN_ID request-labs`. Specify scope, field IDs, quantitative questions, aggregate statistics and conditional next steps. An OPEN ticket blocks overlapping proposals. Receive only aggregate evidence through `labs resolve`.
 - **Immutable identity once proposed**: Never rename arm labels or tweak syntax to evade `request_fingerprint` duplicates or `GATE_PREFLIGHT_BLOCKED`. Inspect `preflight_block` and either `act RUN_ID retry-preflight` or `drop`.
 
 ## 4. Error & Deferral Handling

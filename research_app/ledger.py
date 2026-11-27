@@ -913,8 +913,15 @@ def cmd_ledger_stability(args, _sink):
                 or (alpha_id in training and training[alpha_id] is None)):
             if fallback_series is not None and ml.valid_simulation_id(alpha_id):
                 pnl = fallback_series.get(alpha_id)
+            elif ml.valid_simulation_id(alpha_id):
+                import pnl_store
+
+                committed, declared = pnl_store.read_committed(pnl_dir, [alpha_id])
+                pnl = committed.get(alpha_id) if alpha_id in declared else pnl_snapshot.read_series(
+                    pnl_dir / f"{alpha_id}.json",
+                )
             else:
-                pnl = pnl_snapshot.read_series(pnl_dir / f"{alpha_id}.json")
+                pnl = None
             values = None if pnl is None else experiments.half_split_sharpes(pnl, _stability_cutoff(entry))
         else:
             values = training.get(alpha_id)

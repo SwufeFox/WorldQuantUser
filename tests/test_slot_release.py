@@ -1,7 +1,5 @@
 """A missing receipt cannot free a slot; terminal evidence stays account-scoped."""
 
-from pathlib import Path
-
 import cache_store
 import simulation_slots as slots
 
@@ -23,9 +21,9 @@ def test_missing_receipt_keeps_actual_reservations_in_both_accounts(tmp_path, mo
     missing = _accepted(ACCOUNT, URL)
     live = _accepted(ACCOUNT, URL + "-alive")
     _accepted(OTHER_ACCOUNT, URL)
-    paths = [Path(slots._paths(account["fingerprint"])[0])
-             for account in (ACCOUNT, OTHER_ACCOUNT)]
-    before = [path.read_bytes() for path in paths]
+    fingerprints = [account["fingerprint"] for account in (ACCOUNT, OTHER_ACCOUNT)]
+    paths = [slots._paths(fingerprint)[0] for fingerprint in fingerprints]
+    before = [slots._load(path, fingerprint) for path, fingerprint in zip(paths, fingerprints)]
     reads = []
 
     def poll(url):
@@ -37,7 +35,7 @@ def test_missing_receipt_keeps_actual_reservations_in_both_accounts(tmp_path, mo
     assert report["released"] == []
     assert {item["id"] for item in report["kept"]} == {missing["id"], live["id"]}
     assert sorted(reads) == [URL, URL + "-alive"]
-    assert [path.read_bytes() for path in paths] == before
+    assert [slots._load(path, fingerprint) for path, fingerprint in zip(paths, fingerprints)] == before
     assert slots.snapshot(ACCOUNT, 2)["active"] == 2
     assert slots.snapshot(OTHER_ACCOUNT, 2)["active"] == 1
 
@@ -47,8 +45,9 @@ def test_terminal_release_reads_outside_lock_and_changes_only_the_observed_accou
     accepted = _accepted(ACCOUNT, URL)
     _accepted(OTHER_ACCOUNT, URL)
     _path, lock = slots._paths(ACCOUNT["fingerprint"])
-    other_path = Path(slots._paths(OTHER_ACCOUNT["fingerprint"])[0])
-    other_before = other_path.read_bytes()
+    fingerprint = OTHER_ACCOUNT["fingerprint"]
+    other_path, _ = slots._paths(fingerprint)
+    other_before = slots._load(other_path, fingerprint)
 
     def poll(url):
         assert url == URL
@@ -60,4 +59,4 @@ def test_terminal_release_reads_outside_lock_and_changes_only_the_observed_accou
     assert [item["id"] for item in report["released"]] == [accepted["id"]]
     assert slots.snapshot(ACCOUNT, 2)["active"] == 0
     assert slots.snapshot(OTHER_ACCOUNT, 2)["active"] == 1
-    assert other_path.read_bytes() == other_before
+    assert slots._load(other_path, fingerprint) == other_before

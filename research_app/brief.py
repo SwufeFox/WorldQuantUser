@@ -349,20 +349,28 @@ def cmd_breed(args, _sink):
     output = Path(args.out).expanduser().resolve()
     protect_output(args, output)
 
+    import workspace_db
+
     root = Path(research_paths.ensure_dir()).resolve()
     runs_dir = root / "runs"
     raw_ref = str(args.source)
-    candidate_run = runs_dir / f"{raw_ref}.json"
-    source_path = candidate_run if candidate_run.is_file() else Path(raw_ref).expanduser().resolve()
-    protect_output(args, source_path)
-
-    protected = set()
-    try:
-        path, batch = experiments.load_probe_batch(source_path, source_paths=protected)
-    except CliError:
-        raise
-    finally:
-        protect_output(args, *protected)
+    storage = workspace_db.db_path(root)
+    batch = workspace_db.get_run(raw_ref, research_dir=root)
+    if batch is None:
+        candidate_run = runs_dir / f"{raw_ref}.json"
+        source_path = candidate_run if candidate_run.is_file() else Path(raw_ref).expanduser().resolve()
+        protect_output(args, source_path)
+        protected = set()
+        try:
+            path, batch = experiments.load_probe_batch(source_path, source_paths=protected)
+        finally:
+            protect_output(args, *protected)
+        source = {"batch_path": str(path)}
+    else:
+        source = {"workspace_db": str(storage)}
+        if batch.get("track") == "SPC" or not all(isinstance(batch.get(key), list) for key in ("arms", "rows", "records")):
+            raise CliError("INVALID_INPUT", "the run lacks comparable simulation arms",
+                           "choose a REGULAR run with finished train evidence or a saved probe batch")
 
     lock = Path(f"{output}.lock")
     protect_output(args, lock)
@@ -372,7 +380,7 @@ def cmd_breed(args, _sink):
 
     arms, report = breeding.generation(batch, alpha_registry.load_entries(),
                                       seed=args.seed, limit=args.limit)
-    source_meta = {"batch_path": str(path), "run_id": batch.get("run_id"),
+    source_meta = {**source, "run_id": batch.get("run_id"),
                    "request_fingerprint": batch.get("request_fingerprint"), **report}
     spec = {"name": output.stem, "track": batch.get("track", "REGULAR"), "design": "explore",
             "idea": "Compare train-Fitness parent selection with a seeded lottery at equal budget.",
@@ -396,32 +404,26 @@ def cmd_breed(args, _sink):
             "breeding_source": source_meta}
 
 
-def _state_machine_summary(research_dir):
+def _state_machine_summary(research_dir, limit):
+    import workspace_db
+    from .state_machine import AUTO_STATES, GATE_STATES
+
     runs_dir = research_dir / "runs"
-    by_state = {}
-    actionable = []
-    active_auto = 0
     if runs_dir.is_dir():
-        for path in sorted(runs_dir.glob("*.json")):
-            if path.name.endswith("-selection.json") or path.name.startswith("."):
-                continue
-            doc, err = cache_store.load_json(path)
-            if err or not isinstance(doc, dict) or not doc.get("run_id"):
-                continue
-            state = doc.get("state") or "UNKNOWN"
-            by_state[state] = by_state.get(state, 0) + 1
-            if state.startswith("GATE_"):
-                actionable.append({
-                    "run_id": doc["run_id"],
-                    "name": doc.get("name"),
-                    "state": state,
-                    "track": doc.get("track"),
-                    "updated_at": doc.get("updated_at"),
-                })
-            elif state.startswith("AUTO_"):
-                active_auto += 1
-    return {"runs_dir": str(runs_dir), "actionable_gates": actionable,
-            "active_auto_count": active_auto, "by_state": by_state}
+        workspace_db.import_legacy_run_files(runs_dir, research_dir=research_dir)
+    counts = workspace_db.run_counts(research_dir=research_dir)
+    gates = workspace_db.list_runs(states=GATE_STATES, limit=limit, research_dir=research_dir)
+    return {
+        "db_path": str(workspace_db.db_path(research_dir)),
+        "runs_dir": str(runs_dir),
+        "actionable_gates": [
+            {key: doc.get(key) for key in ("run_id", "name", "state", "track", "updated_at")}
+            for doc in gates
+        ],
+        "actionable_gates_total": sum(counts.get(state, 0) for state in GATE_STATES),
+        "active_auto_count": sum(counts.get(state, 0) for state in AUTO_STATES),
+        "by_state": counts,
+    }
 
 
 def cmd_brief(args, _sink):
@@ -542,7 +544,7 @@ def cmd_brief(args, _sink):
         "as_of": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "window_days": days,
         "research_dir": str(research_dir),
-        "state_machine": _state_machine_summary(research_dir),
+        "state_machine": _state_machine_summary(research_dir, args.top),
         "ledger": {"rows": len(entries), "path": registry_path,
                    "exists": Path(registry_path).exists(),
                    "book_rows_missing_labels": unlabeled,
@@ -563,5 +565,17 @@ def cmd_brief(args, _sink):
         "documents": documents,
         "convergence": _convergence_snapshot(),
         "drift": (_book_drift(book, _drift_check().get("platform")) if getattr(args, "drift", False) else None),
+        "labs": _labs_summary(research_dir, args.top, entries),
         "threads": threads,
+    }
+
+
+def _labs_summary(research_dir, limit, entries):
+    from . import labs
+
+    summary = labs.open_ticket_summary(research_dir, limit=limit)
+    return {
+        "open_count": summary["count"],
+        "open_tickets": summary["tickets"],
+        "suggested_delegations": labs.suggest_delegations(research_dir, limit=limit, entries=entries),
     }

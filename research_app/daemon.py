@@ -6,6 +6,7 @@ import argparse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -19,7 +20,7 @@ import urllib.request
 
 import cache_store
 import machine_lib as ml
-import research_paths
+import workspace_db
 
 from . import buffer_cmd, sm_workers, state_machine
 from .runtime import CliError
@@ -45,16 +46,44 @@ def _run_priority(doc):
     return 99
 
 
-def _pid_alive(pid):
-    if not isinstance(pid, int) or pid <= 0:
-        return False
+def _request_integer(value, name, *, minimum=0):
     try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+        integer = int(value)
+    except (TypeError, ValueError) as exc:
+        raise CliError("INVALID_INPUT", f"{name} must be an integer", f"send an integer for {name}") from exc
+    if not minimum <= integer <= sys.maxsize:
+        raise CliError("INVALID_INPUT", f"{name} must be between {minimum} and {sys.maxsize}",
+                       f"send an integer in the supported range for {name}")
+    return integer
+
+
+def _wait_seconds(value):
+    try:
+        seconds = float(value) if not isinstance(value, bool) else math.nan
+    except (TypeError, ValueError, OverflowError):
+        seconds = math.nan
+    if not math.isfinite(seconds) or seconds < 0:
+        raise CliError("INVALID_INPUT", "max_wait_seconds must be a finite non-negative number",
+                       "send a numeric wait duration in seconds")
+    return min(seconds, 60.0)
+
+
+def _gate_ready(engine, *, run_id=None, gate=None):
+    if run_id is not None:
+        try:
+            doc = engine.load_run_raw(run_id)
+        except CliError as exc:
+            if exc.code != "NOT_FOUND":
+                raise
+            return {"ready": True, "reason": "not_found", "run": None}
+        st = doc.get("state")
+        if st in (state_machine.GATE_STATES | state_machine.TERMINAL_STATES) and (gate is None or st == gate):
+            return {"ready": True, "reason": "target_reached", "run": engine.read_run_view(doc, tool="wait")}
+        return None
+    inbox = engine.inbox(gate=gate)
+    if inbox["actionable"]:
+        return {"ready": True, "reason": "gate_ready", "inbox": inbox}
+    return None
 
 
 class DaemonServer:
@@ -73,6 +102,7 @@ class DaemonServer:
         self._wake_cond = threading.Condition()
         self._gate_cond = threading.Condition()
         self._lock_ctx = None
+        self._store_ctx = None
         self._httpd = None
         self._http_thread = None
         self._worker_thread = None
@@ -105,8 +135,11 @@ class DaemonServer:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(raw)))
-                self.end_headers()
-                self.wfile.write(raw)
+                try:
+                    self.end_headers()
+                    self.wfile.write(raw)
+                except ConnectionError:
+                    self.close_connection = True
 
             def _authorized(self):
                 header = self.headers.get("Authorization") or ""
@@ -114,8 +147,8 @@ class DaemonServer:
                 return hmac.compare_digest(header.encode("utf-8"), expected.encode("utf-8"))
 
             def _read_json(self):
-                length = int(self.headers.get("Content-Length") or "0")
-                if length <= 0:
+                length = _request_integer(self.headers.get("Content-Length", "0"), "Content-Length")
+                if length == 0:
                     return {}
                 raw = self.rfile.read(length)
                 try:
@@ -135,21 +168,21 @@ class DaemonServer:
                         "hint": "use endpoint credentials from daemon/endpoint.json"}})
                     return
                 parsed = urllib.parse.urlsplit(self.path)
-                qs = urllib.parse.parse_qs(parsed.query)
+                qs = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
                 try:
                     if parsed.path == "/v1/status":
                         self._send(200, {"ok": True, "data": server_ref.status_snapshot()})
                     elif parsed.path == "/v1/inbox":
-                        gate = qs.get("gate", [None])[0]
-                        limit = int(qs.get("limit", ["20"])[0])
+                        gate = qs.get("gate", [None])[0] or None
+                        limit = _request_integer(qs.get("limit", ["20"])[0], "limit", minimum=1)
                         self._send(200, {"ok": True, "data": server_ref.engine.inbox(gate=gate, limit=limit)})
                     elif parsed.path == "/v1/runs":
-                        st = qs.get("state", [None])[0]
-                        limit = int(qs.get("limit", ["50"])[0])
+                        st = qs.get("state", [None])[0] or None
+                        limit = _request_integer(qs.get("limit", ["50"])[0], "limit", minimum=1)
                         self._send(200, {"ok": True, "data": server_ref.engine.list_runs(state=st, limit=limit)})
                     elif parsed.path == "/v1/inspect":
                         run_id = qs.get("run_id", [None])[0]
-                        arm = qs.get("arm", [None])[0]
+                        arm = qs.get("arm", [None])[0] or None
                         self._send(200, {"ok": True, "data": server_ref.engine.inspect_run(run_id, arm_label=arm)})
                     else:
                         self._send(404, {"ok": False, "error": {
@@ -196,7 +229,7 @@ class DaemonServer:
                         data = server_ref.wait_for_gate(
                             run_id=body.get("run_id"),
                             gate=body.get("gate"),
-                            max_wait_seconds=float(body.get("max_wait_seconds", 30.0)),
+                            max_wait_seconds=body.get("max_wait_seconds", 30.0),
                         )
                         self._send(200, {"ok": True, "data": data})
                     elif parsed.path == "/v1/stop":
@@ -218,6 +251,9 @@ class DaemonServer:
                         "hint": "inspect daemon status or restart the daemon"}})
 
         try:
+            store = workspace_db.keepalive(self.engine.root)
+            store.__enter__()
+            self._store_ctx = store
             self._httpd = ThreadingHTTPServer((self.host, self.port), _Handler)
             self._httpd.daemon_threads = True
             self.port = self._httpd.server_address[1]
@@ -270,28 +306,12 @@ class DaemonServer:
         with self._gate_cond:
             self._gate_cond.notify_all()
 
-    def _gate_ready(self, *, run_id=None, gate=None):
-        if run_id:
-            try:
-                doc = self.engine.load_run_raw(run_id)
-            except CliError:
-                return {"ready": True, "reason": "not_found", "run": None}
-            st = doc.get("state")
-            if st in (state_machine.GATE_STATES | state_machine.TERMINAL_STATES) and (gate is None or st == gate):
-                return {"ready": True, "reason": "target_reached", "run": state_machine.public_run_view(doc)}
-            return None
-        inbox = self.engine.inbox(gate=gate)
-        if inbox["actionable"]:
-            return {"ready": True, "reason": "gate_ready", "inbox": inbox}
-        return None
-
     def wait_for_gate(self, *, run_id=None, gate=None, max_wait_seconds=30.0):
         """Block up to *max_wait_seconds* (capped at 60s) until a matching gate/terminal event arrives."""
-        budget = min(max(0.0, float(max_wait_seconds)), 60.0)
-        deadline = time.monotonic() + budget
+        deadline = time.monotonic() + _wait_seconds(max_wait_seconds)
         with self._gate_cond:
             while True:
-                hit = self._gate_ready(run_id=run_id, gate=gate)
+                hit = _gate_ready(self.engine, run_id=run_id, gate=gate)
                 if hit is not None:
                     return {"woken": True, **hit}
                 remaining = deadline - time.monotonic()
@@ -309,27 +329,31 @@ class DaemonServer:
                     self._last_reconcile = now
                     try:
                         sm_workers.reconcile_orphan_slots(self.engine, self.session_factory)
+                    except ml.CaptchaRequired as exc:
+                        self._last_error = f"{exc.code}: {exc}"
+                        return
                     except Exception as exc:  # noqa: BLE001
                         self._last_error = f"reconcile: {type(exc).__name__}: {exc}"
 
-                due = [
-                    doc for doc in self.engine.iter_runs()
-                    if doc.get("state") in state_machine.AUTO_STATES
-                    and (doc.get("next_wake_at") is None or doc["next_wake_at"] <= now)
-                ]
+                active = self.engine.iter_runs(states=state_machine.AUTO_STATES)
+                due = [doc for doc in active if doc.get("next_wake_at") is None or doc["next_wake_at"] <= now]
                 due.sort(key=lambda d: (_run_priority(d), d.get("created_at") or "", d["run_id"]))
                 if due:
                     target = due[0]
                     before_state = target.get("state")
                     after = sm_workers.advance_run_once(self.engine, target["run_id"], self.session_factory)
+                    last_error = after.get("last_error") or {}
+                    if last_error.get("code") == "AUTH_CAPTCHA":
+                        self._last_error = f"AUTH_CAPTCHA: {last_error['message']}"
+                        return
                     if after.get("state") in (state_machine.GATE_STATES | state_machine.TERMINAL_STATES) or after.get("state") != before_state:
                         self.notify_gate()
                     continue
 
                 waiting_times = [
                     doc["next_wake_at"] - now
-                    for doc in self.engine.iter_runs()
-                    if doc.get("state") in state_machine.AUTO_STATES and isinstance(doc.get("next_wake_at"), (int, float))
+                    for doc in active
+                    if isinstance(doc.get("next_wake_at"), (int, float))
                 ]
                 sleep_sec = max(0.05, min([1.0, *waiting_times])) if waiting_times else 1.0
             except Exception as exc:  # noqa: BLE001
@@ -342,30 +366,34 @@ class DaemonServer:
                 self._wake_cond.wait(timeout=sleep_sec)
 
     def stop(self):
-        """Stop HTTP server & background worker, remove endpoint.json, and release daemon.lock."""
+        """Stop HTTP and the worker, then unpublish the endpoint and release daemon ownership."""
+        if self._lock_ctx is None:
+            return
         self._stop_event.set()
         self.notify_work()
         self.notify_gate()
         if self._httpd is not None:
-            try:
+            if self._http_thread is not None and self._http_thread.is_alive():
                 self._httpd.shutdown()
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                self._httpd.server_close()
-            except Exception:  # noqa: BLE001
-                pass
+            self._httpd.server_close()
             self._httpd = None
-        if self._http_thread is not None and self._http_thread is not threading.current_thread():
-            self._http_thread.join(timeout=2.0)
-        if self._worker_thread is not None and self._worker_thread is not threading.current_thread():
-            self._worker_thread.join(timeout=2.0)
-        cache_store.remove(self.endpoint_path)
-        if self._lock_ctx is not None:
+        if self._worker_thread is not None and self._worker_thread.ident is not None \
+                and self._worker_thread is not threading.current_thread():
+            # Retain ownership until the current step has saved its final transition.
+            self._worker_thread.join()
+        try:
             try:
-                self._lock_ctx.__exit__(None, None, None)
+                if self._store_ctx is not None:
+                    self._store_ctx.__exit__(None, None, None)
+                    self._store_ctx = None
             finally:
-                self._lock_ctx = None
+                cache_store.remove(self.endpoint_path)
+        finally:
+            if self._lock_ctx is not None:
+                try:
+                    self._lock_ctx.__exit__(None, None, None)
+                finally:
+                    self._lock_ctx = None
 
 
 _NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -434,37 +462,48 @@ def _spawn_detached_daemon(engine):
     return subprocess.Popen(cmd, **kwargs)
 
 
+def _probe_endpoint(engine):
+    endpoint = _read_endpoint(engine)
+    if endpoint is not None:
+        try:
+            status = _http_call(endpoint, "GET", "/v1/status", timeout=1.0)
+        except (OSError, CliError):
+            return None
+        if status.get("running"):
+            return endpoint
+    return None
+
+
 def _spawn_and_wait(engine, timeout=15.0):
-    proc = _spawn_detached_daemon(engine)
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        ep = _read_endpoint(engine)
-        if ep is not None:
-            try:
-                _http_call(ep, "GET", "/v1/status", timeout=1.0)
-                return ep
-            except (OSError, CliError):
-                pass
-        if proc.poll() is not None:
-            break
-        time.sleep(0.05)
+    try:
+        with cache_store.file_lock(engine.daemon_dir / "startup.lock", timeout=timeout):
+            endpoint = _probe_endpoint(engine)
+            if endpoint is not None:
+                return endpoint
+            proc = _spawn_detached_daemon(engine)
+            while time.monotonic() < deadline:
+                endpoint = _probe_endpoint(engine)
+                if endpoint is not None:
+                    return endpoint
+                if proc.poll() is not None:
+                    # A daemon launched elsewhere may own the lock and still be starting.
+                    try:
+                        with cache_store.file_lock(engine.daemon_dir / "daemon.lock", timeout=0):
+                            return _probe_endpoint(engine)
+                    except cache_store.LockTimeout:
+                        pass
+                time.sleep(0.05)
+    except cache_store.LockTimeout:
+        return _probe_endpoint(engine)
     return None
 
 
 def _live_endpoint_or_none(engine, *, autostart=True):
-    endpoint = _read_endpoint(engine)
-    if endpoint is not None:
-        try:
-            _http_call(endpoint, "GET", "/v1/status", timeout=1.5)
-            return endpoint
-        except (OSError, CliError):
-            if not _pid_alive(endpoint.get("pid")):
-                cache_store.remove(engine.daemon_dir / "endpoint.json")
-
-    if not autostart or os.environ.get("WQU_OFFLINE_TEST_WORKSPACE"):
-        return None
-
-    return _spawn_and_wait(engine, timeout=15.0)
+    endpoint = _probe_endpoint(engine)
+    if endpoint is not None or not autostart or os.environ.get("WQU_OFFLINE_TEST_WORKSPACE"):
+        return endpoint
+    return _spawn_and_wait(engine)
 
 
 def _engine_for_args(args):
@@ -493,12 +532,19 @@ def cmd_daemon_stop(args, _sink):
     try:
         res = _http_call(ep, "POST", "/v1/stop", body={}, timeout=2.0)
         deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline and (engine.daemon_dir / "endpoint.json").exists():
+        while _read_endpoint(engine) == ep:
+            if time.monotonic() >= deadline:
+                return {"running": True, "stopped": False, **res}
             time.sleep(0.05)
         return {"running": False, "stopped": True, **res}
     except OSError:
-        if not _pid_alive(ep.get("pid")):
-            cache_store.remove(engine.daemon_dir / "endpoint.json")
+        try:
+            with cache_store.file_lock(engine.daemon_dir / "daemon.lock", timeout=0):
+                if _read_endpoint(engine) == ep:
+                    cache_store.remove(engine.daemon_dir / "endpoint.json")
+        except cache_store.LockTimeout as exc:
+            raise CliError("SESSION_BUSY", "daemon is starting, stopping, or temporarily unreachable",
+                           "retry `research_cli.py daemon stop` once the daemon responds") from exc
         return {"running": False, "stopped": False, "reason": "stale_endpoint_cleared"}
 
 
@@ -630,7 +676,10 @@ def cmd_act(args, _sink):
     """Apply a gate transition decision to a run paused at a GATE_* state."""
     engine = _engine_for_args(args)
     params = {}
-    for field in ("arms", "top", "verdict", "reason", "name", "category", "tags", "description"):
+    for field in (
+        "arms", "top", "verdict", "reason", "name", "category", "tags", "description",
+        "trigger", "fields", "question", "expect", "branch", "dataset",
+    ):
         val = getattr(args, field, None)
         if val is not None:
             params[field] = val
@@ -658,14 +707,16 @@ def cmd_wait(args, _sink):
     engine = _engine_for_args(args)
     run_id = getattr(args, "run_id", None)
     gate = getattr(args, "gate", None)
-    max_wait = float(getattr(args, "max_wait", 30.0))
+    max_wait = _wait_seconds(getattr(args, "max_wait", 30.0))
     ep = _live_endpoint_or_none(engine, autostart=False)
     if ep is not None:
         return _http_call(ep, "POST", "/v1/wait",
                           body={"run_id": run_id, "gate": gate, "max_wait_seconds": max_wait},
-                          timeout=min(max_wait, 60.0) + 5.0)
-    inbox = engine.inbox(gate=gate)
-    return {"woken": bool(inbox["actionable"]), "reason": "gate_ready" if inbox["actionable"] else "daemon_not_running", "inbox": inbox}
+                          timeout=max_wait + 5.0)
+    hit = _gate_ready(engine, run_id=run_id, gate=gate)
+    if hit is not None:
+        return {"woken": True, **hit}
+    return {"woken": False, "reason": "daemon_not_running", "inbox": engine.inbox(gate=gate)}
 
 
 def cmd_migrate_workspace(args, _sink):

@@ -38,14 +38,18 @@ from __future__ import annotations
 
 import argparse
 import collections
+from contextlib import closing, nullcontext
 import datetime as dt
 import glob
 import hashlib
 import json
 import os
+from pathlib import Path
+import shutil
+import sqlite3
 import sys
 import tarfile
-import time
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -53,7 +57,9 @@ sys.path.insert(0, ROOT)
 
 import alpha_registry  # noqa: E402
 import cache_store  # noqa: E402
+import pnl_store  # noqa: E402
 import research_paths  # noqa: E402
+import workspace_db  # noqa: E402
 
 #: What goes into an archive.
 #:
@@ -83,6 +89,24 @@ CACHE_DIR = "cache"
 #: machine costs one login, so there is nothing to trade here.
 SECRET_FILES = frozenset({"session.json", ".env", "cookies.json", "credentials.json",
                           "token.json", ".netrc"})
+DAEMON_ENDPOINT = "daemon/endpoint.json"
+WORKSPACE_DB = workspace_db.db_path(ROOT).name
+PNL_MANIFEST = "pnl/meta.sqlite"
+SQLITE_SIDECARS = ("-wal", "-shm", "-journal")
+
+
+def _is_secret(relative):
+    relative = relative.casefold()
+    return relative.rsplit("/", 1)[-1] in SECRET_FILES or relative == DAEMON_ENDPOINT
+
+
+def _is_sqlite_member(relative):
+    return relative in {WORKSPACE_DB, PNL_MANIFEST} or relative.endswith(".index.sqlite3")
+
+
+def _is_sqlite_sidecar(relative):
+    return any(relative.endswith(suffix) and _is_sqlite_member(relative[:-len(suffix)])
+               for suffix in SQLITE_SIDECARS)
 
 
 # ------------------------------------------------------------------ file walking
@@ -108,9 +132,9 @@ def collect(root, profile="state", extra_exclude=()):
                              and not (profile == "state" and relative_dir == "."
                                       and name == CACHE_DIR))
         for name in filenames:
-            if name.endswith(EXCLUDED_SUFFIXES) or name in SECRET_FILES:
-                continue
             relative = os.path.normpath(os.path.join(relative_dir, name)).replace(os.sep, "/")
+            if name.endswith(EXCLUDED_SUFFIXES) or _is_secret(relative) or _is_sqlite_sidecar(relative):
+                continue
             if relative.startswith(".."):
                 continue
             if wanted is not None and relative not in wanted:
@@ -125,10 +149,56 @@ def secret_files(root):
     for directory, dirnames, filenames in os.walk(root):
         dirnames[:] = [name for name in dirnames if name not in EXCLUDED_DIRS]
         for name in filenames:
-            if name in SECRET_FILES:
-                found.append(os.path.normpath(
-                    os.path.join(os.path.relpath(directory, root), name)).replace(os.sep, "/"))
+            relative = os.path.normpath(
+                os.path.join(os.path.relpath(directory, root), name)).replace(os.sep, "/")
+            if _is_secret(relative):
+                found.append(relative)
     return sorted(found)
+
+
+def _stage_file(root, stage, relative):
+    source = root / relative
+    if source.is_symlink() or not source.is_file() or not source.resolve().is_relative_to(root):
+        raise OSError(f"cannot archive missing or nonregular file {relative}")
+    target = stage / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if not _is_sqlite_member(relative):
+        shutil.copy2(source, target)
+        return
+    with closing(sqlite3.connect(f"{source.as_uri()}?mode=ro", uri=True)) as live:
+        with closing(sqlite3.connect(target)) as snapshot:
+            live.backup(snapshot)
+            snapshot.execute("PRAGMA journal_mode=DELETE")
+    shutil.copystat(source, target)
+
+
+def _stage_workspace(root, stage, profile, extra_exclude):
+    pnl_dir = root / "pnl"
+    include_pnl = profile != "ledger" and "pnl" not in extra_exclude and pnl_dir.is_dir()
+    if include_pnl and not pnl_dir.resolve().is_relative_to(root):
+        raise OSError("cannot archive a PnL directory outside the research root")
+    excluded = [*extra_exclude, stage.name]
+    if not include_pnl:
+        excluded.append("pnl")
+    members = pnl_store.backup_members(pnl_dir) if include_pnl else nullcontext(())
+    with members as parquet:
+        required = {f"pnl/{path.as_posix()}" for path in parquet}
+        files = collect(root, profile, excluded)
+        missing = required.difference(files)
+        if missing:
+            raise OSError("committed PnL files are missing or excluded: " + ", ".join(sorted(missing)))
+        files = [path for path in files if not (path.startswith("pnl/") and path.endswith(".parquet"))
+                 or path in required]
+        for path in files:
+            if path.startswith("pnl/"):
+                _stage_file(root, stage, path)
+    for path in files:
+        if path == "alpha-registry.jsonl":
+            with cache_store.file_lock(root / (path + ".lock"), timeout=30):
+                _stage_file(root, stage, path)
+        elif not path.startswith("pnl/"):
+            _stage_file(root, stage, path)
+    return files
 
 
 def fingerprint(path):
@@ -254,23 +324,21 @@ def write_archive(root, files, manifest, target):
     second one.
     """
     os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
-    with tarfile.open(target, "w:gz") as archive:
-        for relative in files:
-            path = os.path.join(root, relative)
-            if not os.path.isfile(path):
-                continue
-            archive.add(path, arcname=relative, recursive=False)
-    size, digest = fingerprint(target)
-    manifest["archive"] = {"path": os.path.abspath(target), "bytes": size,
-                           "sha256": digest}
-    problems = verify_archive(target, manifest)
-    if problems:
-        raise RuntimeError("archive failed verification: %s" % "; ".join(problems[:3]))
-    # The sidecar is written here rather than by the caller so that an archive can
-    # never exist without the manifest that describes it -- restore and verify both
-    # look for it, and a backup that needs a second step to become verifiable is a
-    # backup that will be verified never.
-    cache_store.write_json_atomic(manifest_path(target), manifest, indent=1)
+    with tempfile.TemporaryDirectory(prefix=".backup-write-", dir=os.path.dirname(os.path.abspath(target))) as work:
+        pending = os.path.join(work, os.path.basename(target))
+        with tarfile.open(pending, "w:gz") as archive:
+            for relative in files:
+                path = os.path.join(root, relative)
+                archive.add(path, arcname=relative, recursive=False)
+        size, digest = fingerprint(pending)
+        manifest["archive"] = {"path": os.path.abspath(target), "bytes": size,
+                                "sha256": digest}
+        problems = verify_archive(pending, manifest)
+        if problems:
+            raise RuntimeError("archive failed verification: %s" % "; ".join(problems[:3]))
+        cache_store.write_json_atomic(manifest_path(pending), manifest, indent=1)
+        os.replace(pending, target)
+        os.replace(manifest_path(pending), manifest_path(target))
     return manifest["archive"]
 
 
@@ -358,7 +426,8 @@ def prune(directory, profile, label, keep, protect=None):
 
 
 def manifest_path(archive):
-    return archive + ".manifest.json"
+    """Return the sidecar path for an archive."""
+    return os.fspath(archive) + ".manifest.json"
 
 
 def load_manifest(archive):
@@ -386,13 +455,25 @@ def restore(archive, target, force=False, dry_run=False, manifest=None):
     problems = verify_archive(archive, manifest)
     if problems:
         return {"ok": False, "problems": problems, "written": []}
-    target = os.path.abspath(target)
-    written, skipped, refused = [], [], []
+    target = os.path.realpath(target)
+    if any(record["path"] == WORKSPACE_DB or record["path"].startswith("pnl/")
+           for record in manifest["files"]):
+        protected = (WORKSPACE_DB, "pnl", DAEMON_ENDPOINT,
+                     *(WORKSPACE_DB + suffix for suffix in SQLITE_SIDECARS))
+        conflicts = [path for path in protected if os.path.lexists(os.path.join(target, path))]
+        if conflicts:
+            return {"ok": False, "written": [], "problems": [
+                "restore workspace state into a new research directory; destination contains "
+                + ", ".join(conflicts)]}
+    written, skipped, refused, skipped_secrets = [], [], [], []
     with tarfile.open(archive, "r:gz") as handle:
         for member in handle.getmembers():
             if not member.isfile():
                 continue
-            destination = os.path.abspath(os.path.join(target, member.name))
+            if _is_secret(member.name):
+                skipped_secrets.append(member.name)
+                continue
+            destination = os.path.realpath(os.path.join(target, member.name))
             if not destination.startswith(target + os.sep):
                 refused.append(member.name)
                 continue
@@ -416,7 +497,8 @@ def restore(archive, target, force=False, dry_run=False, manifest=None):
                        "restored_at": dt.datetime.now(dt.timezone.utc).isoformat(),
                        "files": written}, handle, indent=1)
     return {"ok": True, "problems": [], "written": written,
-            "skipped": skipped, "refused": refused, "dry_run": dry_run}
+            "skipped": skipped, "refused": refused, "skipped_secrets": skipped_secrets,
+            "dry_run": dry_run}
 
 
 # -------------------------------------------------------------------------- asof
@@ -687,16 +769,30 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "backup":
-        root = args.root or research_paths.ensure_dir()
-        files = collect(root, args.profile, args.exclude)
-        if not files:
+        root = Path(args.root or research_paths.ensure_dir()).resolve()
+        if not root.is_dir():
             print("nothing to archive under %s" % root, file=sys.stderr)
             return 2
-        manifest = build_manifest(root, files, args.profile, args.label)
         out_dir = args.out or os.path.join(root, "backups")
         target = os.path.join(out_dir, _archive_name(args.profile, args.label,
                                                      dt.datetime.now(dt.timezone.utc)))
-        write_archive(root, files, manifest, target)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix=".backup-stage-", dir=out_dir) as staging:
+                stage = Path(staging)
+                files = _stage_workspace(root, stage, args.profile, args.exclude)
+                if not files:
+                    print("nothing to archive under %s" % root, file=sys.stderr)
+                    return 2
+                manifest = build_manifest(stage, files, args.profile, args.label)
+                manifest["source"] = str(root)
+                secrets = secret_files(root)
+                if secrets:
+                    manifest["excluded_secrets"] = secrets
+                write_archive(stage, files, manifest, target)
+        except (OSError, sqlite3.Error, cache_store.CacheError, RuntimeError) as error:
+            print(f"backup failed: {error}", file=sys.stderr)
+            return 1
         report_backup(manifest)
         removed = prune(out_dir, args.profile, args.label, args.keep, protect=target)
         if removed:
@@ -732,6 +828,8 @@ def main(argv=None) -> int:
         if outcome["refused"]:
             print("refused %d members whose path escapes the target"
                   % len(outcome["refused"]))
+        if outcome["skipped_secrets"]:
+            print("skipped %d credential files" % len(outcome["skipped_secrets"]))
         return 0
 
     if args.command == "asof":

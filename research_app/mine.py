@@ -69,12 +69,10 @@ def load_catalog(report=None, *, all_scopes=False):
     ignored = 0
     now = cache_store.utc_now()
     for path, account_bound in ml.catalog_field_cache_paths():
-        document, _ = cache_store.load_json(path)
-        payload = document.get("payload") if isinstance(document, dict) else None
+        snapshot = {}
+        payload, envelope = ml.read_cached_field_snapshot(path, report=snapshot)
         if not isinstance(payload, list):
             continue
-        envelope = document.get("_cache")
-        envelope = envelope if isinstance(envelope, dict) else {}
         created = _moment(envelope.get("created_at"))
         expiry = _moment(envelope.get("expires_at"))
         freshness = ("fresh" if expiry > now else "stale") if expiry else "unknown"
@@ -89,7 +87,7 @@ def load_catalog(report=None, *, all_scopes=False):
                 ignored += 1
                 continue
             scope_known = all(key in declared for key in ("region", "universe", "delay"))
-            source = {"path": str(path), "scope_state": "matched" if scope_known else "unknown",
+            source = {"path": snapshot["path"], "scope_state": "matched" if scope_known else "unknown",
                       "account_state": "matched" if account_bound else "unknown",
                       "freshness": freshness, "created_at": envelope.get("created_at"),
                       "expires_at": envelope.get("expires_at"),

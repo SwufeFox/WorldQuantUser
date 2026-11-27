@@ -29,10 +29,20 @@ python3 tools/backup_replay.py replay --ids ALPHA_ID --run
 The default is `state`: the cache is fetched again on demand, the PnL series and the
 ledger are not.
 
-All profiles exclude known credential filenames, including `cache/session.json`
-and `.env`. The manifest lists detected exclusions under `excluded_secrets`.
-This is a filename filter, so notes, results, or source files may still contain
-sensitive content.
+The `state` and `full` profiles use SQLite's backup API to capture committed
+transactions from `workspace.db` and `pnl/meta.sqlite`, including transactions
+still in WAL. SQLite WAL, shared-memory, and rollback journal files are excluded.
+The PnL store holds its publication lock while the backup stages the manifest,
+referenced Parquet files, and legacy JSON. A missing committed file aborts the
+backup. The ledger is staged under its append lock. Each store is captured
+consistently, at its own point in time. Pause workspace writers if you need a
+single cutoff across the database, PnL, and ledger. The output directory needs
+temporary space for the staged files as well as the compressed archive.
+
+All profiles exclude known credential files including `cache/session.json`,
+`.env`, and `daemon/endpoint.json`. The manifest lists detected exclusions under
+`excluded_secrets`. Notes, results, and source files may still contain sensitive
+content.
 
 An archive covers the selected root. Standalone `simulate` defaults to
 `.brain_checkpoints/` in the invocation directory. To keep those checkpoints in
@@ -71,10 +81,12 @@ because it stops you making a second one.
 * a member in the archive that is not in the manifest — an archive that quietly
   gained a file is as suspect as one that lost it.
 
-`restore` verifies first, then extracts. It will not overwrite an existing file
-without `--force`, refuses members whose path escapes the target directory (that is
-a damaged archive, not a path to normalise), and `--dry-run` lists what it would
-write.
+`restore` verifies first, then extracts. Restore archives containing a workspace
+SQLite database or PnL files into a new research directory to preserve their
+consistency. The command rejects existing workspace databases, SQLite sidecars,
+PnL directories, or daemon endpoints in the destination for these archives.
+For ordinary files, `--force` allows overwriting and `--dry-run` lists what would
+be written. Paths that escape the destination are refused.
 
 ## Point-in-time replay (`asof`)
 

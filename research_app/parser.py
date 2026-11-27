@@ -833,7 +833,7 @@ def build_parser():
         help="List runs paused at interaction gates (GATE_*) and active background AUTO_* counts.")
     inbox_p.add_argument("--gate", default=None,
                          choices=["GATE_PREFLIGHT_BLOCKED", "GATE_TRIAGE", "GATE_APPROVE_FULL",
-                                  "GATE_DESCRIBE", "GATE_CONFIRM_SUBMIT"],
+                                  "GATE_DESCRIBE", "GATE_CONFIRM_SUBMIT", "GATE_LABS"],
                          help="Filter actionable items to a specific gate state.")
     inbox_p.add_argument("--limit", type=_positive_count, default=20)
     inbox_p.bind_handler("daemon.cmd_inbox")
@@ -855,8 +855,10 @@ def build_parser():
         help="Apply a decision transition to a run paused at a GATE_* interaction point.")
     act_p.add_argument("run_id", metavar="RUN_ID")
     act_p.add_argument("action", choices=["retry-preflight", "hydrate-pnl", "approve-full",
-                                          "back-to-triage", "describe", "submit", "hold", "drop"])
-    act_p.add_argument("--arms", default=None, help="Comma-separated arm labels for hydrate-pnl or approve-full.")
+                                          "back-to-triage", "describe", "submit", "hold",
+                                          "request-labs", "drop"])
+    act_p.add_argument("--arms", default=None,
+                       help="Comma-separated labels for hydrate-pnl, or one passing label for approve-full.")
     act_p.add_argument("--top", type=_positive_count, default=None, help="Top N positive QUICK arms for hydrate-pnl.")
     act_p.add_argument("--verdict", choices=["rejected", "falsified", "no_go"], default=None,
                        help="Ledger verdict applied by `drop`.")
@@ -867,6 +869,17 @@ def build_parser():
     act_p.add_argument("--tags", nargs="+", default=None, help="Candidate tags for `describe`.")
     act_p.add_argument("--description", default=None,
                        help="Official Power Pool template description (>=100 chars) for `describe`.")
+    act_p.add_argument("--trigger", default="anomaly",
+                       choices=["anomaly", "distribution", "interaction"],
+                       help="BRAIN Labs delegation trigger rule for `request-labs`.")
+    act_p.add_argument("--dataset", default=None, help="Target dataset ID for `request-labs`.")
+    act_p.add_argument("--fields", nargs="+", default=None, help="Target datafield IDs for `request-labs`.")
+    act_p.add_argument("--question", action="append", default=None,
+                       help="Quantitative question to verify in BRAIN Labs (repeatable).")
+    act_p.add_argument("--expect", action="append", default=None,
+                       help="Expected summary metric to return from BRAIN Labs (repeatable).")
+    act_p.add_argument("--branch", action="append", default=None,
+                       help="Conditional next-step branch 'cond -> action' (repeatable).")
     act_p.add_argument("--yes", action="store_true", help="Explicit irreversible authorization for `submit`.")
     act_p.bind_handler("daemon.cmd_act")
 
@@ -918,6 +931,64 @@ def build_parser():
     d_cfg.bind_handler("daemon.cmd_daemon_config")
     d_serve = daemon_sub.add_parser("_serve", help="Internal foreground daemon server loop.")
     d_serve.bind_handler("daemon.cmd_daemon_serve")
+
+    labs_p = sub.add_parser(
+        "labs",
+        help="Delegate quantitative datafield diagnostics to the human collaborator's BRAIN Labs sandbox.")
+    labs_sub = labs_p.add_subparsers(dest="labs_command", required=True, parser_class=JsonArgumentParser)
+
+    labs_open = labs_sub.add_parser(
+        "open",
+        help="Open a structured BRAIN Labs diagnostic ticket (pauses blind simulation on those fields).")
+    labs_open.add_argument("--spec", default=None, help="Optional JSON file defining ticket fields.")
+    labs_open.add_argument("--trigger", default=None, choices=["anomaly", "distribution", "interaction"],
+                           help="Trigger rule: anomaly | distribution | interaction.")
+    labs_open.add_argument("--region", default="USA", help="Target region (e.g. USA, ASI).")
+    labs_open.add_argument("--universe", default="TOP3000", help="Target universe (e.g. TOP3000).")
+    labs_open.add_argument("--delay", type=_non_negative_integer, default=1, help="Target delay integer.")
+    labs_open.add_argument("--dataset", default=None, help="Optional dataset identifier.")
+    labs_open.add_argument("--fields", nargs="+", default=None, help="One or more target datafield IDs.")
+    labs_open.add_argument("--question", action="append", default=None,
+                           help="Specific quantitative question to test in BRAIN Labs (repeatable).")
+    labs_open.add_argument("--expect", action="append", default=None,
+                           help="Expected summary metric name/definition to return (repeatable).")
+    labs_open.add_argument("--branch", action="append", default=None,
+                           help="Conditional next-step branch 'condition -> action' (repeatable).")
+    labs_open.add_argument("--run-id", default=None, dest="run_id",
+                           help="Reference an existing run. Use `act RUN_ID request-labs` to pause it.")
+    labs_open.bind_handler("labs.cmd_labs_open")
+
+    labs_list = labs_sub.add_parser("list", help="List BRAIN Labs diagnostic tickets.")
+    labs_list.add_argument("--status", default=None, choices=["OPEN", "RESOLVED", "CANCELLED"], type=str.upper,
+                           help="Filter tickets by status.")
+    labs_list.add_argument("--field", default=None, help="Filter tickets referencing a datafield ID.")
+    labs_list.add_argument("--limit", type=_positive_count, default=50, help="Maximum tickets returned (up to 100).")
+    labs_list.bind_handler("labs.cmd_labs_list")
+
+    labs_show = labs_sub.add_parser("show", help="Inspect one BRAIN Labs ticket card and Python snippet.")
+    labs_show.add_argument("ticket_id", metavar="TICKET_ID", help="Labs ticket ID returned by `labs open`.")
+    labs_show.bind_handler("labs.cmd_labs_show")
+
+    labs_resolve = labs_sub.add_parser("resolve", help="Resolve an OPEN BRAIN Labs ticket with returned stats.")
+    labs_resolve.add_argument("ticket_id", metavar="TICKET_ID", help="Open Labs ticket ID to resolve.")
+    labs_resolve.add_argument("--summary", required=True, help="Summary findings from BRAIN Labs.")
+    labs_resolve.add_argument("--metrics", default=None, help="Optional JSON object of returned summary statistics.")
+    labs_resolve.add_argument("--chosen-branch", default=None, dest="chosen_branch",
+                              help="Selected next-step branch recorded on the ticket.")
+    labs_resolve.bind_handler("labs.cmd_labs_resolve")
+
+    labs_cancel = labs_sub.add_parser("cancel", help="Cancel an OPEN BRAIN Labs ticket.")
+    labs_cancel.add_argument("ticket_id", metavar="TICKET_ID", help="Open Labs ticket ID to cancel.")
+    labs_cancel.add_argument("--reason", default=None, help="Reason for cancelling the ticket.")
+    labs_cancel.bind_handler("labs.cmd_labs_cancel")
+
+    labs_suggest = labs_sub.add_parser("suggest", help="Identify ledger fields with repeated anomalies needing Labs.")
+    labs_suggest.add_argument("--region", default=None, type=str.upper, help="Filter ledger entries by region.")
+    labs_suggest.add_argument("--field", default=None, help="Filter suggestions to one field ID.")
+    labs_suggest.add_argument("--min-attempts", type=_positive_count, default=3, dest="min_attempts",
+                              help="Minimum attempts before flagging repeated anomalies (default 3).")
+    labs_suggest.add_argument("--limit", type=_positive_count, default=50, help="Maximum suggestions returned (up to 100).")
+    labs_suggest.bind_handler("labs.cmd_labs_suggest")
 
     abl = sub.add_parser(
         "ablate",
@@ -1589,6 +1660,7 @@ _COMMAND_EXAMPLES = {
     "inbox": ["inbox", "inbox --gate GATE_TRIAGE"],
     "inspect": ["inspect RUN_ID", "inspect RUN_ID --arm arm_1"],
     "runs": ["runs --limit 20", "runs --state GATE_TRIAGE"],
+    "labs": ["labs list --status OPEN", "labs suggest --region USA", "labs show TICKET_ID"],
     "act": [
         "act RUN_ID hydrate-pnl --top 3",
         "act RUN_ID approve-full",

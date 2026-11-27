@@ -41,10 +41,13 @@ options and the JSON contract.
 | File | Job |
 | --- | --- |
 | `research_cli.py` | Thin executable entry point. stdout is always one JSON document. |
+| `pnl_store.py` | Immutable daily PnL Parquet generations (`base-*.parquet` and `deltas/*.parquet`) with a SQLite manifest and completeness evidence. |
+| `workspace_db.py` | SQLite WAL store for state-machine runs, events, scheduling config, slot journals, and BRAIN Labs tickets. |
 | `research_app/app.py` | Command execution, workspace selection, error envelopes and exit codes. |
 | `research_app/parser.py` | Argument declarations, terminal help and the schema derived from the live parser. |
 | `research_app/runtime.py` | Shared CLI contract, JSON output, protected state paths and authenticated sessions. |
-| `research_app/state_machine.py` | Persistent 4-gate state machine, Train/Test protocol firewall and `migrate-workspace`. |
+| `research_app/state_machine.py` | Persistent 4-gate + `GATE_LABS` state machine, Train/Test protocol firewall and `migrate-workspace`. |
+| `research_app/labs.py` | BRAIN Labs human-collaborator diagnostic ticket system and blind-simulation guardrails. |
 | `research_app/sm_workers.py` | Autonomous worker transitions (`AUTO_*`), cost audit and orphan slot harvesting. |
 | `research_app/daemon.py` | Resident single-writer HTTP loopback server, bearer-auth IPC and non-blocking CLI handlers. |
 | `research_app/brief.py` | Bounded workspace brief, book health, out-of-sample views log and `breed` offspring generator. |

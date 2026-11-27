@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -318,6 +319,65 @@ class CatalogCacheTests(unittest.TestCase):
         fetch.assert_called_once()
         self.assertEqual(fresh["fields"][0]["id"], "new_signal")
         self.assertFalse(fresh["cache"]["stale"])
+
+    def test_parquet_cache_preserves_field_rows_and_empty_catalogs(self):
+        heterogeneous = [
+            {**_field("first_signal", 1), "dataset": {"id": "first", "labels": [1, "a"]}},
+            {**_field("second_signal", 0.5), "dataset": {"id": "first", "extra": None},
+             "provider_note": None},
+        ]
+        for dataset, rows in [("first", heterogeneous), ("second", [])]:
+            with self.subTest(dataset=dataset):
+                report = {}
+                with mock.patch.object(ml, "_get_datafields", return_value=rows):
+                    ml.get_datafields(self.session, dataset_id=dataset, report=report)
+                path = Path(report["path"])
+                self.assertEqual(path.suffix, ".parquet")
+                self.assertTrue(path.is_file())
+                self.assertFalse(path.with_suffix(".json").exists())
+                cached, envelope = ml.read_cached_field_snapshot(path)
+                self.assertEqual(json.dumps(cached, sort_keys=True), json.dumps(rows, sort_keys=True))
+                self.assertEqual(envelope["kind"], "datafields")
+                with mock.patch.object(ml, "_get_datafields", side_effect=AssertionError("cache miss")):
+                    self.assertEqual(ml.get_datafields(self.session, dataset_id=dataset, report=report), rows)
+                self.assertTrue(report["hit"])
+
+    def test_legacy_migration_preserves_ttl_and_archives_only_valid_entries(self):
+        metadata = Path(research_paths.metadata_root())
+        directory = metadata / "datafields"
+        legacy, malformed = directory / "sample.json", directory / "broken.json"
+        rows = [{**_field("old_signal", 0.7), "dataset": {"id": "first"}}]
+        old = cache_store.utc_now() - timedelta(minutes=2)
+        entry = cache_store.build_entry("datafields", rows, ttl=60, source="brain-api", now=old)
+        cache_store.write_json_atomic(legacy, entry)
+        cache_store.write_text_atomic(malformed, "{")
+        archive = metadata.parent / "archive"
+        dry_run = ml.migrate_legacy_datafield_cache(metadata, archive_dir=archive, dry_run=True)
+        self.assertEqual(dry_run, {"migrated": 1, "skipped": 1})
+        self.assertFalse(archive.exists())
+        self.assertFalse(legacy.with_suffix(".parquet").exists())
+        self.assertEqual(ml.migrate_legacy_datafield_cache(metadata, archive_dir=archive), dry_run)
+        self.assertFalse(legacy.exists())
+        self.assertTrue(malformed.exists())
+        self.assertEqual(cache_store.load_json(archive / legacy.name)[0], entry)
+        self.assertEqual(ml.read_cached_field_snapshot(legacy), (rows, entry["_cache"]))
+        self.assertEqual(ml.migrate_legacy_datafield_cache(metadata, archive_dir=archive),
+                         {"migrated": 0, "skipped": 1})
+
+    def test_invalid_parquet_falls_back_to_exact_legacy_snapshot(self):
+        report = {}
+        previous = [_field("legacy", 0.7)]
+        with mock.patch.object(ml, "_get_datafields", return_value=previous):
+            ml.get_datafields(self.session, dataset_id="first", report=report)
+        parquet = Path(report["path"])
+        legacy = parquet.with_suffix(".json")
+        cache_store.write_json_atomic(legacy, cache_store.build_entry("datafields", previous, ttl=60))
+        cache_store.write_text_atomic(parquet, "truncated")
+        with mock.patch.object(ml, "_get_datafields", side_effect=AssertionError("legacy cache miss")):
+            cached = ml.get_datafields(self.session, dataset_id="first", report=report)
+        self.assertEqual(cached, previous)
+        self.assertEqual(report["path"], str(legacy))
+        self.assertTrue(report["hit"])
 
     def test_account_switch_and_unknown_account_cannot_reuse_other_snapshot(self):
         details = {}

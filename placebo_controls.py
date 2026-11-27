@@ -106,16 +106,13 @@ def normalize(words):
 
 def _load_cached_fields(directory=None):
     """Every datafield the metadata snapshot knows about, without a session."""
-    import glob
     import os
-    root = directory or os.environ.get("MAGIX_FIELD_CACHE") or (
-        "/data/worldquant-research/cache/metadata/datafields")
+    import machine_lib as ml
+
+    root = directory or os.environ.get("MAGIX_FIELD_CACHE")
     fields = []
-    for path in sorted(glob.glob(os.path.join(root, "*.json"))):
-        try:
-            payload = json.load(open(path)).get("payload")
-        except Exception:
-            continue
+    for path, _ in ml.catalog_field_cache_paths(root):
+        payload, _ = ml.read_cached_field_snapshot(path)
         rows = payload if isinstance(payload, list) else [payload]
         fields.extend(row for row in rows if isinstance(row, dict) and row.get("id"))
     return fields

@@ -318,8 +318,12 @@ class BriefTests(unittest.TestCase):
         with open(os.path.join(runs_dir, "auto-run.json"), "w", encoding="utf-8") as handle:
             json.dump({"run_id": "auto-run", "name": "auto", "state": "AUTO_QUICK_SIM",
                        "track": "REGULAR", "updated_at": "2026-11-27T00:00:00Z"}, handle)
-        sm = self._run()["state_machine"]
+        with open(os.path.join(runs_dir, "older-run.json"), "w", encoding="utf-8") as handle:
+            json.dump({"run_id": "older-run", "name": "draft", "state": "GATE_LABS",
+                       "track": "REGULAR", "updated_at": "2026-11-26T00:00:00Z"}, handle)
+        sm = self._run(top=1)["state_machine"]
         self.assertEqual(sm["active_auto_count"], 1)
+        self.assertEqual(sm["actionable_gates_total"], 2)
         self.assertEqual(len(sm["actionable_gates"]), 1)
         self.assertEqual(sm["actionable_gates"][0]["run_id"], "demo-run")
 

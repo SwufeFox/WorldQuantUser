@@ -2,17 +2,14 @@
 
 from datetime import date
 import json
-import math
 from pathlib import Path
 
 import alpha_registry
-import cache_store
 import machine_lib as ml
 import research_paths
 from registry_index import index_path
 
 from .runtime import CliError, protect_output
-from .stats import sharpe
 
 
 _GROUPS = {
@@ -30,7 +27,6 @@ _STAGES = (
 )
 _COHORT_TABLE = "temp.ledger_analysis_cohort"
 _FINISHED = "'COMPLETE', 'WARNING', 'UNSUBMITTED'"
-_MIN_YEAR_POINTS = 145
 
 
 def _rows(connection, sql, parameters):
@@ -58,47 +54,9 @@ def _cohort(args):
 
 
 def _yearly(row, pnl_dir):
-    alpha_id = row["alpha_id"]
-    if not ml.valid_simulation_id(alpha_id):
-        return {"state": "unavailable", "reason": "invalid_alpha_id"}
-    series, error = cache_store.load_json(pnl_dir / (alpha_id + ".json"))
-    if error:
-        return {"state": "unavailable", "reason": "cache_missing" if error == "missing" else "cache_unreadable"}
-    proof = ml.pnl_cache_status(pnl_dir, alpha_id, series)
-    if proof["complete"] is not True:
-        return {"state": "unavailable", "reason": "cache_completeness_unverified"}
+    from .pnl_snapshot import yearly_train_batch
 
-    start, cutoff = row["train_start"][:10], row["test_start"][:10]
-    by_year = {}
-    for day, value in sorted(series.items()):
-        if day < start or day >= cutoff:
-            continue
-        try:
-            as_date = date.fromisoformat(day)
-        except ValueError:
-            continue
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
-            by_year.setdefault(as_date.year, []).append((as_date, value))
-
-    # Complete calendar years must lie wholly inside train and have observations
-    # at both ends. Partial train years are omitted instead of penalizing them.
-    first, last = date.fromisoformat(start), date.fromisoformat(cutoff)
-    years = []
-    for year in range(first.year + (first.month != 1 or first.day != 1), last.year):
-        points = by_year.get(year, [])
-        score = None
-        if len(points) >= _MIN_YEAR_POINTS and points[0][0].month == 1 and points[-1][0].month == 12:
-            score = sharpe([value for _, value in points], min_points=_MIN_YEAR_POINTS)
-        years.append({"year": year, "points": len(points), "sharpe": score})
-    output = {"years": years, "as_of": proof["as_of"], "state": "insufficient_full_train_years"}
-    if len(years) >= 3 and all(item["sharpe"] is not None for item in years):
-        scores = [item["sharpe"] for item in years]
-        worst = min(scores)
-        recent = sum(scores[-3:]) / 3
-        weak_run = any(max(scores[i:i + 3]) < 0.3 for i in range(len(scores) - 2))
-        output.update(state="pass" if worst > 0 and recent >= 1.0 and not weak_run else "fail",
-                      worst_sharpe=worst, recent_three_mean=recent, three_weak_years=weak_run)
-    return output
+    return yearly_train_batch([row], pnl_dir)[0]
 
 
 def _review(connection, where, parameters, group):
@@ -242,6 +200,9 @@ def cmd_ledger_analyze(args, _sink):
     annual = {}
     if args.yearly:
         from . import pnl_snapshot
+
+        protect_output(args, pnl_dir / "meta.sqlite", pnl_dir / "meta.sqlite-wal",
+                       pnl_dir / "meta.sqlite-shm", pnl_dir / "compact.lock")
 
         for row in candidates:
             if ml.valid_simulation_id(row["alpha_id"]):
