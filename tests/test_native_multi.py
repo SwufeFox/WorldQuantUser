@@ -397,7 +397,7 @@ def test_native_resume_restores_parent_location_before_releasing_reservation(sim
 
     with mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL) as post:
         with pytest.raises(KeyboardInterrupt):
-            simulator(on_event=interrupted)
+            simulator(on_event=interrupted, max_wait_seconds=15)
     post.assert_called_once()
     assert not any(row.get("multi_parent_url") for row in durable)
     assert simulation_slots.snapshot(ACCOUNT, 3)["active"] == 1
@@ -412,7 +412,7 @@ def test_native_resume_restores_parent_location_before_releasing_reservation(sim
     with mock.patch.object(ml, "submit_multi_simulation") as resumed_post, \
             mock.patch.object(ml, "read_simulation_snapshot",
                               side_effect=[(parent_complete, None), (child(1), None), (child(2), None)]):
-        records = simulator(initial_records=durable, recover_only=True, fetch_metrics=False, on_event=observe)
+        records = simulator(initial_records=durable, recover_only=True, fetch_metrics=False, on_event=observe, max_wait_seconds=15)
     resumed_post.assert_not_called()
     assert events[0][0:2] == ("multi_submitted", 1)
     assert events[0][2][0]["multi_parent_url"] == PARENT_URL
@@ -505,31 +505,31 @@ def test_native_parent_and_child_retry_after_survive_resume(simulator):
     with mock.patch.object(simulation_multi.time, "time", return_value=100), \
             mock.patch.object(ml, "submit_multi_simulation", return_value=PARENT_URL), \
             mock.patch.object(ml, "read_simulation_snapshot", return_value=(incomplete, 120)):
-        records = simulator(fetch_metrics=False)
+        records = simulator(fetch_metrics=False, max_wait_seconds=15)
     assert records[0]["multi_next_parent_poll_at"] == 220
 
     with mock.patch.object(simulation_multi.time, "time", return_value=110), \
             mock.patch.object(ml, "read_simulation_snapshot") as read:
-        records = simulator(initial_records=records, fetch_metrics=False, recover_only=True)
+        records = simulator(initial_records=records, fetch_metrics=False, recover_only=True, max_wait_seconds=15)
     read.assert_not_called()
 
     parent = {"status": "COMPLETE", "children": ["Child1", "Child2"]}
     with mock.patch.object(simulation_multi.time, "time", return_value=221), \
             mock.patch.object(ml, "read_simulation_snapshot",
                               side_effect=[(parent, None), (child(1), 30), (child(2), None)]):
-        records = simulator(initial_records=records, fetch_metrics=False, recover_only=True)
+        records = simulator(initial_records=records, fetch_metrics=False, recover_only=True, max_wait_seconds=15)
     assert records[0]["multi_child_retry"] == {"Child1": 251}
     assert [row["alpha_id"] for row in records] == [None, "Alpha2"]
 
     with mock.patch.object(simulation_multi.time, "time", return_value=230), \
             mock.patch.object(ml, "read_simulation_snapshot") as read:
-        records = simulator(initial_records=records, fetch_metrics=False, recover_only=True)
+        records = simulator(initial_records=records, fetch_metrics=False, recover_only=True, max_wait_seconds=15)
     read.assert_not_called()
     assert "pending" in records[0]["error"]
 
     with mock.patch.object(simulation_multi.time, "time", return_value=252), \
             mock.patch.object(ml, "read_simulation_snapshot", return_value=(child(1), None)) as read:
-        records = simulator(initial_records=records, fetch_metrics=False, recover_only=True)
+        records = simulator(initial_records=records, fetch_metrics=False, recover_only=True, max_wait_seconds=15)
     assert read.call_args.args[1] == "Child1"
     assert [row["alpha_id"] for row in records] == ["Alpha1", "Alpha2"]
 

@@ -171,7 +171,8 @@ def log_view(tool, view, alpha_ids=(), note=None, *, research_dir=None):
              "alpha_ids": [value for value in alpha_ids if value],
              "note": note}
     try:
-        with open(views_log_path(research_dir), "a", encoding="utf-8") as handle:
+        path = views_log_path() if research_dir is None else views_log_path(research_dir)
+        with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError:
         return None
