@@ -278,6 +278,8 @@ def _step_quick_sim(engine, doc, session, cfg):
 
 
 def _step_hydrate_pnl(engine, doc, session, cfg):
+    from . import pnl_snapshot
+
     selected = doc.get("selected_arms") or []
     pnl_dir = engine.root / "pnl"
     pnl_dir.mkdir(parents=True, exist_ok=True)
@@ -285,6 +287,7 @@ def _step_hydrate_pnl(engine, doc, session, cfg):
     entries = {e.get("alpha_id"): e for e in alpha_registry.load_entries(registry_path) if e.get("alpha_id")}
 
     by_label = {}
+    fetched_items = []
     for item in selected:
         alpha_id = item["alpha_id"]
         entry = entries.get(alpha_id) or {}
@@ -300,18 +303,25 @@ def _step_hydrate_pnl(engine, doc, session, cfg):
         except (ml.BrainError, RequestException) as exc:
             by_label[item["label"]] = {"alpha_id": alpha_id, "yearly_train": {"state": "unavailable", "reason": str(exc)}, "gate_pass": True}
             continue
-
         if train_start and test_start:
-            yearly = ledger_analysis._yearly({"alpha_id": alpha_id, "train_start": train_start, "test_start": test_start}, pnl_dir)
+            fetched_items.append((item, report, {"alpha_id": alpha_id, "train_start": train_start, "test_start": test_start}))
         else:
-            yearly = {"state": "unavailable", "reason": "train_window_not_verified"}
-        gate_pass = yearly.get("state") != "fail"
-        by_label[item["label"]] = {
-            "alpha_id": alpha_id,
-            "yearly_train": yearly,
-            "pnl_fetch": report,
-            "gate_pass": gate_pass,
-        }
+            by_label[item["label"]] = {
+                "alpha_id": alpha_id,
+                "yearly_train": {"state": "unavailable", "reason": "train_window_not_verified"},
+                "pnl_fetch": report,
+                "gate_pass": True,
+            }
+
+    if fetched_items:
+        yearly_results = pnl_snapshot.yearly_train_batch([row for _, _, row in fetched_items], pnl_dir)
+        for (item, report, _), yearly in zip(fetched_items, yearly_results):
+            by_label[item["label"]] = {
+                "alpha_id": item["alpha_id"],
+                "yearly_train": yearly,
+                "pnl_fetch": report,
+                "gate_pass": yearly.get("state") != "fail",
+            }
 
     doc["hydration"] = {"by_label": by_label}
     doc["unchanged_defers"] = 0

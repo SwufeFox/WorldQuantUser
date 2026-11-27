@@ -25,7 +25,7 @@ import numpy as np
 import alpha_registry
 import research_paths
 
-from . import book_state, legs, stats
+from . import book_state, legs, pnl_snapshot, stats
 
 
 def _ledger(registry_path=None):
@@ -38,12 +38,7 @@ def _ledger(registry_path=None):
 
 
 def _load(directory, alpha_ids):
-    series = {}
-    for alpha_id in alpha_ids:
-        values = legs.load_pnl(alpha_id, directory)
-        if values:
-            series[alpha_id] = values
-    return series
+    return pnl_snapshot.load_series_map(directory, alpha_ids)
 
 
 def _sharpe(matrix):
@@ -114,81 +109,113 @@ def cmd_pairs(args, _sink):
         book_centred = book_centred / book_norm_total
 
     sharpes = _sharpe(pool_matrix)
+    n_days = len(dates)
+    row_means = pool_matrix.mean(axis=1)
+    pool_centred = pool_matrix - row_means[:, None]
+    cov = (pool_centred @ pool_centred.T) / n_days
+    var = np.diag(cov)
+    comp_mean = 0.5 * (row_means[:, None] + row_means[None, :])
+    comp_var = 0.25 * (var[:, None] + var[None, :] + 2.0 * cov)
+    comp_norm = np.sqrt(np.maximum(comp_var * n_days, 0.0))
+    comp_std = np.sqrt(np.maximum(comp_var, 0.0))
+    scale = math.sqrt(252.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        comp_sharpe_mat = np.where(comp_std > 0.0, comp_mean / comp_std * scale, np.nan)
+
+    has_book_members = len(book) > 0
+    has_book_total = bool(book_norm_total)
+    book_member_proj = (book_norm @ pool_centred.T) if has_book_members else None
+    book_total_proj = (book_centred @ pool_centred.T) if has_book_total else None
+
+    centered_token = ("group_rank(", "group_zscore(", "group_neutralize(")
+    centered_flags = [
+        any(token in (latest[aid].get("expression") or "") for token in centered_token)
+        for aid in pool
+    ]
+    breadths = [
+        ((latest[aid].get("metrics") or {}).get("longCount") or 0)
+        + ((latest[aid].get("metrics") or {}).get("shortCount") or 0)
+        for aid in pool
+    ]
+    returns_arr = [float((latest[aid].get("metrics") or {}).get("returns") or 0) for aid in pool]
+    turnover_arr = [float((latest[aid].get("metrics") or {}).get("turnover") or 0) for aid in pool]
+
+    ii, jj = np.triu_indices(len(pool), k=1)
+    norms_pair = comp_norm[ii, jj]
+    sharpes_pair = comp_sharpe_mat[ii, jj]
+    keep = (norms_pair > 0.0) & np.isfinite(sharpes_pair)
+    if args.min_composite_sharpe is not None:
+        keep &= sharpes_pair >= args.min_composite_sharpe
+
+    if has_book_total and not math.isnan(book_sharpe):
+        rho_book_all = np.where(
+            norms_pair > 0.0,
+            0.5 * (book_total_proj[ii] + book_total_proj[jj]) / np.where(norms_pair > 0.0, norms_pair, 1.0),
+            0.0,
+        )
+        marginal_all = sharpes_pair - rho_book_all * float(book_sharpe)
+        if args.min_marginal is not None:
+            keep &= np.isfinite(marginal_all) & (marginal_all >= args.min_marginal)
+    else:
+        rho_book_all = np.zeros(len(ii), dtype=np.float64)
+        marginal_all = None
+        if args.min_marginal is not None:
+            keep[:] = False
+
+    cand_idx = np.flatnonzero(keep)
+    cand_i = ii[cand_idx]
+    cand_j = jj[cand_idx]
+    if has_book_members and len(cand_idx):
+        # Compute max(|book_norm @ comp_norm|) in chunks to avoid (B, M) memory blowup.
+        max_rho_cand = np.empty(len(cand_idx), dtype=np.float64)
+        chunk = 16384
+        for start in range(0, len(cand_idx), chunk):
+            end = min(start + chunk, len(cand_idx))
+            ci = cand_i[start:end]
+            cj = cand_j[start:end]
+            cn = norms_pair[cand_idx[start:end]]
+            proj = 0.5 * (book_member_proj[:, ci] + book_member_proj[:, cj]) / cn[None, :]
+            max_rho_cand[start:end] = np.max(np.abs(proj), axis=0)
+    else:
+        max_rho_cand = np.zeros(len(cand_idx), dtype=np.float64)
+
+    plain_only = bool(getattr(args, "plain_legs", False))
     rows = []
-    for i in range(len(pool)):
-        for j in range(i + 1, len(pool)):
-            composite = 0.5 * (pool_matrix[i] + pool_matrix[j])
-            centred = composite - composite.mean()
-            norm = np.linalg.norm(centred)
-            if norm == 0:
+    for k, flat_idx in enumerate(cand_idx):
+        i = int(cand_i[k])
+        j = int(cand_j[k])
+        rho = float(max_rho_cand[k])
+        if args.max_book_rho is not None and rho > args.max_book_rho:
+            continue
+        centred_legs = centered_flags[i] or centered_flags[j]
+        if plain_only and centred_legs:
+            continue
+        breadth_a, breadth_b = breadths[i], breadths[j]
+        support_ratio = None
+        if breadth_a and breadth_b:
+            support_ratio = min(breadth_a, breadth_b) / max(breadth_a, breadth_b)
+        if args.min_support_ratio is not None:
+            if support_ratio is None or support_ratio < args.min_support_ratio:
                 continue
-            rho = float(np.max(np.abs(book_norm @ (centred / norm)))) if len(book) else 0.0
-            rho_book = float(book_centred @ (centred / norm)) if book_norm_total else 0.0
-            # The leg-sum was thought to break for legs that already subtract a group
-            # mean. A controlled test says otherwise: the same two signals built plain and
-            # built with `group_rank - 0.5` are both additive (R^2 0.990 vs 0.999). What
-            # actually broke the earlier predictions was weight bookkeeping inside the
-            # composite - a sub-leg's own 0.5 got multiplied by 0.5 again. The flag is
-            # kept as a reminder to check the arithmetic, not as a claim about algebra.
-            centred_legs = any(
-                token in ((latest[pool[i]].get("expression") or "")
-                          + (latest[pool[j]].get("expression") or ""))
-                for token in ("group_rank(", "group_zscore(", "group_neutralize("))
-            sharpe = _sharpe(composite[None, :])[0]
-            if math.isnan(sharpe):
-                continue
-            if args.max_book_rho is not None and rho > args.max_book_rho:
-                continue
-            # The gate against the worst *member* is not the addition test: what a new
-            # alpha has to beat is the book as a whole, because that is what it is being
-            # added to. A pair can pass 0.7 against every member and still be dilutive.
-            marginal = None
-            if not math.isnan(book_sharpe):
-                marginal = float(sharpe) - rho_book * float(book_sharpe)
-            if args.min_marginal is not None and (marginal is None or marginal < args.min_marginal):
-                continue
-            # `--plain-legs` keeps only pairs whose leg sum is exact. Centred legs can
-            # make the offline prediction overstate what the composite delivers.
-            if getattr(args, "plain_legs", False) and centred_legs:
-                continue
-            if args.min_composite_sharpe is not None and sharpe < args.min_composite_sharpe:
-                continue
-            # Support breadth was expected to decide whether the leg sum means anything:
-            # a 400-name leg next to a 3000-name leg should be diluted inside the
-            # composite. It did not survive a test - matched breadth (0.998) gave R^2
-            # 0.576 while mismatched breadth (0.657) gave 0.924. The filter is kept as a
-            # diversity heuristic only; the residual R^2 has to be measured after the
-            # composite is simulated, not predicted from the legs.
-            breadth_a = ((latest[pool[i]].get("metrics") or {}).get("longCount") or 0) + \
-                        ((latest[pool[i]].get("metrics") or {}).get("shortCount") or 0)
-            breadth_b = ((latest[pool[j]].get("metrics") or {}).get("longCount") or 0) + \
-                        ((latest[pool[j]].get("metrics") or {}).get("shortCount") or 0)
-            support_ratio = None
-            if breadth_a and breadth_b:
-                support_ratio = min(breadth_a, breadth_b) / max(breadth_a, breadth_b)
-            if args.min_support_ratio is not None:
-                if support_ratio is None or support_ratio < args.min_support_ratio:
-                    continue
-            metrics_a = (latest[pool[i]].get("metrics") or {})
-            metrics_b = (latest[pool[j]].get("metrics") or {})
-            returns = (float(metrics_a.get("returns") or 0) + float(metrics_b.get("returns") or 0)) / 2
-            turnover = (float(metrics_a.get("turnover") or 0) + float(metrics_b.get("turnover") or 0)) / 2
-            estimated_fitness = None
-            if returns and turnover:
-                estimated_fitness = stats.platform_fitness(sharpe, returns, turnover)
-            rows.append({
-                "a": pool[i], "b": pool[j],
-                "sharpe_a": None if np.isnan(sharpes[i]) else round(float(sharpes[i]), 3),
-                "sharpe_b": None if np.isnan(sharpes[j]) else round(float(sharpes[j]), 3),
-                "composite_sharpe": round(float(sharpe), 3),
-                "composite_fitness_estimate": None if estimated_fitness is None
-                else round(estimated_fitness, 3),
-                "max_book_rho": round(rho, 3),
-                "book_rho": round(rho_book, 3),
-                "marginal_vs_book": None if marginal is None else round(marginal, 3),
-                "leg_sum_risk": "centred" if centred_legs else "plain",
-                "support_ratio": None if support_ratio is None else round(support_ratio, 3),
-            })
+        sharpe = float(sharpes_pair[flat_idx])
+        rho_book = float(rho_book_all[flat_idx])
+        marginal = None if marginal_all is None else float(marginal_all[flat_idx])
+        returns = 0.5 * (returns_arr[i] + returns_arr[j])
+        turnover = 0.5 * (turnover_arr[i] + turnover_arr[j])
+        estimated_fitness = stats.platform_fitness(sharpe, returns, turnover) if (returns and turnover) else None
+        rows.append({
+            "a": pool[i], "b": pool[j],
+            "sharpe_a": None if np.isnan(sharpes[i]) else round(float(sharpes[i]), 3),
+            "sharpe_b": None if np.isnan(sharpes[j]) else round(float(sharpes[j]), 3),
+            "composite_sharpe": round(sharpe, 3),
+            "composite_fitness_estimate": None if estimated_fitness is None
+            else round(estimated_fitness, 3),
+            "max_book_rho": round(rho, 3),
+            "book_rho": round(rho_book, 3),
+            "marginal_vs_book": None if marginal is None else round(marginal, 3),
+            "leg_sum_risk": "centred" if centred_legs else "plain",
+            "support_ratio": None if support_ratio is None else round(support_ratio, 3),
+        })
 
     rows.sort(key=lambda row: -row["composite_sharpe"]
               if args.rank == "sharpe" else -row["marginal_vs_book"])

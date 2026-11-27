@@ -24,10 +24,11 @@ from datetime import date
 
 import alpha_registry
 from check_evidence import normalize_checks, platform_check_names, summarize_checks
+import correlation
 import machine_lib as ml
 import research_paths
 
-from . import benchmark, costs, legs, mechanisms, selection, stats, submission_planner
+from . import benchmark, costs, legs, mechanisms, pnl_snapshot, selection, stats, submission_planner
 from .book_state import describe_book, member_digest, test_boundaries
 from .runtime import CliError
 
@@ -38,11 +39,7 @@ MIN_OVERLAP_DAYS = stats.MIN_PORTFOLIO_OVERLAP
 def _book_series(latest, directory):
     book = [key for key, entry in latest.items()
             if str(entry.get("status") or "").upper() in ("ACTIVE", "SUBMITTED")]
-    series = {}
-    for alpha_id in book:
-        values = legs.load_pnl(alpha_id, directory)
-        if values:
-            series[alpha_id] = values
+    series = pnl_snapshot.load_series_map(directory, book)
     dates = None
     for values in series.values():
         dates = set(values) if dates is None else dates & set(values)
@@ -114,10 +111,12 @@ def _shelf_scope(path, targets):
 
 def _shelf_correlations(alpha_id, candidate, dates, peers, coverage, missing_boundaries, candidate_complete):
     measured, missing = [], []
+    comparable = {}
+    cand_sliced = {day: candidate[day] for day in dates if day in candidate} if candidate else {}
     for peer, values in peers.items():
         if peer == alpha_id:
             continue
-        shared = [day for day in dates if day in candidate and day in values]
+        shared_count = sum(1 for day in dates if day in candidate and day in values)
         reason = None
         if alpha_id in missing_boundaries or peer in missing_boundaries:
             reason = "missing_train_boundary"
@@ -125,16 +124,32 @@ def _shelf_correlations(alpha_id, candidate, dates, peers, coverage, missing_bou
             reason = "missing_pnl"
         elif candidate_complete is not True or coverage[peer]["complete"] is not True:
             reason = "unverified_pnl_coverage"
-        elif len(shared) < MIN_OVERLAP_DAYS:
+        elif shared_count < MIN_OVERLAP_DAYS:
             reason = "insufficient_overlap"
-        else:
-            rho = legs.correlation([candidate[day] for day in shared], [values[day] for day in shared])
-            if rho is None:
-                reason = "undefined_correlation"
-            else:
-                measured.append((rho, peer, len(shared)))
         if reason:
-            missing.append({"alpha_id": peer, "reason": reason, "overlap_days": len(shared)})
+            missing.append({"alpha_id": peer, "reason": reason, "overlap_days": shared_count})
+        else:
+            comparable[peer] = {day: values[day] for day in dates if day in values}
+
+    if comparable:
+        batch = correlation.matrix({"__cand__": cand_sliced, **comparable}, min_overlap=MIN_OVERLAP_DAYS)
+        by_peer = {}
+        for pair in batch["pairs"]:
+            if pair["a"] == "__cand__":
+                by_peer[pair["b"]] = (pair["r"], pair["n"], None)
+            elif pair["b"] == "__cand__":
+                by_peer[pair["a"]] = (pair["r"], pair["n"], None)
+        for skip in batch["skipped"]:
+            other = skip["b"] if skip["a"] == "__cand__" else (skip["a"] if skip["b"] == "__cand__" else None)
+            if other is not None:
+                by_peer[other] = (None, skip["n"], "undefined_correlation" if skip["reason"] == "undefined" else "insufficient_overlap")
+        for peer in comparable:
+            rho, days, reason = by_peer.get(peer, (None, 0, "insufficient_overlap"))
+            if reason:
+                missing.append({"alpha_id": peer, "reason": reason, "overlap_days": days})
+            else:
+                measured.append((rho, peer, days))
+
     rho, peer, days = max(measured, key=lambda item: abs(item[0]), default=(None, None, None))
     return {"state": "unknown" if missing else "measured", "eligible": len(measured) + len(missing),
             "measured": len(measured), "missing": missing, "max_member": peer,
@@ -378,8 +393,6 @@ def _verdict(row, criteria):
 
 def _candidate_submission_plan(rows, candidate_pnls, scoring_days, max_correlation=None):
     """Suggest an independent candidate subset using train-only PnL and marginal weights."""
-    import itertools
-
     eligible = [
         row for row in rows
         if not row.get("missing") and not row.get("member") and row.get("role") != "diagnostic"
@@ -388,18 +401,19 @@ def _candidate_submission_plan(rows, candidate_pnls, scoring_days, max_correlati
     if len(eligible) < 2:
         return None
     ids = [row["alpha_id"] for row in eligible]
+    day_set = set(scoring_days)
+    sliced = {}
+    for aid in ids:
+        series = candidate_pnls.get(aid) or {}
+        if series:
+            filtered = {day: val for day, val in series.items() if day in day_set}
+            if len(filtered) >= MIN_OVERLAP_DAYS:
+                sliced[aid] = filtered
     correlations = {}
-    for a, b in itertools.combinations(ids, 2):
-        series_a = candidate_pnls.get(a) or {}
-        series_b = candidate_pnls.get(b) or {}
-        if not series_a or not series_b:
-            continue
-        shared = [day for day in scoring_days if day in series_a and day in series_b]
-        if len(shared) < MIN_OVERLAP_DAYS:
-            continue
-        rho = legs.correlation([series_a[day] for day in shared], [series_b[day] for day in shared])
-        if rho is not None:
-            correlations[(a, b)] = round(rho, 4)
+    if len(sliced) >= 2:
+        mat = correlation.matrix(sliced, min_overlap=MIN_OVERLAP_DAYS)
+        for pair in mat["pairs"]:
+            correlations[(pair["a"], pair["b"])] = round(pair["r"], 4)
     threshold = (max_correlation if max_correlation is not None
                  else submission_planner.DEFAULT_MAX_CORRELATION)
     planned = submission_planner.plan(
@@ -546,8 +560,13 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
     costs.evidence({}, "train", decision_criteria["cost_bps"])
     settings = {**decision_criteria, "pnl_dir": directory, "internal": bool(internal),
                 "show_test": bool(show_test), "cohort": _cohort_retentions(latest) if show_test else []}
-    peer_series = {peer: legs.load_pnl(peer, directory) for peer in shelf["member_ids"]} if against_shelf else {}
+    raw_peers = pnl_snapshot.load_series_map(directory, shelf["member_ids"]) if against_shelf else {}
+    peer_series = {peer: raw_peers.get(peer, {}) for peer in shelf["member_ids"]} if against_shelf else {}
     peer_coverage = {peer: ml.pnl_cache_status(directory, peer, values) for peer, values in peer_series.items()}
+    prefetched = pnl_snapshot.load_series_map(
+        directory,
+        [aid for aid in targets if aid not in series and aid in latest],
+    )
     rows = []
     candidate_pnls = {}
     for alpha_id in targets:
@@ -562,7 +581,7 @@ def triage(ids=None, registry_path=None, pnl_dir=None, min_delta=None,
                     row["training_gate"] = _training_gate(row, settings["min_delta"], max_shelf_correlation)
                 rows.append(row)
             continue
-        candidate = series[alpha_id] if alpha_id in series else legs.load_pnl(alpha_id, directory)
+        candidate = series[alpha_id] if alpha_id in series else prefetched.get(alpha_id, {})
         candidate_pnls[alpha_id] = candidate
         row = _score(alpha_id, entry, series, scoring_days, settings, candidate=candidate,
                      book_daily=book_daily, unit_book=unit_book)

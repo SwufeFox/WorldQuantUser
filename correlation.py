@@ -22,6 +22,7 @@ strings (``YYYY-MM-DD``), which is how the API returns them and sorts correctly.
 
 from __future__ import annotations
 
+import math
 from operator import mul
 
 __all__ = [
@@ -32,6 +33,7 @@ __all__ = [
     "pearson_centered",
     "matrix",
     "max_against",
+    "matrix_against_refs",
     "residualize",
     "beta",
 ]
@@ -127,6 +129,78 @@ def residualize(target, controls, min_overlap=200):
     return series
 
 
+def _encode_panel(pnls, ids):
+    """Build masked, scale-normalized, pre-centered dense ``(N, D)`` float64 panels."""
+    try:
+        import numpy as np
+    except ImportError:
+        return None
+    n_rows = len(ids)
+    row_idxs, day_keys, vals = [], [], []
+    for r_idx, aid in enumerate(ids):
+        series = pnls.get(aid) or {}
+        for day, val in series.items():
+            if type(val) in (int, float) and math.isfinite(val):
+                row_idxs.append(r_idx)
+                day_keys.append(day)
+                vals.append(float(val))
+    if not row_idxs:
+        return (
+            np.zeros((n_rows, 0), dtype=np.float64),
+            np.zeros((n_rows, 0), dtype=np.float64),
+            np.zeros(n_rows, dtype=np.float64),
+        )
+    try:
+        import polars as pl
+        frame = pl.DataFrame({"r": row_idxs, "d": day_keys, "v": vals})
+        encoded = frame.select(
+            pl.col("r").cast(pl.Intp),
+            (pl.col("d").rank("dense") - 1).cast(pl.Intp).alias("c"),
+            pl.col("v").cast(pl.Float64),
+        )
+        r_arr = encoded.get_column("r").to_numpy()
+        c_arr = encoded.get_column("c").to_numpy()
+        v_arr = encoded.get_column("v").to_numpy()
+        n_cols = int(c_arr.max()) + 1 if len(c_arr) else 0
+    except Exception:  # noqa: BLE001 - fall back to pure-Python day index when Polars unavailable
+        unique_days = sorted(set(day_keys))
+        day_map = {day: idx for idx, day in enumerate(unique_days)}
+        r_arr = np.asarray(row_idxs, dtype=np.intp)
+        c_arr = np.asarray([day_map[d] for d in day_keys], dtype=np.intp)
+        v_arr = np.asarray(vals, dtype=np.float64)
+        n_cols = len(unique_days)
+
+    V = np.zeros((n_rows, n_cols), dtype=np.float64)
+    M = np.zeros((n_rows, n_cols), dtype=np.float64)
+    V[r_arr, c_arr] = v_arr
+    M[r_arr, c_arr] = 1.0
+
+    # Pre-scale rows above 1e150 so V.sum() never overflows float64, then center observed
+    # entries before scaling by max(|V - mu|) to preserve full precision on large offsets.
+    raw_max = np.max(np.abs(V), axis=1)
+    V = np.where(M > 0.0, V / np.where(raw_max > 1e150, raw_max, 1.0)[:, None], 0.0)
+    counts = M.sum(axis=1)
+    means = np.divide(V.sum(axis=1), counts, out=np.zeros_like(counts), where=counts > 0.0)
+    V_centered_raw = np.where(M > 0.0, V - means[:, None], 0.0)
+    row_max = np.max(np.abs(V_centered_raw), axis=1)
+    safe_scale = np.where(row_max > 0.0, row_max, 1.0)[:, None]
+    Vc = np.where(M > 0.0, V_centered_raw / safe_scale, 0.0)
+    return Vc, M, row_max
+
+
+def _finalize_pair_corr(cov, vx, vy, max_x, max_y, series_x, series_y, min_overlap):
+    """Resolve Pearson r from centered moments, falling back to exact scalar on degenerate pairs."""
+    if max_x == 0.0 or max_y == 0.0:
+        return None
+    if vx <= 1e-22 or vy <= 1e-22 or not (math.isfinite(cov) and math.isfinite(vx) and math.isfinite(vy)):
+        x, y, _ = align(series_x, series_y, min_overlap)
+        return pearson(x, y) if x else None
+    denom = math.sqrt(vx * vy)
+    if denom <= 0.0:
+        return None
+    return max(-1.0, min(1.0, cov / denom))
+
+
 def matrix(pnls, min_overlap=200):
     """Pairwise correlation for ``{name: series}``.
 
@@ -140,6 +214,39 @@ def matrix(pnls, min_overlap=200):
     ids = sorted(pnls)
     pairs = []
     skipped = []
+    if len(ids) >= 4:
+        panel = _encode_panel(pnls, ids)
+        if panel is not None:
+            import numpy as np
+            Vc, M, row_max = panel
+            N_mat = np.rint(M @ M.T).astype(np.int64)
+            S_x = Vc @ M.T
+            S_xx = (Vc * Vc) @ M.T
+            S_xy = Vc @ Vc.T
+            n_ids = len(ids)
+            for i in range(n_ids):
+                left = ids[i]
+                left_series = pnls[left]
+                max_i = float(row_max[i])
+                for j in range(i + 1, n_ids):
+                    right = ids[j]
+                    n = int(N_mat[i, j])
+                    if n < min_overlap:
+                        skipped.append({"a": left, "b": right, "n": 0, "reason": "short_overlap"})
+                        continue
+                    sx = float(S_x[i, j])
+                    sy = float(S_x[j, i])
+                    cov = float(S_xy[i, j]) - (sx * sy) / n
+                    vx = float(S_xx[i, j]) - (sx * sx) / n
+                    vy = float(S_xx[j, i]) - (sy * sy) / n
+                    r = _finalize_pair_corr(cov, vx, vy, max_i, float(row_max[j]),
+                                            left_series, pnls[right], min_overlap)
+                    if r is None:
+                        skipped.append({"a": left, "b": right, "n": n, "reason": "undefined"})
+                    else:
+                        pairs.append({"a": left, "b": right, "r": r, "n": n})
+            return {"ids": ids, "pairs": pairs, "measured": len(pairs), "skipped": skipped}
+
     for i, left in enumerate(ids):
         for right in ids[i + 1:]:
             x, y, dates = align(pnls[left], pnls[right], min_overlap)
@@ -153,6 +260,74 @@ def matrix(pnls, min_overlap=200):
             "skipped": skipped}
 
 
+def matrix_against_refs(targets, refs, min_overlap=200):
+    """Compute ``max_against`` results for many targets against shared references in one BLAS pass."""
+    target_ids = list(targets)
+    ref_ids = list(refs)
+    if not target_ids:
+        return {}
+    if not ref_ids:
+        return {tid: {"max": None, "all": []} for tid in target_ids}
+
+    total_targets = len(target_ids)
+    total_refs = len(ref_ids)
+    if total_targets * total_refs >= 8:
+        ordered_keys = [f"__t_{i}" for i in range(total_targets)] + [f"__r_{j}" for j in range(total_refs)]
+        combined = {f"__t_{i}": targets[tid] for i, tid in enumerate(target_ids)}
+        combined.update({f"__r_{j}": refs[rid] for j, rid in enumerate(ref_ids)})
+        panel = _encode_panel(combined, ordered_keys)
+        if panel is not None:
+            import numpy as np
+            Vc, M, row_max = panel
+            Vc_t, Vc_r = Vc[:total_targets], Vc[total_targets:]
+            M_t, M_r = M[:total_targets], M[total_targets:]
+            rmax_t, rmax_r = row_max[:total_targets], row_max[total_targets:]
+
+            N_mat = np.rint(M_t @ M_r.T).astype(np.int64)
+            S_t = Vc_t @ M_r.T
+            S_r = M_t @ Vc_r.T
+            S_tt = (Vc_t * Vc_t) @ M_r.T
+            S_rr = M_t @ (Vc_r * Vc_r).T
+            S_tr = Vc_t @ Vc_r.T
+
+            results = {}
+            for i, tid in enumerate(target_ids):
+                t_series = targets[tid]
+                max_t = float(rmax_t[i])
+                rows = []
+                for j, rid in enumerate(ref_ids):
+                    n = int(N_mat[i, j])
+                    if n < min_overlap:
+                        continue
+                    st = float(S_t[i, j])
+                    sr = float(S_r[i, j])
+                    cov = float(S_tr[i, j]) - (st * sr) / n
+                    vt = float(S_tt[i, j]) - (st * st) / n
+                    vr = float(S_rr[i, j]) - (sr * sr) / n
+                    r = _finalize_pair_corr(cov, vt, vr, max_t, float(rmax_r[j]),
+                                            t_series, refs[rid], min_overlap)
+                    if r is not None:
+                        rows.append({"with": rid, "r": r, "n": n})
+                rows.sort(key=lambda row: abs(row["r"]), reverse=True)
+                results[tid] = {"max": rows[0] if rows else None, "all": rows}
+            return results
+
+    results = {}
+    for tid in target_ids:
+        t_series = targets[tid]
+        rows = []
+        for rid in ref_ids:
+            x, y, dates = align(refs[rid], t_series, min_overlap)
+            if not x:
+                continue
+            r = pearson(x, y)
+            if r is not None:
+                rows.append({"with": rid, "r": r, "n": len(dates)})
+        rows.sort(key=lambda row: abs(row["r"]), reverse=True)
+        results[tid] = {"max": rows[0] if rows else None, "all": rows}
+    return results
+
+
 def max_against(target, refs, min_overlap=200):
     """Highest absolute correlation of ``target`` against each reference.
 
@@ -160,6 +335,8 @@ def max_against(target, refs, min_overlap=200):
     the caller can see the runner-up and tell a single near-duplicate apart from
     a broad resemblance.
     """
+    if len(refs) >= 8:
+        return matrix_against_refs({"__target__": target}, refs, min_overlap=min_overlap)["__target__"]
     rows = []
     for name, series in refs.items():
         x, y, dates = align(series, target, min_overlap)

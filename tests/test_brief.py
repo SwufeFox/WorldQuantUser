@@ -124,12 +124,19 @@ class BriefTests(unittest.TestCase):
                       encoding="utf-8") as handle:
                 json.dump(series, handle)
             alpha_registry.record_entry(entry(name, "ACTIVE", 2.0), self.registry)
-        with mock.patch.object(cli_campaign.cache_store, "load_json",
-                               wraps=cli_campaign.cache_store.load_json) as read:
+        with mock.patch.object(cli_campaign.pnl_snapshot, "read_series",
+                               wraps=cli_campaign.pnl_snapshot.read_series) as read:
             data = self._run()
         pnl_reads = [call.args[0].name for call in read.call_args_list
                      if os.path.dirname(os.fspath(call.args[0])) == folder]
         self.assertCountEqual(pnl_reads, ["BOOK1.json", "BOOK2.json"])
+        with mock.patch.object(cli_campaign.pnl_snapshot, "read_series",
+                               wraps=cli_campaign.pnl_snapshot.read_series) as warm_read:
+            warm = self._run()
+        warm_reads = [call.args[0].name for call in warm_read.call_args_list
+                      if os.path.dirname(os.fspath(call.args[0])) == folder]
+        self.assertEqual(warm_reads, [])
+        self.assertEqual(warm["book"]["self_duplicates"], data["book"]["self_duplicates"])
         screen = data["book"]["self_duplicates"]
         self.assertGreaterEqual(screen["count"], 1)
         pair = screen["pairs"][0]

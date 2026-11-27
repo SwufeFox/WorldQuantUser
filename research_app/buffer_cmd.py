@@ -463,7 +463,8 @@ def _shelf_submission_plan(rows, args):
     import itertools
     import math
     import alpha_registry
-    from . import book_state, legs, stats, submission_planner
+    import correlation
+    from . import book_state, pnl_snapshot, stats, submission_planner
 
     eligible = [
         row for row in rows
@@ -481,21 +482,32 @@ def _shelf_submission_plan(rows, args):
     ids = [row["alpha_id"] for row in eligible]
     bounds, missing_bounds = book_state.test_boundaries(latest, set(ids))
     pnl_dir = os.path.join(research_paths.research_dir(), "pnl")
-    pnls = {aid: legs.load_pnl(aid, pnl_dir) if os.path.isdir(pnl_dir) else {} for aid in ids}
-    correlations = {}
+    pnls = pnl_snapshot.load_series_map(pnl_dir, ids) if os.path.isdir(pnl_dir) else {}
+
+    pairs_by_cutoff = {}
     for a, b in itertools.combinations(ids, 2):
         if a in missing_bounds or b in missing_bounds:
             continue
+        if not pnls.get(a) or not pnls.get(b):
+            continue
         cutoff = min(bounds[a], bounds[b])
-        series_a, series_b = pnls[a], pnls[b]
-        if not series_a or not series_b:
-            continue
-        shared = sorted(day for day in series_a if day < cutoff and day in series_b)
-        if len(shared) < stats.MIN_PORTFOLIO_OVERLAP:
-            continue
-        rho = legs.correlation([series_a[day] for day in shared], [series_b[day] for day in shared])
-        if rho is not None:
-            correlations[(a, b)] = round(rho, 4)
+        pairs_by_cutoff.setdefault(cutoff, []).append((a, b))
+
+    correlations = {}
+    for cutoff, pair_list in pairs_by_cutoff.items():
+        group_ids = sorted({aid for pair in pair_list for aid in pair})
+        sliced = {
+            aid: {day: val for day, val in pnls[aid].items() if day < cutoff}
+            for aid in group_ids
+        }
+        mat = correlation.matrix(sliced, min_overlap=stats.MIN_PORTFOLIO_OVERLAP)
+        pair_map = {(p["a"], p["b"]): p["r"] for p in mat["pairs"]}
+        for a, b in pair_list:
+            key = (a, b) if a < b else (b, a)
+            rho = pair_map.get(key)
+            if rho is not None:
+                correlations[(a, b)] = round(rho, 4)
+
     candidates = [{"id": row["alpha_id"], "weight": row["train_sharpe"]} for row in eligible]
     planned = submission_planner.plan(candidates, correlations, max_correlation=GATE)
     planned["weight_basis"] = "train_sharpe"

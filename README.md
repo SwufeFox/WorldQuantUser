@@ -189,19 +189,15 @@ indexes these documents and encodes the pre-flight and error-recovery rules.
 pip install -r requirements.txt
 ```
 
-`requests` is loaded on demand. Help, schema, offline lint and Probe previews
-can run without it. Install `pandas` separately for `fields_to_df()` or notebooks.
+`requests`, `numpy`, and `polars` are loaded on demand. Help, schema, offline lint
+and Probe previews can run without importing them; `fields_to_df()` returns a
+`polars.DataFrame`, and PnL-intensive commands automatically maintain a unified
+incremental Parquet cache under `<pnl_dir>/.parquet_cache/pnl.parquet`.
+
+For repeated cross-batch training half-Sharpe reports, `ledger stability --polars`
+also emits a pre-aggregated training snapshot receipt under `cache/`:
 
 ```bash
-pip install "pandas>=2.0"
-```
-
-For repeated cross-batch training PnL queries, install optional Polars and run
-`ledger stability --polars`. The command automatically refreshes its Parquet
-snapshot when the daily PnL files or recorded test boundaries change.
-
-```bash
-pip install "polars>=2.1,<3"
 python research_cli.py ledger stability --polars
 ```
 

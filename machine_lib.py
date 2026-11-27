@@ -8,7 +8,7 @@ recordsets have endpoint-specific readiness protocols. simulate_alphas uses
 durable reservations to continue accepted work after interruption.
 
 Connection setup imports the HTTP client on demand. Command help and offline
-previews can run without it. DataFrame helpers import optional pandas."""
+previews can run without it. DataFrame helpers load ``polars`` on demand."""
 
 import re
 import threading

@@ -1,6 +1,8 @@
 .alma-snapshots/
 __pycache__/
 *.py[cod]
+.venv/
+.pytest_cache/
 
 # credentials and session material -- must never be committed
 .env

@@ -241,12 +241,16 @@ def cmd_ledger_analyze(args, _sink):
     pnl_dir = Path(research_paths.resolve("pnl"))
     annual = {}
     if args.yearly:
+        from . import pnl_snapshot
+
         for row in candidates:
             if ml.valid_simulation_id(row["alpha_id"]):
                 name = row["alpha_id"] + ".json"
                 protect_output(args, pnl_dir / name, pnl_dir / ".meta" / name)
-            row["yearly_train"] = _yearly(row, pnl_dir)
-            state = row["yearly_train"]["state"]
+        yearly_rows = pnl_snapshot.yearly_train_batch(candidates, pnl_dir)
+        for row, yearly_result in zip(candidates, yearly_rows):
+            row["yearly_train"] = yearly_result
+            state = yearly_result["state"]
             annual[state] = annual.get(state, 0) + 1
     return {
         "source": "latest_registry_entry_per_key",

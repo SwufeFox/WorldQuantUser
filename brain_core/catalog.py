@@ -501,22 +501,27 @@ def field_ids(fields, field_type=None, search=""):
 
 
 def fields_to_df(fields):
-    """Wrap ``list[dict]`` metadata in a DataFrame when pandas is installed."""
+    """Convert a list of field metadata dicts into a Polars DataFrame."""
     try:
-        import pandas
+        import polars as pl
     except ImportError as exc:
-        raise RuntimeError("pandas is required for fields_to_df(); pip install pandas") from exc
-    return pandas.DataFrame(fields)
+        raise RuntimeError("polars is required for fields_to_df(); pip install polars") from exc
+    rows = list(fields or [])
+    if not rows:
+        return pl.DataFrame()
+    return pl.DataFrame(rows, infer_schema_length=None, strict=False)
 
 
 def process_datafields(fields):
     """Turn field metadata into directly usable FASTEXPR snippets.
 
-    Accepts the ``list[dict]`` from :func:`get_datafields` (or a DataFrame, for
-    older notebooks). MATRIX fields are winsorized + backfilled, VECTOR fields
-    are converted to a scalar via ``vec_avg``.
+    Accepts the ``list[dict]`` from :func:`get_datafields` (or a Polars/pandas
+    DataFrame). MATRIX fields are winsorized + backfilled, VECTOR fields are
+    converted to a scalar via ``vec_avg``.
     """
-    if hasattr(fields, "to_dict"):
+    if hasattr(fields, "to_dicts"):
+        fields = fields.to_dicts()
+    elif hasattr(fields, "to_dict"):
         fields = fields.to_dict("records")
     matrix = [
         'winsorize(ts_backfill(%s, 120), std=4)' % f["id"]

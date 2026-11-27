@@ -58,7 +58,7 @@ Python 检查源码的字段声明。同次 `probe` 可复用已经在线核验�
 元数据缓存的有效期与最大年龄；复用不更新原观察时间。每组仍独立核对设置。
 `probe` 将预检报告交给 `tools.guarded_sim`，
 仅在完整设置与源码匹配时复用。用 `pip install -r requirements.txt` 安装运行依赖。
-`pandas` 在调用 `fields_to_df()` 时按需加载，DataFrame 用户再单独安装。
+`polars` 在调用 `fields_to_df()` 及 PnL 增量列式缓存时按需加载，避免拖慢轻量命令。
 
 ## 读平台文档和论坛
 
@@ -779,7 +779,6 @@ python3 research_cli.py ledger analyze --region ASI --delay 1 --mode QUICK \
 `--where` 和 `--status` 可继续用来筛选同一份分析缓存。
 
 ```bash
-pip install "polars>=2.1,<3"
 python3 research_cli.py ledger stability --polars --list
 python3 research_cli.py ledger stability --polars --where 'family=quality'
 ```

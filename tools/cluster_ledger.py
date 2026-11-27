@@ -69,18 +69,26 @@ def field_pattern(field_ids):
 
 
 def load_pnls(session, alpha_ids, cache_dir, pause=0.0):
-    """Fetch daily PnL for each id, reusing the cache when present."""
-    out, failed = {}, []
-    for index, alpha_id in enumerate(alpha_ids, 1):
+    """Fetch daily PnL for each id, reusing the incremental Parquet cache when present."""
+    from research_app import pnl_snapshot
+
+    out = pnl_snapshot.load_series_map(cache_dir, alpha_ids) if cache_dir else {}
+    failed = []
+    missing = [aid for aid in alpha_ids if aid not in out]
+    fetched_ids = []
+    for index, alpha_id in enumerate(missing, 1):
         series = ml.fetch_daily_pnl(session, alpha_id, cache_dir=cache_dir)
         if series:
             out[alpha_id] = series
+            fetched_ids.append(alpha_id)
         else:
             failed.append(alpha_id)
         if pause:
             time.sleep(pause)
         if index % 25 == 0:
-            print("  fetched %d/%d" % (index, len(alpha_ids)), flush=True)
+            print("  fetched %d/%d" % (index, len(missing)), flush=True)
+    if cache_dir and fetched_ids:
+        pnl_snapshot.sync_pnl_parquet(cache_dir, alpha_ids=fetched_ids)
     return out, failed
 
 

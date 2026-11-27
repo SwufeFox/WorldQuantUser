@@ -393,7 +393,19 @@ def pnl_cache_status(cache_dir, alpha_id, series=None):
     except (TypeError, ValueError):
         evidence.update(complete=False, error="invalid_pnl_values")
         return evidence
-    metadata = _ml._matching_pnl_evidence(metadata, alpha_id, digest)
+    matched = _ml._matching_pnl_evidence(metadata, alpha_id, digest)
+    if matched is None and path.exists():
+        # Columnar Parquet caches normalize JSON integers (e.g. 100) to float64 (100.0).
+        disk_series, disk_err = _ml.cache_store.load_json(path)
+        if not disk_err and isinstance(disk_series, dict) and disk_series.keys() == series.keys():
+            try:
+                disk_digest = _ml._pnl_digest(disk_series)
+                disk_matched = _ml._matching_pnl_evidence(metadata, alpha_id, disk_digest)
+                if disk_matched is not None and all(float(disk_series[k]) == series[k] for k in series):
+                    matched = disk_matched
+            except (TypeError, ValueError, OverflowError):
+                matched = None
+    metadata = matched
     if metadata is None:
         evidence.update(complete=False, error="pnl_metadata_mismatch")
         return evidence

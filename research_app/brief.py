@@ -106,12 +106,7 @@ def _book_drift(book, platform):
 
 
 def _cached_book_series(book, pnl_dir):
-    series = {}
-    for alpha_id in book:
-        values, _ = cache_store.load_json(pnl_dir / (alpha_id + ".json"))
-        if values is not None:
-            series[alpha_id] = values
-    return series
+    return pnl_snapshot.load_series_map(pnl_dir, list(book))
 
 
 def _book_stability(book, min_move=0.3, limit=3, *, series=None):
@@ -175,41 +170,49 @@ def _book_duplicates(book, gate=0.70, prefilter=0.75, limit=8, *, series=None):
         test = ((book[alpha_id].get("out_of_sample") or {}).get("test") or {})
         train_end = test.get("startDate") or "2023-01-01"
         train[alpha_id] = {day: value for day, value in pnl.items() if day < train_end}
-    sampled = {name: {day: values[day] for day in sorted(values)[::5]} for name, values in train.items()}
-    sampled_correlation = _book_correlator(sampled)
-    daily_correlation = _book_correlator(train)
-    names = sorted(sampled)
-    suspects = []
-    for index, left in enumerate(names):
-        for right in names[index + 1:]:
-            value, _ = sampled_correlation(left, right, min_overlap=40)
-            if value is None or abs(value) < prefilter:
-                continue
-            suspects.append((left, right, value))
+    result = correlation.matrix(train, min_overlap=200)
+    sampled = {}
     hits = []
-    for left, right, strided_r in suspects:
-        value, days = daily_correlation(left, right, min_overlap=200)
-        if value is None or abs(value) < gate:
+    for pair in result["pairs"]:
+        if abs(pair["r"]) < gate:
             continue
-        hits.append({"a": left, "b": right, "r": round(value, 4),
-                     "strided_r": round(strided_r, 3), "days": days})
+        left, right = pair["a"], pair["b"]
+        for side in (left, right):
+            if side not in sampled:
+                vals = train[side]
+                sampled[side] = {day: vals[day] for day in sorted(vals)[::5]}
+        sx, sy, _ = correlation.align(sampled[left], sampled[right], min_overlap=40)
+        strided_r = correlation.pearson(sx, sy) if sx else None
+        hits.append({
+            "a": left,
+            "b": right,
+            "r": round(pair["r"], 4),
+            "strided_r": round(strided_r, 3) if strided_r is not None else round(pair["r"], 3),
+            "days": pair["n"],
+        })
     hits.sort(key=lambda row: abs(row["r"]), reverse=True)
     return {"gate": gate, "prefilter": prefilter, "frequency": "daily", "window": "train",
             "count": len(hits), "pairs": hits[:limit]}
 
 
-def _health_pool(args, latest, pnl_dir, series, book_daily, train_end):
+def _health_pool(args, latest, pnl_dir, series, book_daily, train_end, *, pool_series=None):
     @lru_cache(maxsize=4)
     def reference(days):
         values = [book_daily[day] for day in days]
         units = stats.unit_correlation_rows([[member[day] for day in days] for member in series.values()])
         return values, stats.sharpe(values, min_points=1), units
 
+    candidate_ids = [
+        alpha_id for alpha_id, entry in latest.items()
+        if str(entry.get("status") or "").upper() not in book_state.BOOK_STATUSES
+    ]
+    if pool_series is None:
+        pool_series = pnl_snapshot.load_series_map(pnl_dir, candidate_ids)
+
     rows = []
-    for alpha_id, entry in latest.items():
-        if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES:
-            continue
-        candidate = pnl_snapshot.read_series(pnl_dir / f"{alpha_id}.json")
+    for alpha_id in candidate_ids:
+        entry = latest[alpha_id]
+        candidate = pool_series.get(alpha_id)
         if not candidate:
             continue
         cutoff = train_end
@@ -249,8 +252,10 @@ def cmd_health(args, _sink):
     book = {alpha_id: entry for alpha_id, entry in latest.items()
             if str(entry.get("status") or "").upper() in book_state.BOOK_STATUSES}
     pnl_dir = Path(research_paths.ensure_dir()) / "pnl"
-    series = {alpha_id: values for alpha_id in sorted(book)
-              if (values := pnl_snapshot.read_series(pnl_dir / f"{alpha_id}.json"))}
+    include_pool = bool(getattr(args, "pool", False))
+    load_ids = sorted(latest) if include_pool else sorted(book)
+    all_series = pnl_snapshot.load_series_map(pnl_dir, load_ids)
+    series = {alpha_id: all_series[alpha_id] for alpha_id in sorted(book) if alpha_id in all_series}
     if not series:
         raise CliError("INVALID_INPUT", "no cached PnL for the book",
                        "run `ledger sync` or `alpha get` to warm the cache")
@@ -293,7 +298,8 @@ def cmd_health(args, _sink):
                      "rho_rest": None if rho is None else round(rho, 3),
                      "slope": marginal, "delta": delta, "marginal": marginal})
 
-    pool = _health_pool(args, latest, pnl_dir, series, book_daily, train_end) if getattr(args, "pool", False) else None
+    pool = (_health_pool(args, latest, pnl_dir, series, book_daily, train_end, pool_series=all_series)
+            if include_pool else None)
     rows.sort(key=lambda row: (row["marginal"] if row["marginal"] is not None else 0))
     measured = [row for row in rows if row["marginal"] is not None]
     return {"window": window, "train_end": train_end,

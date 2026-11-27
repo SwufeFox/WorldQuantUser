@@ -903,11 +903,18 @@ def cmd_ledger_stability(args, _sink):
                         if alpha_id in cutoffs})
         training, state = pnl_snapshot.training_half_sharpes(pnl_dir, path, cutoffs, latest)
         snapshot = {"path": str(path), "state": state}
+    fallback_series = None
+    if training is None and not (snapshot is not None and snapshot.get("state") == "source_unavailable"):
+        valid_ids = [aid for aid in latest if ml.valid_simulation_id(aid)]
+        fallback_series = pnl_snapshot.load_series_map(pnl_dir, valid_ids) if valid_ids else {}
     rows = []
     for alpha_id, entry in latest.items():
         if (training is None or not ml.valid_simulation_id(alpha_id)
                 or (alpha_id in training and training[alpha_id] is None)):
-            pnl = pnl_snapshot.read_series(pnl_dir / f"{alpha_id}.json")
+            if fallback_series is not None and ml.valid_simulation_id(alpha_id):
+                pnl = fallback_series.get(alpha_id)
+            else:
+                pnl = pnl_snapshot.read_series(pnl_dir / f"{alpha_id}.json")
             values = None if pnl is None else experiments.half_split_sharpes(pnl, _stability_cutoff(entry))
         else:
             values = training.get(alpha_id)
