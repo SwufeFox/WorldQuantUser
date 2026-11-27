@@ -206,3 +206,53 @@ def test_workspace_skill_and_docs_links_resolve():
             if not resolved.exists():
                 broken.append((str(doc.relative_to(root)), target))
     assert broken == []
+
+
+def test_layered_architecture_has_no_reverse_imports():
+    import ast
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+
+    def imported_roots(path):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        found = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    found.append((node.lineno, alias.name))
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                found.append((node.lineno, node.module))
+        return found
+
+    core_violations = []
+    for path in sorted(root.glob("*.py")) + sorted((root / "brain_core").glob("*.py")):
+        if path.name == "research_cli.py":
+            continue
+        for lineno, target in imported_roots(path):
+            top = target.split(".")[0]
+            if top in {"research_app", "tools"}:
+                core_violations.append((str(path.relative_to(root)), lineno, target))
+    assert core_violations == []
+
+    app_violations = []
+    for path in sorted((root / "research_app").glob("*.py")):
+        for lineno, target in imported_roots(path):
+            if target.split(".")[0] == "tools":
+                app_violations.append((str(path.relative_to(root)), lineno, target))
+    assert app_violations == []
+
+
+def test_compatibility_tool_aliases_resolve_to_canonical_modules():
+    import batch_policy
+    import spc_experiment
+    from research_app import campaign_runner, guarded_sim, queue_runner
+    from tools import _runner, campaign_runner as legacy_campaign_runner, guarded_sim as legacy_guarded_sim
+    from tools import spc_experiment as legacy_spc_experiment
+    from tools.pipeline import batch_policy as legacy_batch_policy
+
+    assert _runner is queue_runner
+    assert legacy_campaign_runner is campaign_runner
+    assert legacy_guarded_sim is guarded_sim
+    assert legacy_spc_experiment is spc_experiment
+    assert legacy_batch_policy is batch_policy

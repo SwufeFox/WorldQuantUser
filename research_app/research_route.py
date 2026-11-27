@@ -39,7 +39,7 @@ def _setting_token(value, key):
 
 
 def _validate_spc(spec):
-    from tools.spc_experiment import _spec, parse_predictions
+    from spc_experiment import _spec, parse_predictions
 
     # Reuse the same source and sample validation as the offline SPC experiment
     # command. Model and frequency availability belong to the provider schema.

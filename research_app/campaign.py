@@ -56,7 +56,7 @@ def _spc_inputs(path, spec):
 
 
 def _spc_report(path, route, runs, reference):
-    from tools.spc_experiment import experiment
+    from spc_experiment import experiment
 
     report = experiment(path, runs, reference_path=reference)
     return {"track": route["track"], "routes": [route], "simulated": 0,
@@ -240,7 +240,7 @@ def cmd_campaign_breed(args, _sink):
 
 def _execute_campaign(root, path, batch, receipt, *, max_wait, concurrency,
                       multi_size=None, recover_only=False, defer_quick_pnl=False, native_poll_once=False):
-    from tools._runner import ProbeRun, run_probe
+    from .queue_runner import ProbeRun, run_probe
 
     try:
         spec, route = _campaign_spec(path)
@@ -333,8 +333,8 @@ def _archive_index_hit(entry, source, revision, spec_revision, root):
 
 
 def _archived_quick_pnl(root, args, *, live_specs=None, archived_specs=None):
-    from tools._runner import probe_state
-    from tools.campaign_runner import campaign_paths
+    from .queue_runner import probe_state
+    from .campaign_runner import campaign_paths
 
     inbox = root / "backlog"
     live = {path.name for path in (inbox.glob("*.json") if live_specs is None else live_specs)}
@@ -411,9 +411,9 @@ def _archived_quick_pnl(root, args, *, live_specs=None, archived_specs=None):
 
 def cmd_campaign_status(args, _sink):
     """Read queue progress from canonical saved probe and SPC receipts."""
-    from tools._runner import (_progress_fingerprint, probe_diagnosis, probe_poll_at, probe_state,
+    from .queue_runner import (_progress_fingerprint, probe_diagnosis, probe_poll_at, probe_state,
                                recent_campaign_attempts, research_root)
-    from tools.campaign_runner import campaign_paths
+    from .campaign_runner import campaign_paths
 
     root = research_root(args.research_dir)
     _protect_campaign_output(args, root)
@@ -468,7 +468,7 @@ def cmd_campaign_status(args, _sink):
 
 def cmd_campaign_recover_pnl(args, sink):
     """Process archived PnL independently of the simulation runner lock."""
-    from tools._runner import CLI_TIMEOUT_GRACE_SECONDS, _RETRYABLE, research_root, run_cli
+    from .queue_runner import CLI_TIMEOUT_GRACE_SECONDS, _RETRYABLE, research_root, run_cli
 
     root = research_root(args.research_dir)
     _protect_campaign_output(args, root)
@@ -525,8 +525,8 @@ def _preferred_launch_rank(ranks, path):
 
 def cmd_campaign_run(args, sink):
     """Advance the existing durable research queue."""
-    from tools._runner import research_root
-    from tools.campaign_runner import run_campaign
+    from .queue_runner import research_root
+    from .campaign_runner import run_campaign
 
     root = research_root(args.research_dir)
     _protect_campaign_output(args, root)

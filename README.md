@@ -53,7 +53,7 @@ available for their specific uses.
 | `research_app/account.py` | Account access and local cache commands. |
 | `research_app/catalog.py` | Dataset, datafield and operator discovery. |
 | `research_app/validation.py` | FASTEXPR lint, Python Alpha static checks and simulation preflight. |
-| `research_app/experiments.py` | Simulation, resumption, labelled probes, ablation and comparison. |
+| `research_app/experiments.py`, `research_app/exp_*.py` | Simulation, resumption, labelled probes, ablation and comparison (`exp_compare`, `exp_sim`, `exp_probe_spec`, `exp_probe_recovery`). |
 | `research_app/alphas.py` | Platform alpha inspection, native recordsets, submission and correlation. |
 | `research_app/simulation_import.py` | Read existing BRAIN simulations and recover their Alpha IDs. |
 | `research_app/triage.py` | Train-only candidate screening, book leave-one-out health and frozen validation. |
@@ -70,7 +70,8 @@ available for their specific uses.
 | `research_app/feed.py` | Multi-source research leads (papers, news, forum, market snapshots) with seen tracking. |
 | `research_app/literature.py` | OpenAlex paper discovery and reading. |
 | `research_config.py` | Research-file format: parsing and validation, shared by CLI and research scripts. |
-| `machine_lib.py` | BRAIN API client, settings, cache policy and simulation execution. |
+| `machine_lib.py`, `brain_core/` | Public facade, canonical defaults and cohesive core submodules (`errors`, `auth`, `catalog`, `transport`, `simulations`, `alphas`, `client`). |
+| `batch_policy.py`, `spc_experiment.py` | Pure QUICK structural/dataset admission policy and offline SPC prediction comparison shared with `research_app` and `tools`. |
 | `check_evidence.py` | Shared normalization and status classification for platform check payloads. |
 | `simulation_capabilities.py` | Account identity and current settings evidence; unknown capabilities remain explicit. |
 | `simulation_slots.py` | Durable simulation reservations shared by the same account and research workspace. |
@@ -95,12 +96,13 @@ available for their specific uses.
 | `alpha_unit.py` | Compress the ledger into constructions: template, grid, derivation. |
 | `expression_units.py` | Field units, harvested from the simulator's rejections. |
 | `rejection_reasons.py` | Why a rejection happened: the cause, not just the gate. |
-| `tools/guarded_sim.py` | Bind simulation launches to preflight for the exact source and settings. |
-| `tools/_runner.py` | Shared workspace and durable Probe handling for research queues. |
-| `tools/campaign_runner.py` | Screen completed experiments on training evidence before candidate promotion. |
+| `research_app/guarded_sim.py` | Bind simulation launches to preflight for the exact source and settings (`tools/guarded_sim.py` is a compatibility alias). |
+| `research_app/queue_runner.py` | Shared workspace and durable Probe handling for research queues (`tools/_runner.py` is a compatibility alias). |
+| `research_app/campaign_runner.py` | Screen completed experiments on training evidence before candidate promotion (`tools/campaign_runner.py` is a compatibility wrapper/alias). |
+| `research_app/batch_admission.py` | Account-and-scope QUICK exploration admission checks shared by `campaign_delivery` and `batch_quick`. |
 | `tools/atom_runner.py` | Run ATOM / Power Pool exploration scans through the durable Probe lifecycle. |
 | `tools/atom_screen.py` | Screen saved ATOM results by sub-universe check margins and Sharpe. |
-| `tools/pipeline/batch_quick.py` | Compatibility Quick exploration batch runner with skeleton and dataset admission gates. |
+| `tools/pipeline/batch_quick.py` | Compatibility Quick exploration batch runner with skeleton and dataset admission gates (`tools/pipeline/batch_policy.py` and `tools/spc_experiment.py` are compatibility aliases). |
 | `tools/probe_units.py` | Measure a field's unit from the simulator's own rejection. |
 | `research_app/substitution.py` | Whole-token field substitution: the "change exactly one input" batch. Exact and identifier-bounded, because `replace("sales", ...)` also rewrote `sales_growth`. |
 | `tools/cluster_ledger.py` | Group the ledger by PnL correlation or by shared datafields. |
@@ -160,9 +162,10 @@ application. Add a command in its owning module, declare its arguments in
 `research_app/parser.py`, and test the implementation module or the executable
 contract. The entry point exports no command handlers or compatibility aliases.
 
-`research_app` adds internal modules, with no additional tool entry points. Probes
-import `tools.guarded_sim` directly; command execution does not change the module
-search path to locate it.
+`research_app` owns internal command and orchestration modules (`guarded_sim`, `queue_runner`,
+`campaign_runner`, `batch_admission`) with a one-way dependency DAG
+(`core` / `brain_core` ← `research_app` ← `tools`). Probes import `research_app.guarded_sim`
+directly without modifying `sys.path`, while legacy paths under `tools/` remain compatibility aliases.
 
 ## The expression tree
 

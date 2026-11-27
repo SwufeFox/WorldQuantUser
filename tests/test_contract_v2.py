@@ -1625,7 +1625,9 @@ class EnvExampleTests(unittest.TestCase):
         explicit = {"BRAIN_USERNAME", "BRAIN_PASSWORD"}
         literal = re.compile(r"""["']([A-Z][A-Z0-9_]{4,})["']""")
         used = set()
-        source_files = sorted(ROOT.glob("*.py")) + sorted((ROOT / "research_app").glob("*.py"))
+        source_files = (sorted(ROOT.glob("*.py"))
+                        + sorted((ROOT / "brain_core").glob("*.py"))
+                        + sorted((ROOT / "research_app").glob("*.py")))
         for path in source_files:
             for candidate in literal.findall(path.read_text(encoding="utf-8")):
                 if candidate in explicit or candidate.endswith(suffixes):

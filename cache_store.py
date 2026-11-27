@@ -28,9 +28,11 @@ import contextlib
 import errno
 import json
 import os
+import subprocess
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 try:  # POSIX advisory locks; absent on Windows.
     import fcntl
@@ -49,7 +51,10 @@ __all__ = [
     "build_entry",
     "cache_stats",
     "clear_dir",
+    "confirm_top_level_entry",
     "file_lock",
+    "fsync_directory",
+    "link_bytes_exclusive",
     "load_json",
     "prune_corrupt",
     "quarantine",
@@ -180,6 +185,57 @@ def remove(path):
         return True
     except FileNotFoundError:
         return False
+
+
+def fsync_directory(path):
+    """Best-effort fsync of directory metadata on POSIX; clean no-op on Windows."""
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.EBADF, errno.EACCES, errno.EPERM):
+                raise
+    finally:
+        os.close(fd)
+
+
+def link_bytes_exclusive(directory, target, payload):
+    """Write ``payload`` to a staging file, fsync, link exclusively to ``target``, and clean up.
+
+    Closes the temporary file handle prior to linking/unlinking so exclusive
+    publication works across both POSIX and Windows.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    handle = tempfile.NamedTemporaryFile(dir=directory, prefix=".publish-", suffix=".tmp", delete=False)
+    tmp_name = handle.name
+    try:
+        try:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        finally:
+            handle.close()
+        os.link(tmp_name, target)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp_name)
+    fsync_directory(directory)
+
+
+def confirm_top_level_entry(target):
+    """Verify top-level visibility of ``target``; falls back cleanly when ``ls`` is absent."""
+    target_path = Path(target)
+    try:
+        listing = subprocess.run(["ls", "-d", "--", str(target_path)],
+                                 capture_output=True, text=True, check=False)
+        return listing.returncode == 0, listing.stdout.strip(), listing.stderr.strip()
+    except FileNotFoundError:
+        visible = target_path.is_file()
+        return visible, str(target_path) if visible else "", "" if visible else "target not visible after link"
 
 
 # ---------------------------------------------------------------------------

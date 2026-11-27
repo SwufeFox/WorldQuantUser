@@ -601,6 +601,36 @@ class CacheMaintenanceTests(TempCacheCase):
         self.assertEqual(removed, 2)
         self.assertEqual(cache_store.cache_stats(root)["files"], 0)
 
+    def test_exclusive_link_and_top_level_confirmation(self):
+        inbox = os.path.join(self.root, "inbox")
+        target = os.path.join(inbox, "pilot.json")
+        cache_store.link_bytes_exclusive(inbox, target, b'{"arms": []}\n')
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), b'{"arms": []}\n')
+        self.assertEqual([n for n in os.listdir(inbox) if n.endswith(".tmp")], [])
+
+        with self.assertRaises(FileExistsError):
+            cache_store.link_bytes_exclusive(inbox, target, b'{"arms": [1]}\n')
+        self.assertEqual([n for n in os.listdir(inbox) if n.endswith(".tmp")], [])
+
+        ok, out, err = cache_store.confirm_top_level_entry(target)
+        self.assertTrue(ok)
+        self.assertEqual(os.path.normpath(out), os.path.normpath(target))
+        self.assertEqual(err, "")
+        cache_store.fsync_directory(inbox)
+
+        missing = os.path.join(inbox, "missing.json")
+        ok_missing, out_missing, err_missing = cache_store.confirm_top_level_entry(missing)
+        self.assertFalse(ok_missing)
+        self.assertEqual(out_missing, "")
+        self.assertTrue(bool(err_missing))
+
+        with mock.patch.object(cache_store.subprocess, "run", side_effect=FileNotFoundError("no ls")):
+            ok_fb, out_fb, err_fb = cache_store.confirm_top_level_entry(target)
+        self.assertTrue(ok_fb)
+        self.assertEqual(os.path.normpath(out_fb), os.path.normpath(target))
+        self.assertEqual(err_fb, "")
+
 
 if __name__ == "__main__":
     unittest.main()

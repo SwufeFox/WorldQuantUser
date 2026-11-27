@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
-import subprocess
-import tempfile
 import time
 
 import cache_store
@@ -17,9 +14,9 @@ import simulation_capabilities
 from . import experiments
 from .campaign import _protect_campaign_output, _quick_training
 from .runtime import CliError, protect_output, with_session
-from tools._runner import probe_poll_at, probe_state, recent_campaign_attempts, research_root, run_cli
-from tools.campaign_runner import campaign_paths
-from tools.pipeline import batch_policy
+from .queue_runner import probe_poll_at, probe_state, recent_campaign_attempts, research_root, run_cli
+from .campaign_runner import campaign_paths
+import batch_policy
 
 
 PILOT_SIZE = 16
@@ -88,15 +85,7 @@ def _pilot_evidence(args, arms, track, box):
 
 def _published_location(inbox, target, payload):
     """Perform the actual top-level listing and account for an immediate claim."""
-    try:
-        listing = subprocess.run(["ls", "-d", "--", str(target)], capture_output=True, text=True, check=False)
-        listed_ok = listing.returncode == 0
-        listed_out = listing.stdout.strip()
-        listing_error = listing.stderr.strip()
-    except FileNotFoundError:
-        listed_ok = target.is_file()
-        listed_out = str(target) if listed_ok else ""
-        listing_error = "" if listed_ok else "target not visible after link"
+    listed_ok, listed_out, listing_error = cache_store.confirm_top_level_entry(target)
     if listed_ok:
         return str(target), "queued", listed_out
     claimed = inbox.parent / "backlog-claimed"
@@ -118,29 +107,17 @@ def _published_location(inbox, target, payload):
 
 
 def _publish(inbox, target, payload):
-    inbox.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=inbox, prefix=".publish-", suffix=".tmp") as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
-        try:
-            os.link(handle.name, target)
-        except FileExistsError as exc:
-            raise CliError("INVALID_INPUT", f"backlog already contains {target.name}",
-                           "run `research_cli.py campaign diagnose` or pick a distinct spec filename") from exc
-        listing = _published_location(inbox, target, payload)
-        if hasattr(os, "O_DIRECTORY"):
-            directory = os.open(inbox, os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
-    return listing
+    try:
+        cache_store.link_bytes_exclusive(inbox, target, payload)
+    except FileExistsError as exc:
+        raise CliError("INVALID_INPUT", f"backlog already contains {target.name}",
+                       "run `research_cli.py campaign diagnose` or pick a distinct spec filename") from exc
+    return _published_location(inbox, target, payload)
 
 
 def cmd_campaign_publish(args, _sink):
     """Check immutable spec bytes and publish only into the top-level inbox."""
-    from tools.pipeline.batch_quick import _build_admission
+    from .batch_admission import build_admission as _build_admission
 
     root, box, inbox = _locations(args)
     source = Path(args.spec).expanduser().resolve()
