@@ -143,9 +143,10 @@ def expression_hash(expression, language=None):
     Indentation and whitespace inside strings can change the program, so all
     other text is retained.
 
-    FASTEXPR uses ``expr2:`` for canonical trees. This collapses extra parentheses
-    and comments. Unparseable source retains the legacy text hash under ``expr:``.
-    Existing ledger keys stay intact to preserve historical deduplication.
+    FASTEXPR uses ``expr2:`` for canonical trees and ``text:`` for anything
+    that is not FASTEXPR (Python source, diagnostic notes). This collapses extra
+    parentheses and comments. Unparseable source hashes as ``text:`` so no entry can
+    reintroduce the retired ``expr:`` prefix.
     """
     if ml.is_python_language(language):
         source = ml.normalize_python_source(expression or "")
@@ -156,7 +157,7 @@ def expression_hash(expression, language=None):
         fastexpr_ast.parse(expression)
         text, prefix = fastexpr_ast.canonical(expression), "expr2:"
     except Exception:  # noqa: BLE001 - unparseable input keeps the old rule
-        text, prefix = " ".join((expression or "").split()), "expr:"
+        text, prefix = " ".join((expression or "").split()), "text:"
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return prefix + digest[:16]
 

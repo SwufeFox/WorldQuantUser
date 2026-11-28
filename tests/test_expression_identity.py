@@ -66,7 +66,7 @@ class Hash(unittest.TestCase):
     def test_damaged_text_keeps_the_old_prefix(self):
         # Historical rows used `expr:`; a damaged expression must not collide with a
         # parseable one that happens to canonicalise to the empty string.
-        self.assertTrue(alpha_registry.expression_hash("rank(close) 13").startswith("expr:"))
+        self.assertTrue(alpha_registry.expression_hash("rank(close) 13").startswith("text:"))
 
     def test_same_expression_helper(self):
         self.assertTrue(alpha_registry.same_expression("a = rank(close);\na",
