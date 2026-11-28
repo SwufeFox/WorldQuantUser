@@ -1535,6 +1535,13 @@ def build_parser():
     _add_cost_args(s_plan)
     s_plan.bind_handler("daemon.cmd_shelf_plan")
 
+    themes_p = sub.add_parser("themes", help="Inspect observed platform theme records.")
+    themes_sub = themes_p.add_subparsers(dest="subcommand", required=True, parser_class=JsonArgumentParser)
+    t_list = themes_sub.add_parser("list", help="List observed themes with regions, multipliers and freshness.")
+    t_list.add_argument("--limit", type=_non_negative_integer, default=50,
+                        help="Maximum themes to return; 0 returns none.")
+    t_list.bind_handler("themes.cmd_themes_list")
+
     fmt = sub.add_parser(
         "fmt", help="Preview review-friendly formatting of native FASTEXPR.",
         description="Format an expression or the FASTEXPR arms in a draft spec. "

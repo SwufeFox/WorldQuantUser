@@ -275,6 +275,21 @@ Alpha 和 probe 的 `incentives` 摘要保留 `MATCHES_PYRAMID`、`MATCHES_THEME
 `alpha check` 的依据为实时检查端点。`effective` 与 `multiplier` 分别保留，不互相推算；
 缺失倍率保持未知，主题命中不能覆盖质量检查失败。该能力提供平台报告的信息，不实现奖励计分公式。
 
+### 主题观测怎么读：`themes list`
+
+`MATCHES_THEMES` 的每次观测都带来源、时间与 scope，落在 `rules-snapshot.jsonl`。
+`themes list` 只读这份历史，把同一个 theme id 折叠成一条：名称、最近倍率、观测过的
+region、首末观测时间与观测次数。
+
+```bash
+python research_cli.py themes list --limit 20
+```
+
+它回答的是「这个主题在哪些区被观测到、证据有多新」，不判断资格、也不参与打分。
+主题会轮换，读的时候先看 `last_observed_at`；倍率只用于分配探索预算，低倍率不是
+否决机制的理由。多主题账户会一次返回多条 `MATCHES_THEMES`，`themes list` 按 id 折叠，
+不会把不同主题混成一条。
+
 ### 核对季度提交日和 Osmosis 范围
 
 ```bash
