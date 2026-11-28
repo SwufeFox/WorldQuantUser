@@ -288,8 +288,9 @@ def _read_records(cache_path, rows):
             frame = frame.select("alpha_id", "day", "pnl")
         except (OSError, pl.exceptions.PolarsError):
             continue
+        columns = frame.to_dict(as_series=False)
         values = {alpha_id: {} for alpha_id in records}
-        for alpha_id, day, pnl in frame.iter_rows():
+        for alpha_id, day, pnl in zip(columns["alpha_id"], columns["day"], columns["pnl"]):
             values[alpha_id][day] = pnl
         for alpha_id, series in values.items():
             row = records[alpha_id]
