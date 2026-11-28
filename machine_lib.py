@@ -93,25 +93,22 @@ ALPHA_COLORS = ("RED", "YELLOW", "GREEN", "BLUE", "PURPLE")
 
 _UNSET = object()
 
-# Re-export cohesive brain_core submodules behind the canonical machine_lib facade.
-from brain_core.errors import (  # noqa: E402
-    set_diagnostic_handler, note, BrainError, MissingCredentials, AuthError, CaptchaRequired, NotFound, RateLimited, SimulationError, SubmissionDisabled, agent_submit_allowed, ServiceError, ReadInterrupted, AuthenticationUnavailable, AuthenticationDeadline, SessionBusy, PermissionDenied,
-)
-from brain_core.auth import (  # noqa: E402
-    _load_dotenv, configured_username, get_credentials, login, authenticate, is_python_language, normalize_python_source, alpha_language, regular_expression, session_cache_path, _session_payload, save_session, _session_from_entry, session_status, invalidate_session, logout_session, fetch_user_profile, fetch_competitions, fetch_user_surface, fetch_consultant_summary, login_lock_timeout, isolated_session, load_session,
-)
-from brain_core.catalog import (  # noqa: E402
-    configure_metadata_cache, metadata_cache_policy, metadata_cache_path, read_cached_field_snapshot, migrate_legacy_datafield_cache, cached_metadata, CatalogAccess, _catalog_account, catalog_field_cache_paths, _cached_account_catalog, get_datasets, _get_datasets, _as_results, _catalog_pages, fetch_operators, _fetch_operators, fetch_operator_doc, _fetch_operator_doc, fetch_data_categories, _fetch_data_categories, get_datafields, _get_datafields, _filter_datafields, search_datafield, get_dataset, get_datafield, field_ids, fields_to_df, process_datafields,
-)
-from brain_core.transport import (  # noqa: E402
-    _SIMULATION_ID, valid_simulation_id, simulation_reference_id, _validated_progress_url, _quick_progress_target, _request_timeout, _retry_after_seconds, _TRANSIENT_READ_STATUSES, _transient_read_error, _wait_for_read_retry, _get_poll_response, _poll_json_when_ready, request_json,
-)
-from brain_core.simulations import (  # noqa: E402
-    read_simulation_snapshot, _read_simulation_snapshot, cancel_simulation, simulation_progress_receipt, recover_accepted_slots, recover_quick_orphans, attach_quick_location, poll_simulation, submit_single_simulation, submit_multi_simulation, _has_multi_simulation_permission, _submit_simulation_request, fetch_alpha_metrics, is_quick_simulation, alpha_classification_ids, defer_alpha_metrics, normalize_setting_keys, resolve_settings, _REGULAR_UNSENT_SETTINGS, _PYTHON_UNSENT_SETTINGS, _regular_unsent_settings, _omit_regular_settings, regular_wire_settings, format_simulation_payload, _single_simulation_data, regular_settings_evidence, _ALPHA_ENTRY_KEYS, normalize_alphas, alpha_candidate_ids, alpha_families, alpha_labels, concurrency_plan, simulate_alphas,
-)
-from brain_core.alphas import (  # noqa: E402
-    _OPERATOR_MENTION, _OPERATOR_FATAL, note_operator_rejection, _CEILING_CHECKS, reconcile_check, _extract_checks, fetch_alpha_checks, _performance_request, fetch_merged_performance, _recordset_paths, _read_recordset, fetch_alpha_recordsets, _PNL_EVIDENCE_FORMAT, _pnl_digest, _matching_pnl_evidence, pnl_cache_status, _write_pnl_cache, fetch_daily_pnl, read_alpha_submission_status, submit_alpha, list_alphas, extract_split, set_alpha_metadata, _CORRELATION_KINDS, _fetch_alpha_correlation_endpoint, fetch_self_correlation, fetch_prod_correlation, build_prod_correlation_archive, fetch_power_pool_correlation, power_pool_correlation_verdict, self_correlation_verdict,
-)
-from brain_core.client import (  # noqa: E402
-    BrainClient,
-)
+# Resolve the core modules lazily. Importing all of them here would make the
+# package unimportable in the other direction, because every brain_core module
+# imports this one for its constants and error types.
+_CORE_MODULES = ("errors", "transport", "auth", "catalog", "client", "simulations", "alphas")
+
+
+def __getattr__(name):
+    """Expose a core symbol through this facade, importing its module on first use."""
+    import importlib
+
+    for module_name in _CORE_MODULES:
+        module = importlib.import_module("brain_core.%s" % module_name)
+        try:
+            value = getattr(module, name)
+        except AttributeError:
+            continue
+        globals()[name] = value
+        return value
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
