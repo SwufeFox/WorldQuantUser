@@ -407,7 +407,7 @@ OPERATOR_LIMIT = 64
 OPERATOR_WARN = 50
 
 _CALL = re.compile(r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\s*\(")
-_BINARY = re.compile(r"(?<![<>!=])(?:[<>!=]=|&&|\|\||[+\-*/<>^?])")
+_OPERATOR_SYMBOL = re.compile(r"[<>!=]=|&&|\|\||[+\-*/<>^?!]")
 
 
 def estimate_operator_count(expression):
@@ -416,15 +416,15 @@ def estimate_operator_count(expression):
     ``operator_count`` elsewhere in this module is the number of *distinct*
     operators, which says nothing about the platform's limit: two alphas can use
     the same nine operators and one of them is rejected for using them ninety-five
-    times. This estimate counts call sites plus binary symbols, and deliberately
-    over-counts rather than under-counts, so a warning arrives early instead of a
-    failed simulation arriving after the quota is spent.
+    times. This estimate counts call sites plus operator symbols, including unary
+    negation, and deliberately over-counts rather than under-counts, so a warning
+    arrives early instead of a failed simulation arriving after the quota is spent.
     """
     text = expression or ""
     calls = [name for name in _CALL.findall(text)
              if name.lower() not in {"if", "else"}]
-    binary = _BINARY.findall(text)
-    return len(calls) + len(binary)
+    symbols = _OPERATOR_SYMBOL.findall(text)
+    return len(calls) + len(symbols)
 
 
 def operator_budget_findings(expression, limit=OPERATOR_LIMIT, warn=OPERATOR_WARN):
