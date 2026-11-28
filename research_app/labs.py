@@ -366,7 +366,7 @@ def suggest_delegations(research_dir=None, *, region=None, field=None, min_attem
     """Suggest diagnostics for recurring market anomalies on distinct completed requests."""
     root = Path(research_dir or research_paths.ensure_dir()).expanduser().resolve()
     if entries is None:
-        entries = alpha_registry.load_entries(root / alpha_registry.DEFAULT_FILENAME)
+        entries = alpha_registry.load_entries(root / "alpha-registry.jsonl")
     buckets = defaultdict(dict)
     for entry in entries:
         if (entry.get("role") in {"control", "diagnostic"} or entry.get("execution_outcome") == "failed"

@@ -155,3 +155,11 @@ def test_snippet_emits_json_aggregates_for_sparse_matrices(tmp_path, capsys):
     assert summary["fields"]["close"]["daily_update_rate"] == 0.5
     assert summary["fields"]["volume"]["mean_coverage"] == 0.5
     assert summary["pairwise_rank_corr"] == {}
+
+
+def test_suggest_delegations_reads_the_workspace_registry(tmp_path):
+    """`labs suggest` used to crash on a missing alpha_registry constant."""
+    from research_app import labs
+
+    (tmp_path / "alpha-registry.jsonl").write_text("", encoding="utf-8")
+    assert labs.suggest_delegations(str(tmp_path)) == []
