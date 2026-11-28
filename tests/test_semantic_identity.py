@@ -32,6 +32,17 @@ class IdentityTests(unittest.TestCase):
     def test_nested_offset_is_not_dropped(self):
         self.assertFalse(si.same_identity("rank(close - 0.5)", "rank(close)"))
 
+    def test_final_value_is_resolved_through_its_binding(self):
+        self.assertTrue(si.same_identity("a = rank(close) - 0.5;\na", "rank(close)"))
+        self.assertTrue(si.same_identity("a = 2 * rank(close);\na", "rank(close)"))
+
+    def test_step_names_do_not_create_identity(self):
+        self.assertTrue(si.same_identity("a = rank(close);\na", "b = rank(close);\nb"))
+
+    def test_offset_inside_an_intermediate_is_kept(self):
+        self.assertFalse(si.same_identity(
+            "leg = rank(close) - 0.5;\nleg + rank(volume)", "rank(close) + rank(volume)"))
+
     def test_fingerprint_is_stable_and_distinguishes_direction(self):
         first = si.fingerprint("2 * rank(close)")
         second = si.fingerprint("rank(close)")

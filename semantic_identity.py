@@ -5,9 +5,12 @@ signal: commutative arguments compare unordered, a positive scalar factor on the
 root is scale rather than signal, a negative factor is direction, and a constant
 additive offset disappears when the neutralisation demeans the book anyway.
 
-This is deliberately conservative. It normalises the root only - nested constants
-stay where they are - because a nested offset can still change what an operator
-sees (a percentile, a threshold, a partition).
+This is deliberately conservative, and it applies to the final value only: the
+signal is resolved through its binding first, then the root is normalised. A
+constant that sits inside an intermediate definition stays where it is, because
+an operator upstream can still read it (a percentile, a threshold, a partition),
+and normalising intermediates would also make two programs differ just because
+they named their steps differently.
 """
 
 from __future__ import annotations
@@ -99,13 +102,30 @@ def _root_sign_and_core(node, demeaned):
     return sign, _canonical(node)
 
 
+def _resolve(node, bindings, seen=()):
+    """Substitute bound names so the final value, not the step names, is compared."""
+    if isinstance(node, ast.Field) and node.name in bindings and node.name not in seen:
+        return _resolve(bindings[node.name], bindings, seen + (node.name,))
+    if isinstance(node, ast.Call):
+        return ast.Call(node.name,
+                        tuple(_resolve(arg, bindings, seen) for arg in node.args),
+                        tuple((key, _resolve(value, bindings, seen)) for key, value in node.kwargs))
+    if isinstance(node, ast.BinOp):
+        return ast.BinOp(node.op, _resolve(node.left, bindings, seen), _resolve(node.right, bindings, seen))
+    if isinstance(node, ast.UnaryOp):
+        return ast.UnaryOp(node.op, _resolve(node.operand, bindings, seen))
+    return node
+
+
 def identity(expression, *, neutralization="INDUSTRY"):
-    """Return the canonical identity string for one expression."""
+    """Return the canonical identity string of the final value of one expression."""
     program = ast.parse(expression)
     signal = program.signal
     if signal is None:
         raise ValueError("expression has no signal")
-    sign, core = _root_sign_and_core(signal, _demeaning(neutralization))
+    bindings = {name: value for name, value in program.assignments}
+    resolved = _resolve(signal, bindings)
+    sign, core = _root_sign_and_core(resolved, _demeaning(neutralization))
     return core if sign > 0 else "-" + core
 
 
