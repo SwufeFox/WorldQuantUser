@@ -46,11 +46,12 @@ The ledger uses `expr2:` hashes for parseable FastExpr and keeps the legacy
 only line endings normalized. Indentation, whitespace, and string contents
 remain part of Python source identity. Existing ledger keys stay in place.
 
-## Optional shorthand for script generators
+## Shorthand for script generators
 
-Some older research scripts use `alpha_sugar.fs()` to generate native FASTEXPR.
-The CLI expects the expanded expression in a spec. For reusable experiment
-templates, use `alpha_unit` to track the underlying construction and its coverage.
+The shorthand generator library was removed with the v4 CLI. Specs carry native
+FASTEXPR or Python, so a legacy generator expands its shorthand before writing the
+spec. For reusable experiment templates, use `alpha_unit` to track the underlying
+construction and its coverage.
 
 | Form | Expands to | Why it exists |
 | --- | --- | --- |

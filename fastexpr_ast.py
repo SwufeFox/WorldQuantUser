@@ -17,8 +17,8 @@ What the tree provides:
   or splicing subexpressions operates on parsed nodes rather than substrings.
 
 Optional macro hooks (:func:`macro`, :func:`expand`) remain available for legacy
-generator scripts (`alpha_sugar.py`) that explicitly emit native FASTEXPR; for
-ledger compression and construction coverage, prefer ``alpha_unit.py``.
+generator scripts that explicitly emit native FASTEXPR; for ledger compression and
+construction coverage, prefer ``alpha_unit.py``.
 Nothing in this module hard-codes BRAIN field or operator names.
 """
 
