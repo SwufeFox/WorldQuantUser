@@ -17,7 +17,7 @@ import cache_store
 
 _EVIDENCE_FORMAT = "worldquantuser.pnl-evidence"
 _META_DB = "meta.sqlite"
-_DEFAULT_MAX_DELTAS = 24
+_DEFAULT_MAX_DELTAS = 128
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS pnl_evidence (
@@ -218,7 +218,7 @@ def write_pnl(cache_dir, alpha_id, series, metadata, *, max_deltas=_DEFAULT_MAX_
     """Publish one whole recordset, then commit its file reference and evidence together."""
     cache_path = Path(cache_dir)
     normalized = _normalize_series(series)
-    digest = canonical_digest(normalized)
+    digest = _digest(normalized)
     metadata = {**(metadata or {}), "format": _EVIDENCE_FORMAT, "alpha_id": alpha_id,
                 "data_sha256": digest, "points": len(normalized)}
     if _import_polars() is None:
@@ -265,7 +265,7 @@ def _read_records(cache_path, rows):
         for alpha_id, series in values.items():
             row = records[alpha_id]
             try:
-                if len(series) == row["points"] and canonical_digest(series) == row["data_sha256"]:
+                if len(series) == row["points"] and _digest(series) == row["data_sha256"]:
                     output[alpha_id] = series
             except (TypeError, ValueError, OverflowError):
                 continue
