@@ -37,8 +37,9 @@ import json
 import random
 import re
 import sys
+from pathlib import Path
 
-sys.path.insert(0, __file__.rsplit("/", 1)[0])
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 RULES_VERSION = "2026-11-02.1"
 
