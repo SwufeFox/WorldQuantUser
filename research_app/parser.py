@@ -1135,6 +1135,27 @@ def build_parser():
 
     a_get.bind_handler("alphas.cmd_alpha_get")
 
+    a_desc = alpha_sub.add_parser(
+        "describe", help="Set an alpha's name, category, tags, colour or description.",
+        description="Writes writable metadata and verifies it stuck. The change is also "
+                    "appended to metadata-log.jsonl in the research directory, so a later "
+                    "reader can tell who changed what and when.")
+    a_desc.add_argument("alpha_id")
+    a_desc.add_argument("--name")
+    a_desc.add_argument("--category", choices=["ANALYST", "FUNDAMENTAL", "PRICE_VOLUME",
+                                               "SENTIMENT", "VOLUME"])
+    a_desc.add_argument("--tags", nargs="+",
+                        help="Comma- or space-separated tags; replaces the stored list.")
+    a_desc.add_argument("--description",
+                        help="Official description: Idea: / Rationale for data used: / "
+                             "Rationale for operators used:, each with '- ' bullets.")
+    a_desc.add_argument("--color", choices=["RED", "YELLOW", "GREEN", "BLUE", "PURPLE", "NONE"])
+    a_desc_visibility = a_desc.add_mutually_exclusive_group()
+    a_desc_visibility.add_argument("--hide", action="store_true")
+    a_desc_visibility.add_argument("--unhide", action="store_true")
+    _add_session_args(a_desc)
+    a_desc.bind_handler("alphas.cmd_alpha_describe")
+
     a_near = alpha_sub.add_parser(
         "near", help="Book alphas closest in structure to an expression (offline).",
         description="Duplicate detection arrives too late by PnL (needs the simulation) "

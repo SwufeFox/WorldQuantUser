@@ -1363,7 +1363,16 @@ def cmd_alpha_describe(args, _sink):
         "description": (current.get("regular") or {}).get("description"),
         "note": "name, category, tags, color and hidden are top-level; description is nested under `regular`",
     }
-
+    changed = {"name": args.name, "category": args.category, "tags": tags,
+               "description": args.description, "hidden": hidden}
+    record = {"at": datetime.now(timezone.utc).isoformat(), "alpha_id": args.alpha_id,
+              "changed": {key: value for key, value in changed.items() if value is not None},
+              "source": "alpha describe"}
+    log_path = Path(research_paths.resolve("metadata-log.jsonl"))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+    data["metadata_log"] = str(log_path)
     return data
 
 

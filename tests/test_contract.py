@@ -148,7 +148,7 @@ class SchemaAndCliContractTests(unittest.TestCase):
             ("promote", "batch.json"),
             ("buffer", "list"),
             ("alpha", "submit", "A1"),
-            ("alpha", "describe", "A1", "--name", "x"),
+            # alpha describe was reinstated in 4.x: it now journals to metadata-log.jsonl.
             ("alpha", "cancel-sim", "S1"),
         ):
             with self.subTest(argv=argv):
