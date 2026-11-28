@@ -70,7 +70,7 @@ stateDiagram-v2
 | `GATE_DESCRIBE` | 门禁 | 验证通过；等待填写候选元数据与官方三段式模板说明 | `act RUN_ID describe --name ... --category ... --tags ... --description ...` |
 | `AUTO_BUFFER` | 自动 | `set_alpha_metadata` 写入平台并回读校验一致，再写入 `seeds.jsonl` 与 `submit-buffer.jsonl` | `shelf list` / `shelf plan` |
 | `GATE_CONFIRM_SUBMIT` | 门禁 | 候选已安全入架；**可选择直接提交或暂存候补** | `act RUN_ID hold`（转 `SHELVED`）或 `act RUN_ID submit --yes`（需 `BRAIN_ALLOW_AGENT_SUBMIT=true`） |
-| `GATE_LABS` | 门禁 | 等待人类协作者回传汇总统计。工单处于 `OPEN` 时，拦截同 Region/Universe/Delay 且字段重叠的提案。 | `labs show TICKET_ID` / `labs resolve TICKET_ID --summary ...` |
+| `GATE_LABS` | 门禁 | 暂停关联 run，等待人类协作者回传汇总统计。其他提案命中开放工单时会收到 `LABS_TICKET_OPEN` 警告并继续预检。 | `labs show TICKET_ID` / `labs resolve TICKET_ID --summary ...` |
 | `AUTO_CANCELLING` | 自动 | 等待平台确认取消、已不存在或进入终态。有未决平台回执时继续退避。 | `inspect RUN_ID` |
 | `AUTO_SPC` | 自动 | 对指定本地结果文件运行 SPC 对比。 | `wait --run-id RUN_ID` |
 | `AUTO_SUBMITTING` | 自动 | 持久化发送 `POST /alphas/{id}/submit`；遇 `UNCERTAIN` 仅走只读回查，绝不重发 `POST` | 等待终态 `SUBMITTED` 或 `REJECTED_AT_SUBMIT` |

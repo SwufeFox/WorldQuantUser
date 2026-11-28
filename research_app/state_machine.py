@@ -202,6 +202,7 @@ def public_run_view(doc, *, arm_label=None):
         "labs_ticket_id": doc.get("labs_ticket_id"),
         "pre_labs_state": doc.get("pre_labs_state"),
         "labs_resolution": doc.get("labs_resolution"),
+        "warnings": doc.get("warnings") or [],
         "preflight_block": doc.get("preflight_block"),
         "last_error": doc.get("last_error"),
         "rows": rows,
@@ -415,16 +416,6 @@ class StateMachineEngine:
                            details={"missing_idea_labels": missing_idea})
         shared_arm_settings(arms)
         _static_validate_arms(arms, source_dir=Path(source_path).parent if source_path else None)
-        conflicts = labs.blocking_tickets_for_arms(arms, research_dir=self.root)
-        if conflicts:
-            first_t = conflicts[0]
-            raise CliError(
-                "PREFLIGHT_FAILED",
-                f"blocked by OPEN BRAIN Labs diagnostic ticket {first_t['ticket_id']} "
-                f"on {', '.join(first_t['overlapping_fields'])} ({first_t['scope']})",
-                f"return collaborator statistics via `research_cli.py labs resolve {first_t['ticket_id']} --summary \"...\"`",
-                details={"blocking_tickets": conflicts},
-            )
         fingerprint = experiments._request_fingerprint(arms)
 
         self._sync_legacy_runs()
@@ -461,6 +452,7 @@ class StateMachineEngine:
             "request_fingerprint": fingerprint,
             "idea": normalized.get("idea"),
             "mechanism": normalized.get("mechanism"),
+            "warnings": labs.open_ticket_warnings_for_arms(arms, research_dir=self.root),
             "source_spec": str(source_path) if source_path else None,
             "created_at": now,
             "updated_at": now,

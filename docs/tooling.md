@@ -228,8 +228,10 @@ python research_cli.py labs show TICKET_ID
 python research_cli.py labs resolve TICKET_ID --summary "Daily update rate was 0.04 and coverage was 95%."
 ```
 
-同一 Region、Universe、Delay 中引用工单字段的新提案会在本地被拦截。使用 `act RUN_ID request-labs`
-将处于预检、训练筛选或全量验证审批门禁的运行暂停于 `GATE_LABS`。关闭对应工单后，运行恢复原门禁。
+新提案引用同一 Region、Universe、Delay 下开放工单的字段时，`propose` 将 `LABS_TICKET_OPEN` 警告
+保存到 run 并在 `warnings` 中返回，提案继续预检。同一工单和作用域只记一条，合并所有臂的重叠字段。
+使用 `act RUN_ID request-labs` 可将处于预检、训练筛选或全量验证审批门禁的运行暂停于 `GATE_LABS`。
+关闭对应工单后，运行恢复原门禁。
 `labs open --run-id` 只记录工单的关联来源。`labs list`、`brief` 和 `inbox` 提供摘要，
 `labs show` 显示完整工单和需要接入 Labs In-Sample 数据加载器的 Python 片段。
 通过 `labs resolve` 回传文字摘要和可选的聚合 JSON 指标，保留原始数据在 Labs 内。

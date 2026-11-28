@@ -78,7 +78,7 @@ For throughput, shared budgets and concurrency measurements, read
 2. 不确定字段的真实更新频率、覆盖率、长尾极值或行业缺失特征。
 3. 需要验证多字段共线性、去冗余或探索非线性/条件分段交互结构。
 
-**工单格式**：注明 `Region/Universe/Delay`、`目标字段`、`待验证的具体定量问题`、`期望用户回传的汇总统计指标`（禁止导出原始数据），以及基于诊断结果的下一步分支方案。在 `OPEN` 工单未通过 `labs resolve` 回传统计摘要前，`propose` 会本地拦截对同作用域目标字段的盲试模拟。
+**工单格式**：注明 `Region/Universe/Delay`、`目标字段`、`待验证的具体定量问题`、`期望用户回传的汇总统计指标`（禁止导出原始数据），以及基于诊断结果的下一步分支方案。新提案命中同作用域的 `OPEN` 工单时，`propose` 返回 `LABS_TICKET_OPEN` 警告并继续预检。
 
 ## Execution invariants
 

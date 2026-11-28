@@ -324,17 +324,20 @@ def _scope_label(region, universe, delay):
     return f"{region}/{universe}/D{delay}"
 
 
-def blocking_tickets_for_arms(arms, *, research_dir=None):
-    """Return a bounded report of open tickets overlapping the proposed arms."""
+def open_ticket_warnings_for_arms(arms, *, research_dir=None):
+    """Return one warning per open ticket and scope, combining fields across arms."""
     limit = 20
-    conflicts = []
+    warnings = []
     for (region, universe, delay), fields in sorted(scope_fields(arms).items()):
         hits = workspace_db.find_open_blocking_tickets(region, universe, delay, fields,
-                                                       limit=limit - len(conflicts), research_dir=research_dir)
-        conflicts.extend({**hit, "scope": _scope_label(region, universe, delay)} for hit in hits)
-        if len(conflicts) == limit:
+                                                       limit=limit - len(warnings), research_dir=research_dir)
+        scope = _scope_label(region, universe, delay)
+        warnings.extend({"code": "LABS_TICKET_OPEN", "ticket_id": hit["ticket_id"],
+                         "overlapping_fields": hit["overlapping_fields"], "scope": scope}
+                        for hit in hits)
+        if len(warnings) == limit:
             break
-    return conflicts
+    return warnings
 
 
 def open_ticket_summary(research_dir=None, *, limit=50):
@@ -408,7 +411,7 @@ def suggest_delegations(research_dir=None, *, region=None, field=None, min_attem
 
 
 def cmd_labs_open(args, _sink):
-    """Open a structured diagnostic ticket and enforce scoped blind-sim blocking."""
+    """Open a structured diagnostic ticket for a specified scope and fields."""
     if args.spec:
         spec_path = Path(args.spec).expanduser().resolve()
         if not spec_path.is_file():

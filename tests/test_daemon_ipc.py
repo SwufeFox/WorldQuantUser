@@ -19,7 +19,7 @@ import pytest
 import cache_store
 import machine_lib as ml
 import simulation_capabilities
-from research_app import daemon, experiments, sm_workers, state_machine, validation
+from research_app import daemon, experiments, labs, sm_workers, state_machine, validation
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -38,6 +38,10 @@ def _http_raw(url, method="GET", token=None, body=None):
 def test_loopback_http_auth_and_wait_wakeup(tmp_path):
     engine = state_machine.StateMachineEngine(tmp_path)
     srv = daemon.DaemonServer(engine, session_factory=lambda: type("S", (), {"close": lambda self: None})())
+    ticket = labs.open_ticket({"trigger_rule": "distribution", "region": "USA", "universe": "TOP3000",
+                               "delay": 1, "fields": ["close"], "questions": ["How often does close change?"],
+                               "expected_metrics": ["Update rate"], "branches": ["Compare horizons"]},
+                              research_dir=tmp_path)
 
     acc = {"fingerprint": "fp-ipc", "quota": {"remaining": 100, "blocked": False}}
     quick_res = [{"index": 0, "label": "c1", "status": "COMPLETE", "alpha_id": "IPC1", "submission_attempted": True,
@@ -75,12 +79,15 @@ def test_loopback_http_auth_and_wait_wakeup(tmp_path):
                     "arms": [{"label": "c1", "expression": "rank(close)"}]}
             proposed = daemon._http_call(ep, "POST", "/v1/propose", body={"spec": spec})
             assert proposed["state"] == "AUTO_PREFLIGHT"
+            assert proposed["warnings"] == [{"code": "LABS_TICKET_OPEN", "ticket_id": ticket["ticket_id"],
+                                             "scope": "USA/TOP3000/D1", "overlapping_fields": ["close"]}]
 
             waited = daemon._http_call(ep, "POST", "/v1/wait",
                                        body={"run_id": proposed["run_id"], "max_wait_seconds": 30.0}, timeout=35.0)
             assert waited["woken"] is True
             assert waited["run"]["state"] == "GATE_TRIAGE"
             assert waited["run"]["test_view_open"] is False
+            assert waited["run"]["warnings"] == proposed["warnings"]
         finally:
             srv.stop()
 

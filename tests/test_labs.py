@@ -1,4 +1,4 @@
-"""Offline tests for Labs ticket validation, scoped blocking, and evidence summaries."""
+"""Offline tests for Labs ticket validation, scoped warnings, and evidence summaries."""
 
 import json
 
@@ -33,18 +33,19 @@ def test_invalid_inputs_are_structured_and_have_no_side_effect(tmp_path, payload
     assert not workspace_db.db_path(tmp_path).exists()
 
 
-def test_proposals_block_only_overlapping_scope_even_with_legacy_override(tmp_path):
+def test_proposals_warn_on_open_tickets_in_the_same_scope(tmp_path):
     engine = state_machine.StateMachineEngine(tmp_path)
     ticket = labs.open_ticket(_ticket(), research_dir=tmp_path)
-    assert engine.propose(_spec("rank(volume)"))["state"] == "AUTO_PREFLIGHT"
-    assert engine.propose(_spec(settings={"region": "EUR", "universe": "TOP1200"}))["state"] == "AUTO_PREFLIGHT"
-    with pytest.raises(CliError) as exc:
-        engine.propose(_spec(allow_open_labs=True))
-    assert exc.value.code == "PREFLIGHT_FAILED"
-    assert exc.value.details["blocking_tickets"] == [{
-        "ticket_id": ticket["ticket_id"], "trigger_rule": "distribution", "scope": "USA/TOP3000/D1",
+    assert engine.propose(_spec("rank(volume)"))["warnings"] == []
+    assert engine.propose(_spec(settings={"region": "EUR", "universe": "TOP1200"}))["warnings"] == []
+    proposed = engine.propose(_spec())
+    assert proposed["state"] == "AUTO_PREFLIGHT"
+    assert proposed["warnings"] == [{
+        "code": "LABS_TICKET_OPEN", "ticket_id": ticket["ticket_id"], "scope": "USA/TOP3000/D1",
         "overlapping_fields": ["close"],
     }]
+    assert engine.load_run_raw(proposed["run_id"])["warnings"] == proposed["warnings"]
+    assert engine.inspect_run(proposed["run_id"])["warnings"] == proposed["warnings"]
     assert engine.inbox(limit=1)["open_labs_total"] == 1
     with pytest.raises(CliError):
         labs.resolve_ticket(ticket["ticket_id"], summary="Invalid numeric summary", metrics='{"rate": NaN}',
@@ -52,15 +53,30 @@ def test_proposals_block_only_overlapping_scope_even_with_legacy_override(tmp_pa
     assert labs.open_ticket_summary(tmp_path)["count"] == 1
     labs.resolve_ticket(ticket["ticket_id"], summary="Median rate was 0.03.", metrics={"median_rate": 0.03},
                         research_dir=tmp_path)
-    assert engine.propose(_spec())["state"] == "AUTO_PREFLIGHT"
+    assert engine.propose(_spec("ts_rank(close, 5)"))["warnings"] == []
 
 
-def test_python_fields_and_effective_delay_are_guarded(tmp_path):
+def test_multiple_arms_and_repeated_proposals_warn_once_per_ticket_and_scope(tmp_path):
+    engine = state_machine.StateMachineEngine(tmp_path)
+    ticket = labs.open_ticket(_ticket(fields=["close", "volume"]), research_dir=tmp_path)
+    expected = [{"code": "LABS_TICKET_OPEN", "ticket_id": ticket["ticket_id"],
+                 "scope": "USA/TOP3000/D1", "overlapping_fields": ["close", "volume"]}]
+
+    for day_count in (5, 10):
+        arms = [{"label": field, "expression": f"ts_rank({field}, {day_count})"}
+                for field in ("close", "volume", "close + volume")]
+        proposed = engine.propose(_spec(arms=arms))
+        assert proposed["state"] == "AUTO_PREFLIGHT"
+        assert proposed["warnings"] == expected
+
+
+def test_python_fields_and_effective_delay_are_reported(tmp_path):
     ticket = labs.open_ticket(_ticket(), research_dir=tmp_path)
     source = 'from brain.alphas import alpha as declare\n@declare(data=["close"])\ndef factor(data, settings):\n    return data.close[-1]\n'
     arms = [{"expression": source, "lookback": 2, "settings": {"language": "python", "delay": None}}]
-    conflicts = labs.blocking_tickets_for_arms(arms, research_dir=tmp_path)
-    assert conflicts[0]["ticket_id"] == ticket["ticket_id"]
+    warnings = labs.open_ticket_warnings_for_arms(arms, research_dir=tmp_path)
+    assert warnings == [{"code": "LABS_TICKET_OPEN", "ticket_id": ticket["ticket_id"],
+                         "scope": "USA/TOP3000/D1", "overlapping_fields": ["close"]}]
 
 
 def test_linked_ticket_restores_exact_gate_and_other_references_cannot_resume_it(tmp_path):

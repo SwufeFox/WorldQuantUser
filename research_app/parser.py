@@ -939,7 +939,7 @@ def build_parser():
 
     labs_open = labs_sub.add_parser(
         "open",
-        help="Open a structured BRAIN Labs diagnostic ticket (pauses blind simulation on those fields).")
+        help="Open a structured BRAIN Labs diagnostic ticket (warns on overlapping proposals).")
     labs_open.add_argument("--spec", default=None, help="Optional JSON file defining ticket fields.")
     labs_open.add_argument("--trigger", default=None, choices=["anomaly", "distribution", "interaction"],
                            help="Trigger rule: anomaly | distribution | interaction.")
