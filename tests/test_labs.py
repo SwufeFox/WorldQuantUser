@@ -163,3 +163,13 @@ def test_suggest_delegations_reads_the_workspace_registry(tmp_path):
 
     (tmp_path / "alpha-registry.jsonl").write_text("", encoding="utf-8")
     assert labs.suggest_delegations(str(tmp_path)) == []
+
+
+def test_suggest_delegations_skips_entries_with_conflicting_settings():
+    """One legacy entry with both spellings must not abort the whole report."""
+    from research_app import labs
+
+    conflicting = {"expression": "rank(close)", "status": "COMPLETE",
+                   "settings": {"nanHandling": "ON", "nan_handling": "OFF",
+                                "region": "HKG", "universe": "TOP500", "delay": 1}}
+    assert labs.suggest_delegations("/nonexistent", entries=[conflicting]) == []

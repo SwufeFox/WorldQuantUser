@@ -374,7 +374,12 @@ def suggest_delegations(research_dir=None, *, region=None, field=None, min_attem
             continue
         if str(entry.get("status") or "").upper() not in alpha_registry.FINISHED_STATUSES | {"UNSUBMITTED"}:
             continue
-        settings = ml.normalize_setting_keys(entry.get("settings") or {})
+        try:
+            settings = ml.normalize_setting_keys(entry.get("settings") or {})
+        except ValueError:
+            # Migrated ledgers can carry both spelling variants with different
+            # values; that entry is unusable for scope attribution, not fatal.
+            continue
         entry_region, universe, delay = (settings.get(key) for key in ("region", "universe", "delay"))
         if (not isinstance(entry_region, str) or not entry_region.strip() or not isinstance(universe, str)
                 or not universe.strip() or type(delay) is not int or not 0 <= delay <= 2**63 - 1):
