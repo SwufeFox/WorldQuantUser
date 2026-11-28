@@ -362,17 +362,17 @@ class RecordsetReadinessTests(unittest.TestCase):
             previous = {"2020-01-01": 1.0}
             session.get.return_value = response(200, payload={"records": [["2020-01-01", 1]], "count": 1})
             self.assertEqual(ml.fetch_daily_pnl(session, "A", cache_dir=directory), previous)
-            publish = pnl_store._publish_delta_file
+            publish = pnl_store._publish_recordset_frame
 
-            def interrupt_data(cache_dir, alpha_id, series):
-                if alpha_id == "A":
+            def interrupt_data(cache_dir, series_by_alpha):
+                if "A" in series_by_alpha:
                     raise KeyboardInterrupt
-                return publish(cache_dir, alpha_id, series)
+                return publish(cache_dir, series_by_alpha)
 
             # Repeated interruptions must carry the proof for the data still on disk.
             for value in (2, 3):
                 session.get.return_value = response(200, payload={"records": [["2020-01-01", value]], "count": 1})
-                with mock.patch.object(pnl_store, "_publish_delta_file", side_effect=interrupt_data), \
+                with mock.patch.object(pnl_store, "_publish_recordset_frame", side_effect=interrupt_data), \
                         self.assertRaises(KeyboardInterrupt):
                     ml.fetch_daily_pnl(session, "A", cache_dir=directory, max_age_hours=0)
                 offline = mock.Mock()

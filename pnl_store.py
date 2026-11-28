@@ -178,16 +178,21 @@ def _publish_frame(frame, target):
     return target
 
 
-def _publish_delta_file(cache_dir, alpha_id, series):
+def _publish_recordset_frame(cache_dir, series_by_alpha):
+    """Write one immutable delta file holding every supplied recordset."""
     pl = _import_polars()
     path = Path(cache_dir) / "deltas" / f"{uuid4().hex}.parquet"
-    return _publish_frame(_frame(pl, {alpha_id: series}), path)
+    return _publish_frame(_frame(pl, series_by_alpha), path)
 
 
-def _values(alpha_id, series, metadata, reference, updated_at):
+def _publish_delta_file(cache_dir, alpha_id, series):
+    return _publish_recordset_frame(cache_dir, {alpha_id: series})
+
+
+def _values(alpha_id, series, metadata, reference, updated_at, digest=None):
     complete = metadata.get("complete")
     return (alpha_id, _EVIDENCE_FORMAT, int(complete) if type(complete) is bool else None,
-            metadata.get("as_of"), canonical_digest(series), metadata.get("pages"),
+            metadata.get("as_of"), digest or canonical_digest(series), metadata.get("pages"),
             metadata.get("start"), metadata.get("end"), metadata.get("missing_values"),
             len(series), reference, updated_at)
 
@@ -214,34 +219,58 @@ def _write_legacy(cache_path, alpha_id, series, metadata):
     return {"storage": "json_fallback", "path": str(path), "metadata_path": str(sidecar)}
 
 
-def write_pnl(cache_dir, alpha_id, series, metadata, *, max_deltas=_DEFAULT_MAX_DELTAS, timeout=30):
-    """Publish one whole recordset, then commit its file reference and evidence together."""
-    cache_path = Path(cache_dir)
+def _prepare_write(alpha_id, series, metadata):
     normalized = _normalize_series(series)
     digest = _digest(normalized)
-    metadata = {**(metadata or {}), "format": _EVIDENCE_FORMAT, "alpha_id": alpha_id,
-                "data_sha256": digest, "points": len(normalized)}
+    payload = {**(metadata or {}), "format": _EVIDENCE_FORMAT, "alpha_id": alpha_id,
+               "data_sha256": digest, "points": len(normalized)}
+    return alpha_id, normalized, payload, digest
+
+
+def write_pnl_many(cache_dir, records, *, max_deltas=_DEFAULT_MAX_DELTAS, timeout=30):
+    """Publish several recordsets in one manifest transaction and one compaction pass."""
+    cache_path = Path(cache_dir)
+    prepared = [_prepare_write(*record) for record in records]
+    receipts = {}
     if _import_polars() is None:
         with cache_store.file_lock(cache_path / "compact.lock", timeout=timeout):
             if (cache_path / _META_DB).is_file():
                 raise cache_store.CacheError("Polars is required to update an existing Parquet PnL store")
-            receipt = _write_legacy(cache_path, alpha_id, normalized, metadata)
-    else:
-        with _manifest(cache_path, write=True, timeout=timeout) as conn:
-            prior = _records(conn, [alpha_id])
-            delta = _publish_delta_file(cache_path, alpha_id, normalized)
-            with conn:
-                conn.execute(_UPSERT, _values(alpha_id, normalized, metadata, delta.name, time.time()))
-            _retire(cache_path, conn, (row["delta_file"] for row in prior))
-            # A maintenance failure does not invalidate the already committed write.
-            with suppress(OSError, cache_store.CacheError, sqlite3.Error):
-                _compact(cache_path, conn, max_deltas=max_deltas)
+            for alpha_id, normalized, payload, digest in prepared:
+                receipt = _write_legacy(cache_path, alpha_id, normalized, payload)
+                receipts[alpha_id] = {**receipt, "data_sha256": digest, "points": len(normalized)}
+        return receipts
+    with _manifest(cache_path, write=True, timeout=timeout) as conn:
+        priors = []
+        rows = []
+        stamp = time.time()
+        for alpha_id, normalized, payload, digest in prepared:
+            priors.extend(row["delta_file"] for row in _records(conn, [alpha_id]))
+        shared = _publish_recordset_frame(cache_path,
+                                          {alpha_id: normalized for alpha_id, normalized, _, _ in prepared})
+        for alpha_id, normalized, payload, digest in prepared:
+            rows.append(_values(alpha_id, normalized, payload, shared.name, stamp, digest))
+        with conn:
+            conn.executemany(_UPSERT, rows)
+        _retire(cache_path, conn, priors)
+        # A maintenance failure does not invalidate the already committed writes.
+        with suppress(OSError, cache_store.CacheError, sqlite3.Error):
+            _compact(cache_path, conn, max_deltas=max_deltas)
+        for alpha_id, normalized, payload, digest in prepared:
             reference = _records(conn, [alpha_id])[0]["delta_file"]
             receipt = {"storage": "parquet", "path": str(_record_path(cache_path, reference)),
-                       "metadata_path": str(cache_path / _META_DB)}
+                       "metadata_path": str(cache_path / _META_DB),
+                       "data_sha256": digest, "points": len(normalized)}
             if _delta_reference(reference):
                 receipt["delta_file"] = reference
-    return {**receipt, "data_sha256": digest, "points": len(normalized)}
+            receipts[alpha_id] = receipt
+    return receipts
+
+
+def write_pnl(cache_dir, alpha_id, series, metadata, *, max_deltas=_DEFAULT_MAX_DELTAS, timeout=30):
+    """Publish one whole recordset, then commit its file reference and evidence together."""
+    return write_pnl_many(cache_dir, [(alpha_id, series, metadata)],
+                          max_deltas=max_deltas, timeout=timeout)[alpha_id]
 
 
 def _read_records(cache_path, rows):
